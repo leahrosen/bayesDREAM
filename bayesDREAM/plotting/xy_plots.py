@@ -3189,6 +3189,7 @@ def plot_negbinom_xy(
     mark_params: bool = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
+    figsize: Optional[Tuple[float, float]] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3257,9 +3258,9 @@ def plot_negbinom_xy(
     # Create axes
     if ax is None:
         if show_correction == 'both':
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig, axes = plt.subplots(1, 2, figsize=figsize or (14, 5))
         else:
-            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+            fig, ax = plt.subplots(1, 1, figsize=figsize or (8, 5))
             axes = [ax]
     else:
         # Single axis provided - in multifeature mode, function is called twice
@@ -3488,6 +3489,7 @@ def plot_binomial_xy(
     mark_params: bool = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
+    figsize: Optional[Tuple[float, float]] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3579,9 +3581,9 @@ def plot_binomial_xy(
     # Create axes
     if ax is None:
         if show_correction == 'both':
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig, axes = plt.subplots(1, 2, figsize=figsize or (14, 5))
         else:
-            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+            fig, ax = plt.subplots(1, 1, figsize=figsize or (8, 5))
             axes = [ax]
     else:
         # Single axis provided - in multifeature mode, function is called twice
@@ -4051,6 +4053,7 @@ def plot_normal_xy(
     mark_params: bool = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
+    figsize: Optional[Tuple[float, float]] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -4117,9 +4120,9 @@ def plot_normal_xy(
     # Create axes
     if ax is None:
         if show_correction == 'both':
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig, axes = plt.subplots(1, 2, figsize=figsize or (14, 5))
         else:
-            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+            fig, ax = plt.subplots(1, 1, figsize=figsize or (8, 5))
             axes = [ax]
     else:
         # Single axis provided - in multifeature mode, function is called twice
@@ -5083,6 +5086,7 @@ def plot_xy_data(
             mark_params=mark_params,
             ci_level=ci_level,
             legend_outside=legend_outside,
+            figsize=figsize,
             **kwargs
         )
 
@@ -5102,6 +5106,7 @@ def plot_xy_data(
             mark_params=mark_params,
             ci_level=ci_level,
             legend_outside=legend_outside,
+            figsize=figsize,
             **kwargs
         )
 
@@ -5139,6 +5144,7 @@ def plot_xy_data(
             mark_params=mark_params,
             ci_level=ci_level,
             legend_outside=legend_outside,
+            figsize=figsize,
             **kwargs
         )
 
