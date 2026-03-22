@@ -3465,9 +3465,8 @@ def plot_negbinom_xy(
         _plot_one(axes[0], corrected=False)
 
     if legend_outside:
-        fig = axes[0].get_figure()
         handles, labels = _collect_legend_handles(axes)
-        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
+        axes[-1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5), loc='center left', frameon=False)
 
     return axes[0] if len(axes) == 1 else axes
 
@@ -3723,9 +3722,8 @@ def plot_binomial_xy(
         _plot_one(axes[0], corrected=False)
 
     if legend_outside:
-        fig = axes[0].get_figure()
         handles, labels = _collect_legend_handles(axes)
-        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
+        axes[-1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5), loc='center left', frameon=False)
 
     return axes[0] if len(axes) == 1 else axes
 
@@ -4262,9 +4260,8 @@ def plot_normal_xy(
         _plot_one(axes[0], corrected=False)
 
     if legend_outside:
-        fig = axes[0].get_figure()
         handles, labels = _collect_legend_handles(axes)
-        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
+        axes[-1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5), loc='center left', frameon=False)
 
     return axes[0] if len(axes) == 1 else axes
 
@@ -5057,7 +5054,7 @@ def plot_xy_data(
 
         if legend_outside:
             handles, labels = _collect_legend_handles(axes.ravel())
-            fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
+            axes[-1, -1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5), loc='center left', frameon=False)
 
         _save_figure(fig, model, filename)
         return fig
