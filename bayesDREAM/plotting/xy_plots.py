@@ -3190,6 +3190,7 @@ def plot_negbinom_xy(
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
+    log2fc: bool = False,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3281,6 +3282,24 @@ def plot_negbinom_xy(
     # Detect NTC cells for gradient coloring
     is_ntc = df['target'].str.lower() == 'ntc'
 
+    # Compute NTC reference values for log2FC mode
+    if log2fc:
+        ntc_df = df[is_ntc]
+        x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
+        y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+        if len(x_ntc_valid) > 0 and len(y_ntc_valid) > 0:
+            x_offset = np.log2(float(x_ntc_valid.mean()))
+            y_offset = np.log2(float(y_ntc_valid.mean()))
+        else:
+            import warnings
+            warnings.warn("log2fc=True: no valid NTC cells found; plotting raw log2 instead.")
+            x_offset = 0.0
+            y_offset = 0.0
+    else:
+        x_offset = 0.0
+        y_offset = 0.0
+
     # Create colormaps for NTC gradient (per technical group)
     # Each group gets white → group_color gradient
     group_cmaps = {}
@@ -3358,8 +3377,8 @@ def plot_negbinom_xy(
                 # Color value = 1 - ntc_prop: high NTC → 0 → white, low NTC → 1 → group color
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
-                    x=np.log2(x_smooth),
-                    y=y_smooth_log,
+                    x=np.log2(x_smooth) - x_offset,
+                    y=y_smooth_log - y_offset,
                     color_values=1 - ntc_prop,  # Darker (group color) = fewer NTCs
                     cmap=group_cmap,
                     ax=ax_plot,
@@ -3398,7 +3417,8 @@ def plot_negbinom_xy(
 
                 # Use standard coloring
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
-                ax_plot.plot(np.log2(x_smooth), y_smooth_log, color=color, linewidth=2, label=group_label)
+                ax_plot.plot(np.log2(x_smooth) - x_offset, y_smooth_log - y_offset,
+                             color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -3414,7 +3434,8 @@ def plot_negbinom_xy(
                 # Filter out zero/negative predictions
                 valid_pred = y_pred > 0
                 if valid_pred.any():
-                    ax_plot.plot(np.log2(x_range[valid_pred]), np.log2(y_pred[valid_pred]),
+                    ax_plot.plot(np.log2(x_range[valid_pred]) - x_offset,
+                                np.log2(y_pred[valid_pred]) - y_offset,
                                 color='black', linestyle='--', linewidth=2,
                                 label='Fitted Trans Function')
 
@@ -3438,7 +3459,7 @@ def plot_negbinom_xy(
                                 else:
                                     A = A_mean[gene_idx]
                             if A > 0:
-                                ax_plot.axhline(np.log2(A), color='red', linestyle=':',
+                                ax_plot.axhline(np.log2(A) - y_offset, color='red', linestyle=':',
                                                 linewidth=1, label='log2(A) baseline')
 
             # Full parameter markers (replaces simple A baseline)
@@ -3449,10 +3470,13 @@ def plot_negbinom_xy(
                 )
                 _draw_hill_markers(ax_plot, _markers)
 
-        ax_plot.set_xlabel(xlabel)
-        ax_plot.set_ylabel('log2(Expression)')
+        ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
+        ax_plot.set_ylabel("log2FC(Expression)" if log2fc else "log2(Expression)")
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
+        if log2fc:
+            ax_plot.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
+            ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
@@ -4664,6 +4688,7 @@ def plot_xy_data(
     mark_params: bool = False,
     legend_outside: bool = False,
     filename: Optional[str] = None,
+    log2fc: bool = False,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -4745,6 +4770,12 @@ def plot_xy_data(
           additionally log2(A+α·Vmax_a+β·Vmax_b) [peak] if activation EC50 < inhibition EC50
         For non-negbinom distributions, all y-axis markers are in linear space.
         Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
+    log2fc : bool
+        If True, plot log2FC relative to NTC instead of raw log2 expression
+        (default: False). Only applies to negbinom modalities.
+        x-axis: log2(x_true) - log2(mean NTC x_true)
+        y-axis: log2(expression) - log2(mean NTC expression)
+        A grey dotted crosshair is drawn at (0, 0) to mark the NTC reference.
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
@@ -5023,6 +5054,7 @@ def plot_xy_data(
                     show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
                     min_counts=min_counts, xlabel=xlabel, ax=ax,
                     subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    log2fc=log2fc,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -5087,6 +5119,7 @@ def plot_xy_data(
             ci_level=ci_level,
             legend_outside=legend_outside,
             figsize=figsize,
+            log2fc=log2fc,
             **kwargs
         )
 
