@@ -4938,85 +4938,59 @@ def plot_xy_data(
             )
 
         # Standard multi-feature plotting for 2D distributions
-        # Layout: features in rows, uncorrected (left) and corrected (right) columns
+        # Layout: features in rows; columns depend on show_correction
         n_rows = n_features
-        n_cols = 2  # Left = uncorrected, Right = corrected
+        if show_correction == 'both':
+            n_cols = 2
+            col_corrections = ['uncorrected', 'corrected']
+        else:
+            n_cols = 1
+            col_corrections = [show_correction]  # 'uncorrected' or 'corrected'
 
         if figsize is None:
-            figsize = (12, 3 * n_rows)  # 12 inches wide (6 per subplot), 3 inches per row
+            figsize = (6 * n_cols, 3 * n_rows)
 
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False,
                                  constrained_layout=True)
 
+        def _plot_one_multifeature(feat_name, ax, correction):
+            if distribution == 'negbinom':
+                plot_negbinom_xy(
+                    model=model, feature=feat_name, modality=modality,
+                    x_true=x_true, window=window, show_correction=correction,
+                    color_palette=color_palette, show_hill_function=show_hill_function,
+                    show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
+                    min_counts=min_counts, xlabel=xlabel, ax=ax,
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
+                )
+            elif distribution == 'binomial':
+                plot_binomial_xy(
+                    model=model, feature=feat_name, modality=modality,
+                    x_true=x_true, window=window, show_correction=correction,
+                    min_counts=min_counts, color_palette=color_palette,
+                    show_trans_function=show_hill_function,
+                    show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
+                )
+            elif distribution in ('normal', 'studentt'):
+                plot_normal_xy(
+                    model=model, feature=feat_name, modality=modality,
+                    x_true=x_true, window=window, show_correction=correction,
+                    color_palette=color_palette, show_trans_function=show_hill_function,
+                    show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
+                )
+            else:
+                ax.text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
+                        ha='center', va='center', transform=ax.transAxes)
+
         # Plot each feature (one row per feature)
         for i, (feat_idx, feat_name) in enumerate(zip(feature_indices, feature_names_resolved)):
-            # Plot uncorrected (left column)
-            if distribution == 'negbinom':
-                plot_negbinom_xy(
-                    model=model, feature=feat_name, modality=modality,
-                    x_true=x_true, window=window, show_correction='uncorrected',
-                    color_palette=color_palette, show_hill_function=show_hill_function,
-                    show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
-                    min_counts=min_counts, xlabel=xlabel, ax=axes[i, 0],
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    **kwargs
-                )
-            elif distribution == 'binomial':
-                plot_binomial_xy(
-                    model=model, feature=feat_name, modality=modality,
-                    x_true=x_true, window=window, show_correction='uncorrected',
-                    min_counts=min_counts, color_palette=color_palette,
-                    show_trans_function=show_hill_function,
-                    show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 0],
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    **kwargs
-                )
-            elif distribution in ('normal', 'studentt'):
-                plot_normal_xy(
-                    model=model, feature=feat_name, modality=modality,
-                    x_true=x_true, window=window, show_correction='uncorrected',
-                    color_palette=color_palette, show_trans_function=show_hill_function,
-                    show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 0],
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    **kwargs
-                )
-            else:
-                axes[i, 0].text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
-                               ha='center', va='center', transform=axes[i, 0].transAxes)
-
-            # Plot corrected (right column)
-            if distribution == 'negbinom':
-                plot_negbinom_xy(
-                    model=model, feature=feat_name, modality=modality,
-                    x_true=x_true, window=window, show_correction='corrected',
-                    color_palette=color_palette, show_hill_function=show_hill_function,
-                    show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
-                    min_counts=min_counts, xlabel=xlabel, ax=axes[i, 1],
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    **kwargs
-                )
-            elif distribution == 'binomial':
-                plot_binomial_xy(
-                    model=model, feature=feat_name, modality=modality,
-                    x_true=x_true, window=window, show_correction='corrected',
-                    min_counts=min_counts, color_palette=color_palette,
-                    show_trans_function=show_hill_function,
-                    show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 1],
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    **kwargs
-                )
-            elif distribution in ('normal', 'studentt'):
-                plot_normal_xy(
-                    model=model, feature=feat_name, modality=modality,
-                    x_true=x_true, window=window, show_correction='corrected',
-                    color_palette=color_palette, show_trans_function=show_hill_function,
-                    show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 1],
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    **kwargs
-                )
-            else:
-                axes[i, 1].text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
-                               ha='center', va='center', transform=axes[i, 1].transAxes)
+            for j, correction in enumerate(col_corrections):
+                _plot_one_multifeature(feat_name, axes[i, j], correction)
 
         plt.suptitle(f"{model.cis_gene} → {feature} (gene, n={n_features} features)")
         return fig
