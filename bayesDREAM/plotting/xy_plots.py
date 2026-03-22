@@ -3144,6 +3144,33 @@ def _draw_hill_markers(ax, markers):
 # Distribution-Specific Plotting Functions
 # ============================================================================
 
+def _save_figure(fig, model, filename):
+    """Save fig to model.output_dir/filename (adds .png if no extension)."""
+    if filename is None:
+        return
+    import os
+    if not os.path.splitext(filename)[1]:
+        filename = filename + '.png'
+    if os.path.isabs(filename):
+        save_path = filename
+    else:
+        save_path = os.path.join(model.output_dir, filename)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, bbox_inches='tight')
+    print(f"[PLOT] Saved to {save_path}")
+
+
+def _collect_legend_handles(axes):
+    """Collect deduplicated (handle, label) pairs from a list of axes."""
+    handles, labels = [], []
+    for ax in axes:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in labels:
+                handles.append(h)
+                labels.append(l)
+    return handles, labels
+
+
 def plot_negbinom_xy(
     model,
     feature: str,
@@ -3161,6 +3188,7 @@ def plot_negbinom_xy(
     subset_mask: Optional[np.ndarray] = None,
     mark_params: bool = False,
     ci_level: float = 95.0,
+    legend_outside: bool = False,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3424,7 +3452,8 @@ def plot_negbinom_xy(
         ax_plot.set_ylabel('log2(Expression)')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
-        ax_plot.legend(frameon=False)
+        if not legend_outside:
+            ax_plot.legend(frameon=False)
 
     # Plot
     if show_correction == 'both':
@@ -3434,6 +3463,11 @@ def plot_negbinom_xy(
         _plot_one(axes[0], corrected=True)
     else:
         _plot_one(axes[0], corrected=False)
+
+    if legend_outside:
+        fig = axes[0].get_figure()
+        handles, labels = _collect_legend_handles(axes)
+        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
 
     return axes[0] if len(axes) == 1 else axes
 
@@ -3454,6 +3488,7 @@ def plot_binomial_xy(
     subset_mask: Optional[np.ndarray] = None,
     mark_params: bool = False,
     ci_level: float = 95.0,
+    legend_outside: bool = False,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3673,7 +3708,8 @@ def plot_binomial_xy(
         ax_plot.set_ylabel('PSI (%)')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature} (min_counts={min_counts}{title_suffix})")
-        ax_plot.legend(frameon=False)
+        if not legend_outside:
+            ax_plot.legend(frameon=False)
 
     # Plot
     # NOTE: When ax is provided (multifeature mode), show_correction will be 'uncorrected' or 'corrected'
@@ -3685,6 +3721,11 @@ def plot_binomial_xy(
         _plot_one(axes[0], corrected=True)
     else:  # show_correction == 'uncorrected'
         _plot_one(axes[0], corrected=False)
+
+    if legend_outside:
+        fig = axes[0].get_figure()
+        handles, labels = _collect_legend_handles(axes)
+        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
 
     return axes[0] if len(axes) == 1 else axes
 
@@ -4011,6 +4052,7 @@ def plot_normal_xy(
     subset_mask: Optional[np.ndarray] = None,
     mark_params: bool = False,
     ci_level: float = 95.0,
+    legend_outside: bool = False,
     **kwargs
 ) -> plt.Axes:
     """
@@ -4207,7 +4249,8 @@ def plot_normal_xy(
         ax_plot.set_ylabel('Value')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
-        ax_plot.legend(frameon=False)
+        if not legend_outside:
+            ax_plot.legend(frameon=False)
 
     # Plot
     if show_correction == 'both':
@@ -4217,6 +4260,11 @@ def plot_normal_xy(
         _plot_one(axes[0], corrected=True)
     else:
         _plot_one(axes[0], corrected=False)
+
+    if legend_outside:
+        fig = axes[0].get_figure()
+        handles, labels = _collect_legend_handles(axes)
+        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
 
     return axes[0] if len(axes) == 1 else axes
 
@@ -4614,6 +4662,8 @@ def plot_xy_data(
     only_dependent: bool = False,
     ci_level: float = 95.0,
     mark_params: bool = False,
+    legend_outside: bool = False,
+    filename: Optional[str] = None,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -4695,6 +4745,17 @@ def plot_xy_data(
           additionally log2(A+α·Vmax_a+β·Vmax_b) [peak] if activation EC50 < inhibition EC50
         For non-negbinom distributions, all y-axis markers are in linear space.
         Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
+    legend_outside : bool
+        Place the legend outside the panel to the right, shared across all panels
+        (default: False). Useful when many lines clutter the plot area.
+    filename : str, optional
+        If provided, save the figure to ``model.output_dir / filename``.
+        A ``.png`` extension is added automatically if none is given.
+        Use a full path to save elsewhere.
+    figsize : tuple, optional
+        Figure size as ``(width, height)`` in inches.  When None (default) the
+        size is chosen automatically: 6 inches per column × 3 inches per row
+        for multi-panel plots, or (8, 5) / (14, 5) for single-panel plots.
     **kwargs
         Additional plotting arguments
 
@@ -4993,6 +5054,12 @@ def plot_xy_data(
                 _plot_one_multifeature(feat_name, axes[i, j], correction)
 
         plt.suptitle(f"{model.cis_gene} → {feature} (gene, n={n_features} features)")
+
+        if legend_outside:
+            handles, labels = _collect_legend_handles(axes.ravel())
+            fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left', frameon=False)
+
+        _save_figure(fig, model, filename)
         return fig
 
     # Single feature - use original code path
@@ -5002,7 +5069,7 @@ def plot_xy_data(
     distribution = modality.distribution
 
     if distribution == 'negbinom':
-        return plot_negbinom_xy(
+        result = plot_negbinom_xy(
             model=model,
             feature=feature,
             modality=modality,
@@ -5018,11 +5085,12 @@ def plot_xy_data(
             subset_mask=subset_mask,
             mark_params=mark_params,
             ci_level=ci_level,
+            legend_outside=legend_outside,
             **kwargs
         )
 
     elif distribution == 'binomial':
-        return plot_binomial_xy(
+        result = plot_binomial_xy(
             model=model,
             feature=feature,
             modality=modality,
@@ -5036,11 +5104,12 @@ def plot_xy_data(
             subset_mask=subset_mask,
             mark_params=mark_params,
             ci_level=ci_level,
+            legend_outside=legend_outside,
             **kwargs
         )
 
     elif distribution == 'multinomial':
-        return plot_multinomial_xy(
+        result = plot_multinomial_xy(
             model=model,
             feature=feature,
             modality=modality,
@@ -5058,7 +5127,7 @@ def plot_xy_data(
         )
 
     elif distribution in ('normal', 'studentt'):
-        return plot_normal_xy(
+        result = plot_normal_xy(
             model=model,
             feature=feature,
             modality=modality,
@@ -5072,8 +5141,15 @@ def plot_xy_data(
             subset_mask=subset_mask,
             mark_params=mark_params,
             ci_level=ci_level,
+            legend_outside=legend_outside,
             **kwargs
         )
 
     else:
         raise ValueError(f"Plotting not implemented for distribution '{distribution}'")
+
+    # Save single-feature figure
+    if filename is not None:
+        ax_result = result if isinstance(result, plt.Axes) else result[0]
+        _save_figure(ax_result.get_figure(), model, filename)
+    return result
