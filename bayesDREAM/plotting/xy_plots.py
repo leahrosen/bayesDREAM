@@ -3415,7 +3415,7 @@ def plot_negbinom_xy(
                 valid_pred = y_pred > 0
                 if valid_pred.any():
                     ax_plot.plot(np.log2(x_range[valid_pred]), np.log2(y_pred[valid_pred]),
-                                color='blue', linestyle='--', linewidth=2,
+                                color='black', linestyle='--', linewidth=2,
                                 label='Fitted Trans Function')
 
                 # Add baseline (only when not using full mark_params)
@@ -3694,7 +3694,7 @@ def plot_binomial_xy(
                 y_pred_pct = y_pred * 100.0
                 y_pred_clipped = np.clip(y_pred_pct, 0, 100)
                 ax_plot.plot(np.log2(x_range), y_pred_clipped,
-                           color='blue', linestyle='--', linewidth=2,
+                           color='black', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
 
         # Full parameter markers (PSI%, linear y-axis)
@@ -4235,7 +4235,7 @@ def plot_normal_xy(
 
             if y_pred is not None:
                 ax_plot.plot(np.log2(x_range), y_pred,
-                           color='blue', linestyle='--', linewidth=2,
+                           color='black', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
 
         # Full parameter markers (linear y-axis)
