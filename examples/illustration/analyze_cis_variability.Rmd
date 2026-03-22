@@ -1,0 +1,223 @@
+---
+title: "bayesDREAM: Cis variability across 100 seeds"
+output:
+  html_document:
+    fig_width: 9
+    fig_height: 5
+    theme: minimal
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# ── Path to output ─────────────────────────────────────────────────────────
+OUT_DIR <- file.path(dirname(rstudioapi::getSourceEditorContext()$path),
+                     "output_illustration")
+if (!dir.exists(OUT_DIR)) OUT_DIR <- "output_illustration"
+
+# ── Load and join data ─────────────────────────────────────────────────────
+df   <- read.csv(file.path(OUT_DIR, "cis_variability_100seeds.csv"))
+conv <- read.csv(file.path(OUT_DIR, "seed_convergence.csv"))
+df   <- merge(df, conv[, c("seed", "converged", "final_loss")], by = "seed")
+
+# ── Guide ordering (ascending true FC) and colours ────────────────────────
+guide_order <- df %>%
+  distinct(guide, true_fc) %>%
+  arrange(true_fc) %>%
+  pull(guide)
+
+df$guide <- factor(df$guide, levels = guide_order)
+
+guide_colours <- c(
+  "KO1"   = "#1A237E",
+  "KO2"   = "#3949AB",
+  "KO3"   = "#90CAF9",
+  "NTC_1" = "#2ECC71",
+  "CA1"   = "#EF9A9A",
+  "CA2"   = "#C62828"
+)
+
+conv_colours <- c("True" = "#2ECC71", "False" = "#E74C3C")
+conv_shapes  <- c("True" = 16,        "False" = 4)
+
+true_vals <- df %>% distinct(guide, true_fc)
+
+theme_bd <- theme_classic(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    axis.title      = element_text(size = 11),
+    legend.position = "none"
+  )
+```
+
+## Convergence note
+
+**97/100 converged** with niters=10 000 (tolerance 1e-4); 3 did not.
+Convergence steps ranged from 692 to 9612.
+
+---
+
+## Plot 1: Estimated log₂FC per guide across 100 seeds
+
+Each dot is one seed (● = converged, × = did not converge). Black diamond = true log₂FC.
+
+```{r plot1-jitter, fig.height=4.5, fig.width=7}
+ggplot(df, aes(x = guide, y = est_fc, colour = guide)) +
+  geom_jitter(aes(shape = converged), alpha = 0.55, size = 1.8,
+              position = position_jitter(width = 0.18, seed = 1)) +
+  geom_point(data = true_vals, aes(x = guide, y = true_fc),
+             shape = 18, size = 5, colour = "black", inherit.aes = FALSE) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed",
+             linewidth = 0.5) +
+  scale_colour_manual(values = guide_colours) +
+  labs(title = "Estimated log2FC across 100 seeds",
+       x = "Guide", y = "Estimated log2FC") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+---
+
+## Plot 1b: Per-cell x_true correlation by guide
+
+For each seed × guide, Pearson and Spearman r between the latent true x (Normal draw)
+and the model's per-cell posterior mean x_true, computed across cells within that guide.
+Each dot is one seed (● = converged, × = did not converge).
+
+```{r plot1b-xtrue-corr, fig.height=8, fig.width=7}
+p_pearson <- ggplot(df, aes(x = guide, y = r_pearson, colour = guide)) +
+  geom_jitter(aes(shape = converged), alpha = 0.55, size = 1.8,
+              position = position_jitter(width = 0.18, seed = 1)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed", linewidth = 0.5) +
+  scale_colour_manual(values = guide_colours) +
+  labs(title = "Pearson r: true x vs estimated x_true",
+       x = "Guide", y = "Pearson r") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p_spearman <- ggplot(df, aes(x = guide, y = r_spearman, colour = guide)) +
+  geom_jitter(aes(shape = converged), alpha = 0.55, size = 1.8,
+              position = position_jitter(width = 0.18, seed = 1)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed", linewidth = 0.5) +
+  scale_colour_manual(values = guide_colours) +
+  labs(title = "Spearman r: true x vs estimated x_true",
+       x = "Guide", y = "Spearman r") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p_pearson / p_spearman
+
+p_pearson <- ggplot(df, aes(x = guide, y = r_pearson, fill = guide)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed", linewidth = 0.5) +
+  scale_fill_manual(values = guide_colours) +
+  labs(title = "Pearson r: true x vs estimated x_true",
+       x = "Guide", y = "Pearson r") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p_spearman <- ggplot(df, aes(x = guide, y = r_spearman, fill = guide)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed", linewidth = 0.5) +
+  scale_fill_manual(values = guide_colours) +
+  labs(title = "Spearman r: true x vs estimated x_true",
+       x = "Guide", y = "Spearman r") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p_pearson / p_spearman
+```
+
+---
+
+## Error summary
+
+```{r error-summary}
+df %>%
+  group_by(guide) %>%
+  summarise(
+    true_fc   = first(true_fc),
+    mean_est  = mean(est_fc),
+    mean_bias = mean(bias),
+    sd_bias   = sd(bias),
+    pct_large = mean(abs(bias) > 0.3),
+    .groups   = "drop"
+  ) %>%
+  arrange(true_fc) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 3)),
+         pct_large = scales::percent(pct_large, accuracy = 1)) %>%
+  knitr::kable(
+    col.names = c("Guide", "True FC", "Mean est", "Mean bias", "SD bias", "|bias|>0.3"),
+    align = "lrrrrr"
+  )
+```
+
+---
+
+## Plot 2: Pairwise correlation of bias across seeds
+
+High positive correlation = the same seeds produce large errors in the same direction for both guides.
+
+```{r plot2-pairwise-corr, fig.height=11, fig.width=12}
+make_cor_plot <- function(data, title) {
+  wide <- data %>%
+    select(seed, guide, bias) %>%
+    pivot_wider(names_from = guide, values_from = bias) %>%
+    select(-seed)
+  cm  <- cor(wide, method = "pearson")
+  gns <- rownames(cm)
+  cl  <- data.frame(
+    guide1 = factor(rep(gns, times = length(gns)), levels = guide_order),
+    guide2 = factor(rep(gns, each  = length(gns)), levels = rev(guide_order)),
+    r      = as.vector(cm)
+  )
+  ggplot(cl, aes(x = guide1, y = guide2, fill = r)) +
+    geom_tile(colour = "white", linewidth = 0.5) +
+    geom_text(aes(label = round(r, 2)), size = 3.5, colour = "black") +
+    scale_fill_gradient2(low = "#3949AB", mid = "white", high = "#C62828",
+                         midpoint = 0, limits = c(-1, 1), name = "Pearson r") +
+    scale_x_discrete(position = "top") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 12),
+          axis.text = element_text(size = 10), axis.ticks = element_blank(),
+          legend.position = "right")
+}
+
+p_all     <- make_cor_plot(df,
+               paste0("All seeds (n=", n_distinct(df$seed), ")"))
+p_conv    <- make_cor_plot(filter(df, converged == "True"),
+               paste0("Converged (n=",
+                      n_distinct(filter(df, converged == "True")$seed), ")"))
+p_notconv <- make_cor_plot(filter(df, converged == "False"),
+               paste0("Did not converge (n=",
+                      n_distinct(filter(df, converged == "False")$seed), ")"))
+
+p_all / (p_conv + p_notconv)
+```
+
+---
+
+## Plot 3: Final loss vs absolute bias, facetted by guide
+
+Does higher final ELBO loss predict larger estimation error?
+
+```{r plot3-loss-vs-error, fig.height=6, fig.width=9}
+ggplot(df, aes(x = final_loss, y = bias,
+               colour = converged, shape = converged)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  facet_wrap(~ guide, scales = "free_x", nrow = 2) +
+  scale_colour_manual(values = conv_colours, name = NULL) +
+  scale_shape_manual(values = conv_shapes, name = NULL) +
+  geom_hline(yintercept=0, lty='dashed', colour='grey70') +
+  labs(title = "Final loss vs bias per guide",
+       x = "Final ELBO loss", y = "bias (log2FC)") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```

@@ -1258,7 +1258,9 @@ class ModelSummarizer:
         compute_inflection: bool = True,
         compute_full_log2fc: bool = True,
         compute_derivative_roots: bool = True,
-        compute_log2fc_params: bool = True
+        compute_log2fc_params: bool = True,
+        x_ntc: Optional[float] = None,
+        y_ntc=None,
     ):
         """
         Save trans fit parameters as feature-wise CSV.
@@ -1368,7 +1370,16 @@ class ModelSummarizer:
             If True (default), compute parameters in log2FC space relative to NTC:
             - x-axis: log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
             - y-axis: log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
-            Requires posterior_samples_technical to be available.
+            Requires posterior_samples_technical to be available, or x_ntc/y_ntc to be
+            provided manually.
+        x_ntc : float, optional
+            Manually provided NTC mean for the cis gene (x-axis reference point).
+            If None (default), computed from posterior_samples_technical of the cis modality.
+            Useful when fit_technical was not run (e.g., CRISPRa/CRISPRi-only subsets).
+        y_ntc : array-like, optional
+            Manually provided NTC means for each trans feature (y-axis reference points).
+            Shape: (n_features,). If None (default), computed from posterior_samples_technical
+            of the trans modality.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -1471,37 +1482,47 @@ class ModelSummarizer:
 
 
         # Get x_ntc and y_ntc for log2FC parameter computation
-        x_ntc = None
-        y_ntc = None
+        # Use manually provided values if given, otherwise try to compute from technical fit
+        _x_ntc = float(x_ntc) if x_ntc is not None else None
+        _y_ntc = np.asarray(y_ntc) if y_ntc is not None else None
+
         if compute_log2fc_params:
-            # Get x_ntc from cis modality's technical fit
-            cis_mod = self.model.get_modality('cis')
-            if hasattr(cis_mod, 'posterior_samples_technical') and cis_mod.posterior_samples_technical is not None:
-                if 'mu_ntc' in cis_mod.posterior_samples_technical:
-                    mu_ntc_cis = cis_mod.posterior_samples_technical['mu_ntc']
-                    if isinstance(mu_ntc_cis, torch.Tensor):
-                        mu_ntc_cis = mu_ntc_cis.cpu().numpy()
-                    # mu_ntc is [n_samples, n_groups, 1] for cis (single gene)
-                    # Average over samples and groups to get scalar x_ntc
-                    x_ntc = mu_ntc_cis.mean()
-                    data['x_ntc'] = x_ntc
+            # Get x_ntc from cis modality's technical fit (if not manually provided)
+            if _x_ntc is None:
+                cis_mod = self.model.get_modality('cis')
+                if hasattr(cis_mod, 'posterior_samples_technical') and cis_mod.posterior_samples_technical is not None:
+                    if 'mu_ntc' in cis_mod.posterior_samples_technical:
+                        mu_ntc_cis = cis_mod.posterior_samples_technical['mu_ntc']
+                        if isinstance(mu_ntc_cis, torch.Tensor):
+                            mu_ntc_cis = mu_ntc_cis.cpu().numpy()
+                        # mu_ntc is [n_samples, n_groups, 1] for cis (single gene)
+                        # Average over samples and groups to get scalar x_ntc
+                        _x_ntc = float(mu_ntc_cis.mean())
 
-            # Get y_ntc from trans modality's technical fit (per-feature)
-            if hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-                if 'mu_ntc' in modality.posterior_samples_technical:
-                    mu_ntc_trans = modality.posterior_samples_technical['mu_ntc']
-                    if isinstance(mu_ntc_trans, torch.Tensor):
-                        mu_ntc_trans = mu_ntc_trans.cpu().numpy()
-                    # mu_ntc is [n_samples, n_groups, n_features]
-                    # Average over samples and groups to get [n_features] y_ntc
-                    y_ntc = mu_ntc_trans.mean(axis=(0, 1))
-                    data['y_ntc'] = y_ntc
+            if _x_ntc is not None:
+                data['x_ntc'] = _x_ntc
 
-            if x_ntc is None:
-                print("[WARNING] Cannot compute log2FC params: x_ntc not available from cis modality")
+            # Get y_ntc from trans modality's technical fit (per-feature, if not manually provided)
+            if _y_ntc is None:
+                if hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
+                    if 'mu_ntc' in modality.posterior_samples_technical:
+                        mu_ntc_trans = modality.posterior_samples_technical['mu_ntc']
+                        if isinstance(mu_ntc_trans, torch.Tensor):
+                            mu_ntc_trans = mu_ntc_trans.cpu().numpy()
+                        # mu_ntc is [n_samples, n_groups, n_features]
+                        # Average over samples and groups to get [n_features] y_ntc
+                        _y_ntc = mu_ntc_trans.mean(axis=(0, 1))
+
+            if _y_ntc is not None:
+                data['y_ntc'] = _y_ntc
+
+            if _x_ntc is None:
+                print("[WARNING] Cannot compute log2FC params: x_ntc not available from cis modality. "
+                      "Provide x_ntc manually to save_trans_summary().")
                 compute_log2fc_params = False
-            if y_ntc is None:
-                print("[WARNING] Cannot compute log2FC params: y_ntc not available from trans modality")
+            if _y_ntc is None:
+                print("[WARNING] Cannot compute log2FC params: y_ntc not available from trans modality. "
+                      "Provide y_ntc manually to save_trans_summary().")
                 compute_log2fc_params = False
 
         # Add function-specific parameters
@@ -1510,7 +1531,7 @@ class ModelSummarizer:
                 data, posterior, n_features,
                 compute_inflection, compute_full_log2fc,
                 compute_derivative_roots, x_range,
-                compute_log2fc_params, x_ntc, y_ntc,
+                compute_log2fc_params, _x_ntc, _y_ntc,
                 x_obs_min, x_obs_max
             )
         elif function_type == 'single_hill':
@@ -1523,8 +1544,8 @@ class ModelSummarizer:
                 x_obs_min=x_obs_min,
                 x_obs_max=x_obs_max,
                 compute_log2fc_params=compute_log2fc_params,
-                x_ntc=x_ntc,
-                y_ntc=y_ntc
+                x_ntc=_x_ntc,
+                y_ntc=_y_ntc
             )
         elif function_type == 'polynomial':
             data = self._add_polynomial_params(
@@ -1565,11 +1586,17 @@ class ModelSummarizer:
                 alpha_y_tech = modality.alpha_y_prefit
             if isinstance(alpha_y_tech, torch.Tensor):
                 alpha_y_tech = alpha_y_tech.cpu().numpy()
-            # Shape: [n_samples, n_groups, n_features]
-            alpha_y_mean = alpha_y_tech.mean(axis=0)  # [n_groups, n_features]
-            n_groups = alpha_y_mean.shape[0]
-            for g in range(n_groups):
-                data[f'group_{g}_alpha_y_mean'] = alpha_y_mean[g, :]
+            # Shape: [n_samples, n_groups, n_features] (posterior) or [n_groups, n_features] (point)
+            if alpha_y_tech.ndim == 3:
+                alpha_y_mean = alpha_y_tech.mean(axis=0)  # [n_groups, n_features]
+            elif alpha_y_tech.ndim == 2:
+                alpha_y_mean = alpha_y_tech  # already [n_groups, n_features]
+            else:
+                alpha_y_mean = None
+            if alpha_y_mean is not None and alpha_y_mean.ndim == 2:
+                n_groups = alpha_y_mean.shape[0]
+                for g in range(n_groups):
+                    data[f'group_{g}_alpha_y_mean'] = alpha_y_mean[g, :]
 
         df = pd.DataFrame(data)
 

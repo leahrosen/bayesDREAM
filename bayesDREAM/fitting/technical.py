@@ -1256,7 +1256,7 @@ class TechnicalFitter:
         # Guide + init functions
         # ---------------------------
         import pyro.poutine as poutine
-        from pyro.infer.autoguide import AutoGuideList, AutoDelta, AutoNormal, AutoIAFNormal
+        from pyro.infer.autoguide import AutoGuideList, AutoDelta, AutoNormal, AutoNormalMessenger, AutoIAFNormal
         from pyro.infer.autoguide.initialization import init_to_median
         
         def _safe_simplex_from_counts(total_counts_TK: torch.Tensor, interior_floor=1e-3) -> torch.Tensor:
@@ -1450,7 +1450,7 @@ class TechnicalFitter:
 
         elif distribution in ['binomial', 'normal', 'studentt']:
             # Calmer guide for these distributions
-            guide_cellline = AutoNormal(self._model_technical, init_loc_fn=init_loc_fn)
+            guide_cellline = AutoNormalMessenger(self._model_technical, init_loc_fn=init_loc_fn)
 
         else:
             # For negbinom and other distributions: check if IAF is feasible
@@ -1531,10 +1531,10 @@ class TechnicalFitter:
                 guide_cellline.to(self.model.device)
             else:
                 # Fallback to memory-efficient AutoNormal
-                guide_cellline = AutoNormal(self._model_technical, init_loc_fn=init_loc_fn)
-        
+                guide_cellline = AutoNormalMessenger(self._model_technical, init_loc_fn=init_loc_fn)
+
         # Choose ELBO based on guide type
-        if isinstance(guide_cellline, infer.autoguide.AutoNormal):
+        if isinstance(guide_cellline, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
             # lower-variance estimator for mean-field Normal
             elbo = pyro.infer.TraceMeanField_ELBO(num_particles=1)
         else:

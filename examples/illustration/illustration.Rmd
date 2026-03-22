@@ -1,0 +1,257 @@
+---
+title: "bayesDREAM: Three-Step Illustration"
+output:
+  html_document:
+    fig_width: 7
+    fig_height: 5
+    theme: minimal
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+library(ggplot2)
+library(dplyr)
+library(ggExtra)   # for marginal density panel
+library(patchwork) # for plot layout (optional)
+
+# ── Path to bayesDREAM output ──────────────────────────────────────────────
+OUT_DIR <- file.path(dirname(rstudioapi::getSourceEditorContext()$path),
+                     "output_illustration")
+# Fallback if not running in RStudio:
+if (!dir.exists(OUT_DIR)) OUT_DIR <- "output_illustration"
+
+# ── Shared theme ───────────────────────────────────────────────────────────
+theme_bd <- theme_classic(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    axis.title    = element_text(size = 12),
+    legend.title  = element_text(size = 11),
+    legend.text   = element_text(size = 10),
+    legend.position = "right"
+  )
+```
+
+---
+
+## Step 1: Fit Technical
+
+Technical variation shifts gene expression across cell lines. bayesDREAM estimates
+cell-line–level offsets in NTC cells and corrects them before modelling cis effects.
+
+```{r plot1-technical, fig.height=5, fig.width=6.5}
+tech <- read.csv(file.path(OUT_DIR, "data_technical.csv"))
+
+# ── Colour palette: grey reference + 3 purple shades ──────────────────────
+group_levels <- c("Reference",
+                  "Technical group A",
+                  "Technical group B",
+                  "Technical group C")
+tech$group <- factor(tech$group, levels = group_levels)
+
+group_colours <- c(
+  "Reference"          = "#999999",
+  "Technical group A"  = "#9B59B6",
+  "Technical group B"  = "#6C3483",
+  "Technical group C"  = "#D2B4DE"
+)
+
+# ── Group means ────────────────────────────────────────────────────────────
+gm <- tech %>%
+  group_by(group) %>%
+  summarise(mx = mean(x_logcounts), my = mean(y_logcounts), .groups = "drop")
+
+ref_mean <- gm %>% filter(group == "Reference")
+
+# ── Arrow data: from each non-reference group mean → reference mean ────────
+arrows_df <- gm %>%
+  filter(group != "Reference") %>%
+  mutate(
+    xend = ref_mean$mx,
+    yend = ref_mean$my
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────
+p1_tech <- ggplot(tech, aes(x = x_logcounts, y = y_logcounts, colour = group)) +
+  geom_point(alpha = 0.55, size = 2) +
+  geom_point(data = gm, aes(x = mx, y = my, colour = group),
+             size = 5, shape = 18) +
+  geom_segment(
+    data = arrows_df,
+    aes(x = mx, y = my, xend = xend, yend = yend, colour = group),
+    arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = group_colours, name = "Group") +
+  labs(
+    title = "Step 1: Fit Technical",
+    x     = "Cis gene logcounts",
+    y     = "Trans gene Y logcounts"
+  ) +
+  theme_classic() +
+  theme(axis.text=element_blank(),
+        axis.ticks=element_blank())
+ggsave(
+  filename = file.path("bayesDREAM_cartoon", "01_tech.png"),
+  plot = p1_tech,
+  width = 5,
+  height = 3.2,
+  dpi = 300,
+  bg = "transparent",
+  create.dir = TRUE
+)
+```
+
+---
+
+## Step 2: Fit Cis
+
+bayesDREAM estimates guide-level true expression (*x*_true) for the cis gene,
+integrating over cell-to-cell noise. Each dot is a cell; the vertical position
+shows the posterior mean log₂(*x*_true) for that guide.
+
+```{r plot2-cis, fig.height=5.5, fig.width=7}
+library(stringr)
+cis <- read.csv(file.path(OUT_DIR, "data_cis.csv"))
+# x_true_log2fc already computed in Python relative to fitted NTC mean
+cis$guide <- str_replace_all(cis$guide, 'KO', 'CI')
+# ── Guide ordering (ascending x_true) and per-guide colours ──────────────
+guide_order <- cis %>%
+  group_by(guide) %>%
+  summarise(mean_xt = mean(x_true_log2_mean, na.rm = TRUE), .groups = "drop") %>%
+  arrange(mean_xt) %>%
+  pull(guide)
+cis$guide <- factor(cis$guide, levels = guide_order)
+
+guide_colours <- c(
+  "CI1"   = "#1A237E",
+  "CI2"   = "#3949AB",
+  "CI3"   = "#90CAF9",
+  "NTC_1" = "#2ECC71",
+  "CA1"   = "#EF9A9A",
+  "CA2"   = "#C62828"
+)
+
+# ── Bonus plot: underlying x vs fitted x_true ─────────────────────────────
+p_bonus <- ggplot(cis, aes(x = x_underlying_log2, y = x_true_log2_mean, colour = guide)) +
+  geom_abline(intercept = 0, slope = 1, colour = "grey60", linetype = "dashed",
+              linewidth = 0.5) +
+  geom_jitter(alpha = 0.35, size = 1.6, width = 0.02, height = 0) +
+  scale_colour_manual(values = guide_colours, name = "Guide") +
+  labs(
+    title = "Bonus: True x vs Fitted x_true",
+    x     = expression(paste("True log"[2], " x")),
+    y     = expression(paste("Fitted log"[2], " x"[true]))
+  ) +
+  theme_classic() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(
+  filename = file.path("bayesDREAM_cartoon", "00_bonus_xvsx.png"),
+  plot = p_bonus,
+  width = 5,
+  height = 3.2,
+  dpi = 300,
+  bg = "transparent"
+)
+
+# ── Scatter: x = raw log₂ counts, y = fitted log₂ x_true (same scale) ────
+p2_base <- ggplot(cis, aes(x = x_logcounts, y = x_true_log2_mean, colour = guide)) +
+  geom_abline(intercept = 0, slope = 1, colour = "grey60", linetype = "dashed",
+              linewidth = 0.5) +
+  geom_jitter(alpha = 0.35, size = 1.6, width = 0.04, height = 0) +
+  scale_colour_manual(values = guide_colours, name = "Guide") +
+  labs(
+    title = "Step 2: Fit Cis",
+    x     = expression(paste("Cis gene log"[2], " counts")),
+    y     = expression(paste("Fitted log"[2], " x"[true]))
+  ) +
+  theme_classic() +
+  theme(axis.text=element_blank(),
+        axis.ticks=element_blank())
+
+# Add marginal density on the right (y-axis = fitted log₂ x_true)
+p2_cis <- ggMarginal(p2_base, type = "density", margins = "y",
+           groupColour = TRUE, groupFill = TRUE, alpha = 0.35)
+ggsave(
+  filename = file.path("bayesDREAM_cartoon", "02_cis.png"),
+  plot = p2_cis,
+  width = 5,
+  height = 3.2,
+  dpi = 300,
+  bg = "transparent"
+)
+```
+
+---
+
+## Step 3: Fit Trans
+
+bayesDREAM fits a non-monotonic (additive Hill) function linking cis gene
+expression to trans gene expression. Each dot is a cell coloured by guide;
+the curve shows the posterior mean fit with 90 % credible band.
+
+```{r plot3-trans, fig.height=5, fig.width=7}
+trans  <- read.csv(file.path(OUT_DIR, "data_trans.csv"))
+hill   <- read.csv(file.path(OUT_DIR, "hill_curve.csv"))
+refval <- read.csv(file.path(OUT_DIR, "ntc_reference.csv"))
+
+x_ntc_log2 <- refval$x_ntc_log2[1]
+y_ntc_log2  <- refval$y_ntc_log2[1]
+
+# Convert y to log₂FC (relative to NTC y)
+trans$y_log2fc      <- trans$y_logcounts   - y_ntc_log2
+hill$y_post_mean_fc <- hill$y_post_mean    - y_ntc_log2
+hill$y_post_lo_fc   <- hill$y_post_lo      - y_ntc_log2
+hill$y_post_hi_fc   <- hill$y_post_hi      - y_ntc_log2
+
+# Guide type factor ordering
+type_levels <- c("CRISPRi", "NTC", "CRISPRa")
+trans$guide_type <- factor(trans$guide_type, levels = type_levels)
+
+p_trans <- ggplot() +
+  # 90% credible band
+  geom_ribbon(
+    data = hill,
+    aes(x = x_log2fc, ymin = y_post_lo_fc, ymax = y_post_hi_fc),
+    fill = "#BDC3C7", alpha = 0.5
+  ) +
+  # Posterior mean Hill curve
+  geom_line(
+    data = hill,
+    aes(x = x_log2fc, y = y_post_mean_fc),
+    colour = "#2C3E50", linewidth = 1.1
+  ) +
+  # NTC reference lines (both at 0 in FC space)
+  geom_vline(xintercept = 0, colour = "grey70", linetype = "dashed", linewidth = 0.6) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed", linewidth = 0.6) +
+  # Cell-level scatter
+  geom_point(
+    data = trans,
+    aes(x = x_log2fc, y = y_log2fc, colour = guide_type),
+    alpha = 0.45, size = 1
+  ) +
+  scale_colour_manual(
+    values = c("CRISPRi" = "#3949AB", "NTC" = "#2ECC71", "CRISPRa" = "#C62828"),
+    name = "Guide type"
+  ) +
+  scale_x_continuous(
+    name   = expression(paste(log[2], "FC in cis gene")),
+    breaks = 0, labels = "0",
+    limits = c(-2.6, 1.6)
+  ) +
+  scale_y_continuous(
+    name   = expression(paste(log[2], "FC in trans gene Y")),
+    breaks = 0, labels = "0"
+  ) +
+  labs(title = "Step 3: Fit Trans") +
+  theme_classic()
+ggsave(
+  filename = file.path("bayesDREAM_cartoon", "03_trans.png"),
+  plot = p_trans,
+  width = 5,
+  height = 3.2,
+  dpi = 300,
+  bg = "transparent"
+)
+```

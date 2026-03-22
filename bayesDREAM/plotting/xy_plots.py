@@ -1205,21 +1205,22 @@ def predict_trans_derivatives(
         except (KeyError, IndexError, AttributeError):
             return None, None, None
 
-    elif 'Vmax' in posterior and 'K' in posterior and 'n' in posterior:
+    elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            Vmax = _extract_param(posterior['Vmax'], feature_idx)
-            K = _extract_param(posterior['K'], feature_idx)
-            n = _extract_param(posterior['n'], feature_idx)
+            alpha = _extract_param(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param(posterior['K_a'], feature_idx)
+            n_a = _extract_param(posterior['n_a'], feature_idx)
 
             # First derivative
-            first_deriv = Hill_first_derivative(x_range, Vmax=Vmax, K=K, n=n)
+            first_deriv = alpha * Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
 
             # Second derivative
-            second_deriv = Hill_second_derivative(x_range, Vmax=Vmax, K=K, n=n)
+            second_deriv = alpha * Hill_second_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
 
             # Third derivative
-            third_deriv = Hill_third_derivative(x_range, Vmax=Vmax, K=K, n=n)
+            third_deriv = alpha * Hill_third_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
 
             return first_deriv, second_deriv, third_deriv
 
@@ -1897,6 +1898,27 @@ def plot_trans_functions(
         else:
             raise ValueError("x_range must be provided if model.x_true is not set")
 
+    # Check if NTC data is available for log2FC/delta_p; fall back to log2 if not
+    if use_log2fc or use_delta_p:
+        cis_mod = model.get_modality('cis')
+        ntc_available = (
+            cis_mod is not None
+            and hasattr(cis_mod, 'posterior_samples_technical')
+            and cis_mod.posterior_samples_technical is not None
+            and 'mu_ntc' in cis_mod.posterior_samples_technical
+        )
+        if not ntc_available:
+            import warnings
+            flag = 'use_log2fc' if use_log2fc else 'use_delta_p'
+            warnings.warn(
+                f"{flag}=True requested but NTC technical fit (posterior_samples_technical) "
+                f"is not available. Falling back to log2(x) x-axis.",
+                UserWarning
+            )
+            use_log2fc = False
+            use_delta_p = False
+            use_log2_x = True
+
     # Setup colors
     if colors is None:
         color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -2410,15 +2432,17 @@ def predict_trans_function(
         except (KeyError, IndexError, AttributeError):
             return None
 
-    elif 'Vmax' in posterior and 'K' in posterior and 'n' in posterior:
+    elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            Vmax = _extract_param(posterior['Vmax'], feature_idx)
-            K = _extract_param(posterior['K'], feature_idx)
-            n = _extract_param(posterior['n'], feature_idx)
+            alpha = _extract_param(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param(posterior['K_a'], feature_idx)
+            n_a = _extract_param(posterior['n_a'], feature_idx)
 
-            # Compute Hill function
-            y_pred = Hill_based_positive(x_range, Vmax=Vmax, A=A, K=K, n=n)
+            # Compute Hill function: y = A + alpha * Hill(x, Vmax=Vmax_a, K=K_a, n=n_a)
+            Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
+            y_pred = A + alpha * Hill_a
             return y_pred
 
         except (KeyError, IndexError, AttributeError):
@@ -2626,28 +2650,31 @@ def predict_trans_function_samples(
         except (KeyError, IndexError, AttributeError):
             return None
 
-    elif 'Vmax' in posterior and 'K' in posterior and 'n' in posterior:
+    elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            Vmax = _extract_samples('Vmax', feature_idx)
-            K = _extract_samples('K', feature_idx)
-            n = _extract_samples('n', feature_idx)
+            alpha = _extract_samples('alpha', feature_idx)
+            Vmax_a = _extract_samples('Vmax_a', feature_idx)
+            K_a = _extract_samples('K_a', feature_idx)
+            n_a = _extract_samples('n_a', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
                 indices = np.random.choice(n_samples, max_samples, replace=False)
                 A = A[indices]
-                Vmax = Vmax[indices]
-                K = K[indices]
-                n = n[indices]
+                alpha = alpha[indices]
+                Vmax_a = Vmax_a[indices]
+                K_a = K_a[indices]
+                n_a = n_a[indices]
                 n_samples = max_samples
 
             n_points = len(x_range)
             y_pred = np.zeros((n_samples, n_points))
 
             for s in range(n_samples):
-                y_pred[s, :] = Hill_based_positive(x_range, Vmax=Vmax[s], A=A[s], K=K[s], n=n[s])
+                Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a[s], A=0, K=K_a[s], n=n_a[s])
+                y_pred[s, :] = A[s] + alpha[s] * Hill_a
 
             return y_pred
 
@@ -2825,21 +2852,23 @@ def predict_trans_derivatives_samples(
         except (KeyError, IndexError, AttributeError):
             return None, None, None, None
 
-    elif 'Vmax' in posterior and 'K' in posterior and 'n' in posterior:
+    elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            Vmax = _extract_samples('Vmax', feature_idx)
-            K = _extract_samples('K', feature_idx)
-            n = _extract_samples('n', feature_idx)
+            alpha = _extract_samples('alpha', feature_idx)
+            Vmax_a = _extract_samples('Vmax_a', feature_idx)
+            K_a = _extract_samples('K_a', feature_idx)
+            n_a = _extract_samples('n_a', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
                 indices = np.random.choice(n_samples, max_samples, replace=False)
                 A = A[indices]
-                Vmax = Vmax[indices]
-                K = K[indices]
-                n = n[indices]
+                alpha = alpha[indices]
+                Vmax_a = Vmax_a[indices]
+                K_a = K_a[indices]
+                n_a = n_a[indices]
                 n_samples = max_samples
 
             n_points = len(x_range)
@@ -2849,10 +2878,11 @@ def predict_trans_derivatives_samples(
             third_deriv_samples = np.zeros((n_samples, n_points))
 
             for s in range(n_samples):
-                y_samples[s, :] = Hill_based_positive(x_range, Vmax=Vmax[s], A=A[s], K=K[s], n=n[s])
-                first_deriv_samples[s, :] = Hill_first_derivative(x_range, Vmax=Vmax[s], K=K[s], n=n[s])
-                second_deriv_samples[s, :] = Hill_second_derivative(x_range, Vmax=Vmax[s], K=K[s], n=n[s])
-                third_deriv_samples[s, :] = Hill_third_derivative(x_range, Vmax=Vmax[s], K=K[s], n=n[s])
+                Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a[s], A=0, K=K_a[s], n=n_a[s])
+                y_samples[s, :] = A[s] + alpha[s] * Hill_a
+                first_deriv_samples[s, :] = alpha[s] * Hill_first_derivative(x_range, Vmax=Vmax_a[s], K=K_a[s], n=n_a[s])
+                second_deriv_samples[s, :] = alpha[s] * Hill_second_derivative(x_range, Vmax=Vmax_a[s], K=K_a[s], n=n_a[s])
+                third_deriv_samples[s, :] = alpha[s] * Hill_third_derivative(x_range, Vmax=Vmax_a[s], K=K_a[s], n=n_a[s])
 
             return y_samples, first_deriv_samples, second_deriv_samples, third_deriv_samples
 
@@ -2862,6 +2892,252 @@ def predict_trans_derivatives_samples(
     else:
         # Polynomial or unknown - not supported
         return None, None, None, None
+
+
+# ============================================================================
+# Hill Parameter Marker Helpers
+# ============================================================================
+
+def _extract_hill_param_samples(posterior, feature_idx):
+    """Extract per-feature posterior samples (shape S,) for all Hill parameters."""
+    def _get(key):
+        if key not in posterior:
+            return None
+        arr = posterior[key]
+        if hasattr(arr, 'cpu'):
+            arr = arr.cpu().numpy()
+        elif not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr)
+        if arr.ndim == 2:        # (S, T)
+            return arr[:, feature_idx]
+        elif arr.ndim == 3:      # (S, C, T) - squeeze cis dim
+            return arr[:, 0, feature_idx]
+        return None
+
+    return {k: _get(k) for k in ['A', 'alpha', 'beta', 'Vmax_a', 'Vmax_b', 'K_a', 'K_b', 'n_a', 'n_b']
+            if _get(k) is not None}
+
+
+def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=True, y_scale=1.0):
+    """
+    Compute meaningful parameter markers for single_hill and additive_hill trans functions.
+
+    Returns a list of marker dicts with keys:
+        'axis' ('h' or 'v'), 'value', 'label', 'linestyle', 'color', 'alpha'
+
+    Parameters
+    ----------
+    log2_space : bool
+        True for negbinom (y-axis is log2). False for binomial/normal (linear y-axis).
+    y_scale : float
+        Multiplicative scale applied to linear y-values before plotting (e.g. 100 for PSI%).
+    ci_level : float
+        Credible interval level used to classify additive_hill regime (default 95.0).
+    """
+    # ── Resolve posterior and feature list ─────────────────────────────────
+    if modality.name == model.primary_modality:
+        if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
+            return []
+        posterior = model.posterior_samples_trans
+        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+    else:
+        if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
+            return []
+        posterior = modality.posterior_samples_trans
+        if modality.feature_names is not None:
+            feature_list = list(modality.feature_names)
+        elif modality.feature_meta is not None:
+            feature_list = None
+            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
+                if col in modality.feature_meta.columns:
+                    feature_list = modality.feature_meta[col].tolist()
+                    break
+            if feature_list is None:
+                return []
+        else:
+            return []
+
+    if feature not in feature_list:
+        return []
+    if 'Vmax_a' not in posterior:   # polynomial or unknown
+        return []
+
+    feature_idx = feature_list.index(feature)
+    params = _extract_hill_param_samples(posterior, feature_idx)
+
+    required = ['A', 'alpha', 'Vmax_a', 'K_a', 'n_a']
+    if not all(k in params for k in required):
+        return []
+
+    def pmean(key):
+        return float(params[key].mean()) if key in params else None
+
+    def pci(key):
+        if key not in params:
+            return None, None
+        lo = float(np.percentile(params[key], (100 - ci_level) / 2))
+        hi = float(np.percentile(params[key], 100 - (100 - ci_level) / 2))
+        return lo, hi
+
+    A      = pmean('A');     alpha = pmean('alpha');  Vmax_a = pmean('Vmax_a')
+    K_a    = pmean('K_a');   n_a   = pmean('n_a')
+
+    # ── y-axis transform ───────────────────────────────────────────────────
+    def yv(v):
+        """Transform a linear y-value for the plot's y-axis."""
+        if v is None:
+            return None
+        if log2_space:
+            return float(np.log2(v)) if v > 0 else None
+        return float(v * y_scale)
+
+    # ── x-axis transform (always log2 of K) ───────────────────────────────
+    def xv(k):
+        if k is None or k <= 0:
+            return None
+        return float(np.log2(k))
+
+    markers = []
+    is_additive = ('Vmax_b' in posterior and 'Vmax_b' in params and
+                   'n_b' in params and 'beta' in params and 'K_b' in params)
+
+    # ── Single Hill ────────────────────────────────────────────────────────
+    if not is_additive:
+        low_asym  = A
+        high_asym = A + alpha * Vmax_a
+        EC50      = K_a
+
+        lv = yv(low_asym);  hv = yv(high_asym);  ev = xv(EC50)
+        if lv is not None and np.isfinite(lv):
+            markers.append({'axis': 'h', 'value': lv,
+                            'label': 'log2(A)' if log2_space else 'A',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if hv is not None and np.isfinite(hv):
+            markers.append({'axis': 'h', 'value': hv,
+                            'label': 'log2(A+α·Vmax)' if log2_space else 'A+α·Vmax',
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if ev is not None and np.isfinite(ev):
+            markers.append({'axis': 'v', 'value': ev, 'label': 'log2(EC50)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+        return markers
+
+    # ── Additive Hill ──────────────────────────────────────────────────────
+    beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
+    K_b    = pmean('K_b');   n_b    = pmean('n_b')
+
+    n_a_lo, n_a_hi = pci('n_a')
+    n_b_lo, n_b_hi = pci('n_b')
+    a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
+    b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
+
+    if a_null or b_null:
+        # ── Effectively single Hill ────────────────────────────────────────
+        if a_null and not b_null:
+            act_alpha, act_Vmax, act_K = beta, Vmax_b, K_b
+        elif b_null and not a_null:
+            act_alpha, act_Vmax, act_K = alpha, Vmax_a, K_a
+        else:
+            # Both null - just mark A
+            lv = yv(A)
+            if lv is not None and np.isfinite(lv):
+                markers.append({'axis': 'h', 'value': lv,
+                                'label': 'log2(A)' if log2_space else 'A',
+                                'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+            return markers
+
+        lv = yv(A);  hv = yv(A + act_alpha * act_Vmax);  ev = xv(act_K)
+        if lv is not None and np.isfinite(lv):
+            markers.append({'axis': 'h', 'value': lv,
+                            'label': 'log2(A)' if log2_space else 'A',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if hv is not None and np.isfinite(hv):
+            markers.append({'axis': 'h', 'value': hv,
+                            'label': 'log2(A+α·Vmax)' if log2_space else 'A+α·Vmax',
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if ev is not None and np.isfinite(ev):
+            markers.append({'axis': 'v', 'value': ev, 'label': 'log2(EC50)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+
+    elif (n_a > 0) == (n_b > 0):
+        # ── Same-sign monotone sum ─────────────────────────────────────────
+        low_asym  = A
+        high_asym = A + alpha * Vmax_a + beta * Vmax_b
+        K_lower = min(K_a, K_b);  K_upper = max(K_a, K_b)
+
+        lv = yv(low_asym);  hv = yv(high_asym)
+        e1 = xv(K_lower);   e2 = xv(K_upper)
+
+        if lv is not None and np.isfinite(lv):
+            markers.append({'axis': 'h', 'value': lv,
+                            'label': 'log2(A)' if log2_space else 'A',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if hv is not None and np.isfinite(hv):
+            markers.append({'axis': 'h', 'value': hv,
+                            'label': ('log2(A+α·Vmax_a+β·Vmax_b)' if log2_space
+                                      else 'A+α·Vmax_a+β·Vmax_b'),
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if e1 is not None and np.isfinite(e1):
+            markers.append({'axis': 'v', 'value': e1, 'label': 'log2(EC50_lower)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+        if e2 is not None and np.isfinite(e2) and abs(e2 - e1) > 0.05:
+            markers.append({'axis': 'v', 'value': e2, 'label': 'log2(EC50_upper)',
+                            'linestyle': ':', 'color': 'darkgreen', 'alpha': 0.85})
+
+    else:
+        # ── Non-monotonic (opposite-sign Hills) ───────────────────────────
+        # Component with n>0 activates (0→Vmax as x↑)
+        # Component with n<0 inhibits  (Vmax→0 as x↑)
+        if n_a > 0:   # a activates, b inhibits
+            asym_low_x  = A + beta  * Vmax_b   # y at x→0
+            asym_high_x = A + alpha * Vmax_a   # y at x→∞
+            K_act, K_inh = K_a, K_b
+        else:         # b activates, a inhibits
+            asym_low_x  = A + alpha * Vmax_a   # y at x→0
+            asym_high_x = A + beta  * Vmax_b   # y at x→∞
+            K_act, K_inh = K_b, K_a
+
+        # Peak exists when activating component's EC50 < inhibiting component's EC50
+        # (activation precedes deactivation → intermediate region where both ≈ 1)
+        has_peak = (K_act < K_inh)
+        peak_val = A + alpha * Vmax_a + beta * Vmax_b
+
+        a1 = yv(asym_low_x);   a2 = yv(asym_high_x)
+        e1 = xv(min(K_a, K_b)); e2 = xv(max(K_a, K_b))
+
+        if a1 is not None and np.isfinite(a1):
+            markers.append({'axis': 'h', 'value': a1,
+                            'label': 'log2(y: x→0)' if log2_space else 'y(x→0)',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if a2 is not None and np.isfinite(a2) and (a1 is None or abs(a2 - a1) > 0.05):
+            markers.append({'axis': 'h', 'value': a2,
+                            'label': 'log2(y: x→∞)' if log2_space else 'y(x→∞)',
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if has_peak:
+            pv = yv(peak_val)
+            if pv is not None and np.isfinite(pv):
+                markers.append({'axis': 'h', 'value': pv,
+                                'label': ('log2(A+α·Vmax_a+β·Vmax_b) [peak]' if log2_space
+                                          else 'A+α·Vmax_a+β·Vmax_b [peak]'),
+                                'linestyle': '--', 'color': 'darkorange', 'alpha': 0.85})
+        if e1 is not None and np.isfinite(e1):
+            markers.append({'axis': 'v', 'value': e1, 'label': 'log2(EC50_lower)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+        if e2 is not None and np.isfinite(e2) and abs(e2 - e1) > 0.05:
+            markers.append({'axis': 'v', 'value': e2, 'label': 'log2(EC50_upper)',
+                            'linestyle': ':', 'color': 'darkgreen', 'alpha': 0.85})
+
+    return markers
+
+
+def _draw_hill_markers(ax, markers):
+    """Draw Hill parameter marker lines (axhline / axvline) on ax."""
+    for m in markers:
+        kw = dict(linestyle=m['linestyle'], color=m['color'],
+                  alpha=m['alpha'], linewidth=1, label=m['label'])
+        if m['axis'] == 'h':
+            ax.axhline(m['value'], **kw)
+        elif m['axis'] == 'v':
+            ax.axvline(m['value'], **kw)
 
 
 # ============================================================================
@@ -2883,6 +3159,8 @@ def plot_negbinom_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
+    mark_params: bool = False,
+    ci_level: float = 95.0,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3094,8 +3372,8 @@ def plot_negbinom_xy(
                 ax_plot.plot(np.log2(x_smooth), y_smooth_log, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
-        # Show on corrected plot only (trans model was fitted on corrected data)
-        if show_hill_function and corrected:
+        # Show on corrected plot if available, otherwise show on uncorrected plot
+        if show_hill_function and (corrected or not has_technical_fit):
             # Evenly spaced points in log2 space for smooth curve on log-log plot
             log2_min = np.log2(max(x_true.min(), 1e-6))
             log2_max = np.log2(x_true.max())
@@ -3111,27 +3389,36 @@ def plot_negbinom_xy(
                                 color='blue', linestyle='--', linewidth=2,
                                 label='Fitted Trans Function')
 
-                # Add baseline if available
-                if hasattr(model, 'posterior_samples_trans') and 'A' in model.posterior_samples_trans:
-                    A_samples = model.posterior_samples_trans['A']
-                    trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
-                    if feature in trans_genes:
-                        gene_idx = trans_genes.index(feature)
-                        # Handle shape (S, n_cis, T) - squeeze out n_cis dimension if present
-                        if hasattr(A_samples, 'mean'):
-                            A_mean = A_samples.mean(dim=0)  # (n_cis, T) or (T,)
-                            if A_mean.ndim == 2:
-                                A = A_mean[0, gene_idx].item()  # (n_cis, T) -> index both dims
+                # Add baseline (only when not using full mark_params)
+                if not mark_params:
+                    if hasattr(model, 'posterior_samples_trans') and 'A' in model.posterior_samples_trans:
+                        A_samples = model.posterior_samples_trans['A']
+                        trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
+                        if feature in trans_genes:
+                            gene_idx = trans_genes.index(feature)
+                            if hasattr(A_samples, 'mean'):
+                                A_mean = A_samples.mean(dim=0)
+                                if A_mean.ndim == 2:
+                                    A = A_mean[0, gene_idx].item()
+                                else:
+                                    A = A_mean[gene_idx].item()
                             else:
-                                A = A_mean[gene_idx].item()  # (T,) -> index directly
-                        else:
-                            A_mean = A_samples.mean(axis=0)
-                            if A_mean.ndim == 2:
-                                A = A_mean[0, gene_idx]
-                            else:
-                                A = A_mean[gene_idx]
-                        if A > 0:
-                            ax_plot.axhline(np.log2(A), color='red', linestyle=':', linewidth=1, label='log2(A) baseline')
+                                A_mean = A_samples.mean(axis=0)
+                                if A_mean.ndim == 2:
+                                    A = A_mean[0, gene_idx]
+                                else:
+                                    A = A_mean[gene_idx]
+                            if A > 0:
+                                ax_plot.axhline(np.log2(A), color='red', linestyle=':',
+                                                linewidth=1, label='log2(A) baseline')
+
+            # Full parameter markers (replaces simple A baseline)
+            if mark_params and (corrected or not has_technical_fit):
+                _markers = _compute_hill_markers(
+                    model, feature, modality,
+                    ci_level=ci_level, log2_space=True, y_scale=1.0
+                )
+                _draw_hill_markers(ax_plot, _markers)
 
         ax_plot.set_xlabel(xlabel)
         ax_plot.set_ylabel('log2(Expression)')
@@ -3165,6 +3452,8 @@ def plot_binomial_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
+    mark_params: bool = False,
+    ci_level: float = 95.0,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3356,8 +3645,8 @@ def plot_binomial_xy(
             ax_plot.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
-        # Show on corrected plot only (trans model was fitted on corrected data)
-        if show_trans_function and corrected:
+        # Show on corrected plot if available, otherwise show on uncorrected plot
+        if show_trans_function and (corrected or not has_technical_fit):
             # Evenly spaced points in log2 space for smooth curve on log-log plot
             log2_min = np.log2(max(x_true.min(), 1e-6))
             log2_max = np.log2(x_true.max())
@@ -3371,6 +3660,14 @@ def plot_binomial_xy(
                 ax_plot.plot(np.log2(x_range), y_pred_clipped,
                            color='blue', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
+
+        # Full parameter markers (PSI%, linear y-axis)
+        if mark_params and (corrected or not has_technical_fit):
+            _markers = _compute_hill_markers(
+                model, feature, modality,
+                ci_level=ci_level, log2_space=False, y_scale=100.0
+            )
+            _draw_hill_markers(ax_plot, _markers)
 
         ax_plot.set_xlabel(xlabel)
         ax_plot.set_ylabel('PSI (%)')
@@ -3712,6 +4009,8 @@ def plot_normal_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
+    mark_params: bool = False,
+    ci_level: float = 95.0,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3883,8 +4182,8 @@ def plot_normal_xy(
                 ax_plot.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
-        # Show on corrected plot only (trans model was fitted on corrected data)
-        if show_trans_function and corrected:
+        # Show on corrected plot if available, otherwise show on uncorrected plot
+        if show_trans_function and (corrected or not has_technical_fit):
             # Evenly spaced points in log2 space for smooth curve on log-log plot
             log2_min = np.log2(max(x_true.min(), 1e-6))
             log2_max = np.log2(x_true.max())
@@ -3895,6 +4194,14 @@ def plot_normal_xy(
                 ax_plot.plot(np.log2(x_range), y_pred,
                            color='blue', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
+
+        # Full parameter markers (linear y-axis)
+        if mark_params and (corrected or not has_technical_fit):
+            _markers = _compute_hill_markers(
+                model, feature, modality,
+                ci_level=ci_level, log2_space=False, y_scale=1.0
+            )
+            _draw_hill_markers(ax_plot, _markers)
 
         ax_plot.set_xlabel(xlabel)
         ax_plot.set_ylabel('Value')
@@ -4306,6 +4613,7 @@ def plot_xy_data(
     subset_meta: Optional[Dict[str, Any]] = None,
     only_dependent: bool = False,
     ci_level: float = 95.0,
+    mark_params: bool = False,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -4371,8 +4679,22 @@ def plot_xy_data(
         Requires fit_trans() to have been run with function_type='additive_hill'.
         Ignored for single-feature plots.
     ci_level : float
-        Credible interval level for dependency filtering (default: 95.0).
-        Only used if only_dependent=True.
+        Credible interval level for dependency filtering and parameter marker
+        classification (default: 95.0).
+        Used by only_dependent=True and mark_params=True.
+    mark_params : bool
+        Overlay meaningful parameter markers on the Hill function (default: False).
+        Requires show_hill_function=True and fit_trans() completed with
+        function_type='single_hill' or 'additive_hill'.
+        Markers drawn depend on the fitted regime:
+        - **Single Hill / effectively single**: log2(A), log2(A+α·Vmax), log2(EC50)
+        - **Same-sign additive** (both Hills in same direction):
+          log2(A), log2(A+α·Vmax_a+β·Vmax_b), log2(EC50_lower), log2(EC50_upper)
+        - **Non-monotonic** (opposite-sign Hills):
+          log2(y: x→0), log2(y: x→∞), log2(EC50_lower), log2(EC50_upper);
+          additionally log2(A+α·Vmax_a+β·Vmax_b) [peak] if activation EC50 < inhibition EC50
+        For non-negbinom distributions, all y-axis markers are in linear space.
+        Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
     **kwargs
         Additional plotting arguments
 
@@ -4636,7 +4958,8 @@ def plot_xy_data(
                     color_palette=color_palette, show_hill_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
                     min_counts=min_counts, xlabel=xlabel, ax=axes[i, 0],
-                    subset_mask=subset_mask, **kwargs
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
                 )
             elif distribution == 'binomial':
                 plot_binomial_xy(
@@ -4645,7 +4968,8 @@ def plot_xy_data(
                     min_counts=min_counts, color_palette=color_palette,
                     show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 0],
-                    subset_mask=subset_mask, **kwargs
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
                 )
             elif distribution in ('normal', 'studentt'):
                 plot_normal_xy(
@@ -4653,7 +4977,8 @@ def plot_xy_data(
                     x_true=x_true, window=window, show_correction='uncorrected',
                     color_palette=color_palette, show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 0],
-                    subset_mask=subset_mask, **kwargs
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
                 )
             else:
                 axes[i, 0].text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
@@ -4667,7 +4992,8 @@ def plot_xy_data(
                     color_palette=color_palette, show_hill_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
                     min_counts=min_counts, xlabel=xlabel, ax=axes[i, 1],
-                    subset_mask=subset_mask, **kwargs
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
                 )
             elif distribution == 'binomial':
                 plot_binomial_xy(
@@ -4676,7 +5002,8 @@ def plot_xy_data(
                     min_counts=min_counts, color_palette=color_palette,
                     show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 1],
-                    subset_mask=subset_mask, **kwargs
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
                 )
             elif distribution in ('normal', 'studentt'):
                 plot_normal_xy(
@@ -4684,7 +5011,8 @@ def plot_xy_data(
                     x_true=x_true, window=window, show_correction='corrected',
                     color_palette=color_palette, show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=axes[i, 1],
-                    subset_mask=subset_mask, **kwargs
+                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    **kwargs
                 )
             else:
                 axes[i, 1].text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
@@ -4714,6 +5042,8 @@ def plot_xy_data(
             min_counts=min_counts,
             xlabel=xlabel,
             subset_mask=subset_mask,
+            mark_params=mark_params,
+            ci_level=ci_level,
             **kwargs
         )
 
@@ -4730,6 +5060,8 @@ def plot_xy_data(
             show_ntc_gradient=show_ntc_gradient,
             xlabel=xlabel,
             subset_mask=subset_mask,
+            mark_params=mark_params,
+            ci_level=ci_level,
             **kwargs
         )
 
@@ -4764,6 +5096,8 @@ def plot_xy_data(
             show_ntc_gradient=show_ntc_gradient,
             xlabel=xlabel,
             subset_mask=subset_mask,
+            mark_params=mark_params,
+            ci_level=ci_level,
             **kwargs
         )
 
