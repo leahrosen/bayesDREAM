@@ -1190,6 +1190,7 @@ class TransFitter:
         correct_priors_for_technical: bool = True,
         use_archive_prior_computation: bool = False,
         use_epsilon: bool = False,
+        warmup_steps: int = 0,
         **kwargs
     ):
         """
@@ -1238,6 +1239,13 @@ class TransFitter:
         use_epsilon : bool, optional
             If True, add 1e-8 epsilon for numerical stability in NegativeBinomial logits.
             If False (default), use log(mu) - log(phi) directly.
+        warmup_steps : int, optional
+            For additive_hill/nested_hill only. Run this many steps as single_hill first,
+            then switch to the full additive/nested model. The second component (K_b, Vmax_b,
+            beta) is initialised fresh from the prior at the switch point, while shared
+            parameters (K_a, Vmax_a, A, o_y, etc.) carry over from the warmup.
+            Temperature schedule restarts from init_temp at the switch point.
+            Default: 0 (no warmup, original behaviour).
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
         **kwargs
@@ -2140,18 +2148,37 @@ class TransFitter:
             if "poly_coeff" in name and "loc" in name:
                 print(name, value.shape, value.min().item(), value.max().item())
 
+        # Curriculum warmup: only applies to additive_hill / nested_hill
+        _do_warmup = (warmup_steps > 0 and function_type in ['additive_hill', 'nested_hill'])
+        if _do_warmup:
+            print(f"[INFO] Curriculum warmup: running {warmup_steps} steps as single_hill "
+                  f"before switching to {function_type}.")
+
         self.losses_trans = []
         smoothed_loss = None
+        _phase2_announced = False
         for step in range(niters):
-            # a simple linear schedule from init_temp down to final_temp:
-            fraction_done = step / float(niters)
-            if function_type in ['single_hill', 'additive_hill', 'nested_hill']:
-                current_temp = init_temp + (final_temp - init_temp) * fraction_done
-            elif function_type == 'polynomial':
-                current_temp = init_temp + (final_temp - init_temp) * (2*fraction_done-1)
-                #current_temp = init_temp + (final_temp - init_temp) * fraction_done
+            # ── Curriculum: choose effective function type ──────────────────
+            if _do_warmup and step < warmup_steps:
+                effective_function_type = 'single_hill'
+                # Temperature schedule over the warmup phase
+                phase_fraction = step / float(warmup_steps)
+                current_temp = init_temp + (final_temp - init_temp) * phase_fraction
             else:
-                raise ValueError(f"Unknown function_type: {function_type}")
+                effective_function_type = function_type
+                if _do_warmup and not _phase2_announced:
+                    print(f"[INFO] Warmup complete at step {step}. Switching to {function_type}.")
+                    _phase2_announced = True
+                # Temperature schedule restarts from init_temp at the switch point
+                phase_steps = niters - warmup_steps if _do_warmup else niters
+                phase_step  = step - warmup_steps   if _do_warmup else step
+                phase_fraction = phase_step / float(phase_steps) if phase_steps > 0 else 1.0
+                if effective_function_type in ['single_hill', 'additive_hill', 'nested_hill']:
+                    current_temp = init_temp + (final_temp - init_temp) * phase_fraction
+                elif effective_function_type == 'polynomial':
+                    current_temp = init_temp + (final_temp - init_temp) * (2*phase_fraction-1)
+                else:
+                    raise ValueError(f"Unknown function_type: {effective_function_type}")
                 
             #if step < 0.7 * niters:
             #    # First 70% of training: linearly decrease from 1.0 to 0.1
@@ -2220,9 +2247,9 @@ class TransFitter:
                 groups_tensor=groups_tensor,
                 temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
                 use_straight_through=use_straight_through,
-                function_type=function_type,
+                function_type=effective_function_type,
                 polynomial_degree=polynomial_degree,
-                use_alpha=True if function_type != 'polynomial' else True if fraction_done>=0.5 else False,
+                use_alpha=True if effective_function_type != 'polynomial' else True if phase_fraction>=0.5 else False,
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
@@ -2252,9 +2279,9 @@ class TransFitter:
                     groups_tensor=groups_tensor,
                     temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
                     use_straight_through=use_straight_through,
-                    function_type=function_type,
+                    function_type=effective_function_type,
                     polynomial_degree=polynomial_degree,
-                    use_alpha=True if function_type != 'polynomial' else True if fraction_done>=0.5 else False,
+                    use_alpha=True if effective_function_type != 'polynomial' else True if phase_fraction>=0.5 else False,
                     distribution=distribution,
                     denominator_tensor=denominator_tensor,
                     K=K,
