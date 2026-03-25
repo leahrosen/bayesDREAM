@@ -659,13 +659,19 @@ class TransFitter:
                     Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
 
                     if use_lognormal_priors:
-                        # Log-Normal priors (experimental) - use for comparison
+                        # Log-Normal priors: use Gamma-equivalent K width (not CV-based) to
+                        # prevent K_a/K_b from diverging and overfitting single-Hill data.
+                        # K_sigma = K_max/(2*sqrt(K_alpha)) is the Gamma-equivalent std.
+                        ratio_K_ln = (K_sigma / K_mean_prior).clamp_min(self._t(1e-6))
+                        K_log_sigma_ln = torch.sqrt(torch.log1p(ratio_K_ln ** 2))
+                        K_log_mu_ln = torch.log(K_mean_prior) - 0.5 * K_log_sigma_ln ** 2
+
                         Vmax_log_mu = torch.log(Vmax_prior_mean) - 0.5 * torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
                         Vmax_log_sigma = torch.sqrt(torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2))
                         log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
                         Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
 
-                        log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))
+                        log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu_ln, K_log_sigma_ln))
                         K_a = pyro.deterministic("K_a", torch.exp(log_K_a))
                     else:
                         # Gamma priors (default, matching archive) - better convergence and sparsity
@@ -729,11 +735,12 @@ class TransFitter:
                         # For negbinom/normal/studentt: Choose between Gamma and Log-Normal priors
                         # K_sigma and Vmax_sigma were computed above in the Vmax_a/K_a section
                         if use_lognormal_priors:
-                            # Log-Normal priors (experimental) - Vmax_log_mu/sigma computed in Vmax_a section
+                            # Log-Normal priors: use same Gamma-equivalent K width as K_a
+                            # (K_log_mu_ln and K_log_sigma_ln computed in Vmax_a/K_a section above)
                             log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
                             Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
 
-                            log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))
+                            log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu_ln, K_log_sigma_ln))
                             K_b = pyro.deterministic("K_b", torch.exp(log_K_b))
                         else:
                             # Gamma priors (default, matching archive) - better convergence and sparsity
