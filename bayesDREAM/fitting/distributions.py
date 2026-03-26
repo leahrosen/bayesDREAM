@@ -20,6 +20,7 @@ Technical group covariate handling:
 """
 
 import torch
+import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
 
@@ -361,21 +362,23 @@ def sample_binomial_trans(
     else:
         logit_final = logit_mu
 
-    # Compute log probability manually to handle masking
-    # For valid observations: Binomial log-prob
-    # For masked observations: 0 contribution
-    p = torch.sigmoid(logit_final)
+    # Numerically stable binomial log-probability via binary_cross_entropy_with_logits.
+    #
+    # The naive sigmoid → clamp(p, 1e-12, 1-1e-12) → log(1-p) approach fails in float32
+    # because 1 - 1e-12 = 1.0 exactly (float32 epsilon ≈ 1.2e-7), so the upper clamp
+    # provides no protection. sigmoid(logit) = 1.0 for logit > ~16, making log(0) = -inf
+    # and producing NaN gradients via the chain rule (0 * inf = nan from d(clamp)/d(p)=0).
+    #
+    # F.binary_cross_entropy_with_logits uses the numerically stable identity:
+    #   BCE(logit, t) = max(logit, 0) - logit*t + log(1 + exp(-|logit|))
+    # which is safe for any finite logit.
+    #
+    # Binomial log P(y|n,p) = y*log(p) + (n-y)*log(1-p) = n * [−BCE(logit, y/n)]
+    y_safe = torch.where(valid_mask, y_obs_tensor.float(), torch.zeros_like(y_obs_tensor.float()))
+    n_safe = torch.where(valid_mask, denominator_tensor.float(), torch.ones_like(denominator_tensor.float()))
+    target = y_safe / n_safe  # fraction of successes in [0, 1]; n_safe >= 1 always
 
-    # Binomial log-probability: log C(n,k) + k*log(p) + (n-k)*log(1-p)
-    # We ignore the combinatorial term log C(n,k) since it doesn't depend on parameters
-    y_clamped = torch.where(valid_mask, y_obs_tensor, torch.zeros_like(y_obs_tensor))
-    n_clamped = torch.where(valid_mask, denominator_tensor, torch.ones_like(denominator_tensor))  # Avoid log(0)
-    p_clamped = torch.clamp(p, min=1e-12, max=1-1e-12)
-
-    log_prob = (
-        y_clamped * torch.log(p_clamped) +
-        (n_clamped - y_clamped) * torch.log(1 - p_clamped)
-    )
+    log_prob = n_safe * (-F.binary_cross_entropy_with_logits(logit_final, target, reduction='none'))
 
     # Zero out masked entries
     log_prob = torch.where(valid_mask, log_prob, torch.zeros_like(log_prob))
