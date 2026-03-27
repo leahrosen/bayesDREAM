@@ -1282,6 +1282,19 @@ class ModelSummarizer:
         - observed_delta_p: y_max - y_min over observed x range (probability difference)
         - full_delta_p_mean/lower/upper: y_max - y_min over theoretical x range
 
+        FDR columns (all function types):
+        - fdr_alpha: Bayesian q-value for component A (positive Hill, or the single Hill
+                     component in single_hill).  The minimum expected FDR among all called
+                     sets that include this feature's component A.  Analogous to a
+                     Benjamini-Hochberg adjusted p-value: calling all features with
+                     fdr_alpha <= q controls the expected false discovery rate at q.
+                     For additive_hill, computed over the *pooled* family of 2*n_features
+                     tests (alpha + beta), which accounts for the increased multiple-testing
+                     burden relative to single_hill.
+        - fdr_beta:  Bayesian q-value for component B (negative Hill).  NaN for
+                     single_hill and polynomial.  Computed in the same pooled family as
+                     fdr_alpha for additive_hill.
+
         For additive_hill (all parameters needed to recreate: y = A + alpha*Vmax_a*Hill(x;K_a,n_a) + beta*Vmax_b*Hill(x;K_b,n_b)):
         - A_mean, A_lower, A_upper: Baseline (intercept)
         - Vmax_a_mean, Vmax_a_lower, Vmax_a_upper: Component A magnitude
@@ -1557,6 +1570,10 @@ class ModelSummarizer:
                 x_obs_max=x_obs_max
             )
 
+        # Compute Bayesian q-values (FDR columns) for Hill components
+        fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features)
+        data.update(fdr_cols)
+
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
         if 'o_y' in posterior:
             o_y = posterior['o_y']
@@ -1674,6 +1691,145 @@ class ModelSummarizer:
         log2fc_se = np.sqrt(se_ntc**2 + se_pert**2) / np.log(2)
 
         return log2fc, log2fc_se
+
+    def _compute_bayesian_fdr(
+        self,
+        posterior: dict,
+        function_type: str,
+        n_features: int,
+    ) -> dict:
+        """
+        Compute per-component Bayesian q-values (FDR-equivalents) for Hill components.
+
+        The Bayesian q-value for component i is the minimum expected false discovery rate
+        (FDR) of any called set that includes component i:
+
+            q_i = min_{k' >= rank(i)}  BayesFDR(top-k'),
+
+        where features are ranked by local FDR ascending (most-significant first),
+
+            lfdr_i = 1 - E[alpha_i]   (posterior probability that component is inactive),
+
+        and BayesFDR(top-k) = mean of lfdr over the k most-significant features.
+
+        This is the Bayesian analogue of the Benjamini-Hochberg adjusted p-value: calling
+        all features with q_i <= q controls the expected false discovery rate at level q.
+
+        For additive_hill (two components per feature), alpha and beta are treated as a
+        *single pooled family* of 2*n_features tests.  This directly accounts for the
+        increased multiple-testing burden: a feature must clear a higher evidence bar to
+        reach the same q-value as in single_hill.
+
+        Parameters
+        ----------
+        posterior : dict
+            Posterior samples dict from fit_trans (keys include 'alpha', 'beta', etc.).
+        function_type : str
+            'additive_hill', 'single_hill', or 'polynomial'.
+        n_features : int
+            Number of trans features.
+
+        Returns
+        -------
+        dict with keys:
+            fdr_alpha : ndarray (n_features,)
+                Bayesian q-value for component A (positive Hill / only component).
+                Interpret as: the minimum expected FDR at which this feature's positive
+                component would be included in a called set.
+            fdr_beta : ndarray (n_features,)
+                Bayesian q-value for component B (negative Hill).
+                NaN for single_hill and polynomial.
+
+        Notes
+        -----
+        The q-value formula uses the "running minimum from the right" trick to ensure
+        monotonicity: q_i <= q_j whenever lfdr_i <= lfdr_j.  Concretely:
+
+            cumfdr     = cumulative mean of sorted lfdr array
+            qvals      = reverse running minimum of cumfdr
+                       = minimum.accumulate(cumfdr[::-1])[::-1]
+
+        The posterior mean E[alpha] is computed as the sample mean across all MCMC/VI
+        samples.  Values are clipped to [0, 1] to guard against numerical noise.
+        """
+
+        def _posterior_mean(key: str) -> Optional[np.ndarray]:
+            """Extract posterior mean for a parameter → shape (n_features,)."""
+            if key not in posterior:
+                return None
+            param = posterior[key]
+            if isinstance(param, torch.Tensor):
+                param = param.cpu().numpy()
+            if param.ndim == 0:
+                return np.full(n_features, float(param))
+            if param.ndim == 1:
+                if param.shape[0] == n_features:
+                    return param.copy()
+                return np.full(n_features, float(param.mean()))
+            # ≥ 2D: average over sample axis 0
+            val = param.mean(axis=0)
+            val = np.squeeze(val)
+            if val.shape == () or val.shape == (1,):
+                return np.full(n_features, float(val))
+            return val
+
+        def _qvalues(lfdr: np.ndarray) -> np.ndarray:
+            """
+            Convert a local-FDR array to Bayesian q-values.
+
+            q_i = min_{k' >= rank(i)} cumulative_mean(lfdr_sorted[:k'])
+
+            Implemented as a right-to-left running minimum of the cumulative mean,
+            which ensures q-values are non-decreasing as local FDR increases.
+            """
+            n = len(lfdr)
+            if n == 0:
+                return np.array([], dtype=float)
+            order = np.argsort(lfdr)
+            lfdr_sorted = lfdr[order]
+            cumfdr = np.cumsum(lfdr_sorted) / (np.arange(n, dtype=float) + 1.0)
+            # Running minimum from right guarantees monotonicity
+            qvals_sorted = np.minimum.accumulate(cumfdr[::-1])[::-1]
+            qvals = np.empty(n, dtype=float)
+            qvals[order] = qvals_sorted
+            return qvals
+
+        nan_col = np.full(n_features, np.nan)
+
+        if function_type == 'polynomial':
+            # Polynomial has no sparsity indicator; FDR not applicable
+            return {'fdr_alpha': nan_col.copy(), 'fdr_beta': nan_col.copy()}
+
+        if function_type == 'single_hill':
+            E_alpha = _posterior_mean('alpha')
+            if E_alpha is None:
+                # No sparsity prior fitted — all features considered active
+                return {'fdr_alpha': np.zeros(n_features, dtype=float),
+                        'fdr_beta': nan_col.copy()}
+            E_alpha = np.clip(E_alpha, 0.0, 1.0)
+            return {
+                'fdr_alpha': _qvalues(1.0 - E_alpha),
+                'fdr_beta':  nan_col.copy(),
+            }
+
+        if function_type in ('additive_hill', 'nested_hill'):
+            E_alpha = _posterior_mean('alpha')
+            E_beta  = _posterior_mean('beta')
+            E_alpha = np.ones(n_features) if E_alpha is None else np.clip(E_alpha, 0.0, 1.0)
+            E_beta  = np.ones(n_features) if E_beta  is None else np.clip(E_beta,  0.0, 1.0)
+
+            # Pool both components into a single family of 2*n_features tests.
+            # The first n_features entries correspond to alpha (component A),
+            # the next n_features to beta (component B).
+            lfdr_all  = np.concatenate([1.0 - E_alpha, 1.0 - E_beta])
+            qvals_all = _qvalues(lfdr_all)
+            return {
+                'fdr_alpha': qvals_all[:n_features],
+                'fdr_beta':  qvals_all[n_features:],
+            }
+
+        # Unknown function type — return NaN
+        return {'fdr_alpha': nan_col.copy(), 'fdr_beta': nan_col.copy()}
 
     def _add_additive_hill_params(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
                                     compute_derivative_roots=True, x_range=None,
