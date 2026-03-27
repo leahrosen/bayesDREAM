@@ -1190,7 +1190,8 @@ class TransFitter:
         correct_priors_for_technical: bool = True,
         use_archive_prior_computation: bool = False,
         use_epsilon: bool = False,
-        warmup_steps: int = 0,
+        warmup: bool = True,
+        warmup_T_min: float = 0.5,
         **kwargs
     ):
         """
@@ -1239,13 +1240,20 @@ class TransFitter:
         use_epsilon : bool, optional
             If True, add 1e-8 epsilon for numerical stability in NegativeBinomial logits.
             If False (default), use log(mu) - log(phi) directly.
-        warmup_steps : int, optional
-            For additive_hill/nested_hill only. Run this many steps as single_hill first,
-            then switch to the full additive/nested model. The second component (K_b, Vmax_b,
-            beta) is initialised fresh from the prior at the switch point, while shared
-            parameters (K_a, Vmax_a, A, o_y, etc.) carry over from the warmup.
-            Temperature schedule restarts from init_temp at the switch point.
-            Default: 0 (no warmup, original behaviour).
+        warmup : bool, optional
+            For additive_hill/nested_hill: run a single_hill warmup phase before the main
+            fit. Default True (warmup is on by default for additive/nested hill).
+            Ignored for single_hill and polynomial.
+        warmup_T_min : float, optional
+            Temperature at which Phase 1 (single_hill warmup) ends. Phase 1 cools from
+            init_temp down to warmup_T_min at the same rate as Phase 2, so the number of
+            warmup steps is computed automatically:
+                warmup_steps = round(niters * (init_temp - warmup_T_min) /
+                                               (init_temp - final_temp))
+            niters always refers to Phase 2 (additive_hill) steps; total steps =
+            warmup_steps + niters. Default 0.5 (roughly half the annealing range,
+            saves ~44% of a full single_hill run while still reaching the separation
+            point where active and null genes are clearly distinguished).
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
         **kwargs
@@ -1328,6 +1336,7 @@ class TransFitter:
         # ---------------------------
         if niters is None:
             # Default: 100,000 unless multinomial OR polynomial function, then 200,000
+            # niters always means Phase 2 (additive/nested hill) steps.
             if distribution == 'multinomial':
                 niters = 200_000
                 print(f"[INFO] Using default niters=200,000 for multivariate distribution '{distribution}'")
@@ -1337,6 +1346,37 @@ class TransFitter:
             else:
                 niters = 100_000
                 print(f"[INFO] Using default niters=100,000 for distribution '{distribution}' and function_type '{function_type}'")
+
+        # ---------------------------
+        # Curriculum warmup: compute warmup_steps so Phase 1 cools at the same
+        # rate as Phase 2 but stops at warmup_T_min instead of final_temp.
+        # niters always refers to Phase 2 steps; total = warmup_steps + niters.
+        # ---------------------------
+        _do_warmup = (warmup and function_type in ['additive_hill', 'nested_hill'])
+        if _do_warmup:
+            if warmup_T_min >= init_temp:
+                raise ValueError(
+                    f"warmup_T_min ({warmup_T_min}) must be less than init_temp ({init_temp})"
+                )
+            if warmup_T_min < final_temp:
+                import warnings as _w
+                _w.warn(
+                    f"warmup_T_min ({warmup_T_min}) is below final_temp ({final_temp}); "
+                    f"Phase 1 will cool past the Phase 2 endpoint."
+                )
+            # Same cooling rate per step as Phase 2
+            warmup_steps = round(niters * (init_temp - warmup_T_min) /
+                                 (init_temp - final_temp))
+            total_steps = warmup_steps + niters
+            print(
+                f"[INFO] Curriculum warmup: {warmup_steps} steps as single_hill "
+                f"(T: {init_temp} → {warmup_T_min}), then {niters} steps as "
+                f"{function_type} (T: {init_temp} → {final_temp}). "
+                f"Total: {total_steps} steps."
+            )
+        else:
+            warmup_steps = 0
+            total_steps = niters
         
         #if lr is None:
         #    # Default: 100,000 unless multinomial OR polynomial function, then 200,000
@@ -2148,31 +2188,24 @@ class TransFitter:
             if "poly_coeff" in name and "loc" in name:
                 print(name, value.shape, value.min().item(), value.max().item())
 
-        # Curriculum warmup: only applies to additive_hill / nested_hill
-        _do_warmup = (warmup_steps > 0 and function_type in ['additive_hill', 'nested_hill'])
-        if _do_warmup:
-            print(f"[INFO] Curriculum warmup: running {warmup_steps} steps as single_hill "
-                  f"before switching to {function_type}.")
-
         self.losses_trans = []
         smoothed_loss = None
         _phase2_announced = False
-        for step in range(niters):
-            # ── Curriculum: choose effective function type ──────────────────
+        for step in range(total_steps):
+            # ── Curriculum: choose effective function type and temperature ──
             if _do_warmup and step < warmup_steps:
                 effective_function_type = 'single_hill'
-                # Temperature schedule over the warmup phase
+                # Phase 1: cool from init_temp to warmup_T_min at same rate as Phase 2
                 phase_fraction = step / float(warmup_steps)
-                current_temp = init_temp + (final_temp - init_temp) * phase_fraction
+                current_temp = init_temp + (warmup_T_min - init_temp) * phase_fraction
             else:
                 effective_function_type = function_type
                 if _do_warmup and not _phase2_announced:
                     print(f"[INFO] Warmup complete at step {step}. Switching to {function_type}.")
                     _phase2_announced = True
-                # Temperature schedule restarts from init_temp at the switch point
-                phase_steps = niters - warmup_steps if _do_warmup else niters
-                phase_step  = step - warmup_steps   if _do_warmup else step
-                phase_fraction = phase_step / float(phase_steps) if phase_steps > 0 else 1.0
+                # Phase 2: restart from init_temp, cool to final_temp over niters steps
+                phase_step = step - warmup_steps if _do_warmup else step
+                phase_fraction = phase_step / float(niters) if niters > 0 else 1.0
                 if effective_function_type in ['single_hill', 'additive_hill', 'nested_hill']:
                     current_temp = init_temp + (final_temp - init_temp) * phase_fraction
                 elif effective_function_type == 'polynomial':
