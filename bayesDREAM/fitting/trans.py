@@ -755,12 +755,11 @@ class TransFitter:
                     A_kminus1_expanded = A_kminus1.unsqueeze(0)  # [1, T, K-1]
 
                     if function_type == 'single_hill':
-                        # Compute Hills for K-1 categories using Vmax_a directly
+                        # Compute Hills for K-1 categories using log_K_a (numerically stable)
                         Hilla_list = []
                         for k in range(K_minus_1):
-                            hill_k = Hill_based_positive(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                        K=K_a[:, k], n=n_a[:, k],  # [T]
-                                                        epsilon=epsilon_tensor)  # [N, T]
+                            hill_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
+                                                              logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
                             Hilla_list.append(hill_k.unsqueeze(-1))  # [N, T, 1]
                         Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
 
@@ -769,16 +768,14 @@ class TransFitter:
                         y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
 
                     elif function_type == 'additive_hill':
-                        # Compute Hills for K-1 categories using Vmax_a and Vmax_b directly
+                        # Compute Hills for K-1 categories using log_K_a/log_K_b (numerically stable)
                         Hilla_list = []
                         Hillb_list = []
                         for k in range(K_minus_1):
-                            hill_a_k = Hill_based_positive(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                          K=K_a[:, k], n=n_a[:, k],  # [T]
-                                                          epsilon=epsilon_tensor)  # [N, T]
-                            hill_b_k = Hill_based_positive(x_expanded, Vmax=Vmax_b[:, k], A=0,
-                                                          K=K_b[:, k], n=n_b[:, k],  # [T]
-                                                          epsilon=epsilon_tensor)  # [N, T]
+                            hill_a_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
+                                                                logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
+                            hill_b_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_b[:, k], A=0,
+                                                                logK=log_K_b[:, k], n=n_b[:, k])  # [N, T]
                             Hilla_list.append(hill_a_k.unsqueeze(-1))  # [N, T, 1]
                             Hillb_list.append(hill_b_k.unsqueeze(-1))  # [N, T, 1]
                         Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
@@ -790,12 +787,12 @@ class TransFitter:
                         y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
 
                     elif function_type == 'nested_hill':
-                        # Compute nested Hills for K-1 categories using Vmax_a and Vmax_b directly
+                        # Compute nested Hills for K-1 categories
+                        # First Hill uses log_K_a (stable); second Hill feeds Hilla output as x
                         Hillb_list = []
                         for k in range(K_minus_1):
-                            hill_a_k = Hill_based_positive(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                          K=K_a[:, k], n=n_a[:, k],
-                                                          epsilon=epsilon_tensor)  # [N, T]
+                            hill_a_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
+                                                                logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
                             hill_b_k = Hill_based_positive(hill_a_k.unsqueeze(-1), Vmax=Vmax_b[:, k], A=0,
                                                           K=K_b[:, k], n=n_b[:, k],
                                                           epsilon=epsilon_tensor)  # [N, T]
@@ -827,21 +824,21 @@ class TransFitter:
                 else:
                     # For non-multinomial: standard Hill computation
                     if distribution == 'binomial':
-                        # For binomial: Use Vmax_a and Vmax_b directly (sampled independently)
+                        # For binomial: use log_K_a/log_K_b (numerically stable sigmoid formulation)
                         # y = A + (alpha * Hill_a(Vmax=Vmax_a)) + (beta * Hill_b(Vmax=Vmax_b))
                         # Note: Vmax_a + Vmax_b CAN exceed 1 - we'll try without clamp first
 
                         if function_type == 'single_hill':
-                            Hilla = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, K=K_a, n=n_a, epsilon=epsilon_tensor)
+                            Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
                             y_dose_response = A + (alpha * Hilla)
 
                         elif function_type == 'additive_hill':
-                            Hilla = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, K=K_a, n=n_a, epsilon=epsilon_tensor)
-                            Hillb = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_b, A=0, K=K_b, n=n_b, epsilon=epsilon_tensor)
+                            Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
+                            Hillb = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_b, A=0, logK=log_K_b, n=n_b)
                             y_dose_response = A + (alpha * Hilla) + (beta * Hillb)
 
                         elif function_type == 'nested_hill':
-                            Hilla = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, K=K_a, n=n_a, epsilon=epsilon_tensor)
+                            Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
                             Hillb = Hill_based_positive(Hilla, Vmax=Vmax_b, A=0, K=K_b, n=n_b, epsilon=epsilon_tensor)
                             y_dose_response = A + (alpha * Hillb)
 
