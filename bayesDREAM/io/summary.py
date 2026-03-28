@@ -1697,6 +1697,7 @@ class ModelSummarizer:
         posterior: dict,
         function_type: str,
         n_features: int,
+        activity_epsilon: float = 0.01,
     ) -> dict:
         """
         Compute per-component Bayesian q-values (FDR-equivalents) for Hill components.
@@ -1708,17 +1709,21 @@ class ModelSummarizer:
 
         where features are ranked by local FDR ascending (most-significant first),
 
-            lfdr_i = 1 - E[alpha_i]   (posterior probability that component is inactive),
+            lfdr_i = 1 - P(alpha_i * Vmax_a_i / A_i > epsilon)
 
         and BayesFDR(top-k) = mean of lfdr over the k most-significant features.
 
-        This is the Bayesian analogue of the Benjamini-Hochberg adjusted p-value: calling
-        all features with q_i <= q controls the expected false discovery rate at level q.
+        Using the product alpha * Vmax_a / A (normalized effect size) instead of E[alpha]
+        avoids the alpha–Vmax non-identifiability: the data constrains the product well
+        even when the individual factors are poorly identified.  The ratio relative to A
+        makes the threshold expression-scale invariant.
 
-        For additive_hill (two components per feature), alpha and beta are treated as a
-        *single pooled family* of 2*n_features tests.  This directly accounts for the
-        increased multiple-testing burden: a feature must clear a higher evidence bar to
-        reach the same q-value as in single_hill.
+        The choice of epsilon (default 0.01) is essentially arbitrary because true
+        negatives have alpha * Vmax_a / A ~ 1e-50 while true positives have values
+        >= ~0.15; any epsilon in [1e-8, 0.1] gives identical calls.
+
+        For additive_hill (two components per feature), alpha and beta components are
+        treated as a *single pooled family* of 2*n_features tests.
 
         Parameters
         ----------
@@ -1728,6 +1733,10 @@ class ModelSummarizer:
             'additive_hill', 'single_hill', or 'polynomial'.
         n_features : int
             Number of trans features.
+        activity_epsilon : float
+            Threshold for the normalized effect size alpha * Vmax / A above which a
+            component is considered active.  Insensitive to the exact value chosen;
+            default 0.01 (1% of baseline).
 
         Returns
         -------
@@ -1748,18 +1757,25 @@ class ModelSummarizer:
             cumfdr     = cumulative mean of sorted lfdr array
             qvals      = reverse running minimum of cumfdr
                        = minimum.accumulate(cumfdr[::-1])[::-1]
-
-        The posterior mean E[alpha] is computed as the sample mean across all MCMC/VI
-        samples.  Values are clipped to [0, 1] to guard against numerical noise.
         """
 
-        def _posterior_mean(key: str) -> Optional[np.ndarray]:
-            """Extract posterior mean for a parameter → shape (n_features,)."""
+        def _to_numpy(key: str):
+            """Extract posterior samples for a parameter as numpy array."""
             if key not in posterior:
                 return None
             param = posterior[key]
             if isinstance(param, torch.Tensor):
                 param = param.cpu().numpy()
+            # Squeeze trailing size-1 dims: [S, 1, T] -> [S, T]
+            if param.ndim == 3 and param.shape[1] == 1:
+                param = param.squeeze(1)
+            return param
+
+        def _posterior_mean(key: str) -> Optional[np.ndarray]:
+            """Extract posterior mean for a parameter → shape (n_features,)."""
+            param = _to_numpy(key)
+            if param is None:
+                return None
             if param.ndim == 0:
                 return np.full(n_features, float(param))
             if param.ndim == 1:
@@ -1772,6 +1788,29 @@ class ModelSummarizer:
             if val.shape == () or val.shape == (1,):
                 return np.full(n_features, float(val))
             return val
+
+        def _p_active(alpha_key: str, vmax_key: str) -> np.ndarray:
+            """
+            Compute P(alpha * Vmax / A > epsilon) across posterior samples.
+
+            Falls back to E[alpha] if full samples or A are unavailable.
+            """
+            alpha_s = _to_numpy(alpha_key)
+            vmax_s  = _to_numpy(vmax_key)
+            A_s     = _to_numpy('A')
+
+            # Need 2D sample arrays for the product computation
+            if (alpha_s is not None and alpha_s.ndim >= 2 and
+                    vmax_s is not None and vmax_s.ndim >= 2 and
+                    A_s    is not None and A_s.ndim    >= 2):
+                ratio = alpha_s * vmax_s / np.maximum(A_s, 1e-12)
+                return (ratio > activity_epsilon).mean(axis=0)
+
+            # Fallback: use posterior mean of alpha
+            E_alpha = _posterior_mean(alpha_key)
+            if E_alpha is None:
+                return np.ones(n_features, dtype=float)
+            return np.clip(E_alpha, 0.0, 1.0)
 
         def _qvalues(lfdr: np.ndarray) -> np.ndarray:
             """
@@ -1801,27 +1840,20 @@ class ModelSummarizer:
             return {'fdr_alpha': nan_col.copy(), 'fdr_beta': nan_col.copy()}
 
         if function_type == 'single_hill':
-            E_alpha = _posterior_mean('alpha')
-            if E_alpha is None:
-                # No sparsity prior fitted — all features considered active
-                return {'fdr_alpha': np.zeros(n_features, dtype=float),
-                        'fdr_beta': nan_col.copy()}
-            E_alpha = np.clip(E_alpha, 0.0, 1.0)
+            p_active_a = _p_active('alpha', 'Vmax_a')
             return {
-                'fdr_alpha': _qvalues(1.0 - E_alpha),
+                'fdr_alpha': _qvalues(1.0 - p_active_a),
                 'fdr_beta':  nan_col.copy(),
             }
 
         if function_type in ('additive_hill', 'nested_hill'):
-            E_alpha = _posterior_mean('alpha')
-            E_beta  = _posterior_mean('beta')
-            E_alpha = np.ones(n_features) if E_alpha is None else np.clip(E_alpha, 0.0, 1.0)
-            E_beta  = np.ones(n_features) if E_beta  is None else np.clip(E_beta,  0.0, 1.0)
+            p_active_a = _p_active('alpha', 'Vmax_a')
+            p_active_b = _p_active('beta',  'Vmax_b')
 
             # Pool both components into a single family of 2*n_features tests.
             # The first n_features entries correspond to alpha (component A),
             # the next n_features to beta (component B).
-            lfdr_all  = np.concatenate([1.0 - E_alpha, 1.0 - E_beta])
+            lfdr_all  = np.concatenate([1.0 - p_active_a, 1.0 - p_active_b])
             qvals_all = _qvalues(lfdr_all)
             return {
                 'fdr_alpha': qvals_all[:n_features],
@@ -2152,6 +2184,22 @@ class ModelSummarizer:
         K_b_full = extract_param_full('K_b')
         n_b_full = extract_param_full('n_b')
 
+        # Compute product-based activity probabilities: P(alpha * Vmax_a / A > epsilon)
+        # These avoid the alpha-Vmax non-identifiability by using the well-constrained product.
+        _ACTIVITY_EPSILON = 0.01
+        if (alpha_full.ndim >= 2 and Vmax_a_full.ndim >= 2 and A_full.ndim >= 2):
+            _ratio_a = alpha_full * Vmax_a_full / np.maximum(A_full, 1e-12)
+            p_active_a = (_ratio_a > _ACTIVITY_EPSILON).mean(axis=0)
+        else:
+            p_active_a = alpha_mean.copy()  # fallback to E[alpha]
+        if (beta_full.ndim >= 2 and Vmax_b_full.ndim >= 2 and A_full.ndim >= 2):
+            _ratio_b = beta_full * Vmax_b_full / np.maximum(A_full, 1e-12)
+            p_active_b = (_ratio_b > _ACTIVITY_EPSILON).mean(axis=0)
+        else:
+            p_active_b = beta_mean.copy()  # fallback to E[beta]
+        p_active_a = np.asarray(p_active_a, dtype=float).ravel()
+        p_active_b = np.asarray(p_active_b, dtype=float).ravel()
+
         # Initialize arrays for per-feature results
         classifications = []
         first_deriv_roots_mean_list = []
@@ -2370,14 +2418,16 @@ class ModelSummarizer:
                 first_roots_mean, second_roots_mean,
                 x_range if x_range is not None else np.array([1.0]),
                 Vmax_a_i, K_a_i, Vmax_b_i, K_b_i,
-                x_ntc=x_ntc  # Pass x_ntc for non-monotonic classification
+                x_ntc=x_ntc,
+                p_active_a=float(p_active_a[i]),
+                p_active_b=float(p_active_b[i])
             )
             classifications.append(classification)
 
             # Compute full dynamic range
             # For negbinom: full_log2fc = log2(y_max / y_min)
             # For binomial: full_delta_p = y_max - y_min
-            is_flat_i = bool(n_a_zeroed[i]) and bool(n_b_zeroed[i])
+            is_flat_i = (p_active_a[i] <= 0.5) and (p_active_b[i] <= 0.5)
             if is_flat_i:
                 full_log2fc_i = 0.0
             elif is_binomial:
@@ -3842,13 +3892,16 @@ class ModelSummarizer:
                                  second_deriv_roots: List[float],
                                  x_range: np.ndarray,
                                  Vmax_a, K_a, Vmax_b, K_b,
-                                 x_ntc: float = None) -> str:
+                                 x_ntc: float = None,
+                                 p_active_a: float = None,
+                                 p_active_b: float = None) -> str:
         """
         Classify additive Hill function into categories based on dependency masks.
 
         Classification Logic:
-        - dep_mask_a: Component A is active (0 NOT in CI of alpha AND 0 NOT in CI of n_a)
-        - dep_mask_b: Component B is active (0 NOT in CI of beta AND 0 NOT in CI of n_b)
+        - dep_mask_a: Component A is active — P(alpha*Vmax_a/A > epsilon) > 0.5
+        - dep_mask_b: Component B is active — P(beta*Vmax_b/A > epsilon) > 0.5
+          Falls back to CI-based check if p_active_a/p_active_b not provided.
         - dep_mask: Either component is active
 
         Categories:
@@ -3865,18 +3918,21 @@ class ModelSummarizer:
         - 'non_monotonic_max': Both active, opposite signs, local maximum at nearest extremum to x_ntc
             (where S'=0, checked via S'' < 0 at that point)
         """
-        # Define dependency masks
-        # Component is "active" if its weight is non-zero AND its Hill coefficient is non-zero
-        # Use CI to determine if 0 is in the credible interval
-        alpha_active = not (alpha_lower <= 0 <= alpha_upper)  # 0 NOT in CI
-        n_a_active = not (n_a_lower <= 0 <= n_a_upper)  # n_a is not ~0
+        # Define dependency masks using product-based activity probability when available,
+        # falling back to CI-based check otherwise.
+        if p_active_a is not None:
+            dep_mask_a = p_active_a > 0.5
+        else:
+            alpha_active = not (alpha_lower <= 0 <= alpha_upper)
+            n_a_active   = not (n_a_lower   <= 0 <= n_a_upper)
+            dep_mask_a   = alpha_active and n_a_active
 
-        beta_active = not (beta_lower <= 0 <= beta_upper)  # 0 NOT in CI
-        n_b_active = not (n_b_lower <= 0 <= n_b_upper)  # n_b is not ~0
-
-        # Dependency masks
-        dep_mask_a = alpha_active and n_a_active
-        dep_mask_b = beta_active and n_b_active
+        if p_active_b is not None:
+            dep_mask_b = p_active_b > 0.5
+        else:
+            beta_active = not (beta_lower <= 0 <= beta_upper)
+            n_b_active  = not (n_b_lower  <= 0 <= n_b_upper)
+            dep_mask_b  = beta_active and n_b_active
         dep_mask = dep_mask_a or dep_mask_b  # At least one component active
 
         # Check if both components are active
