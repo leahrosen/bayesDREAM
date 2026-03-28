@@ -442,9 +442,9 @@ class TransFitter:
             # ----------------------------------------------------
             # 1) Define global hyperparameters for n_a
             # ----------------------------------------------------
-            sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(1/5))) #   -> controls how variable n_a can be across genes
+            sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(1.0))) #   -> controls how variable n_a can be across genes; Exp(1) keeps n_a within ~±3 by default
             if function_type in ['additive_hill', 'nested_hill']:
-                sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1/5))) #   -> controls how variable n_a can be across genes
+                sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0))) #   -> controls how variable n_b can be across genes; Exp(1) keeps n_b within ~±3 by default
         if function_type in ['polynomial']:
             #sigma_coeff = pyro.sample("sigma_coeff", dist.Exponential(100)) #   -> controls how variable n_a can be across genes
             sigma_coeff = pyro.sample("sigma_coeff", dist.HalfCauchy(scale=self._t(1.0)))
