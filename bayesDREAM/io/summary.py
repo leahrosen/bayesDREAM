@@ -1866,7 +1866,7 @@ class ModelSummarizer:
     def _add_additive_hill_params(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
                                     compute_derivative_roots=True, x_range=None,
                                     compute_log2fc_params=False, x_ntc=None, y_ntc=None,
-                                    x_obs_min=None, x_obs_max=None):
+                                    x_obs_min=None, x_obs_max=None, fdr_threshold=0.05):
         """
         Add additive Hill parameters to data dict.
 
@@ -1891,7 +1891,8 @@ class ModelSummarizer:
         return self._add_additive_hill_params_individual(
             data, posterior, n_features, compute_inflection, compute_full_log2fc,
             compute_derivative_roots, x_range,
-            compute_log2fc_params, x_ntc, y_ntc, x_obs_min, x_obs_max
+            compute_log2fc_params, x_ntc, y_ntc, x_obs_min, x_obs_max,
+            fdr_threshold=fdr_threshold
         )
 
     # Helper function to compute y(x) given parameters
@@ -1915,7 +1916,7 @@ class ModelSummarizer:
     def _add_additive_hill_params_individual(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
                                               compute_derivative_roots=True, x_range=None,
                                               compute_log2fc_params=False, x_ntc=None, y_ntc=None,
-                                              x_obs_min=None, x_obs_max=None):
+                                              x_obs_min=None, x_obs_max=None, fdr_threshold=0.05):
         """
         Add additive Hill parameters from individual parameter architecture (Vmax_a, K_a, n_a, etc.).
 
@@ -2200,6 +2201,17 @@ class ModelSummarizer:
         p_active_a = np.asarray(p_active_a, dtype=float).ravel()
         p_active_b = np.asarray(p_active_b, dtype=float).ravel()
 
+        # Convert p_active to Bayesian q-values (pooled over both components).
+        # dep_mask uses q < fdr_threshold so the criterion is globally calibrated.
+        _lfdr_all = np.concatenate([1.0 - p_active_a, 1.0 - p_active_b])
+        _n_all = len(_lfdr_all)
+        _ord = np.argsort(_lfdr_all)
+        _cumfdr = np.cumsum(_lfdr_all[_ord]) / (np.arange(_n_all, dtype=float) + 1.0)
+        _qsorted = np.minimum.accumulate(_cumfdr[::-1])[::-1]
+        _qall = np.empty(_n_all, dtype=float); _qall[_ord] = _qsorted
+        q_active_a = _qall[:n_features]
+        q_active_b = _qall[n_features:]
+
         # Initialize arrays for per-feature results
         classifications = []
         first_deriv_roots_mean_list = []
@@ -2419,15 +2431,16 @@ class ModelSummarizer:
                 x_range if x_range is not None else np.array([1.0]),
                 Vmax_a_i, K_a_i, Vmax_b_i, K_b_i,
                 x_ntc=x_ntc,
-                p_active_a=float(p_active_a[i]),
-                p_active_b=float(p_active_b[i])
+                p_active_a=float(q_active_a[i]),
+                p_active_b=float(q_active_b[i]),
+                fdr_threshold=fdr_threshold
             )
             classifications.append(classification)
 
             # Compute full dynamic range
             # For negbinom: full_log2fc = log2(y_max / y_min)
             # For binomial: full_delta_p = y_max - y_min
-            is_flat_i = (p_active_a[i] <= 0.5) and (p_active_b[i] <= 0.5)
+            is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
             if is_flat_i:
                 full_log2fc_i = 0.0
             elif is_binomial:
@@ -3894,13 +3907,16 @@ class ModelSummarizer:
                                  Vmax_a, K_a, Vmax_b, K_b,
                                  x_ntc: float = None,
                                  p_active_a: float = None,
-                                 p_active_b: float = None) -> str:
+                                 p_active_b: float = None,
+                                 fdr_threshold: float = 0.05) -> str:
         """
         Classify additive Hill function into categories based on dependency masks.
 
         Classification Logic:
-        - dep_mask_a: Component A is active — P(alpha*Vmax_a/A > epsilon) > 0.5
-        - dep_mask_b: Component B is active — P(beta*Vmax_b/A > epsilon) > 0.5
+        - dep_mask_a: Component A is active — Bayesian q-value < fdr_threshold (default 0.05)
+          where q-value is derived from P(alpha*Vmax_a/A > epsilon) pooled over both components.
+          Note: p_active_a is actually the q-value passed from _add_additive_hill_params_individual.
+        - dep_mask_b: Component B is active — q-value < fdr_threshold
           Falls back to CI-based check if p_active_a/p_active_b not provided.
         - dep_mask: Either component is active
 
@@ -3918,17 +3934,18 @@ class ModelSummarizer:
         - 'non_monotonic_max': Both active, opposite signs, local maximum at nearest extremum to x_ntc
             (where S'=0, checked via S'' < 0 at that point)
         """
-        # Define dependency masks using product-based activity probability when available,
+        # Define dependency masks using Bayesian q-value < fdr_threshold when available
+        # (p_active_a/b are actually q-values passed from _add_additive_hill_params_individual),
         # falling back to CI-based check otherwise.
         if p_active_a is not None:
-            dep_mask_a = p_active_a > 0.5
+            dep_mask_a = p_active_a < fdr_threshold
         else:
             alpha_active = not (alpha_lower <= 0 <= alpha_upper)
             n_a_active   = not (n_a_lower   <= 0 <= n_a_upper)
             dep_mask_a   = alpha_active and n_a_active
 
         if p_active_b is not None:
-            dep_mask_b = p_active_b > 0.5
+            dep_mask_b = p_active_b < fdr_threshold
         else:
             beta_active = not (beta_lower <= 0 <= beta_upper)
             n_b_active  = not (n_b_lower  <= 0 <= n_b_upper)
