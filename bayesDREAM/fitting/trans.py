@@ -586,24 +586,16 @@ class TransFitter:
                     # Each category gets its own Hill function parameters
                     with pyro.plate("category_plate_n_a", K_minus_1, dim=-1):
                         n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_tensor, sigma_n_a))  # [T, K-1]
-                        BOX_LOW  = self._t(-20.0)
-                        BOX_HIGH = self._t( 20.0)
-                        low  = torch.maximum(nmin, BOX_LOW)
-                        high = torch.minimum(nmax, BOX_HIGH)
                         n_a = pyro.deterministic(
                             "n_a",
-                            (alpha.unsqueeze(-1) * n_a_raw).clamp(min=low.item(), max=high.item())
-                        )  # [T, 1] * [T, K-1] -> [T, K-1]
+                            n_a_raw.clamp(min=nmin.item(), max=nmax.item())
+                        )  # [T, K-1]
                 else:
                     # For non-multinomial: single set of parameters per feature
                     n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_tensor, sigma_n_a))
-                    BOX_LOW  = self._t(-20.0)
-                    BOX_HIGH = self._t( 20.0)
-                    low  = torch.maximum(nmin, BOX_LOW)
-                    high = torch.minimum(nmax, BOX_HIGH)
                     n_a = pyro.deterministic(
                         "n_a",
-                        (alpha * n_a_raw).clamp(min=low.item(), max=high.item())
+                        n_a_raw.clamp(min=nmin.item(), max=nmax.item())
                     )
                 
                 # Scale for Vmax, K is multiplied by alpha
@@ -688,23 +680,15 @@ class TransFitter:
                         K_minus_1 = K - 1
                         with pyro.plate("category_plate_n_b", K_minus_1, dim=-1):
                             n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_tensor, sigma_n_b))  # [T, K-1]
-                            BOX_LOW  = self._t(-20.0)
-                            BOX_HIGH = self._t( 20.0)
-                            low  = torch.maximum(nmin, BOX_LOW)
-                            high = torch.minimum(nmax, BOX_HIGH)
                             n_b = pyro.deterministic(
                                 "n_b",
-                                (beta.unsqueeze(-1) * n_b_raw).clamp(min=low.item(), max=high.item())
-                            )  # [T, 1] * [T, K-1] -> [T, K-1]
+                                n_b_raw.clamp(min=nmin.item(), max=nmax.item())
+                            )  # [T, K-1]
                     else:
                         n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_tensor, sigma_n_b))
-                        BOX_LOW  = self._t(-20.0)
-                        BOX_HIGH = self._t( 20.0)
-                        low  = torch.maximum(nmin, BOX_LOW)
-                        high = torch.minimum(nmax, BOX_HIGH)
                         n_b = pyro.deterministic(
                             "n_b",
-                            (beta * n_b_raw).clamp(min=low.item(), max=high.item())
+                            n_b_raw.clamp(min=nmin.item(), max=nmax.item())
                         )
 
                     # Vmax_b and K_b: same structure as Vmax_a and K_a
@@ -1582,11 +1566,10 @@ class TransFitter:
         nmin_cand = (-log_fmax / torch.abs(torch.log(x_min))) if (x_min < 1) else torch.tensor(float('-inf'), device=self.model.device)
         nmax_cand = ( log_fmax / torch.abs(torch.log(x_max))) if (x_max > 1) else torch.tensor(float('inf'),  device=self.model.device)
 
-        BOX_LOW  = torch.tensor(-20.0, device=self.model.device)
-        BOX_HIGH = torch.tensor( 20.0, device=self.model.device)
-
-        nmin = torch.where(torch.isfinite(nmin_cand), torch.maximum(nmin_cand, BOX_LOW),  BOX_LOW)
-        nmax = torch.where(torch.isfinite(nmax_cand), torch.minimum(nmax_cand, BOX_HIGH), BOX_HIGH)
+        # Use physically-derived overflow bounds directly; fall back to ±100 if infinite
+        # (nmin_cand is -inf when x_min >= 1; nmax_cand is +inf when x_max <= 1)
+        nmin = torch.where(torch.isfinite(nmin_cand), nmin_cand, torch.tensor(-100.0, device=self.model.device))
+        nmax = torch.where(torch.isfinite(nmax_cand), nmax_cand, torch.tensor( 100.0, device=self.model.device))
         # ensure proper ordering just in case
         nmin = torch.minimum(nmin, nmax)
 
