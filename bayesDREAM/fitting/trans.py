@@ -632,20 +632,31 @@ class TransFitter:
                 # When NTC mean is known, center the prior there with ±5 log2FC coverage.
                 # This ensures the P.O.I. starts within the observed x-range regardless of
                 # whether the subset is KO-only, CA-only, or full.
+                #
+                # Minimum prior width: K_log_sigma >= 5*ln(2)/2 ≈ 1.73
+                # This guarantees the lower end of the 95% CI extends at least 2^{-5} (1/32x)
+                # below the prior centre, matching the NTC-centred branch below.
+                _K_log_sigma_min = self._t(5.0 * 0.6931 / 2.0)  # 5 * ln(2) / 2 ≈ 1.733
+
                 if x_ntc_mean is not None:
-                    # log(K) ~ N(log(x_ntc), sigma²) with sigma = 5*ln(2)/2 ≈ 1.73
-                    # → E[K] = x_ntc; 95% CI spans ±5 log2FC around NTC mean
-                    K_log_sigma = self._t(5.0 * 0.6931 / 2.0)  # 5 * ln(2) / 2 ≈ 1.733
+                    # Centre K prior at NTC mean with ±5 log2FC (95% CI) coverage.
+                    # Note: for one-sided fits (CRISPRi-only or CRISPRa-only), K is not
+                    # identifiable from the data when the true EC50 lies outside the observed
+                    # x-range.  The NTC-centred prior then dominates and will under/over-shoot
+                    # the true K.  This is a data limitation, not a code bug — the full dataset
+                    # should be used for reliable EC50 estimation.
+                    K_log_sigma = _K_log_sigma_min  # = 5*ln(2)/2
                     K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor)) - 0.5 * K_log_sigma ** 2
                 else:
-                    # Fallback: center at half the max observed x, width from CV
+                    # Fallback: centre at half the max observed x, width from CV.
+                    # Floor sigma so the prior always spans at least ±5 log2FC.
                     K_mean_prior = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
                     if x_true_CV is not None:
                         K_std_prior = K_mean_prior * x_true_CV
                     else:
                         K_std_prior = K_max_tensor / (self._t(2.0) * torch.sqrt(K_alpha_tensor))
                     ratio_K = (K_std_prior / K_mean_prior).clamp_min(self._t(1e-6))
-                    K_log_sigma = torch.sqrt(torch.log1p(ratio_K ** 2))
+                    K_log_sigma = torch.sqrt(torch.log1p(ratio_K ** 2)).clamp_min(_K_log_sigma_min)
                     K_log_mu = torch.log(K_mean_prior) - 0.5 * K_log_sigma ** 2
 
                 if distribution in ['binomial', 'multinomial']:
