@@ -1,26 +1,27 @@
 # Bayesian FDR: Mathematical Derivation
 
 This document explains the probability theory behind the `fdr_alpha` and `fdr_beta`
-columns produced by `save_trans_summary`.
+columns produced by `save_trans_summary`, and the FDR-based dependency criterion
+used for classification and `full_log2fc` computation.
 
 ---
 
 ## 1. The Hypothesis Testing Setup
 
 After running `fit_trans` with `function_type='additive_hill'`, every trans gene $i$
-has two latent binary indicators:
+has two latent sparsity indicators:
 
-$$\alpha_i \in \{0, 1\}, \quad \beta_i \in \{0, 1\}$$
+$$\alpha_i \in [0, 1], \quad \beta_i \in [0, 1]$$
 
-- $\alpha_i = 1$: the positive Hill component (component A) is active for gene $i$
-- $\beta_i = 1$: the negative Hill component (component B) is active for gene $i$
+- $\alpha_i \approx 1$: the positive Hill component (component A) is active for gene $i$
+- $\beta_i \approx 1$: the negative Hill component (component B) is active for gene $i$
 
-These define four null hypotheses per gene:
+These define two null hypotheses per gene:
 
 | Null | Meaning |
 |------|---------|
-| $H_0^{(i,A)}: \alpha_i = 0$ | Gene $i$ has no positive regulation |
-| $H_0^{(i,B)}: \beta_i = 0$ | Gene $i$ has no negative regulation |
+| $H_0^{(i,A)}$: component A inactive | Gene $i$ has no positive regulation |
+| $H_0^{(i,B)}$: component B inactive | Gene $i$ has no negative regulation |
 
 For `single_hill`, only $H_0^{(i,A)}$ is tested.
 
@@ -28,128 +29,113 @@ For `single_hill`, only $H_0^{(i,A)}$ is tested.
 
 ## 2. The Prior on $\alpha_i$ and $\beta_i$
 
-The model places a **sparse prior** on whether each component is active:
+The model places a **sparse prior** on whether each component is active.
+In log-odds form:
 
-$$\alpha_i \sim \text{Bernoulli}(p_0), \quad p_0 = 10^{-6}$$
+$$\text{logit}(\alpha_i) \sim \mathcal{N}(\text{logit}(p_0),\; \sigma_\alpha^2)$$
 
-In log-odds form, this is $\text{logit}(p_0) \approx -13.8$.  The identical prior is placed on $\beta_i$.
+with $p_0 = 10^{-6}$, so $\text{logit}(p_0) \approx -13.8$.  The identical prior is
+placed on $\beta_i$.
 
-The prior encodes the belief that *very few genes are truly regulated* by the cis
-perturbation.  With $n = 10{,}000$ trans genes, the prior predicts approximately 0.01
-truly regulated genes — an extremely conservative assumption, intended to impose
-strong sparsity.
+This encodes the belief that *very few trans genes are truly regulated* by the cis
+perturbation.  Only genes for which the data provides sufficient likelihood improvement
+will shift away from this prior.
 
-During variational inference, the AutoNormal guide fits a Normal distribution on the
-logit of each component:
-
-$$\text{logit}(\alpha_i) \sim \mathcal{N}(\mu_i, \sigma_i^2)$$
-
-where $\mu_i$ and $\sigma_i$ are learned variational parameters.  The posterior mean is
-approximated from samples:
-
-$$E[\alpha_i \mid \text{data}] \approx \frac{1}{S} \sum_{s=1}^{S} \alpha_i^{(s)}$$
-
-where $\alpha_i^{(s)}$ are draws from the guide.
+During variational inference, the AutoNormal guide fits mean and variance parameters
+$(\mu_i, \sigma_i)$ for each component's logit, from which posterior samples
+$\alpha_i^{(s)}$ are drawn.
 
 ---
 
-## 3. Local False Discovery Rate
+## 3. The Alpha–Vmax Non-Identifiability Problem
 
-The **local false discovery rate** (lfdr) for component $A$ of gene $i$ is the posterior
-probability that the null hypothesis is true:
+A naive activity measure would be $E[\alpha_i \mid \text{data}]$.  This fails in
+practice because $\alpha_i$ and $\text{Vmax}_{a,i}$ are **non-identified jointly**:
+only their product is constrained by the data.
 
-$$\text{lfdr}_{i,A} = P(H_0^{(i,A)} \mid \text{data}) = P(\alpha_i = 0 \mid \text{data}) = 1 - E[\alpha_i \mid \text{data}]$$
+The Hill model for gene $i$ is:
 
-Intuitively:
-- $\text{lfdr}_{i,A} \approx 1$: the data gives almost no evidence that component A is active; this gene is almost certainly a false positive if called
-- $\text{lfdr}_{i,A} \approx 0$: the posterior is concentrated at $\alpha_i = 1$; this gene is almost certainly a true positive
+$$y_i = A_i + \alpha_i \cdot \text{Vmax}_{a,i} \cdot h_+(x; K_{a,i}, n_{a,i})
+       + \beta_i \cdot \text{Vmax}_{b,i} \cdot h_-(x; K_{b,i}, n_{b,i})$$
 
-This is the Bayesian analogue of a frequentist p-value.  Unlike a p-value, it is a
-**direct probability statement about the hypothesis** given the data.
+The data directly constrains $\alpha_i \cdot \text{Vmax}_{a,i}$ (the effective
+amplitude of component A), but not $\alpha_i$ or $\text{Vmax}_{a,i}$ separately.
+As a result:
+
+- For a **true positive** gene: $\alpha_i \cdot \text{Vmax}_{a,i}$ is pulled to the
+  true amplitude, but the posterior for $\alpha_i$ alone can remain at $0.6$–$0.8$
+  rather than approaching 1.
+- $E[\alpha_i]$ therefore stays depressed for true positives, making
+  $\text{lfdr} = 1 - E[\alpha_i]$ inflated (too conservative).
 
 ---
 
-## 4. Bayesian FDR for a Called Set
+## 4. The Product-Based Activity Probability
 
-Given any set $S$ of called genes/components, define the **false discovery proportion** (FDP):
+To avoid the non-identifiability, the activity probability is computed from the
+**normalized effect size**:
 
-$$\text{FDP}(S) = \frac{\#\{(i,c) \in S : H_0^{(i,c)} \text{ true}\}}{|S|}$$
+$$r_i^{(s)} = \frac{\alpha_i^{(s)} \cdot \text{Vmax}_{a,i}^{(s)}}{A_i^{(s)}}$$
 
-The (frequentist) FDR is $E[\text{FDP}(S)]$.  In the Bayesian framework, after
-observing the data, we have a **posterior FDR**:
+Dividing by $A_i$ makes the quantity expression-scale invariant (a 10% perturbation
+on a lowly expressed gene has the same scale as a 10% perturbation on a highly
+expressed gene).
 
-$$\text{BayesFDR}(S) = E\left[\text{FDP}(S) \mid \text{data}\right]$$
+The **local FDR** for component A of gene $i$ is then:
 
-Expanding:
+$$\text{lfdr}_{i,A} = 1 - P\!\left(r_i > \varepsilon \mid \text{data}\right)
+= 1 - \frac{1}{S}\sum_{s=1}^{S} \mathbf{1}\!\left[r_i^{(s)} > \varepsilon\right]$$
 
-$$\text{BayesFDR}(S)
-= E\left[\frac{1}{|S|}\sum_{(i,c) \in S} \mathbf{1}[H_0^{(i,c)} \text{ true}] \;\middle|\; \text{data}\right]
-= \frac{1}{|S|} \sum_{(i,c) \in S} P(H_0^{(i,c)} \mid \text{data})
+where $\varepsilon = 0.01$ (1% of baseline) is a threshold below which the component
+is considered negligibly active.
+
+### Why epsilon is insensitive
+
+Empirically, there is a 50+ log$_2$-unit gap between true negatives and true positives
+in the posterior mean of $r_i$:
+
+| Gene class | $\log_2 E[r_i]$ |
+|------------|-----------------|
+| True negatives | −30 to −54 |
+| True positives | −2.7 to +7.7 |
+
+Any $\varepsilon$ in the range $[10^{-8},\, 0.05]$ gives identical rankings and hence
+identical q-values.  The default $\varepsilon = 0.01$ lies comfortably in this plateau.
+
+Analogously for component B: $r_{i,B}^{(s)} = \beta_i^{(s)} \cdot \text{Vmax}_{b,i}^{(s)} / A_i^{(s)}$.
+
+---
+
+## 5. Bayesian FDR for a Called Set
+
+Given any set $S$ of called gene/component pairs, the **posterior FDR** is:
+
+$$\text{BayesFDR}(S) = E\!\left[\text{FDP}(S) \mid \text{data}\right]
 = \frac{1}{|S|} \sum_{(i,c) \in S} \text{lfdr}_{i,c}$$
 
-> **Key result**: the Bayesian FDR of a called set is simply the *mean of the local FDRs*
-> over all called tests.  No distributional assumptions, no permutations needed.
+> **Key result**: the Bayesian FDR of a called set equals the *mean local FDR* over
+> all called tests.  No distributional assumptions, no permutations required.
 
 ---
 
-## 5. The Optimal Calling Rule
-
-**Goal**: find the largest set $S$ such that $\text{BayesFDR}(S) \leq q$ (a target level,
-e.g., $q = 0.05$).
-
-**Claim**: the optimal set is a **top-$k$ set** obtained by sorting tests in ascending
-order of local FDR and calling the $k$ most significant, where $k$ is the largest
-integer satisfying $\overline{\ell}(k) \leq q$.
-
-*Proof sketch*: Suppose $S^*$ is an optimal set of size $k$.  Any test
-$(i,c) \notin S^*$ with $\text{lfdr}_{i,c} > \overline{\ell}(k)$ would increase the
-mean lfdr if added.  Any test in $S^*$ with $\text{lfdr}_{i,c} > \overline{\ell}(k)$
-could be replaced by a test outside $S^*$ with lower lfdr, reducing the mean.  So at
-optimality, $S^*$ is exactly the set of tests with the $k$ smallest local FDRs.
-
-Define the **cumulative mean** at rank $k$ (sorting by lfdr ascending):
-
-$$\overline{\ell}(k) = \frac{1}{k} \sum_{j=1}^{k} \ell_{(j)}$$
-
-where $\ell_{(1)} \leq \ell_{(2)} \leq \cdots$ are the order statistics.  Then the
-optimal threshold is:
-
-$$k^* = \max\left\{k : \overline{\ell}(k) \leq q\right\}$$
-
----
-
-## 6. Q-Values and the Running Minimum
+## 6. The Optimal Calling Rule and Q-Values
 
 The **q-value** $q_{i,c}$ is the minimum Bayesian FDR at which test $(i,c)$ would be
 included in the called set:
 
 $$q_{i,c} = \min_{k \geq \text{rank}(i,c)} \overline{\ell}(k)$$
 
-where $\text{rank}(i,c)$ is the position of test $(i,c)$ in the sorted list.
+where $\overline{\ell}(k)$ is the cumulative mean of the $k$ smallest local FDRs.
 
-**Interpretation**: if you want to call all tests with $q_{i,c} \leq q$, the expected
-FDR among those calls is at most $q$.  This is directly analogous to a
-Benjamini-Hochberg adjusted p-value.
+**Calling rule**: call all tests with $q_{i,c} \leq q$ to control the expected FDR
+at level $q$ (default $q = 0.05$).
 
-**Why not just use $\overline{\ell}(\text{rank}(i,c))$ directly?**
+**Monotonicity**: because $\overline{\ell}(k)$ is not necessarily monotone, the
+running minimum from the right is applied:
 
-The cumulative mean $\overline{\ell}(k)$ is not necessarily monotone.  It satisfies:
+$$q_{(k)} = \min\!\left(\overline{\ell}(k),\; q_{(k+1)}\right)$$
 
-$$\overline{\ell}(k+1) = \frac{k \cdot \overline{\ell}(k) + \ell_{(k+1)}}{k+1}$$
-
-so $\overline{\ell}$ *decreases* when $\ell_{(k+1)} < \overline{\ell}(k)$ (the $(k+1)$th
-gene has lower lfdr than the current average) and *increases* otherwise.
-
-If $\overline{\ell}(k_1) > \overline{\ell}(k_2)$ for some $k_2 > k_1$, then the test at
-rank $k_1$ can be included in the larger called set $\{1,\ldots,k_2\}$ at the lower FDR
-$\overline{\ell}(k_2)$.  So the minimum FDR to include rank-$k_1$ is
-$\min_{k \geq k_1} \overline{\ell}(k)$, which may be strictly less than $\overline{\ell}(k_1)$.
-
-The running minimum from the right:
-
-$$q_{(k)} = \min\left(\overline{\ell}(k),\, q_{(k+1)}\right) \quad \text{(evaluated right to left)}$$
-
-ensures **monotonicity**: $q_{(1)} \leq q_{(2)} \leq \cdots$.  In code:
+ensuring $q_{(1)} \leq q_{(2)} \leq \cdots$.  In code:
 
 ```python
 cumfdr       = np.cumsum(lfdr_sorted) / (np.arange(n) + 1)
@@ -158,197 +144,162 @@ qvals_sorted = np.minimum.accumulate(cumfdr[::-1])[::-1]
 
 ---
 
-## 7. Multiple Testing: Pooling Alpha and Beta for `additive_hill`
+## 7. Multiple Testing: Pooled Family for `additive_hill`
 
-For `additive_hill` there are $2n$ tests (one alpha and one beta per gene).  The question
-is: should we compute q-values separately for the $n$ alpha tests and the $n$ beta tests,
-or pool them into one family?
+For `additive_hill`, there are $2n$ tests (one per component per gene).  Both
+components are pooled into a **single family** of $2n$ tests:
 
-**Pooling is correct** when you want to control FDR over all effect calls jointly.
-Here is why this matters in practice:
+$$\boldsymbol{\ell} = \left(
+  \underbrace{\ell_{1,A}, \ldots, \ell_{n,A}}_{n \text{ alpha tests}},\;
+  \underbrace{\ell_{1,B}, \ldots, \ell_{n,B}}_{n \text{ beta tests}}
+\right)$$
 
-### Separate families (wrong for joint control)
+Steps 3–6 are applied to this pooled vector.  The output is split back into
+`fdr_alpha` (first $n$ entries) and `fdr_beta` (last $n$ entries).
 
-If you compute q-values separately:
-- Alpha q-values are computed over $n$ tests
-- Beta q-values are computed over $n$ tests
+**Why pool?** Calling `fdr_alpha ≤ 0.05` and `fdr_beta ≤ 0.05` separately controls
+FDR at 5% per component family, but the combined list of calls has FDR up to ~10%.
+Pooling ensures that the joint FDR over all effect calls is controlled at 5%.
 
-Calling all genes with `fdr_alpha <= 0.05` controls FDR at 5% among positive-component
-calls.  Calling all genes with `fdr_beta <= 0.05` controls FDR at 5% among
-negative-component calls.
+**Formal guarantee**: Calling all tests with $q_{i,c}^{\text{pool}} \leq q$ satisfies:
 
-But the *combined* list of called effects has an FDR that could approach 10%: you are
-making two independent 5%-FDR calls per gene, so a null gene can be falsely called
-on either component.
-
-### Pooled family (implemented in bayesDREAM)
-
-Stack the $2n$ local FDRs into one array:
-
-$$\boldsymbol{\ell} = \left(\underbrace{\ell_{1,A}, \ldots, \ell_{n,A}}_{n \text{ alpha tests}},\; \underbrace{\ell_{1,B}, \ldots, \ell_{n,B}}_{n \text{ beta tests}}\right)$$
-
-Sort all $2n$ values, compute the cumulative mean and running minimum as before.
-The q-value for component $(i,c)$ is its position in this joint ranking.
-
-**Effect on stringency**: a test with local FDR $\ell$ gets a higher (more conservative)
-q-value when pooled than when ranked against only $n$ tests, because there are more
-competing tests with small lfdr.  Concretely, if exactly half the genes have active
-alpha and half have active beta (both low lfdr), pooling effectively doubles the
-number of strong tests, which pushes the cumulative mean at every rank downward —
-making q-values *smaller* (less conservative).  Conversely, if only a handful of
-genes have very low lfdr in either component, each low-lfdr test ranks first in the
-$2n$ pool just as it would in the $n$ pool.
-
-The practical effect is approximately a 2× increase in multiple-testing stringency
-for null genes, matching the intuition that `additive_hill` has twice the number of
-testing opportunities.
-
-### Formal statement
-
-**Proposition**: Calling all tests $(i,c)$ with $q_{i,c}^{\text{pool}} \leq q$ controls
-the Bayesian FDR over the joint family of $2n$ hypotheses at level $q$:
-
-$$\text{BayesFDR}\left(\{(i,c) : q_{i,c}^{\text{pool}} \leq q\}\right) \leq q$$
-
-*Proof*: Let $S_q = \{(i,c) : q_{i,c}^{\text{pool}} \leq q\}$.  By definition of the
-q-value and the running minimum construction, $S_q$ is a top-$k$ set for some $k$
-satisfying $\overline{\ell}(k) \leq q$.  Therefore:
-
-$$\text{BayesFDR}(S_q) = \overline{\ell}(k) \leq q \qquad \square$$
+$$\text{BayesFDR}\!\left(\{(i,c) : q_{i,c}^{\text{pool}} \leq q\}\right) \leq q \qquad \square$$
 
 ---
 
-## 8. Connection to the KL Cost in the ELBO
+## 8. Full Algorithm
 
-The ELBO for a feature with $\text{logit}(\alpha_i) \sim \mathcal{N}(\mu_i, \sigma_i^2)$
-in the guide and $\text{logit}(\alpha_i) = \text{logit}(p_0)$ in the prior includes:
+Given posterior samples $\{\alpha_i^{(s)}, \text{Vmax}_{a,i}^{(s)}, A_i^{(s)}\}_{s=1}^{S}$
+for each gene $i$ (and analogously for component B):
 
-$$-\text{KL}\left(\mathcal{N}(\mu_i, \sigma_i^2) \;\|\; \delta_{\text{logit}(p_0)}\right)$$
+**Step 1: Compute normalized effect size per sample**
+$$r_{i,A}^{(s)} \leftarrow \frac{\alpha_i^{(s)} \cdot \text{Vmax}_{a,i}^{(s)}}{\max(A_i^{(s)},\, 10^{-12})}$$
 
-For a feature where the posterior has concentrated to $\alpha_i \approx 1$, the KL
-from the prior logit $\approx -13.8$ is approximately:
+**Step 2: Compute activity probability**
+$$p_{i,A} \leftarrow \frac{1}{S}\sum_{s=1}^{S} \mathbf{1}[r_{i,A}^{(s)} > \varepsilon]$$
 
-$$\text{KL} \approx \log\frac{1 - p_0}{p_0} \approx \log\left(10^6\right) \approx 13.8 \text{ nats}$$
+**Step 3: Compute local FDR**
+$$\ell_{i,A} \leftarrow 1 - p_{i,A}$$
 
-The model will only pay this KL cost if the data likelihood improvement for gene $i$
-exceeds 13.8 nats.  In terms of posterior probability:
+**Step 4: Pool and sort** (concatenate alpha and beta local FDRs for `additive_hill`)
 
-$$E[\alpha_i] = P(\alpha_i = 1 \mid \text{data}) = \frac{p_0 \cdot P(\text{data} \mid \alpha_i=1)}{p_0 \cdot P(\text{data} \mid \alpha_i=1) + (1-p_0) \cdot P(\text{data} \mid \alpha_i=0)}$$
+**Step 5: Cumulative mean and running minimum** → q-values
 
-Rearranging in terms of the Bayes factor $\text{BF}_{10} = P(\text{data} \mid \alpha_i=1) / P(\text{data} \mid \alpha_i=0)$:
+**Step 6: Map back** to per-gene `fdr_alpha` and `fdr_beta`
 
-$$E[\alpha_i] = \frac{p_0 \cdot \text{BF}_{10}}{p_0 \cdot \text{BF}_{10} + (1 - p_0)}$$
-
-To reach $E[\alpha_i] = 0.5$ (equally probable active/inactive), the data must provide:
-
-$$\text{BF}_{10} = \frac{1 - p_0}{p_0} \approx 10^6$$
-
-The $p_0 = 10^{-6}$ prior is therefore a **strong regularizer**: only features with
-overwhelming data support will have $E[\alpha_i]$ near 1 and hence low lfdr.
+**Calling rule at target FDR $q$**: call component $(i,c)$ if $q_{i,c} \leq q$.
 
 ---
 
-## 9. Calibration Considerations
+## 9. FDR-Based Dependency in Classification
 
-The Bayesian FDR is exactly calibrated *if* the model is correctly specified.  In
+The q-values are not only stored as output columns — they **drive the per-feature
+classification** and `full_log2fc` computation.
+
+### Dependency masks
+
+A component is considered **active** (dep_mask = True) if its q-value is below the
+FDR threshold:
+
+$$\text{dep\_mask}_{i,A} = q_{i,A}^{\text{pool}} < 0.05$$
+$$\text{dep\_mask}_{i,B} = q_{i,B}^{\text{pool}} < 0.05$$
+
+These are used by `_classify_additive_hill` to assign each gene to:
+`flat`, `single_positive`, `single_negative`, `additive_positive`, `additive_negative`,
+`non_monotonic_min`, or `non_monotonic_max`.
+
+### `full_log2fc` / `full_delta_p`
+
+A gene is classified as **flat** (full dynamic range = 0) if both components fail the
+FDR threshold:
+
+$$\text{is\_flat}_i = (q_{i,A}^{\text{pool}} \geq 0.05) \;\wedge\; (q_{i,B}^{\text{pool}} \geq 0.05)$$
+
+For non-flat genes the dynamic range is computed over the theoretical x-range by
+evaluating the full fitted additive Hill function.
+
+### Consistency between output columns and classification
+
+The q-values used internally for dep_mask are computed by the same pooled formula as
+the `fdr_alpha`/`fdr_beta` output columns.  Consequently:
+
+- A gene classified as `flat` will have `fdr_alpha >= 0.05` **and** `fdr_beta >= 0.05`
+- A gene classified as `single_positive` or `single_negative` will have exactly one of
+  `fdr_alpha < 0.05` or `fdr_beta < 0.05`
+- A gene classified as `additive_*` or `non_monotonic_*` will have both
+  `fdr_alpha < 0.05` and `fdr_beta < 0.05`
+
+The `fdr_threshold` parameter (default 0.05) can be passed to `_add_additive_hill_params`
+to change this consistently for both classification and output.
+
+---
+
+## 10. Calibration Considerations
+
+The Bayesian FDR is exactly calibrated if the model is correctly specified.  In
 practice, three sources of miscalibration can arise:
 
-### 9.1 Misspecified prior $p_0$
+### 10.1 Alpha–Vmax posterior correlation
 
-If more than 1-in-$10^6$ genes are truly regulated, the posterior $E[\alpha_i]$ will
-be systematically underestimated (because the model "charges" too high a KL penalty
-for activation).  The resulting local FDRs will be too large, and the Bayesian FDR
-will be **conservative** — you will call fewer genes than you should at any given $q$.
+If $\alpha_i$ and $\text{Vmax}_{a,i}$ are positively correlated in the posterior
+(which they will be for true positives), the mean of the product exceeds the product
+of means:
 
-If very few genes are truly regulated (fewer than 1-in-$10^6$), the reverse applies,
-but this is an extreme scenario.
+$$E[\alpha_i \cdot \text{Vmax}_{a,i}] \geq E[\alpha_i] \cdot E[\text{Vmax}_{a,i}]$$
 
-### 9.2 RelaxedBernoulli temperature approximation
+This inflates $p_{i,A}$ for true positives (good) and also slightly for true negatives
+if Vmax_a has a heavy prior tail.  In practice the prior on Vmax_a is log-normal with
+moderate variance, so this effect is small for null genes.
 
-The model samples $\alpha_i$ from a **RelaxedBernoulli** (BinConcrete) distribution
-with temperature $T$, not a true Bernoulli.  The FDR calculation treats
+### 10.2 Misspecified prior $p_0$
 
-$$E[\alpha_i] \approx P(\alpha_i = 1 \mid \text{data})$$
+The $p_0 = 10^{-6}$ prior imposes a very high KL cost for activation.  If more genes
+are truly regulated than this prior predicts, posteriors will be systematically pulled
+toward 0, making $p_{i,A}$ smaller for true positives and the FDR **conservative**.
+This is the preferred direction of error (fewer false positives at the cost of some
+power).
 
-but this is only exact as $T \to 0$.  At finite $T$, the posterior samples lie in
-$(0, 1)$ rather than $\{0, 1\}$, and the posterior mean is:
+### 10.3 RelaxedBernoulli temperature approximation
 
-$$E[\text{RelaxedBernoulli}(T, \sigma(\mu_i))] = \sigma(\mu_i) \cdot f(T)$$
+The model samples $\alpha_i$ from a RelaxedBernoulli (BinConcrete) with temperature
+$T_{\text{final}} = 0.1$, not a true Bernoulli.  Posterior samples lie in $(0, 1)$.
+At $T = 0.1$ the distribution is highly concentrated near 0 and 1, so the per-sample
+product $\alpha_i^{(s)} \cdot \text{Vmax}_{a,i}^{(s)}$ approximates the true
+Bernoulli-gated product well.
 
-where $f(T) \to 1$ as $T \to 0$.  At the default final temperature $T = 0.1$, the
-relaxation is highly concentrated near 0 and 1, so the approximation is accurate.
-At higher temperatures (e.g., the warmup phases where $T \in [0.5, 1.0]$), the
-posterior means are "smeared" and would give unreliable local FDRs — but the summary
-is only ever called on the final converged posterior, which uses $T_\text{final} = 0.1$.
+### 10.4 VI approximation error
 
-### 9.3 VI approximation error
-
-AutoNormal uses a mean-field Normal guide, which may underestimate posterior variance
-(a known property of mean-field VI).  Underestimated variance means the posterior mean
-$E[\alpha_i]$ can be pulled toward 0.5 rather than the true value, making the lfdr
-less discriminating.
-
-### 9.3 Model misspecification
-
-If the true dose-response is not well-approximated by an additive Hill function, the
-likelihood $P(\text{data} \mid \alpha_i)$ is mis-evaluated for both $\alpha_i = 0$ and
-$\alpha_i = 1$, making the Bayes factors and hence local FDRs unreliable.
+Mean-field VI tends to underestimate posterior variance.  For most parameters this
+means the posterior mean is reliable but the tails are underrepresented.  The product
+$\alpha_i \cdot \text{Vmax}_{a,i}$ is relatively robust because VI minimizes
+reverse-KL, which pins the mode; the product at the mode is well-estimated.
 
 ---
 
-## 10. Summary of the Algorithm
+## 11. Relationship to the Old CI-Based Criterion
 
-Given posterior samples $\{\alpha_i^{(s)}\}_{s=1}^{S}$ for each gene $i$:
+Prior to the current implementation, dependency was assessed by checking whether 0
+lies inside the 95% credible interval of $\alpha_i$ **and** $n_{a,i}$:
 
-**Step 1: Compute posterior means**
-$$E_i \leftarrow \frac{1}{S}\sum_{s=1}^{S} \alpha_i^{(s)} \in [0,1]$$
+$$\text{dep\_mask}_{i,A}^{\text{old}} =
+  \mathbf{1}[0 \notin \text{CI}_{95}(\alpha_i)] \;\wedge\;
+  \mathbf{1}[0 \notin \text{CI}_{95}(n_{a,i})]$$
 
-**Step 2: Compute local FDRs**
-$$\ell_i \leftarrow 1 - E_i$$
+This approach has two fundamental problems:
 
-**Step 3: Sort ascending**
-$$\ell_{(1)} \leq \ell_{(2)} \leq \cdots \leq \ell_{(n)}$$
+1. **Alpha CI never contains 0**: the RelaxedBernoulli CI is bounded away from 0,
+   so $\mathbf{1}[0 \notin \text{CI}_{95}(\alpha_i)] = 1$ for every gene.  The alpha
+   check is vacuous.
+2. **$n_a$ CI too wide with loose nmin/nmax**: once the Hill coefficient bounds were
+   widened from ±20 to physically-derived values (~±38), the posterior CI for $n_a$
+   spans 0 for essentially all genes, making the $n_a$ check also vacuous.
 
-**Step 4: Compute cumulative mean**
-$$\overline{\ell}(k) = \frac{1}{k}\sum_{j=1}^{k} \ell_{(j)} = \text{BayesFDR if top-}k \text{ called}$$
+The current product-based FDR approach bypasses both issues entirely.
 
-**Step 5: Running minimum (ensure monotonicity)**
-$$q_{(k)} = \min_{k' \geq k}\, \overline{\ell}(k')$$
-
-**Step 6: Map back to original order**
-
-The q-value for gene $i$ at its rank $r_i$ is $q_{(r_i)}$.
-
-**For `additive_hill`**: concatenate the $n$ alpha local FDRs and $n$ beta local FDRs
-into a single vector of length $2n$, apply Steps 3–6 to this pooled vector, then split
-the output back into `fdr_alpha` (first $n$) and `fdr_beta` (last $n$).
-
-**Calling rule at target FDR $q$**: call all tests with q-value $\leq q$.  The
-expected fraction of false positives among the called set will be at most $q$.
-
----
-
-## 11. Relationship to Your CI-Based Criterion
-
-The existing `classification` column determines whether a component is active based on
-whether 0 is inside the 95% credible interval of $n_a$ (or $n_b$).  Formally:
-
-$$\text{dep\_a}_i = \mathbf{1}[0 \notin \text{CI}_{95}(\alpha_i)] \;\wedge\; \mathbf{1}[0 \notin \text{CI}_{95}(n_{a,i})]$$
-
-This is a **hard threshold** applied to two parameters jointly.  By contrast, `fdr_alpha`
-is a **soft continuous ranking** based solely on the posterior probability that
-$\alpha_i > 0$.
-
-| Property | CI criterion | `fdr_alpha` |
-|----------|-------------|-------------|
-| Input | Posterior of $\alpha$ and $n_a$ | Posterior of $\alpha$ only |
-| Output | Binary (active/inactive) | Continuous probability |
-| Threshold | Fixed (0 in 95% CI) | User-chosen FDR level |
-| Multiple testing | Not corrected | Corrected via q-value |
-| Interpretable as | "Both indicators non-zero" | "Expected FDR at this threshold" |
-
-A gene can pass the CI criterion but have high `fdr_alpha` if most other genes also
-show evidence (shifting the cumulative mean up), or fail the CI criterion but have
-low `fdr_alpha` if the data strongly support $\alpha > 0$ even though the CI marginally
-crosses 0.  Plotting `fdr_alpha` against `dep_a` (from the classification) shows how
-these two views of evidence correlate.
+| Property | Old CI criterion | Current FDR criterion |
+|----------|-----------------|----------------------|
+| Basis | Posterior CI of $\alpha$ and $n_a$ | $P(\alpha \cdot \text{Vmax}_a / A > \varepsilon)$ |
+| Alpha–Vmax identifiability | Ignores | Avoided by using product |
+| Multiple testing | Not corrected | Pooled q-value corrected |
+| Threshold | Hard (0 in CI) | Calibrated FDR = 0.05 |
+| Consistent with output FDR columns | No | Yes |
