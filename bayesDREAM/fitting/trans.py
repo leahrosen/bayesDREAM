@@ -26,6 +26,27 @@ import pyro.distributions as dist
 from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
 
 
+def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    """
+    Soft (differentiable) clamp to the interval (lo, hi) using tanh.
+
+    Replaces torch.clamp, which has zero gradient outside [lo, hi] (dead-gradient
+    problem: once n_raw overshoots the boundary, the optimizer has no signal to pull
+    it back).
+
+    Mapping:  x_clamped = center + half * tanh(x / half)
+      where center = (hi + lo) / 2  and  half = (hi - lo) / 2
+
+    Properties:
+    - Linear (identity) for |x - center| << half  →  prior unchanged in typical range
+    - Gradient = sech²(x/half) ≥ sech²(1) ≈ 0.42 at the "boundary" (|x| = half)
+    - Gradient never reaches zero for finite x  →  no dead gradient
+    - Asymptotes to ±half as |x| → ∞
+    """
+    half = 0.5 * (hi - lo)
+    center = 0.5 * (hi + lo)
+    return center + half * torch.tanh(x / half)
+
 
 class TransFitter:
     """Handles trans effects fitting."""
@@ -386,6 +407,7 @@ class TransFitter:
         D=None,
         mean_within_guide_var=None,
         x_true_CV=None,
+        x_ntc_mean=None,
         use_data_driven_priors=True,
         use_lognormal_priors=True,
         use_epsilon=True,
@@ -588,14 +610,14 @@ class TransFitter:
                         n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_tensor, sigma_n_a))  # [T, K-1]
                         n_a = pyro.deterministic(
                             "n_a",
-                            n_a_raw.clamp(min=nmin.item(), max=nmax.item())
+                            _soft_clamp(n_a_raw, nmin, nmax)
                         )  # [T, K-1]
                 else:
                     # For non-multinomial: single set of parameters per feature
                     n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_tensor, sigma_n_a))
                     n_a = pyro.deterministic(
                         "n_a",
-                        n_a_raw.clamp(min=nmin.item(), max=nmax.item())
+                        _soft_clamp(n_a_raw, nmin, nmax)
                     )
                 
                 # Scale for Vmax, K is multiplied by alpha
@@ -607,17 +629,24 @@ class TransFitter:
                 # Vmax uses raw variance (data-driven) for negbinom/normal/studentt
 
                 # K parameterization (UNIFIED for all distributions)
-                K_mean_prior = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)  # Half of max cis expression
-                if x_true_CV is not None:
-                    K_std_prior = K_mean_prior * x_true_CV  # Scale by coefficient of variation
+                # When NTC mean is known, center the prior there with ±5 log2FC coverage.
+                # This ensures the P.O.I. starts within the observed x-range regardless of
+                # whether the subset is KO-only, CA-only, or full.
+                if x_ntc_mean is not None:
+                    # log(K) ~ N(log(x_ntc), sigma²) with sigma = 5*ln(2)/2 ≈ 1.73
+                    # → E[K] = x_ntc; 95% CI spans ±5 log2FC around NTC mean
+                    K_log_sigma = self._t(5.0 * 0.6931 / 2.0)  # 5 * ln(2) / 2 ≈ 1.733
+                    K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor)) - 0.5 * K_log_sigma ** 2
                 else:
-                    # Fallback to fixed alpha if CV not provided
-                    K_std_prior = K_max_tensor / (self._t(2.0) * torch.sqrt(K_alpha_tensor))
-
-                # Log-Normal parameterization for K
-                ratio_K = (K_std_prior / K_mean_prior).clamp_min(self._t(1e-6))
-                K_log_sigma = torch.sqrt(torch.log1p(ratio_K ** 2))
-                K_log_mu = torch.log(K_mean_prior) - 0.5 * K_log_sigma ** 2
+                    # Fallback: center at half the max observed x, width from CV
+                    K_mean_prior = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
+                    if x_true_CV is not None:
+                        K_std_prior = K_mean_prior * x_true_CV
+                    else:
+                        K_std_prior = K_max_tensor / (self._t(2.0) * torch.sqrt(K_alpha_tensor))
+                    ratio_K = (K_std_prior / K_mean_prior).clamp_min(self._t(1e-6))
+                    K_log_sigma = torch.sqrt(torch.log1p(ratio_K ** 2))
+                    K_log_mu = torch.log(K_mean_prior) - 0.5 * K_log_sigma ** 2
 
                 if distribution in ['binomial', 'multinomial']:
                     # For binomial/multinomial: Sample Vmax_a INDEPENDENTLY (like BCD1C4F)
@@ -682,13 +711,13 @@ class TransFitter:
                             n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_tensor, sigma_n_b))  # [T, K-1]
                             n_b = pyro.deterministic(
                                 "n_b",
-                                n_b_raw.clamp(min=nmin.item(), max=nmax.item())
+                                _soft_clamp(n_b_raw, nmin, nmax)
                             )  # [T, K-1]
                     else:
                         n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_tensor, sigma_n_b))
                         n_b = pyro.deterministic(
                             "n_b",
-                            n_b_raw.clamp(min=nmin.item(), max=nmax.item())
+                            _soft_clamp(n_b_raw, nmin, nmax)
                         )
 
                     # Vmax_b and K_b: same structure as Vmax_a and K_a
@@ -2052,10 +2081,20 @@ class TransFitter:
         else:
             K_max_tensor = x_true_mean.max()
 
+        # NTC mean of x_true: center K prior here so the P.O.I. starts within the observed range.
+        # Any fold change within ±5 log2 of NTC covers the full CRISPR perturbation range.
+        x_ntc_mean = None
+        if 'target' in self.model.meta.columns:
+            ntc_mask = self.model.meta['target'].str.lower() == 'ntc'
+            if ntc_mask.any():
+                ntc_idx = torch.tensor(ntc_mask.values, dtype=torch.bool, device=self.model.device)
+                x_ntc_mean = x_true_mean[ntc_idx].mean()
+
         print("[DEBUG] Amean:", Amean_tensor.min().item(), Amean_tensor.max().item())
         print("[DEBUG] Vmax_mean:", Vmax_mean_tensor.min().item(), Vmax_mean_tensor.max().item())
         print("[DEBUG] Mean within-guide variance:", mean_within_guide_var.min().item(), mean_within_guide_var.max().item())
-        print("[DEBUG] x_true CV:", x_true_CV.item(), "K_max:", K_max_tensor.item())
+        print("[DEBUG] x_true CV:", x_true_CV.item(), "K_max:", K_max_tensor.item(),
+              "x_ntc_mean:", x_ntc_mean.item() if x_ntc_mean is not None else "N/A")
 
         # Diagnostic: Verify alpha_y_prefit is correctly structured
         if alpha_y_prefit is not None and groups_tensor is not None:
@@ -2119,6 +2158,7 @@ class TransFitter:
                 D=D,
                 mean_within_guide_var=mean_within_guide_var,
                 x_true_CV=x_true_CV,
+                x_ntc_mean=x_ntc_mean,
                 use_data_driven_priors=use_data_driven_priors,
                 use_lognormal_priors=use_lognormal_priors,
                 use_epsilon=use_epsilon,
@@ -2269,6 +2309,7 @@ class TransFitter:
                 D=D,
                 mean_within_guide_var=mean_within_guide_var,
                 x_true_CV=x_true_CV,
+                x_ntc_mean=x_ntc_mean,
                 use_data_driven_priors=use_data_driven_priors,
                 use_lognormal_priors=use_lognormal_priors,
                 use_epsilon=use_epsilon,
