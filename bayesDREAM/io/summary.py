@@ -1841,8 +1841,15 @@ class ModelSummarizer:
 
         if function_type == 'single_hill':
             p_active_a = _p_active('alpha', 'Vmax_a')
+            qvals_a = _qvalues(1.0 - p_active_a)
+            # Floor: a test with zero posterior evidence (p_active ≈ 0) can only reach
+            # q < FDR_threshold by being "carried" by many other true positives in the
+            # pooled cumulative mean.  The FDR of the call set is still controlled, but
+            # the individual gene has no evidence at all.  Hard-floor q to 1 so these
+            # genes can never be classified as active.
+            qvals_a = np.where(p_active_a < 1e-9, 1.0, qvals_a)
             return {
-                'fdr_alpha': _qvalues(1.0 - p_active_a),
+                'fdr_alpha': qvals_a,
                 'fdr_beta':  nan_col.copy(),
             }
 
@@ -1855,6 +1862,9 @@ class ModelSummarizer:
             # the next n_features to beta (component B).
             lfdr_all  = np.concatenate([1.0 - p_active_a, 1.0 - p_active_b])
             qvals_all = _qvalues(lfdr_all)
+            # Floor: tests with p_active ≈ 0 get q = 1 (see single_hill comment above).
+            p_active_all = np.concatenate([p_active_a, p_active_b])
+            qvals_all = np.where(p_active_all < 1e-9, 1.0, qvals_all)
             return {
                 'fdr_alpha': qvals_all[:n_features],
                 'fdr_beta':  qvals_all[n_features:],
@@ -2209,6 +2219,9 @@ class ModelSummarizer:
         _cumfdr = np.cumsum(_lfdr_all[_ord]) / (np.arange(_n_all, dtype=float) + 1.0)
         _qsorted = np.minimum.accumulate(_cumfdr[::-1])[::-1]
         _qall = np.empty(_n_all, dtype=float); _qall[_ord] = _qsorted
+        # Floor: tests with p_active ≈ 0 get q = 1 regardless of pool dilution.
+        _p_active_all = np.concatenate([p_active_a, p_active_b])
+        _qall = np.where(_p_active_all < 1e-9, 1.0, _qall)
         q_active_a = _qall[:n_features]
         q_active_b = _qall[n_features:]
 
