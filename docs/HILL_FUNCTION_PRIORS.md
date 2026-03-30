@@ -104,8 +104,8 @@ K_std_prior = K_mean_prior * x_true_CV  # CV-based variance
 | **Vmax_b** | Log-Normal | `Vmax_mean` | Raw variance (data-driven) | `[T]` |
 | **K_a** | Log-Normal | `K_max / 2` | CV-based (data-driven) | `[T]` |
 | **K_b** | Log-Normal | `K_max / 2` | CV-based (data-driven) | `[T]` |
-| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/5)` | `[T]` |
-| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/5)` | `[T]` |
+| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/2)` | `[T]` |
+| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/2)` | `[T]` |
 | **alpha** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` |
 | **beta** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` |
 
@@ -166,8 +166,8 @@ y = A + Vmax_sum * (alpha * Hill_a + beta * Hill_b)
 | **Vmax_sum** | Deterministic | `upper_limit - A` (clamped ≥ 0) | - | `[T]` | ✓ (derived) |
 | **K_a** | Log-Normal | `K_mean / 2` | CV-based (data-driven) | `[T]` | ✓ (mean & var) |
 | **K_b** | Log-Normal | `K_mean / 2` | CV-based (data-driven) | `[T]` | ✓ (mean & var) |
-| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/5)` | `[T]` | Partially |
-| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/5)` | `[T]` | Partially |
+| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/2)` | `[T]` | Partially |
+| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/2)` | `[T]` | Partially |
 | **alpha** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` | No |
 | **beta** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` | No |
 
@@ -235,8 +235,8 @@ y_K = 1 - sum(y_1, ..., y_{K-1})
 | **Vmax_sum** | Deterministic | `upper_limit - A` (clamped ≥ 0) | - | `[T, K]` | ✓ (derived) |
 | **K_a** | Log-Normal | `K_mean / 2` | CV-based (data-driven) | `[T, K-1]` | ✓ (mean & var) |
 | **K_b** | Log-Normal | `K_mean / 2` | CV-based (data-driven) | `[T, K-1]` | ✓ (mean & var) |
-| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/5)` | `[K-1, T]` | Partially |
-| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/5)` | `[K-1, T]` | Partially |
+| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/2)` | `[K-1, T]` | Partially |
+| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/2)` | `[K-1, T]` | Partially |
 | **alpha** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` | No |
 | **beta** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` | No |
 
@@ -287,8 +287,8 @@ upper_limit ~ Dirichlet(concentration_upper)
 | **Vmax_b** | Log-Normal | `Vmax_mean` | Raw variance (data-driven) | `[T]` |
 | **K_a** | Log-Normal | `K_max / 2` | CV-based (data-driven) | `[T]` |
 | **K_b** | Log-Normal | `K_max / 2` | CV-based (data-driven) | `[T]` |
-| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/5)` | `[T]` |
-| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/5)` | `[T]` |
+| **n_a** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_a ~ Exponential(1/2)` | `[T]` |
+| **n_b** | Normal (raw) | `n_mu` (default: 0) | `sigma_n_b ~ Exponential(1/2)` | `[T]` |
 | **alpha** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` |
 | **beta** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` |
 
@@ -380,7 +380,7 @@ K_std_prior = K_mean_prior * x_true_CV  # CV-based variance
 - ✓: Fully data-driven (computed from observed data)
 - ✓ (`value`): Data-driven with shown computation
 - ✗ (`param`): Uses fixed or weak prior with minimal assumptions
-- ✗ (hierarchical): Uses global hyperprior (`sigma_n ~ Exponential(1/5)`)
+- ✗ (hierarchical): Uses global hyperprior (`sigma_n ~ Exponential(1/2)`)
 - Partially: Mean is fixed (default 0), variance is hierarchical
 
 ---
@@ -493,17 +493,22 @@ K_std_prior = K_mean_prior * x_true_CV
 
 ### Hierarchical n Prior
 
-The Hill coefficient `n` uses a **hierarchical prior**:
+The Hill coefficient `n` uses a **hierarchical prior** with a soft-clamping transformation:
 ```
-sigma_n_a ~ Exponential(1/5)  # Global variance (shared across genes)
-n_a_raw ~ Normal(0, sigma_n_a)  # Per-gene value
-n_a = alpha * n_a_raw  # Multiplied by sparsity parameter
+sigma_n_a  ~ Exponential(1/2)                          # Global variance (shared across all T genes)
+n_mu_raw   = half_n * atanh((0 - center_n) / half_n)  # Inverse soft_clamp of n_mu=0
+n_a_raw    ~ Normal(n_mu_raw, sigma_n_a)               # Per-gene unconstrained value
+n_a        = soft_clamp(n_a_raw, nmin, nmax)           # Constrained to physically safe range
 ```
 
+where `center_n = (nmin + nmax) / 2` and `half_n = (nmax - nmin) / 2`.
+
+The `n_mu_raw` correction ensures the **constrained prior mode is exactly at n_mu = 0** regardless of the asymmetry of [nmin, nmax]. Without it, `Normal(0, sigma)` on n_a_raw has its constrained mode at center_n, which can be strongly negative when nmin << nmax (e.g., all-CA data with nmin = −100, nmax ≈ 38, center ≈ −31).
+
 This allows:
-- Global learning of typical variability in Hill coefficients
+- Global learning of typical variability in Hill coefficients across all T genes
 - Per-gene flexibility while sharing information
-- Automatic sparsity through `alpha` parameter
+- The sparsity prior on `alpha` / `beta` gates whether a component has any effect at all; `n_a` controls the shape conditional on the component being active
 
 ---
 

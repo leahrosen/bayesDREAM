@@ -146,23 +146,62 @@ where `weight = o_y / (o_y + beta_o_beta/beta_o_alpha)` adaptively blends toward
 ## 5. n (Hill Coefficient) Prior — Hierarchical
 
 ```
-sigma_n_a ~ Exponential(1/5)   # global hyperprior (shared across all T genes)
-n_a_raw   ~ Normal(0, sigma_n_a)
-n_a       = alpha * n_a_raw     # effective regularization via sparsity
+sigma_n_a  ~ Exponential(1/2)                  # global hyperprior (mean = 2)
+n_mu_raw   = half_n * atanh((n_mu - center_n) / half_n)   # inverse soft_clamp of n_mu = 0
+n_a_raw    ~ Normal(n_mu_raw, sigma_n_a)        # per-gene in unconstrained space
+n_a        = soft_clamp(n_a_raw, nmin, nmax)   # constrained to safe range
 ```
+
+where `center_n = (nmin + nmax) / 2`, `half_n = (nmax - nmin) / 2`, and `nmin`/`nmax` are physically-derived overflow bounds (see §11).
 
 ### Why Hierarchical
 
-- Shares information across all T genes: if most genes have weak, near-zero n, sigma_n_a is learned to be small, which regularises all genes simultaneously
-- `n = alpha * n_a_raw` means that when alpha → 0 (component inactive), n → 0 and `Hill(x)` becomes 0.5 everywhere — the contribution collapses gracefully without requiring a separate n prior
+- Shares information across all T genes: if most genes have weak, near-zero n, sigma_n_a shrinks, regularising all genes simultaneously.
+- `n_a` gates the Hill shape; the sparsity prior on `alpha` / `beta` gates whether the component has any effect at all. The two work in concert: a component with alpha ≈ 0 contributes nothing regardless of n_a.
 
 ### Why *n* Gets This Treatment but K and Vmax Do Not
 
-The user's design intent: K and Vmax priors should be **per-gene and data-driven** (no information sharing across genes, as their magnitudes are gene-specific). n is a *shape* parameter (cooperativity) that should plausibly share information — most genes are expected to have moderate cooperativity, and the hyperprior enforces this. This is analogous to a random-effects model for shape.
+K and Vmax priors are **per-gene and data-driven** (magnitudes are gene-specific; no sharing is appropriate). n is a *shape* parameter (cooperativity) where sharing information across genes is reasonable — most genes are expected to have moderate cooperativity. This is analogous to a random-effects model for shape.
 
-### Archive Consistency
+### sigma_n Prior Width History
 
-Unchanged from archive: `sigma_n_a ~ Exponential(1/5)`, `n_mu = 0`. Same for `sigma_n_b`.
+| Commit | Date | Change | Rationale |
+|--------|------|--------|-----------|
+| (archive) | pre-2026 | `Exp(1/5)`, mean = 5 | Original value |
+| `8d8332d` | 2026-03-30 | `Exp(1/2)`, mean = 2 | Exp(1/5) allowed sigma_n to grow so large that n routinely hit the physical overflow bounds (nmin/nmax ≈ ±38). Exp(1/2) covers biological Hill coefficients ~0.5–8 without systematic boundary hits. |
+
+### Hard Clamp → Soft Clamp (`_soft_clamp`)
+
+**Original** (`torch.clamp`):
+```python
+n_a = n_a_raw.clamp(nmin, nmax)
+```
+`torch.clamp` has zero gradient outside [nmin, nmax]. Once n_a_raw overshoots the boundary, the optimizer receives no signal to pull it back ("dead-gradient" problem).
+
+**Current** (`_soft_clamp`):
+```python
+def _soft_clamp(x, lo, hi):
+    half = 0.5 * (hi - lo);  center = 0.5 * (hi + lo)
+    return center + half * tanh(x / half)
+```
+Gradient = sech²(x/half) ≥ sech²(1) ≈ 0.42 at the boundary, never zero. **Introduced**: `a75bee7`, 2026-03-30.
+
+### Prior Miscalibration Bug (Fixed `8350c35`, 2026-03-30)
+
+With the soft_clamp, `Normal(0, sigma)` on n_a_raw does **not** mean the constrained prior mode is 0. The prior mode of n_a is:
+
+$$\text{mode}(n_a) = \text{soft\_clamp}(0,\, n_{\min},\, n_{\max}) = \frac{n_{\min} + n_{\max}}{2}$$
+
+For typical data spanning x ∈ [0.3, 5] (KO to CA guides):
+- nmin ≈ −74, nmax ≈ 55 → prior mode ≈ **−9.3** — systematically negative!
+
+**Fix**: Use the inverse soft_clamp of n_mu (= 0) as the prior mean for n_a_raw:
+```python
+center_n     = 0.5 * (nmax + nmin)
+half_n       = 0.5 * (nmax - nmin)
+n_mu_raw     = half_n * atanh((n_mu - center_n) / half_n)
+```
+By construction, `soft_clamp(n_mu_raw, nmin, nmax) = n_mu = 0`, so the constrained prior mode is always at the intended value regardless of dataset asymmetry.
 
 ---
 
@@ -307,18 +346,69 @@ using `x^n / (exp(n * logK) + x^n)` to avoid computing `K^n` directly (which can
 
 ---
 
-## 12. Known Issues and Open Questions
+## 12. K–n Joint Identifiability and the Smoothing-Out Bias
+
+### The Identifiability Problem
+
+The Hill function has a well-known joint non-identifiability between K and n when the data do not span both sides of K:
+
+$$h_+(x;\, K, n) = \frac{x^n}{K^n + x^n}$$
+
+When all observed x values are **far below K** (e.g., K >> max(x)), the function is approximately:
+$$h_+(x;\, K, n) \approx \left(\frac{x}{K}\right)^n$$
+
+This is a power law. Any pair (K′, n′) satisfying `n′ * log(K′) ≈ n * log(K)` (i.e., the same log-ratio) fits the sub-threshold data equally well. The likelihood surface is flat along this ridge, so the **prior dominates** in this regime.
+
+### Why This Manifests as "Smoothing Out"
+
+The NTC-centred K prior has `E[K] = x_NTC` and `sigma = 5·ln(2)/2`, giving a 95% CI of ±5 log2FC around NTC. The n prior has mode at 0 (no cooperativity → near-linear response).
+
+When the true EC50 lies far above the observed x range (e.g., CRISPRi-only data where all x < x_NTC):
+1. The data provides no gradient pulling K above the observed range.
+2. The K prior pulls K back toward x_NTC.
+3. With K ≈ x_NTC and all x below K, the Hill function is quasi-linear near 0: h+(x) ≈ (x/K)^n.
+4. The n prior, pulling toward 0, makes the response even shallower.
+5. The net result: the model fits a **gently rising curve** rather than a steep sigmoid whose plateau is off-screen.
+
+This behaviour is called "smoothing out" — the model acts as if the dose-response is still rising at the limit of the observed range, rather than acknowledging that the plateau may be unreachable.
+
+### When This Is a Problem vs. Acceptable
+
+| Fit type | K outside observed range? | Effect | Status |
+|----------|--------------------------|--------|--------|
+| **Full dataset** (CRISPRi + NTC + CRISPRa) | Only if true K >> CA expression level | Rare; CA guides usually reach > 3 log2FC, covering most plausible K | Acceptable |
+| **CRISPRa-only** | If true K << NTC (K below the activation range) | Unusual; most activatable genes have K near or below NTC | Occasionally an issue |
+| **CRISPRi-only** | Almost always: true K ≥ NTC, but all x < NTC | Common and systematic | **Known limitation** |
+
+### Practical Implication
+
+**EC50 estimates from one-sided fits (CRISPRi-only or CRISPRa-only) are unreliable when the true EC50 lies outside the observed x-range.** The NTC-centred prior is the most informative default available without external data, but it will pull K toward NTC and underestimate EC50 when the true value is far above (or below) NTC.
+
+For ALAS2: full and CRISPRa fits agree on log2(EC50) ≈ +3.2; the CRISPRi-only fit returns ≈ +0.95. The CRISPRi data cannot distinguish EC50 = 0.95 from EC50 = 3.2 because all observations lie below both values. This is not a model failure — it is a fundamental data limitation.
+
+**Recommended practice**: Use the full-dataset fit for EC50 estimation. One-sided fits remain valid for effect-direction classification and FDR-controlled detection of active components.
+
+### The Deliberate Bias Is in the Right Direction
+
+Smoothing out is a better failure mode than the alternative (K drifting to implausible extremes):
+- A smoothed-out Hill curve still fits the observed data well.
+- A Hill curve with K wildly off-range can produce near-zero gradients for the observed data, destabilising training.
+- The FDR criterion for component activity (`fdr_alpha < 0.05`) uses `P(alpha * Vmax / A > ε)`, which correctly captures whether an *observable* effect exists in the data, not whether the fitted K is the true EC50.
+
+---
+
+## 13. Known Issues and Open Questions
 
 | Issue | Status | Notes |
 |--|--|--|
-| Massive CIs when subsetting to CRISPRi-only or CRISPRa-only with additive_hill | **Open** | Likely identifiability issue: one-directional data cannot constrain both K and Vmax of the Hill plateau. Curriculum warmup may help but does not fully resolve. Investigate whether single_hill or a Vmax regularisation improves this. |
-| Two-component overfitting when fitting additive_hill to single-Hill data | **Partially addressed** | Curriculum warmup reduces early-phase K_b contamination. The CV-based K prior remains wide by design (uninformative). If warmup is insufficient, increase warmup_steps. |
+| EC50 underestimation in CRISPRi-only / CRISPRa-only fits | **By design / documented limitation** | K–n joint non-identifiability when true EC50 lies outside observed x-range. See §12 for full analysis. Use full-dataset fits for EC50 estimation. |
+| Two-component overfitting when fitting additive_hill to single-Hill data | **Partially addressed** | Curriculum warmup reduces early-phase K_b contamination. The CV-based K prior remains wide by design. If warmup is insufficient, increase warmup_steps. |
 | correct_priors_for_technical noisiness | **Open** | When alpha_y is large and variable, dividing y_obs_for_prior by it can introduce instability in prior estimates. Consider capping the correction factor. |
 | No cross-gene sharing of K/Vmax | **By design** | User preference: K and Vmax are gene-specific. Only n has a hierarchical prior (sigma_n_a). |
 
 ---
 
-## 13. Parameter Defaults Summary
+## 14. Parameter Defaults Summary
 
 | Parameter | Default | Archive | Rationale for difference |
 |--|--|--|--|
