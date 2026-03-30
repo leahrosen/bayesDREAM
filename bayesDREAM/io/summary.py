@@ -2061,13 +2061,10 @@ class ModelSummarizer:
         data['n_b_lower'] = n_b_lower
         data['n_b_upper'] = n_b_upper
 
-        # APPLY YOUR RULE: if 0 in 95% CI, set n=0 for all downstream computations
-        n_a_eff_mean, n_a_zeroed = self._n_effective_from_ci(n_a_mean, n_a_lower, n_a_upper)
-        n_b_eff_mean, n_b_zeroed = self._n_effective_from_ci(n_b_mean, n_b_lower, n_b_upper)
-        
-        # overwrite the n used for computations (but keep original summaries as exported)
-        n_a_used = n_a_eff_mean
-        n_b_used = n_b_eff_mean
+        # Use raw posterior means for n; component activity is determined by FDR
+        # (q_active_a / q_active_b, computed below) rather than CI-based n-zeroing.
+        n_a_used = n_a_mean
+        n_b_used = n_b_mean
         
         # Pi_y (sparsity weight) - optional
         if 'pi_y' in posterior:
@@ -2152,42 +2149,7 @@ class ModelSummarizer:
         data['A_lower'] = A_lower
         data['A_upper'] = A_upper
 
-        # Compute inflection points for individual Hill components
-        if compute_inflection:
-            # Use the n USED for computations (already zeroed if CI includes 0)
-            nA = np.asarray(n_a_used, dtype=float)
-            nB = np.asarray(n_b_used, dtype=float)
-        
-            # For CI, we should use |n| bounds. A conservative choice:
-            #   nabs_lower = min(|n_lo|, |n_hi|)  (lower bound on magnitude, but can be too small if CI spans 0)
-            #   nabs_upper = max(|n_lo|, |n_hi|)
-            nAabs_lo = np.minimum(np.abs(n_a_lower), np.abs(n_a_upper))
-            nAabs_hi = np.maximum(np.abs(n_a_lower), np.abs(n_a_upper))
-            nBabs_lo = np.minimum(np.abs(n_b_lower), np.abs(n_b_upper))
-            nBabs_hi = np.maximum(np.abs(n_b_lower), np.abs(n_b_upper))
-        
-            # If you zeroed n because CI contains 0, enforce magnitude bounds = 0 too
-            nAabs_lo[n_a_zeroed] = 0.0
-            nAabs_hi[n_a_zeroed] = 0.0
-            nBabs_lo[n_b_zeroed] = 0.0
-            nBabs_hi[n_b_zeroed] = 0.0
-        
-            inflection_a_mean = self._compute_hill_inflection(nA,      K_a_mean)
-            inflection_a_lower = self._compute_hill_inflection(nAabs_lo, K_a_lower)  # magnitude-lower
-            inflection_a_upper = self._compute_hill_inflection(nAabs_hi, K_a_upper)  # magnitude-upper
-        
-            inflection_b_mean = self._compute_hill_inflection(nB,      K_b_mean)
-            inflection_b_lower = self._compute_hill_inflection(nBabs_lo, K_b_lower)
-            inflection_b_upper = self._compute_hill_inflection(nBabs_hi, K_b_upper)
-        
-            data['inflection_a_mean'] = inflection_a_mean
-            data['inflection_a_lower'] = inflection_a_lower
-            data['inflection_a_upper'] = inflection_a_upper
-            data['inflection_b_mean'] = inflection_b_mean
-            data['inflection_b_lower'] = inflection_b_lower
-            data['inflection_b_upper'] = inflection_b_upper
-
-        # Get full posterior samples for derivative computation
+        # Get full posterior samples (needed for FDR and per-sample CI computations)
         Vmax_a_full = extract_param_full('Vmax_a')
         K_a_full = extract_param_full('K_a')
         n_a_full = extract_param_full('n_a')
@@ -2196,7 +2158,7 @@ class ModelSummarizer:
         n_b_full = extract_param_full('n_b')
 
         # Compute product-based activity probabilities: P(alpha * Vmax_a / A > epsilon)
-        # These avoid the alpha-Vmax non-identifiability by using the well-constrained product.
+        # These avoid the alpha–Vmax non-identifiability by using the well-constrained product.
         _ACTIVITY_EPSILON = 0.01
         if (alpha_full.ndim >= 2 and Vmax_a_full.ndim >= 2 and A_full.ndim >= 2):
             _ratio_a = alpha_full * Vmax_a_full / np.maximum(A_full, 1e-12)
@@ -2224,6 +2186,43 @@ class ModelSummarizer:
         _qall = np.where(_p_active_all < 1e-9, 1.0, _qall)
         q_active_a = _qall[:n_features]
         q_active_b = _qall[n_features:]
+
+        # Compute inflection points for individual Hill components
+        if compute_inflection:
+            # Use raw n means (FDR controls activity, not CI-based n-zeroing)
+            nA = np.asarray(n_a_used, dtype=float)
+            nB = np.asarray(n_b_used, dtype=float)
+
+            # For CI, we should use |n| bounds. A conservative choice:
+            #   nabs_lower = min(|n_lo|, |n_hi|)  (lower bound on magnitude)
+            #   nabs_upper = max(|n_lo|, |n_hi|)
+            nAabs_lo = np.minimum(np.abs(n_a_lower), np.abs(n_a_upper))
+            nAabs_hi = np.maximum(np.abs(n_a_lower), np.abs(n_a_upper))
+            nBabs_lo = np.minimum(np.abs(n_b_lower), np.abs(n_b_upper))
+            nBabs_hi = np.maximum(np.abs(n_b_lower), np.abs(n_b_upper))
+
+            # FDR-inactive components: zero inflection magnitude bounds
+            _fdr_inactive_a = q_active_a >= fdr_threshold
+            _fdr_inactive_b = q_active_b >= fdr_threshold
+            nAabs_lo[_fdr_inactive_a] = 0.0
+            nAabs_hi[_fdr_inactive_a] = 0.0
+            nBabs_lo[_fdr_inactive_b] = 0.0
+            nBabs_hi[_fdr_inactive_b] = 0.0
+        
+            inflection_a_mean = self._compute_hill_inflection(nA,      K_a_mean)
+            inflection_a_lower = self._compute_hill_inflection(nAabs_lo, K_a_lower)  # magnitude-lower
+            inflection_a_upper = self._compute_hill_inflection(nAabs_hi, K_a_upper)  # magnitude-upper
+        
+            inflection_b_mean = self._compute_hill_inflection(nB,      K_b_mean)
+            inflection_b_lower = self._compute_hill_inflection(nBabs_lo, K_b_lower)
+            inflection_b_upper = self._compute_hill_inflection(nBabs_hi, K_b_upper)
+        
+            data['inflection_a_mean'] = inflection_a_mean
+            data['inflection_a_lower'] = inflection_a_lower
+            data['inflection_a_upper'] = inflection_a_upper
+            data['inflection_b_mean'] = inflection_b_mean
+            data['inflection_b_lower'] = inflection_b_lower
+            data['inflection_b_upper'] = inflection_b_upper
 
         # Initialize arrays for per-feature results
         classifications = []
@@ -2512,7 +2511,7 @@ class ModelSummarizer:
                 # optional: dedup candidates in log2 space
                 x_candidates_obs = self._dedup_roots_log2(x_candidates_obs, tol_log2=1e-3)
 
-                is_flat_i = bool(n_a_zeroed[i]) and bool(n_b_zeroed[i])
+                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
                 if is_flat_i:
                     observed_log2fc_lower_list.append(0.0)
                     observed_log2fc_upper_list.append(0.0)
@@ -2528,8 +2527,13 @@ class ModelSummarizer:
                         K_a_s    = float(K_a_full[s, i])
                         K_b_s    = float(K_b_full[s, i])
 
-                        n_a_s = self._maybe_zero_scalar(n_a_full[s, i], bool(n_a_zeroed[i]))
-                        n_b_s = self._maybe_zero_scalar(n_b_full[s, i], bool(n_b_zeroed[i]))
+                        n_a_s = float(n_a_full[s, i])
+                        n_b_s = float(n_b_full[s, i])
+                        # Gate inactive components via FDR (zero alpha/beta, not n)
+                        if q_active_a[i] >= fdr_threshold:
+                            alpha_s = 0.0
+                        if q_active_b[i] >= fdr_threshold:
+                            beta_s = 0.0
 
                         if is_binomial:
                             v = self._observed_delta_p_candidates_no_roots(
@@ -2571,9 +2575,8 @@ class ModelSummarizer:
 
                 sample_log2fcs = []
 
-                # Optional: short-circuit truly flat (both n zeroed by your rule)
-                # This matches what you do later for log2fc-derivatives.
-                is_flat_i = bool(n_a_zeroed[i]) and bool(n_b_zeroed[i])
+                # Short-circuit genes where both components are FDR-inactive
+                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
                 if is_flat_i:
                     full_log2fc_lower_list.append(0.0)
                     full_log2fc_upper_list.append(0.0)
@@ -2588,9 +2591,13 @@ class ModelSummarizer:
                         K_a_s    = float(K_a_full[s, i])
                         K_b_s    = float(K_b_full[s, i])
 
-                        # FEATURE-WISE ZEROING RULE (keep exactly your semantics)
-                        n_a_s = self._maybe_zero_scalar(n_a_full[s, i], bool(n_a_zeroed[i]))
-                        n_b_s = self._maybe_zero_scalar(n_b_full[s, i], bool(n_b_zeroed[i]))
+                        n_a_s = float(n_a_full[s, i])
+                        n_b_s = float(n_b_full[s, i])
+                        # Gate inactive components via FDR (zero alpha/beta, not n)
+                        if q_active_a[i] >= fdr_threshold:
+                            alpha_s = 0.0
+                        if q_active_b[i] >= fdr_threshold:
+                            beta_s = 0.0
 
                         if is_binomial:
                             val = self._full_delta_p_candidates_no_roots(
@@ -2795,8 +2802,7 @@ class ModelSummarizer:
                     return dg_du, d2g_du2, d3g_du3
 
             for i in range(n_features):
-                is_flat_i = bool(n_a_zeroed[i]) and bool(n_b_zeroed[i])
-                # (or stricter: both components inactive by your dep_mask definition)
+                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
                 
                 if is_flat_i:
                     y_ntc_i = y_ntc[i] if y_ntc is not None else np.nan
@@ -2863,14 +2869,19 @@ class ModelSummarizer:
                         sample_d3g_du3 = []
 
                         for s in range(n_samples):
-                            alpha_s = alpha_full[s, i] if alpha_full.ndim > 1 else alpha_full[i]
-                            beta_s = beta_full[s, i] if beta_full.ndim > 1 else beta_full[i]
+                            alpha_s = float(alpha_full[s, i] if alpha_full.ndim > 1 else alpha_full[i])
+                            beta_s  = float(beta_full[s, i]  if beta_full.ndim > 1 else beta_full[i])
                             Vmax_a_s = Vmax_a_full[s, i]
                             Vmax_b_s = Vmax_b_full[s, i]
                             K_a_s = K_a_full[s, i]
                             K_b_s = K_b_full[s, i]
-                            n_a_s = self._maybe_zero_scalar(n_a_full[s, i], bool(n_a_zeroed[i]))
-                            n_b_s = self._maybe_zero_scalar(n_b_full[s, i], bool(n_b_zeroed[i]))
+                            n_a_s = float(n_a_full[s, i])
+                            n_b_s = float(n_b_full[s, i])
+                            # Gate inactive components via FDR (zero alpha/beta, not n)
+                            if q_active_a[i] >= fdr_threshold:
+                                alpha_s = 0.0
+                            if q_active_b[i] >= fdr_threshold:
+                                beta_s = 0.0
                             A_s = A_full[s, i] if A_full.ndim > 1 else A_full[i]
 
                             dg, d2g, d3g = _compute_derivs_at_u0(
@@ -2997,6 +3008,7 @@ class ModelSummarizer:
         compute_log2fc_params: bool = False,
         x_ntc=None,
         y_ntc=None,
+        fdr_threshold: float = 0.05,
     ):
         """
         Add single Hill parameters to data dict.
@@ -3076,9 +3088,8 @@ class ModelSummarizer:
         K_mean,    K_lo,    K_hi    = extract_param('K_a')
         n_mean,    n_lo,    n_hi    = extract_param('n_a')
 
-        # APPLY SAME RULE AS ADDITIVE:
-        n_used, n_zeroed = self._n_effective_from_ci(n_mean, n_lo, n_hi)
-        # use n_used for all downstream computations
+        # Use raw n means; FDR thresholding controls activity.
+        n_used = n_mean
     
         Vmax_full = extract_param_full('Vmax_a')
         K_full    = extract_param_full('K_a')
@@ -3124,7 +3135,22 @@ class ModelSummarizer:
         data['A_mean'] = A_mean
         data['A_lower'] = A_lo
         data['A_upper'] = A_hi
-    
+
+        # Compute product-based FDR for single_hill: P(alpha * Vmax / A > epsilon)
+        _ACTIVITY_EPSILON = 0.01
+        if alpha_full.ndim >= 2 and Vmax_full.ndim >= 2 and A_full.ndim >= 2:
+            _ratio = alpha_full * Vmax_full / np.maximum(A_full, 1e-12)
+            p_active = (_ratio > _ACTIVITY_EPSILON).mean(axis=0)
+        else:
+            p_active = alpha_mean.copy()
+        p_active = np.asarray(p_active, dtype=float).ravel()
+        _lfdr = 1.0 - p_active
+        _ord = np.argsort(_lfdr)
+        _cumfdr = np.cumsum(_lfdr[_ord]) / (np.arange(n_features, dtype=float) + 1.0)
+        _qsorted = np.minimum.accumulate(_cumfdr[::-1])[::-1]
+        q_active = np.empty(n_features, dtype=float); q_active[_ord] = _qsorted
+        q_active = np.where(p_active < 1e-9, 1.0, q_active)
+
         # --- inflection of the Hill component ---
         if compute_inflection:
             n_abs_mean, n_abs_lo, n_abs_hi = extract_param_abs('n_a')
@@ -3177,11 +3203,11 @@ class ModelSummarizer:
                         V_s = float(Vmax_full[s, i])
                         K_s = float(K_full[s, i])
                         a_s = float(alpha_full[s, i]) if alpha_full.ndim == 2 else float(alpha_full[i])
-                        # A isn't extracted full in your current function; easiest is to add A_full extraction.
-                        # For now, if A was point/broadcast: use A_mean[i]
                         A_s = float(A_full[s, i]) if A_full.ndim == 2 else float(A_full[i])
-        
-                        n_s = self._maybe_zero_scalar(n_full[s, i], bool(n_zeroed[i]))
+                        n_s = float(n_full[s, i])
+                        # Gate inactive component via FDR (zero alpha, not n)
+                        if q_active[i] >= fdr_threshold:
+                            a_s = 0.0
         
                         # boundaries for single hill
                         if abs(n_s) < 1e-15:
@@ -3232,19 +3258,18 @@ class ModelSummarizer:
             nS = min(S, 500)
         
             for i in range(n_features):
-                if bool(n_zeroed[i]):
+                if q_active[i] >= fdr_threshold:
                     lo[i] = 0.0
                     hi[i] = 0.0
                     continue
-        
+
                 vals = []
                 for s in range(nS):
                     V_s = float(Vmax_full[s, i])
                     K_s = float(K_full[s, i])
                     a_s = float(alpha_full[s, i])
                     A_s = float(A_full[s, i])
-        
-                    n_s = self._maybe_zero_scalar(n_full[s, i], bool(n_zeroed[i]))
+                    n_s = float(n_full[s, i])
         
                     def y_at(x):
                         H = self._hill_value(x, V_s, K_s, n_s)
