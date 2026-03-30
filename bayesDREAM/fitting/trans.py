@@ -601,20 +601,29 @@ class TransFitter:
 
                 Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
 
+                # Compute the unconstrained prior mean for n_raw that maps to n_mu under
+                # soft_clamp.  Without this correction, Normal(0, sigma) on n_raw has its
+                # constrained mode at center_n = (nmin + nmax)/2, which can be far from 0
+                # when nmin/nmax are asymmetric (e.g. all x > 1 → nmin = −100, center ≈ −31).
+                _center_n = 0.5 * (nmax + nmin)
+                _half_n   = 0.5 * (nmax - nmin).clamp_min(epsilon_tensor)
+                _ratio_n  = ((n_mu_tensor - _center_n) / _half_n).clamp(-1 + 1e-6, 1 - 1e-6)
+                n_mu_raw_tensor = _half_n * torch.atanh(_ratio_n)
+
                 # For multinomial, we need per-category parameters (K-1 categories, Kth is residual)
                 if distribution == 'multinomial' and K is not None:
                     K_minus_1 = K - 1
                     # Sample parameters for K-1 categories
                     # Each category gets its own Hill function parameters
                     with pyro.plate("category_plate_n_a", K_minus_1, dim=-1):
-                        n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_tensor, sigma_n_a))  # [T, K-1]
+                        n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a))  # [T, K-1]
                         n_a = pyro.deterministic(
                             "n_a",
                             _soft_clamp(n_a_raw, nmin, nmax)
                         )  # [T, K-1]
                 else:
                     # For non-multinomial: single set of parameters per feature
-                    n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_tensor, sigma_n_a))
+                    n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a))
                     n_a = pyro.deterministic(
                         "n_a",
                         _soft_clamp(n_a_raw, nmin, nmax)
@@ -719,13 +728,13 @@ class TransFitter:
                     if distribution == 'multinomial' and K is not None:
                         K_minus_1 = K - 1
                         with pyro.plate("category_plate_n_b", K_minus_1, dim=-1):
-                            n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_tensor, sigma_n_b))  # [T, K-1]
+                            n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b))  # [T, K-1]
                             n_b = pyro.deterministic(
                                 "n_b",
                                 _soft_clamp(n_b_raw, nmin, nmax)
                             )  # [T, K-1]
                     else:
-                        n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_tensor, sigma_n_b))
+                        n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b))
                         n_b = pyro.deterministic(
                             "n_b",
                             _soft_clamp(n_b_raw, nmin, nmax)
