@@ -2577,9 +2577,70 @@ class TransFitter:
             print(f"[INFO] n_a boundary check: nmin={nmin_val:.2f}, nmax={nmax_val:.2f}")
             print(f"[INFO]   {close_to_min*100:.1f}% of samples near lower bound, {close_to_max*100:.1f}% near upper bound")
 
+        # ── Compute and save prior parameters for diagnostic plotting ─────────
+        # These let plot_parameter_ci_panel overlay prior distributions as violins
+        trans_prior_params = None
+        if function_type in ['single_hill', 'additive_hill']:
+            _K_log_sigma_min_val = 5.0 * 0.6931 / 2.0  # 5*ln(2)/2 ≈ 1.733
+
+            # n prior: unconstrained mean (maps to n_mu=0 in constrained space)
+            _half_n_p   = 0.5 * (nmax - nmin).clamp_min(epsilon_tensor)
+            _center_n_p = 0.5 * (nmax + nmin)
+            _ratio_n_p  = ((n_mu_tensor - _center_n_p) / _half_n_p).clamp(-1 + 1e-6, 1 - 1e-6)
+            n_mu_raw_prior = float((_half_n_p * torch.atanh(_ratio_n_p)).item())
+
+            # Vmax prior (log-normal): Vmax_log_sigma is the same for all genes
+            # because sigma/mean = 1/sqrt(Vmax_alpha) regardless of Vmax_mean
+            if distribution not in ['binomial', 'multinomial']:
+                Vmax_alpha_val  = float(Vmax_alpha_tensor.item())
+                Vmax_log_sigma_p = float(np.sqrt(np.log1p(1.0 / Vmax_alpha_val)))
+                Vmax_log_mu_p   = (np.log(Vmax_mean_tensor.cpu().numpy())
+                                   - 0.5 * Vmax_log_sigma_p ** 2)  # [T]
+            else:
+                Vmax_log_sigma_p = None
+                Vmax_log_mu_p    = None
+
+            # K prior (log-normal): usually scalar (NTC-centred or K_max/2 fallback)
+            if x_ntc_mean is not None:
+                K_log_sigma_p = _K_log_sigma_min_val
+                K_log_mu_p    = float(torch.log(x_ntc_mean.clamp_min(epsilon_tensor)).item()
+                                      - 0.5 * K_log_sigma_p ** 2)
+            else:
+                _K_mean_p  = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
+                _K_std_p   = (_K_mean_p * x_true_CV if x_true_CV is not None
+                              else K_max_tensor / (2.0 * torch.sqrt(K_alpha_tensor)))
+                _ratio_K_p = (_K_std_p / _K_mean_p).clamp_min(self._t(1e-6))
+                K_log_sigma_p = float(torch.sqrt(torch.log1p(_ratio_K_p ** 2))
+                                      .clamp_min(self._t(_K_log_sigma_min_val)).item())
+                K_log_mu_p    = float(torch.log(_K_mean_p).item() - 0.5 * K_log_sigma_p ** 2)
+
+            trans_prior_params = {
+                'function_type':    function_type,
+                'distribution':     distribution,
+                # n_a / n_b
+                'nmin':             float(nmin.item()),
+                'nmax':             float(nmax.item()),
+                'n_mu_raw':         n_mu_raw_prior,
+                'sigma_n_prior_rate': 0.5,           # Exp(0.5) prior → mean sigma = 2
+                # Vmax_a / Vmax_b (log-normal)
+                'Vmax_log_mu':      Vmax_log_mu_p,   # [T] numpy array or None
+                'Vmax_log_sigma':   Vmax_log_sigma_p, # scalar or None
+                # K_a / K_b (log-normal)
+                'K_log_mu':         K_log_mu_p,      # scalar
+                'K_log_sigma':      K_log_sigma_p,   # scalar
+                # A (Exponential, negbinom only)
+                'Amean':            (Amean_tensor.cpu().numpy()
+                                     if distribution not in ['binomial', 'multinomial']
+                                     else None),      # [T] or None
+                # alpha / beta (RelaxedBernoulli)
+                'p_n_logits':       float(p_n_logits_tensor.item()),
+                'temperature_prior': 1.0,
+            }
+
         # Store results
         # Store in modality
         modality.posterior_samples_trans = posterior_samples_y
+        modality.trans_prior_params = trans_prior_params
         modality.losses_trans = self.losses_trans  # Store loss history
 
         # Update alpha_y_prefit in modality if it was None and alpha_y was sampled
@@ -2590,7 +2651,8 @@ class TransFitter:
         # If primary modality, also store at model level (backward compatibility)
         if modality_name == self.model.primary_modality:
             self.model.posterior_samples_trans = posterior_samples_y
-            self.model.losses_trans = self.losses_trans  # Store loss history at model level
+            self.model.losses_trans = self.losses_trans
+            self.model.trans_prior_params = trans_prior_params
             # NOTE: alpha_y_prefit is stored per-modality (already done above), not at model level
             print(f"[INFO] Stored results in modality '{modality_name}' and at model level (primary modality)")
         else:

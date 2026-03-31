@@ -467,6 +467,75 @@ def scatter_param_mean_vs_ci(
     return ax
 
 
+def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=None):
+    """
+    Generate samples from the analytic prior distribution for one parameter × gene.
+
+    Returns a 1-D numpy array of length n_samples, or None if the parameter's
+    prior is not stored in prior_params.
+
+    Prior distributions
+    -------------------
+    n_a, n_b  : marginal over sigma_n ~ Exp(rate) of Normal(n_mu_raw, sigma_n),
+                then soft-clamped to [nmin, nmax]
+    Vmax_a/b  : LogNormal(Vmax_log_mu[gene], Vmax_log_sigma)
+    K_a/b     : LogNormal(K_log_mu, K_log_sigma)
+    A         : Exponential(rate=1/Amean[gene])
+    alpha/beta: RelaxedBernoulli(logits=p_n_logits, temperature=1)
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    if param in ('n_a', 'n_b'):
+        nmin      = prior_params.get('nmin')
+        nmax      = prior_params.get('nmax')
+        n_mu_raw  = prior_params.get('n_mu_raw', 0.0)
+        rate      = prior_params.get('sigma_n_prior_rate', 0.5)
+        if nmin is None or nmax is None:
+            return None
+        sigma_n = rng.exponential(1.0 / rate, n_samples)       # marginalise sigma_n
+        n_raw   = rng.normal(n_mu_raw, sigma_n)
+        half    = 0.5 * (nmax - nmin)
+        center  = 0.5 * (nmax + nmin)
+        return center + half * np.tanh(n_raw / half)            # soft_clamp
+
+    elif param in ('Vmax_a', 'Vmax_b'):
+        Vmax_log_mu    = prior_params.get('Vmax_log_mu')
+        Vmax_log_sigma = prior_params.get('Vmax_log_sigma')
+        if Vmax_log_mu is None or Vmax_log_sigma is None:
+            return None
+        mu = (float(Vmax_log_mu[gene_idx])
+              if hasattr(Vmax_log_mu, '__len__') else float(Vmax_log_mu))
+        return np.exp(rng.normal(mu, float(Vmax_log_sigma), n_samples))
+
+    elif param in ('K_a', 'K_b'):
+        K_log_mu    = prior_params.get('K_log_mu')
+        K_log_sigma = prior_params.get('K_log_sigma')
+        if K_log_mu is None or K_log_sigma is None:
+            return None
+        mu = (float(K_log_mu[gene_idx])
+              if hasattr(K_log_mu, '__len__') else float(K_log_mu))
+        return np.exp(rng.normal(mu, float(K_log_sigma), n_samples))
+
+    elif param == 'A':
+        Amean = prior_params.get('Amean')
+        if Amean is None:
+            return None
+        amean_val = (float(Amean[gene_idx])
+                     if hasattr(Amean, '__len__') else float(Amean))
+        return rng.exponential(amean_val, n_samples)   # Exp(rate=1/amean)
+
+    elif param in ('alpha', 'beta'):
+        logits = prior_params.get('p_n_logits', -13.8)
+        temp   = prior_params.get('temperature_prior', 1.0)
+        # RelaxedBernoulli via logistic-noise reparameterisation
+        u        = rng.uniform(1e-8, 1 - 1e-8, n_samples)
+        log_odds = np.log(u / (1.0 - u))
+        return 1.0 / (1.0 + np.exp(-(logits + log_odds) / temp))
+
+    return None
+
+
 def plot_parameter_ci_panel(
     model,
     params: list,
@@ -492,6 +561,7 @@ def plot_parameter_ci_panel(
     fdr_df=None,
     fdr_threshold: float = 0.05,
     hide_inactive: bool = False,
+    show_prior: bool = False,
 ):
     """
     Forest plot (dot + whisker CI) for posterior parameters across trans genes.
@@ -569,6 +639,12 @@ def plot_parameter_ci_panel(
         hidden (not plotted at all) rather than shown in grey (default: False).
         Useful to avoid visual clutter from wandering posteriors of "off"
         components.
+    show_prior : bool
+        If True, underlay each posterior CI with a light-grey violin drawn from
+        the analytic prior distribution (default: False).  Requires
+        ``model.trans_prior_params`` to be set (automatically set by
+        ``fit_trans()``).  Useful for assessing how much the posterior has moved
+        away from the prior.
 
     Returns
     -------
@@ -796,6 +872,45 @@ def plot_parameter_ci_panel(
         offsets = np.linspace(-width/2, width/2, n_params)
     else:
         offsets = np.array([0.0])
+
+    # --- Prior violin underlay ---
+    if show_prior:
+        prior_params = None
+        if hasattr(modality, 'trans_prior_params') and modality.trans_prior_params is not None:
+            prior_params = modality.trans_prior_params
+        elif (modality_name == model.primary_modality
+              and hasattr(model, 'trans_prior_params')
+              and model.trans_prior_params is not None):
+            prior_params = model.trans_prior_params
+
+        if prior_params is not None:
+            _rng = np.random.default_rng(0)
+            for j, param in enumerate(params):
+                violin_data = []
+                violin_positions = []
+                for k, gene_idx in enumerate(gene_indices):
+                    samps_prior = _sample_prior_for_param(
+                        param, int(gene_idx), prior_params, n_samples=400, rng=_rng)
+                    if samps_prior is not None and np.isfinite(samps_prior).any():
+                        violin_data.append(samps_prior[np.isfinite(samps_prior)])
+                        violin_positions.append(x_base[k] + offsets[j])
+
+                if violin_data:
+                    parts = ax.violinplot(
+                        violin_data, positions=violin_positions,
+                        widths=0.18, showmeans=False, showmedians=False,
+                        showextrema=False)
+                    for body in parts['bodies']:
+                        body.set_facecolor('lightgray')
+                        body.set_edgecolor('gray')
+                        body.set_alpha(0.35)
+                        body.set_zorder(0)
+        else:
+            import warnings
+            warnings.warn(
+                "show_prior=True but no trans_prior_params found on modality or model. "
+                "Run fit_trans() first."
+            )
 
     # Plot each parameter
     for j, param in enumerate(params):
