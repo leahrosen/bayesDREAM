@@ -491,6 +491,7 @@ def plot_parameter_ci_panel(
     show: bool = True,
     fdr_df=None,
     fdr_threshold: float = 0.05,
+    hide_inactive: bool = False,
 ):
     """
     Forest plot (dot + whisker CI) for posterior parameters across trans genes.
@@ -553,13 +554,21 @@ def plot_parameter_ci_panel(
     show : bool
         Whether to display the plot (default: True)
     fdr_df : pd.DataFrame, optional
-        trans_summary DataFrame (output of save_trans_summary). When provided,
+        trans_summary DataFrame (output of ``save_trans_summary()``).  The
+        DataFrame must contain a gene name column (``gene_name`` or ``gene``)
+        and the FDR columns ``fdr_alpha`` and ``fdr_beta``.  When provided,
         parameters belonging to FDR-inactive components (fdr_alpha or fdr_beta
-        >= fdr_threshold) are rendered in light grey instead of their normal
-        color. Component mapping: alpha/n_a/K_a/Vmax_a → fdr_alpha;
+        >= fdr_threshold) are either rendered in light grey (default) or
+        omitted entirely (when ``hide_inactive=True``).
+        Component mapping: alpha/n_a/K_a/Vmax_a → fdr_alpha;
         beta/n_b/K_b/Vmax_b → fdr_beta.
     fdr_threshold : float
         FDR threshold for inactivity (default: 0.05). Used with fdr_df.
+    hide_inactive : bool
+        If True and fdr_df is provided, FDR-inactive parameters are completely
+        hidden (not plotted at all) rather than shown in grey (default: False).
+        Useful to avoid visual clutter from wandering posteriors of "off"
+        components.
 
     Returns
     -------
@@ -814,8 +823,8 @@ def plot_parameter_ci_panel(
             # No active genes — add phantom entry for legend
             ax.scatter([], [], label=param, s=marker_size, color=color)
 
-        # Plot inactive genes greyed out
-        if inactive_plot.any():
+        # Plot inactive genes: grey (default) or hidden (hide_inactive=True)
+        if inactive_plot.any() and not hide_inactive:
             ax.scatter(x[inactive_plot], medians[inactive_plot],
                        s=marker_size, zorder=3, color='lightgray', alpha=0.5)
             yerr_inact = np.vstack([medians[inactive_plot] - los[inactive_plot],

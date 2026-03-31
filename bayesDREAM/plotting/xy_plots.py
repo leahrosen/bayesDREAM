@@ -2958,6 +2958,199 @@ def _extract_hill_param_samples(posterior, feature_idx):
             if _get(k) is not None}
 
 
+def _build_hill_markers_from_params(
+    A, alpha, Vmax_a, K_a, n_a,
+    beta=None, Vmax_b=None, K_b=None, n_b=None,
+    a_null=False, b_null=False,
+    is_additive=False,
+    log2_space=True, y_scale=1.0,
+) -> list:
+    """
+    Core Hill marker building logic shared by both posterior-based and summary-row-based callers.
+
+    Parameters
+    ----------
+    A, alpha, Vmax_a, K_a, n_a : float
+        Posterior/summary mean values for component A parameters.
+    beta, Vmax_b, K_b, n_b : float or None
+        Component B parameters (additive_hill only).
+    a_null, b_null : bool
+        Whether each component is FDR-inactive (True = skip that component).
+    is_additive : bool
+        Whether this is an additive_hill model with both components.
+    log2_space : bool
+        True for negbinom (y-axis in log2). False for linear distributions.
+    y_scale : float
+        Multiplicative scale applied to linear y-values before plotting.
+    """
+    def yv(v):
+        if v is None:
+            return None
+        if log2_space:
+            return float(np.log2(v)) if v > 0 else None
+        return float(v * y_scale)
+
+    def xv(k):
+        if k is None or k <= 0:
+            return None
+        return float(np.log2(k))
+
+    markers = []
+
+    if not is_additive:
+        # ── Single Hill ────────────────────────────────────────────────────
+        lv = yv(A)
+        hv = yv(A + alpha * Vmax_a)
+        ev = xv(K_a)
+        if lv is not None and np.isfinite(lv):
+            markers.append({'axis': 'h', 'value': lv,
+                            'label': 'log2(A)' if log2_space else 'A',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if hv is not None and np.isfinite(hv):
+            markers.append({'axis': 'h', 'value': hv,
+                            'label': 'log2(A+α·Vmax)' if log2_space else 'A+α·Vmax',
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if ev is not None and np.isfinite(ev):
+            markers.append({'axis': 'v', 'value': ev, 'label': 'log2(EC50)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+        return markers
+
+    # ── Additive Hill ──────────────────────────────────────────────────────
+    if a_null or b_null:
+        # ── Effectively single Hill ────────────────────────────────────────
+        if a_null and not b_null:
+            act_alpha, act_Vmax, act_K = beta, Vmax_b, K_b
+        elif b_null and not a_null:
+            act_alpha, act_Vmax, act_K = alpha, Vmax_a, K_a
+        else:
+            # Both null — just mark A
+            lv = yv(A)
+            if lv is not None and np.isfinite(lv):
+                markers.append({'axis': 'h', 'value': lv,
+                                'label': 'log2(A)' if log2_space else 'A',
+                                'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+            return markers
+
+        lv = yv(A)
+        hv = yv(A + act_alpha * act_Vmax)
+        ev = xv(act_K)
+        if lv is not None and np.isfinite(lv):
+            markers.append({'axis': 'h', 'value': lv,
+                            'label': 'log2(A)' if log2_space else 'A',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if hv is not None and np.isfinite(hv):
+            markers.append({'axis': 'h', 'value': hv,
+                            'label': 'log2(A+α·Vmax)' if log2_space else 'A+α·Vmax',
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if ev is not None and np.isfinite(ev):
+            markers.append({'axis': 'v', 'value': ev, 'label': 'log2(EC50)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+
+    elif (n_a > 0) == (n_b > 0):
+        # ── Same-sign monotone sum ─────────────────────────────────────────
+        lv  = yv(A)
+        hv  = yv(A + alpha * Vmax_a + beta * Vmax_b)
+        e1  = xv(min(K_a, K_b))
+        e2  = xv(max(K_a, K_b))
+        if lv is not None and np.isfinite(lv):
+            markers.append({'axis': 'h', 'value': lv,
+                            'label': 'log2(A)' if log2_space else 'A',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if hv is not None and np.isfinite(hv):
+            markers.append({'axis': 'h', 'value': hv,
+                            'label': ('log2(A+α·Vmax_a+β·Vmax_b)' if log2_space
+                                      else 'A+α·Vmax_a+β·Vmax_b'),
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if e1 is not None and np.isfinite(e1):
+            markers.append({'axis': 'v', 'value': e1, 'label': 'log2(EC50_lower)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+        if e2 is not None and np.isfinite(e2) and abs(e2 - e1) > 0.05:
+            markers.append({'axis': 'v', 'value': e2, 'label': 'log2(EC50_upper)',
+                            'linestyle': ':', 'color': 'darkgreen', 'alpha': 0.85})
+
+    else:
+        # ── Non-monotonic (opposite-sign Hills) ───────────────────────────
+        if n_a > 0:   # a activates, b inhibits
+            asym_low_x  = A + beta  * Vmax_b
+            asym_high_x = A + alpha * Vmax_a
+            K_act, K_inh = K_a, K_b
+        else:         # b activates, a inhibits
+            asym_low_x  = A + alpha * Vmax_a
+            asym_high_x = A + beta  * Vmax_b
+            K_act, K_inh = K_b, K_a
+
+        has_peak  = (K_act < K_inh)
+        peak_val  = A + alpha * Vmax_a + beta * Vmax_b
+        a1 = yv(asym_low_x)
+        a2 = yv(asym_high_x)
+        e1 = xv(min(K_a, K_b))
+        e2 = xv(max(K_a, K_b))
+
+        if a1 is not None and np.isfinite(a1):
+            markers.append({'axis': 'h', 'value': a1,
+                            'label': 'log2(y: x→0)' if log2_space else 'y(x→0)',
+                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
+        if a2 is not None and np.isfinite(a2) and (a1 is None or abs(a2 - a1) > 0.05):
+            markers.append({'axis': 'h', 'value': a2,
+                            'label': 'log2(y: x→∞)' if log2_space else 'y(x→∞)',
+                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
+        if has_peak:
+            pv = yv(peak_val)
+            if pv is not None and np.isfinite(pv):
+                markers.append({'axis': 'h', 'value': pv,
+                                'label': ('log2(A+α·Vmax_a+β·Vmax_b) [peak]' if log2_space
+                                          else 'A+α·Vmax_a+β·Vmax_b [peak]'),
+                                'linestyle': '--', 'color': 'darkorange', 'alpha': 0.85})
+        if e1 is not None and np.isfinite(e1):
+            markers.append({'axis': 'v', 'value': e1, 'label': 'log2(EC50_lower)',
+                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
+        if e2 is not None and np.isfinite(e2) and abs(e2 - e1) > 0.05:
+            markers.append({'axis': 'v', 'value': e2, 'label': 'log2(EC50_upper)',
+                            'linestyle': ':', 'color': 'darkgreen', 'alpha': 0.85})
+
+    return markers
+
+
+def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
+                                           fdr_threshold=0.05) -> list:
+    """
+    Compute Hill parameter markers from a trans_summary DataFrame row.
+
+    Reads *_mean columns for parameter values and fdr_alpha / fdr_beta for
+    activity classification.  Returns the same list-of-dicts format as
+    _compute_hill_markers / _build_hill_markers_from_params.
+    """
+    def _g(col, default=None):
+        v = row.get(col, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        return v if np.isfinite(v) else default
+
+    A      = _g('A_mean', 0.0);  alpha = _g('alpha_mean', 1.0)
+    Vmax_a = _g('Vmax_a_mean');  K_a   = _g('K_a_mean');  n_a = _g('n_a_mean')
+    if Vmax_a is None or K_a is None or n_a is None:
+        return []
+
+    beta   = _g('beta_mean', 0.0)
+    Vmax_b = _g('Vmax_b_mean');  K_b   = _g('K_b_mean');  n_b = _g('n_b_mean')
+    is_additive = (Vmax_b is not None and K_b is not None and n_b is not None)
+
+    fdr_alpha_val = _g('fdr_alpha', 1.0)
+    fdr_beta_val  = _g('fdr_beta',  1.0)
+    a_null = fdr_alpha_val >= fdr_threshold
+    b_null = fdr_beta_val  >= fdr_threshold
+
+    return _build_hill_markers_from_params(
+        A=A, alpha=alpha, Vmax_a=Vmax_a, K_a=K_a, n_a=n_a,
+        beta=beta, Vmax_b=Vmax_b, K_b=K_b, n_b=n_b,
+        a_null=a_null, b_null=b_null,
+        is_additive=is_additive,
+        log2_space=log2_space, y_scale=y_scale,
+    )
+
+
 def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=True, y_scale=1.0,
                           fdr_df=None, fdr_threshold=0.05):
     """
@@ -3023,164 +3216,41 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
     A      = pmean('A');     alpha = pmean('alpha');  Vmax_a = pmean('Vmax_a')
     K_a    = pmean('K_a');   n_a   = pmean('n_a')
 
-    # ── y-axis transform ───────────────────────────────────────────────────
-    def yv(v):
-        """Transform a linear y-value for the plot's y-axis."""
-        if v is None:
-            return None
-        if log2_space:
-            return float(np.log2(v)) if v > 0 else None
-        return float(v * y_scale)
-
-    # ── x-axis transform (always log2 of K) ───────────────────────────────
-    def xv(k):
-        if k is None or k <= 0:
-            return None
-        return float(np.log2(k))
-
-    markers = []
     is_additive = ('Vmax_b' in posterior and 'Vmax_b' in params and
                    'n_b' in params and 'beta' in params and 'K_b' in params)
 
-    # ── Single Hill ────────────────────────────────────────────────────────
-    if not is_additive:
-        low_asym  = A
-        high_asym = A + alpha * Vmax_a
-        EC50      = K_a
+    beta = Vmax_b = K_b = n_b = None
+    if is_additive:
+        beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
+        K_b    = pmean('K_b');   n_b    = pmean('n_b')
 
-        lv = yv(low_asym);  hv = yv(high_asym);  ev = xv(EC50)
-        if lv is not None and np.isfinite(lv):
-            markers.append({'axis': 'h', 'value': lv,
-                            'label': 'log2(A)' if log2_space else 'A',
-                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
-        if hv is not None and np.isfinite(hv):
-            markers.append({'axis': 'h', 'value': hv,
-                            'label': 'log2(A+α·Vmax)' if log2_space else 'A+α·Vmax',
-                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
-        if ev is not None and np.isfinite(ev):
-            markers.append({'axis': 'v', 'value': ev, 'label': 'log2(EC50)',
-                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
-        return markers
+        n_a_lo, n_a_hi = pci('n_a')
+        n_b_lo, n_b_hi = pci('n_b')
 
-    # ── Additive Hill ──────────────────────────────────────────────────────
-    beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
-    K_b    = pmean('K_b');   n_b    = pmean('n_b')
-
-    n_a_lo, n_a_hi = pci('n_a')
-    n_b_lo, n_b_hi = pci('n_b')
-
-    # Prefer FDR-based null classification; fall back to CI criterion
-    _fdr_row = None
-    if fdr_df is not None:
-        _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
-        if _name_col:
-            _match = fdr_df[fdr_df[_name_col] == feature]
-            if not _match.empty:
-                _fdr_row = _match.iloc[0]
-    if _fdr_row is not None:
-        a_null = float(_fdr_row.get('fdr_alpha', 1.0)) >= fdr_threshold
-        b_null = float(_fdr_row.get('fdr_beta',  1.0)) >= fdr_threshold
-    else:
-        a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
-        b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
-
-    if a_null or b_null:
-        # ── Effectively single Hill ────────────────────────────────────────
-        if a_null and not b_null:
-            act_alpha, act_Vmax, act_K = beta, Vmax_b, K_b
-        elif b_null and not a_null:
-            act_alpha, act_Vmax, act_K = alpha, Vmax_a, K_a
+        # Prefer FDR-based null classification; fall back to CI criterion
+        _fdr_row = None
+        if fdr_df is not None:
+            _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
+            if _name_col:
+                _match = fdr_df[fdr_df[_name_col] == feature]
+                if not _match.empty:
+                    _fdr_row = _match.iloc[0]
+        if _fdr_row is not None:
+            a_null = float(_fdr_row.get('fdr_alpha', 1.0)) >= fdr_threshold
+            b_null = float(_fdr_row.get('fdr_beta',  1.0)) >= fdr_threshold
         else:
-            # Both null - just mark A
-            lv = yv(A)
-            if lv is not None and np.isfinite(lv):
-                markers.append({'axis': 'h', 'value': lv,
-                                'label': 'log2(A)' if log2_space else 'A',
-                                'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
-            return markers
-
-        lv = yv(A);  hv = yv(A + act_alpha * act_Vmax);  ev = xv(act_K)
-        if lv is not None and np.isfinite(lv):
-            markers.append({'axis': 'h', 'value': lv,
-                            'label': 'log2(A)' if log2_space else 'A',
-                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
-        if hv is not None and np.isfinite(hv):
-            markers.append({'axis': 'h', 'value': hv,
-                            'label': 'log2(A+α·Vmax)' if log2_space else 'A+α·Vmax',
-                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
-        if ev is not None and np.isfinite(ev):
-            markers.append({'axis': 'v', 'value': ev, 'label': 'log2(EC50)',
-                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
-
-    elif (n_a > 0) == (n_b > 0):
-        # ── Same-sign monotone sum ─────────────────────────────────────────
-        low_asym  = A
-        high_asym = A + alpha * Vmax_a + beta * Vmax_b
-        K_lower = min(K_a, K_b);  K_upper = max(K_a, K_b)
-
-        lv = yv(low_asym);  hv = yv(high_asym)
-        e1 = xv(K_lower);   e2 = xv(K_upper)
-
-        if lv is not None and np.isfinite(lv):
-            markers.append({'axis': 'h', 'value': lv,
-                            'label': 'log2(A)' if log2_space else 'A',
-                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
-        if hv is not None and np.isfinite(hv):
-            markers.append({'axis': 'h', 'value': hv,
-                            'label': ('log2(A+α·Vmax_a+β·Vmax_b)' if log2_space
-                                      else 'A+α·Vmax_a+β·Vmax_b'),
-                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
-        if e1 is not None and np.isfinite(e1):
-            markers.append({'axis': 'v', 'value': e1, 'label': 'log2(EC50_lower)',
-                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
-        if e2 is not None and np.isfinite(e2) and abs(e2 - e1) > 0.05:
-            markers.append({'axis': 'v', 'value': e2, 'label': 'log2(EC50_upper)',
-                            'linestyle': ':', 'color': 'darkgreen', 'alpha': 0.85})
-
+            a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
+            b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
     else:
-        # ── Non-monotonic (opposite-sign Hills) ───────────────────────────
-        # Component with n>0 activates (0→Vmax as x↑)
-        # Component with n<0 inhibits  (Vmax→0 as x↑)
-        if n_a > 0:   # a activates, b inhibits
-            asym_low_x  = A + beta  * Vmax_b   # y at x→0
-            asym_high_x = A + alpha * Vmax_a   # y at x→∞
-            K_act, K_inh = K_a, K_b
-        else:         # b activates, a inhibits
-            asym_low_x  = A + alpha * Vmax_a   # y at x→0
-            asym_high_x = A + beta  * Vmax_b   # y at x→∞
-            K_act, K_inh = K_b, K_a
+        a_null = b_null = False
 
-        # Peak exists when activating component's EC50 < inhibiting component's EC50
-        # (activation precedes deactivation → intermediate region where both ≈ 1)
-        has_peak = (K_act < K_inh)
-        peak_val = A + alpha * Vmax_a + beta * Vmax_b
-
-        a1 = yv(asym_low_x);   a2 = yv(asym_high_x)
-        e1 = xv(min(K_a, K_b)); e2 = xv(max(K_a, K_b))
-
-        if a1 is not None and np.isfinite(a1):
-            markers.append({'axis': 'h', 'value': a1,
-                            'label': 'log2(y: x→0)' if log2_space else 'y(x→0)',
-                            'linestyle': ':', 'color': 'darkred', 'alpha': 0.85})
-        if a2 is not None and np.isfinite(a2) and (a1 is None or abs(a2 - a1) > 0.05):
-            markers.append({'axis': 'h', 'value': a2,
-                            'label': 'log2(y: x→∞)' if log2_space else 'y(x→∞)',
-                            'linestyle': ':', 'color': 'darkblue', 'alpha': 0.85})
-        if has_peak:
-            pv = yv(peak_val)
-            if pv is not None and np.isfinite(pv):
-                markers.append({'axis': 'h', 'value': pv,
-                                'label': ('log2(A+α·Vmax_a+β·Vmax_b) [peak]' if log2_space
-                                          else 'A+α·Vmax_a+β·Vmax_b [peak]'),
-                                'linestyle': '--', 'color': 'darkorange', 'alpha': 0.85})
-        if e1 is not None and np.isfinite(e1):
-            markers.append({'axis': 'v', 'value': e1, 'label': 'log2(EC50_lower)',
-                            'linestyle': '--', 'color': 'darkgreen', 'alpha': 0.85})
-        if e2 is not None and np.isfinite(e2) and abs(e2 - e1) > 0.05:
-            markers.append({'axis': 'v', 'value': e2, 'label': 'log2(EC50_upper)',
-                            'linestyle': ':', 'color': 'darkgreen', 'alpha': 0.85})
-
-    return markers
+    return _build_hill_markers_from_params(
+        A=A, alpha=alpha, Vmax_a=Vmax_a, K_a=K_a, n_a=n_a,
+        beta=beta, Vmax_b=Vmax_b, K_b=K_b, n_b=n_b,
+        a_null=a_null, b_null=b_null,
+        is_additive=is_additive,
+        log2_space=log2_space, y_scale=y_scale,
+    )
 
 
 def _draw_hill_markers(ax, markers):
@@ -3520,11 +3590,13 @@ def plot_negbinom_xy(
                                                 linewidth=1, label='log2(A) baseline')
 
             # Full parameter markers (replaces simple A baseline)
+            # Use reference_df as FDR source if no explicit fdr_df provided
+            _effective_fdr_df = fdr_df if fdr_df is not None else reference_df
             if mark_params and (corrected or not has_technical_fit):
                 _markers = _compute_hill_markers(
                     model, feature, modality,
                     ci_level=ci_level, log2_space=True, y_scale=1.0,
-                    fdr_df=fdr_df, fdr_threshold=fdr_threshold,
+                    fdr_df=_effective_fdr_df, fdr_threshold=fdr_threshold,
                 )
                 _draw_hill_markers(ax_plot, _markers)
 
@@ -3547,13 +3619,21 @@ def plot_negbinom_xy(
                                     np.log2(_y_ref[_valid_ref]) - y_offset,
                                     color='red', linestyle='--', linewidth=2,
                                     alpha=0.8, label='Reference Function')
-                        # Reference mark_params
+                        # Reference mark_params: full set of Hill markers (A, Vmax, K)
                         if mark_params:
-                            _ref_A = float(_ref_row.get('A_mean', 0.0) or 0.0)
-                            if _ref_A > 0:
-                                ax_plot.axhline(np.log2(_ref_A) - y_offset,
-                                                color='red', linestyle=':', linewidth=1.5,
-                                                alpha=0.6, label='Reference log2(A)')
+                            _ref_markers = _compute_hill_markers_from_summary_row(
+                                _ref_row, log2_space=True, y_scale=1.0,
+                                fdr_threshold=fdr_threshold,
+                            )
+                            # Offset reference markers visually (thinner, semi-transparent)
+                            for _m in _ref_markers:
+                                _kw = dict(linestyle=_m['linestyle'], color='red',
+                                           alpha=0.5, linewidth=1.2,
+                                           label=f'Ref {_m["label"]}')
+                                if _m['axis'] == 'h':
+                                    ax_plot.axhline(_m['value'] - y_offset, **_kw)
+                                elif _m['axis'] == 'v':
+                                    ax_plot.axvline(_m['value'] - x_offset, **_kw)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
         ax_plot.set_ylabel("log2FC(Expression)" if log2fc else "log2(Expression)")
