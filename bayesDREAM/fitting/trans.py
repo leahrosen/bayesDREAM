@@ -1222,7 +1222,6 @@ class TransFitter:
         correct_priors_for_technical: bool = True,
         use_archive_prior_computation: bool = False,
         use_epsilon: bool = False,
-        nmax_hard_cap: float = 20.0,
         warmup: bool = True,
         warmup_T_min: float = 0.5,
         **kwargs
@@ -1273,12 +1272,6 @@ class TransFitter:
         use_epsilon : bool, optional
             If True, add 1e-8 epsilon for numerical stability in NegativeBinomial logits.
             If False (default), use log(mu) - log(phi) directly.
-        nmax_hard_cap : float, optional
-            Hard cap on the magnitude of the Hill coefficient n (default: 20.0).
-            Both nmin and nmax are clamped to [-nmax_hard_cap, +nmax_hard_cap].
-            Prevents n from hitting physically-derived overflow bounds (which can be
-            very large for narrow x-ranges in CRISPRi/a subsets), avoiding step-function
-            fits that overfit local noise and produce wide CIs crossing zero.
         warmup : bool, optional
             For additive_hill/nested_hill: run a single_hill warmup phase before the main
             fit. Default True (warmup is on by default for additive/nested hill).
@@ -1625,10 +1618,6 @@ class TransFitter:
         # (nmin_cand is -inf when x_min >= 1; nmax_cand is +inf when x_max <= 1)
         nmin = torch.where(torch.isfinite(nmin_cand), nmin_cand, torch.tensor(-100.0, device=self.model.device))
         nmax = torch.where(torch.isfinite(nmax_cand), nmax_cand, torch.tensor( 100.0, device=self.model.device))
-        # Cap at biologically reasonable range to prevent n from hitting extreme boundaries
-        # (n > ~20 is an essentially discontinuous step function and leads to poor fits)
-        nmin = nmin.clamp_min(self._t(-nmax_hard_cap))
-        nmax = nmax.clamp_max(self._t( nmax_hard_cap))
         # ensure proper ordering just in case
         nmin = torch.minimum(nmin, nmax)
 
