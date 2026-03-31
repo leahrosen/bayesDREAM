@@ -409,7 +409,6 @@ class TransFitter:
         x_true_CV=None,
         x_ntc_mean=None,
         use_data_driven_priors=True,
-        use_lognormal_priors=True,
         use_epsilon=True,
     ):
 
@@ -886,28 +885,18 @@ class TransFitter:
                         # y_dose_response = torch.clamp(y_dose_response, min=epsilon_tensor, max=1.0 - epsilon_tensor)
 
                     else:
-                        # For negbinom/normal/studentt: use standard formulation with learned Vmax_a/Vmax_b
+                        # For negbinom/normal/studentt: log_K_a/b are always available
+                        # (log-normal prior is now the only path), so always use logK variant.
                         if function_type == 'single_hill':
-                            if use_lognormal_priors:
-                                Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
-                            else:
-                                Hilla = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, K=K_a, n=n_a, epsilon=epsilon_tensor)
+                            Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
                             y_dose_response = A + (alpha * Hilla)
                         elif function_type == 'additive_hill':
-                            if use_lognormal_priors:
-                                Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
-                                Hillb = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_b, A=0, logK=log_K_b, n=n_b)
-                            else:
-                                Hilla = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, K=K_a, n=n_a, epsilon=epsilon_tensor)
-                                Hillb = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_b, A=0, K=K_b, n=n_b, epsilon=epsilon_tensor)
+                            Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
+                            Hillb = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_b, A=0, logK=log_K_b, n=n_b)
                             y_dose_response = A + (alpha * Hilla) + (beta * Hillb)
                         elif function_type == 'nested_hill':
-                            if use_lognormal_priors:
-                                Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
-                                Hillb = Hill_based_positive_logK(Hilla, Vmax=Vmax_b, A=0, logK=log_K_b, n=n_b)
-                            else:
-                                Hilla = Hill_based_positive(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, K=K_a, n=n_a, epsilon=epsilon_tensor)
-                                Hillb = Hill_based_positive(Hilla, Vmax=Vmax_b, A=0, K=K_b, n=n_b, epsilon=epsilon_tensor)
+                            Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
+                            Hillb = Hill_based_positive_logK(Hilla, Vmax=Vmax_b, A=0, logK=log_K_b, n=n_b)
                             y_dose_response = A + (alpha * Hillb)
 
             elif function_type == 'polynomial':
@@ -1206,7 +1195,6 @@ class TransFitter:
         modality_name: str = None,
         min_denominator: int = None,
         use_data_driven_priors: bool = True,
-        use_lognormal_priors: bool = True,
         correct_priors_for_technical: bool = True,
         use_archive_prior_computation: bool = False,
         use_epsilon: bool = False,
@@ -1242,10 +1230,6 @@ class TransFitter:
             If True (default), use Beta priors for A and upper_limit based on data percentiles.
             If False, use uniform priors (Beta(1, 1)). Useful for testing if data-driven
             priors are too strong or causing issues. Default: True.
-        use_lognormal_priors : bool, optional
-            If True (default), use Log-Normal priors for Vmax and K.
-            If False, use direct Gamma priors (archive behavior).
-            Only affects negbinom/normal/studentt distributions.
         correct_priors_for_technical : bool, optional
             If True (default), correct data for technical effects before computing priors (Amean, Vmax_mean).
             If False (archive behavior), compute priors from raw sum_factor-normalized data.
@@ -2170,7 +2154,6 @@ class TransFitter:
                 x_true_CV=x_true_CV,
                 x_ntc_mean=x_ntc_mean,
                 use_data_driven_priors=use_data_driven_priors,
-                use_lognormal_priors=use_lognormal_priors,
                 use_epsilon=use_epsilon,
             )
             # OneCycleLR for polynomial only
@@ -2321,7 +2304,6 @@ class TransFitter:
                 x_true_CV=x_true_CV,
                 x_ntc_mean=x_ntc_mean,
                 use_data_driven_priors=use_data_driven_priors,
-                use_lognormal_priors=use_lognormal_priors,
                 use_epsilon=use_epsilon,
             )
             '''
@@ -2353,7 +2335,6 @@ class TransFitter:
                     mean_within_guide_var=mean_within_guide_var,
                     x_true_CV=x_true_CV,
                     use_data_driven_priors=use_data_driven_priors,
-                    use_lognormal_priors=use_lognormal_priors,
                     use_epsilon=use_epsilon,
                 )
             except FloatingPointError as e:
@@ -2430,7 +2411,6 @@ class TransFitter:
                 "mean_within_guide_var": self._to_cpu(mean_within_guide_var) if mean_within_guide_var is not None else None,
                 "x_true_CV": self._to_cpu(x_true_CV) if x_true_CV is not None else None,
                 "use_data_driven_priors": use_data_driven_priors,
-                "use_lognormal_priors": use_lognormal_priors,
                 "use_epsilon": use_epsilon,
             }
         else:
@@ -2471,7 +2451,6 @@ class TransFitter:
                 "mean_within_guide_var": mean_within_guide_var,
                 "x_true_CV": x_true_CV,
                 "use_data_driven_priors": use_data_driven_priors,
-                "use_lognormal_priors": use_lognormal_priors,
                 "use_epsilon": use_epsilon,
             }
 
