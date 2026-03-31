@@ -489,6 +489,8 @@ def plot_parameter_ci_panel(
     show_gene_separators: bool = True,
     ax=None,
     show: bool = True,
+    fdr_df=None,
+    fdr_threshold: float = 0.05,
 ):
     """
     Forest plot (dot + whisker CI) for posterior parameters across trans genes.
@@ -550,6 +552,14 @@ def plot_parameter_ci_panel(
         Axes to plot on. If None, creates new figure.
     show : bool
         Whether to display the plot (default: True)
+    fdr_df : pd.DataFrame, optional
+        trans_summary DataFrame (output of save_trans_summary). When provided,
+        parameters belonging to FDR-inactive components (fdr_alpha or fdr_beta
+        >= fdr_threshold) are rendered in light grey instead of their normal
+        color. Component mapping: alpha/n_a/K_a/Vmax_a → fdr_alpha;
+        beta/n_b/K_b/Vmax_b → fdr_beta.
+    fdr_threshold : float
+        FDR threshold for inactivity (default: 0.05). Used with fdr_df.
 
     Returns
     -------
@@ -636,6 +646,25 @@ def plot_parameter_ci_panel(
     # Ensure gene_names matches T
     if len(gene_names) != T:
         gene_names = gene_names[:T]
+
+    # Build per-param FDR inactive masks from fdr_df (if provided)
+    _PARAM_TO_FDR_COL = {
+        'alpha': 'fdr_alpha', 'n_a': 'fdr_alpha', 'K_a': 'fdr_alpha', 'Vmax_a': 'fdr_alpha',
+        'beta':  'fdr_beta',  'n_b': 'fdr_beta',  'K_b': 'fdr_beta',  'Vmax_b': 'fdr_beta',
+    }
+    inactive_masks = {}  # {param: bool array of length T}
+    if fdr_df is not None:
+        _gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+        _name_col = next((c for c in ['gene_name', 'gene', 'feature'] if c in fdr_df.columns), None)
+        for param in params:
+            fdr_col = _PARAM_TO_FDR_COL.get(param)
+            if fdr_col and fdr_col in fdr_df.columns and _name_col:
+                mask = np.zeros(T, dtype=bool)
+                for _, row in fdr_df.iterrows():
+                    gname = row[_name_col]
+                    if gname in _gene_to_idx and np.isfinite(row[fdr_col]):
+                        mask[_gene_to_idx[gname]] = row[fdr_col] >= fdr_threshold
+                inactive_masks[param] = mask
 
     # Compute CI bounds
     lo_q = (100 - ci_level) / 2.0
@@ -768,13 +797,32 @@ def plot_parameter_ci_panel(
         x = x_base + offsets[j]
         color = color_palette.get(param, 'blue')
 
-        # Plot median points
-        ax.scatter(x, medians, label=param, s=marker_size, zorder=3, color=color)
+        # Determine FDR inactive subset (greyed out)
+        raw_inactive = inactive_masks.get(param)
+        inactive_plot = raw_inactive[gene_indices] if raw_inactive is not None else np.zeros(len(gene_indices), dtype=bool)
+        active_plot = ~inactive_plot
 
-        # Plot error bars
-        yerr = np.vstack([medians - los, his - medians])
-        ax.errorbar(x, medians, yerr=yerr, fmt="none",
-                    elinewidth=1.5, capsize=capsize, color=color, zorder=2)
+        # Plot active genes with full color
+        if active_plot.any():
+            ax.scatter(x[active_plot], medians[active_plot], label=param,
+                       s=marker_size, zorder=3, color=color)
+            yerr_act = np.vstack([medians[active_plot] - los[active_plot],
+                                   his[active_plot] - medians[active_plot]])
+            ax.errorbar(x[active_plot], medians[active_plot], yerr=yerr_act,
+                        fmt='none', elinewidth=1.5, capsize=capsize, color=color, zorder=2)
+        else:
+            # No active genes — add phantom entry for legend
+            ax.scatter([], [], label=param, s=marker_size, color=color)
+
+        # Plot inactive genes greyed out
+        if inactive_plot.any():
+            ax.scatter(x[inactive_plot], medians[inactive_plot],
+                       s=marker_size, zorder=3, color='lightgray', alpha=0.5)
+            yerr_inact = np.vstack([medians[inactive_plot] - los[inactive_plot],
+                                     his[inactive_plot] - medians[inactive_plot]])
+            ax.errorbar(x[inactive_plot], medians[inactive_plot], yerr=yerr_inact,
+                        fmt='none', elinewidth=1.5, capsize=capsize,
+                        color='lightgray', alpha=0.5, zorder=2)
 
     # Styling
     if title is None:

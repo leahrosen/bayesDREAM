@@ -2490,6 +2490,46 @@ def predict_trans_function(
         return None
 
 
+def predict_hill_from_summary_row(row, x_range: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Compute a Hill curve from a trans_summary DataFrame row.
+
+    Supports both additive_hill (has Vmax_b_mean) and single_hill rows.
+    Parameters are read from columns named A_mean, alpha_mean, Vmax_a_mean,
+    K_a_mean, n_a_mean, beta_mean, Vmax_b_mean, K_b_mean, n_b_mean.
+
+    Returns y values at x_range, or None if required columns are missing.
+    """
+    def _g(col, default=None):
+        v = row.get(col, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        return v if np.isfinite(v) else default
+
+    A       = _g('A_mean', 0.0)
+    alpha   = _g('alpha_mean', 1.0)
+    Vmax_a  = _g('Vmax_a_mean')
+    K_a     = _g('K_a_mean')
+    n_a     = _g('n_a_mean')
+    if Vmax_a is None or K_a is None or n_a is None:
+        return None
+
+    Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
+    y_pred = A + alpha * Hill_a
+
+    beta   = _g('beta_mean', 0.0)
+    Vmax_b = _g('Vmax_b_mean')
+    K_b    = _g('K_b_mean')
+    n_b    = _g('n_b_mean')
+    if Vmax_b is not None and K_b is not None and n_b is not None and beta != 0.0:
+        Hill_b = Hill_based_positive(x_range, Vmax=Vmax_b, A=0, K=K_b, n=n_b)
+        y_pred = y_pred + beta * Hill_b
+
+    return y_pred
+
+
 def predict_trans_function_samples(
     model,
     feature: str,
@@ -2918,7 +2958,8 @@ def _extract_hill_param_samples(posterior, feature_idx):
             if _get(k) is not None}
 
 
-def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=True, y_scale=1.0):
+def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=True, y_scale=1.0,
+                          fdr_df=None, fdr_threshold=0.05):
     """
     Compute meaningful parameter markers for single_hill and additive_hill trans functions.
 
@@ -3027,8 +3068,21 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
 
     n_a_lo, n_a_hi = pci('n_a')
     n_b_lo, n_b_hi = pci('n_b')
-    a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
-    b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
+
+    # Prefer FDR-based null classification; fall back to CI criterion
+    _fdr_row = None
+    if fdr_df is not None:
+        _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
+        if _name_col:
+            _match = fdr_df[fdr_df[_name_col] == feature]
+            if not _match.empty:
+                _fdr_row = _match.iloc[0]
+    if _fdr_row is not None:
+        a_null = float(_fdr_row.get('fdr_alpha', 1.0)) >= fdr_threshold
+        b_null = float(_fdr_row.get('fdr_beta',  1.0)) >= fdr_threshold
+    else:
+        a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
+        b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
 
     if a_null or b_null:
         # ── Effectively single Hill ────────────────────────────────────────
@@ -3191,6 +3245,9 @@ def plot_negbinom_xy(
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
     log2fc: bool = False,
+    reference_df=None,
+    fdr_df=None,
+    fdr_threshold: float = 0.05,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3466,9 +3523,37 @@ def plot_negbinom_xy(
             if mark_params and (corrected or not has_technical_fit):
                 _markers = _compute_hill_markers(
                     model, feature, modality,
-                    ci_level=ci_level, log2_space=True, y_scale=1.0
+                    ci_level=ci_level, log2_space=True, y_scale=1.0,
+                    fdr_df=fdr_df, fdr_threshold=fdr_threshold,
                 )
                 _draw_hill_markers(ax_plot, _markers)
+
+            # Reference curve overlay (from trans_summary DataFrame)
+            if reference_df is not None and (corrected or not has_technical_fit):
+                _name_col = next((c for c in ['gene_name', 'gene'] if c in reference_df.columns), None)
+                if _name_col:
+                    _ref_match = reference_df[reference_df[_name_col] == feature]
+                    if not _ref_match.empty:
+                        _ref_row = _ref_match.iloc[0]
+                        _x_ref = x_range if 'x_range' in dir() else (
+                            2 ** np.linspace(np.log2(max(x_true.min(), 1e-6)),
+                                             np.log2(x_true.max()), 2000))
+                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref)
+                        if _y_ref is not None:
+                            _valid_ref = _y_ref > 0
+                            if _valid_ref.any():
+                                ax_plot.plot(
+                                    np.log2(_x_ref[_valid_ref]) - x_offset,
+                                    np.log2(_y_ref[_valid_ref]) - y_offset,
+                                    color='red', linestyle='--', linewidth=2,
+                                    alpha=0.8, label='Reference Function')
+                        # Reference mark_params
+                        if mark_params:
+                            _ref_A = float(_ref_row.get('A_mean', 0.0) or 0.0)
+                            if _ref_A > 0:
+                                ax_plot.axhline(np.log2(_ref_A) - y_offset,
+                                                color='red', linestyle=':', linewidth=1.5,
+                                                alpha=0.6, label='Reference log2(A)')
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
         ax_plot.set_ylabel("log2FC(Expression)" if log2fc else "log2(Expression)")
@@ -4689,6 +4774,9 @@ def plot_xy_data(
     legend_outside: bool = False,
     filename: Optional[str] = None,
     log2fc: bool = False,
+    reference_df=None,
+    fdr_df=None,
+    fdr_threshold: float = 0.05,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -4787,6 +4875,22 @@ def plot_xy_data(
         Figure size as ``(width, height)`` in inches.  When None (default) the
         size is chosen automatically: 6 inches per column × 3 inches per row
         for multi-panel plots, or (8, 5) / (14, 5) for single-panel plots.
+    reference_df : pd.DataFrame, optional
+        A ``trans_summary`` DataFrame whose rows contain fitted Hill parameters
+        (columns ending in ``_mean``, e.g. ``A_mean``, ``Vmax_a_mean``, etc.).
+        When provided, a reference Hill curve is overlaid in red dashed on each
+        negbinom panel.  The feature name is matched via a ``gene_name`` or
+        ``gene`` column.  Only applied to negbinom modalities.
+    fdr_df : pd.DataFrame, optional
+        A ``trans_summary`` DataFrame with ``fdr_alpha`` and ``fdr_beta`` columns
+        (e.g. the output of ``save_trans_summary``).  Used for two purposes:
+        (1) greying out FDR-inactive parameter markers in ``mark_params`` mode,
+        (2) classifying the Hill regime for ``_compute_hill_markers``.
+        Feature names are matched via a ``gene_name`` or ``gene`` column.
+    fdr_threshold : float
+        FDR threshold for classifying components as active (default: 0.05).
+        Components with ``fdr_alpha`` or ``fdr_beta`` >= this threshold are
+        treated as inactive.  Only used when ``fdr_df`` is provided.
     **kwargs
         Additional plotting arguments
 
@@ -5054,7 +5158,8 @@ def plot_xy_data(
                     show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
                     min_counts=min_counts, xlabel=xlabel, ax=ax,
                     subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
-                    log2fc=log2fc,
+                    log2fc=log2fc, reference_df=reference_df,
+                    fdr_df=fdr_df, fdr_threshold=fdr_threshold,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -5120,6 +5225,9 @@ def plot_xy_data(
             legend_outside=legend_outside,
             figsize=figsize,
             log2fc=log2fc,
+            reference_df=reference_df,
+            fdr_df=fdr_df,
+            fdr_threshold=fdr_threshold,
             **kwargs
         )
 
