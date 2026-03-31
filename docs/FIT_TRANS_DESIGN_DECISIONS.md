@@ -29,35 +29,23 @@ where `Hill(x; Vmax, K, n) = Vmax * x^n / (K^n + x^n)` and `n` can be positive (
 
 ## 1. K Prior: Distribution Family
 
-**Current default**: LogNormal (`use_lognormal_priors=True`)
-**Alternative**: Gamma (`use_lognormal_priors=False`)
+**Current**: LogNormal (only option — Gamma path removed)
 
 ### History
 
 | Commit | Date | Change |
 |--------|------|--------|
 | (pre-repo, ~Oct–Nov 2025) | ~Oct–Nov 2025 | LogNormal introduced for binomial/multinomial; later unified to all distributions |
-| `754f4ab` | 2026-01-22 | Reverted negbinom/normal/studentt K and Vmax to **Gamma** (`use_lognormal_priors=False` as default) after observing two-component overfitting and convergence gap |
-| `9884956` | 2026-01-23 | Restored **LogNormal as default** after identifying the real cause of the overfitting as a bug in x_true point-estimate handling (`c5b1024`, 2025-12-17) rather than the prior choice |
+| `754f4ab` | 2026-01-22 | Reverted negbinom/normal/studentt K and Vmax to **Gamma** after observing two-component overfitting |
+| `9884956` | 2026-01-23 | Restored **LogNormal as default** after identifying the real cause of overfitting as an x_true bug |
+| `b966bfd` | 2026-03-31 | Removed `use_lognormal_priors` parameter; LogNormal is now the only path |
 
 ### Reasoning for LogNormal
 
 - **Unified code**: same parameterization for all distributions (binomial, multinomial, negbinom, normal)
-- **AutoNormal guide compatibility**: `log_K` lives on the real line → Normal variational distribution is well-suited; Gamma requires a constrained-to-positive parameterization
+- **AutoNormal guide compatibility**: `log_K` lives on the real line → Normal variational distribution is well-suited
 - **Numerical stability**: working in log-space avoids near-zero K values causing gradient explosions
 - **Natural positivity**: K > 0 is guaranteed by the exp transform without explicit clamping
-
-### Pros/Cons
-
-| | LogNormal (current default) | Gamma |
-|--|--|--|
-| **Parameterization** | log_K ~ Normal → natural for AutoNormal guide | Gamma ~ direct, matched to archive |
-| **Tail behaviour** | Heavier right tail → more exploration of large K | Lighter tail → more conservative |
-| **Convergence** | Slightly slower (when it was the *only* change before x_true bug was fixed) | Slightly faster in archive comparison |
-| **Sparsity enforcement** | Good; recovered after x_true bug fix | Good |
-| **Code unification** | Yes (same for all distributions) | No (separate path for negbinom/normal) |
-
-**Current status**: LogNormal is the default and the intended long-term choice. The `use_lognormal_priors=False` option is retained for comparison / regression testing against the archive.
 
 ---
 
@@ -103,25 +91,28 @@ When `x_true_CV` is large (≥ 0.7, typical for full CRISPR data with both KO an
 
 ---
 
-## 3. Vmax Prior: Distribution Family
+## 3. Vmax Prior: Distribution Family and Width
 
-**Current default**: LogNormal (`use_lognormal_priors=True`)
-**Vmax_log_sigma** is computed from within-guide variance (raw, not CV):
+**Current**: LogNormal with a minimum log_sigma floor of **1.0** (negbinom/normal/studentt):
 ```python
-Vmax_std_prior = sqrt(mean_within_guide_var)
-ratio_Vmax     = Vmax_std_prior / Vmax_mean_prior
-Vmax_log_sigma = sqrt(log1p(ratio_Vmax^2))
+Vmax_sigma     = Vmax_prior_mean / sqrt(Vmax_alpha)
+Vmax_log_sigma = max(sqrt(log1p((Vmax_sigma / Vmax_prior_mean)^2)), 1.0)
+Vmax_log_mu    = log(Vmax_prior_mean) - 0.5 * Vmax_log_sigma^2
 ```
 
-### Why Raw Variance (Not CV) for Vmax
+The floor of 1.0 means the 95% CI upper bound is ≈ **4.3× Vmax_mean**, regardless of the data-driven spread. This is necessary because for one-sided subsets (CRISPRa-only or CRISPRi-only), `Vmax_mean` underestimates the true dynamic range and a tight prior would prevent the posterior from moving to the true value.
 
-- Vmax is an *absolute* amplitude (expression units), not a relative quantity
-- Using raw variance preserves scale information needed to constrain the response magnitude
-- Contrast with K (a *position* on the x-axis), where scale-invariance is desirable
+For **binomial/multinomial**, `Vmax_a ~ Beta(Vmax_mean × 2, (1 − Vmax_mean) × 2)` — concentration=2 gives CV ≈ 0.6–1.0, replacing the previous concentration=10.
 
 ### History
 
-Same as K prior history — LogNormal was introduced ~Oct–Nov 2025, reverted Jan 22, restored Jan 23. See §1.
+| Commit | Date | Change |
+|--------|------|--------|
+| ~Oct–Nov 2025 | | LogNormal introduced alongside K |
+| `754f4ab` | 2026-01-22 | Reverted to Gamma |
+| `9884956` | 2026-01-23 | Restored LogNormal as default |
+| `b966bfd` | 2026-03-31 | Removed Gamma path; LogNormal is now the only option |
+| `05b0375` | 2026-03-31 | Added log_sigma floor=1.0; lowered binomial/multinomial concentration 10→2 |
 
 ---
 
@@ -331,7 +322,7 @@ All fitting (technical, cis, trans) uses `pyro.infer.autoguide.AutoNormalMesseng
 
 ### logK Parameterisation for Hill Function
 
-For negbinom/normal when `use_lognormal_priors=True`, the Hill function is evaluated as:
+For negbinom/normal/studentt, the Hill function is evaluated as:
 ```python
 Hill_based_positive_logK(x, Vmax, A=0, logK, n)
 ```
@@ -412,7 +403,9 @@ Smoothing out is a better failure mode than the alternative (K drifting to impla
 
 | Parameter | Default | Archive | Rationale for difference |
 |--|--|--|--|
-| `use_lognormal_priors` | `True` | `False` (Gamma) | Unified parameterisation, better guide compatibility |
+| Vmax/K prior family | LogNormal (only) | Gamma | LogNormal removed Gamma path entirely (b966bfd) |
+| Vmax log_sigma floor | 1.0 | none | Allows posterior to explore 4× above data-driven estimate |
+| Beta concentration (bin/multi) | 2 | 10 | More diffuse; allows one-sided subsets to fit properly |
 | `use_data_driven_priors` | `True` | `True` (implicit) | Both use guide means; percentiles vs min/max differ |
 | `use_archive_prior_computation` | `False` | `True` | Percentile method more robust |
 | `correct_priors_for_technical` | `True` | `False` | Priors in biological space (not batch-confounded) |
@@ -423,11 +416,10 @@ Smoothing out is a better failure mode than the alternative (K drifting to impla
 | `K_alpha` | `2` | `2` | Unchanged |
 | `warmup_steps` | `0` | N/A | New; default preserves original behaviour |
 
-To exactly replicate archive behaviour:
+To approximately replicate archive behaviour (note: Gamma path no longer available):
 ```python
 model.fit_trans(
     ...,
-    use_lognormal_priors=False,
     correct_priors_for_technical=False,
     use_archive_prior_computation=True,
     use_epsilon=False,

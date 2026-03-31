@@ -606,7 +606,6 @@ model.fit_trans(
     modality_name=None,
     min_denominator=None,
     use_data_driven_priors=True,
-    use_lognormal_priors=True,
     correct_priors_for_technical=True,
     use_archive_prior_computation=False,
     use_epsilon=False
@@ -652,7 +651,6 @@ Fit trans model to estimate downstream effects as a function of cis expression.
   - Observations with denominator < min_denominator are masked (excluded)
   - Useful for filtering low-coverage splicing junctions
 - `use_data_driven_priors` (bool): Use data-driven Beta/Dirichlet priors. Default: True
-- `use_lognormal_priors` (bool): Use Log-Normal priors for Vmax/K. Default: True
 - `correct_priors_for_technical` (bool): Correct data for technical effects before computing priors. Default: True
 - `use_archive_prior_computation` (bool): Use archive method for Amean/Vmax_mean. Default: False
 - `use_epsilon` (bool): Add epsilon for numerical stability in NegativeBinomial. Default: False
