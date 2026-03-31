@@ -15,7 +15,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bayesDREAM import bayesDREAM
+# Guard: bayesDREAM transitively imports torch, which may not be available in
+# every environment (e.g. wrong GLIBCXX). Skip collection gracefully.
+bayesDREAM = pytest.importorskip(
+    "bayesDREAM",
+    reason="bayesDREAM or its torch dependency not available",
+    exc_type=ImportError,
+).bayesDREAM
 
 
 def _make_quick_test_data(n_cells: int = 50, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:

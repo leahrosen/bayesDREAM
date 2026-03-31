@@ -1,133 +1,105 @@
-"""
-Test the new exon skipping aggregation functionality.
-"""
+"""Test exon skipping aggregation functionality."""
+
+import unittest
 import numpy as np
 import pandas as pd
-from bayesDREAM import Modality
 
-print("=" * 60)
-print("Test 1: Create exon skipping modality with inc1/inc2/skip")
-print("=" * 60)
 
-n_events = 5
-n_cells = 10
+def _make_exon_skip_data(n_events=5, n_cells=10, seed=42):
+    np.random.seed(seed)
+    inc1 = np.random.poisson(10, (n_events, n_cells)).astype(float)
+    inc2 = np.random.poisson(12, (n_events, n_cells)).astype(float)
+    skip = np.random.poisson(8, (n_events, n_cells)).astype(float)
+    feature_meta = pd.DataFrame({
+        'trip_id': range(n_events),
+        'chrom': ['chr1'] * n_events,
+        'strand': ['+'] * n_events,
+    })
+    return inc1, inc2, skip, feature_meta
 
-# Create synthetic data
-np.random.seed(42)
-inc1 = np.random.poisson(10, (n_events, n_cells)).astype(float)
-inc2 = np.random.poisson(12, (n_events, n_cells)).astype(float)
-skip = np.random.poisson(8, (n_events, n_cells)).astype(float)
 
-# Compute inclusion with min method
-inclusion_min = np.minimum(inc1, inc2)
-total_min = inclusion_min + skip
+class TestExonSkipAggregation(unittest.TestCase):
+    """Test Modality with exon skipping inc1/inc2/skip arrays."""
 
-# Create feature metadata
-feature_meta = pd.DataFrame({
-    'trip_id': range(n_events),
-    'chrom': ['chr1'] * n_events,
-    'strand': ['+'] * n_events
-})
+    @classmethod
+    def setUpClass(cls):
+        from bayesDREAM import Modality
+        cls.Modality = Modality
+        cls.inc1, cls.inc2, cls.skip, cls.feature_meta = _make_exon_skip_data()
+        cls.inclusion_min = np.minimum(cls.inc1, cls.inc2)
+        cls.total_min = cls.inclusion_min + cls.skip
 
-# Create modality with min aggregation
-modality = Modality(
-    name='exon_skip_test',
-    counts=inclusion_min,
-    feature_meta=feature_meta,
-    distribution='binomial',
-    denominator=total_min,
-    inc1=inc1,
-    inc2=inc2,
-    skip=skip,
-    exon_aggregate_method='min'
-)
+    def _make_modality(self, method='min'):
+        return self.Modality(
+            name='exon_skip_test',
+            counts=self.inclusion_min.copy(),
+            feature_meta=self.feature_meta,
+            distribution='binomial',
+            denominator=self.total_min.copy(),
+            inc1=self.inc1,
+            inc2=self.inc2,
+            skip=self.skip,
+            exon_aggregate_method=method,
+        )
 
-print(f"✓ Created modality: {modality}")
-print(f"✓ Is exon skipping: {modality.is_exon_skipping()}")
-print(f"✓ Aggregation method: {modality.exon_aggregate_method}")
-print(f"✓ Inc1 shape: {modality.inc1.shape}")
-print(f"✓ Inc2 shape: {modality.inc2.shape}")
-print(f"✓ Skip shape: {modality.skip.shape}")
+    def test_create_with_min_aggregation(self):
+        mod = self._make_modality('min')
+        self.assertTrue(mod.is_exon_skipping())
+        self.assertEqual(mod.exon_aggregate_method, 'min')
+        self.assertEqual(mod.inc1.shape, self.inc1.shape)
+        self.assertEqual(mod.inc2.shape, self.inc2.shape)
+        self.assertEqual(mod.skip.shape, self.skip.shape)
 
-print("\n" + "=" * 60)
-print("Test 2: Change aggregation method from 'min' to 'mean'")
-print("=" * 60)
+    def test_change_aggregation_to_mean(self):
+        mod = self._make_modality('min')
+        old_counts = mod.counts.copy()
+        mod.set_exon_aggregate_method('mean')
+        self.assertEqual(mod.exon_aggregate_method, 'mean')
+        # Counts should have changed
+        self.assertFalse(np.allclose(old_counts, mod.counts))
+        expected_inclusion_mean = (self.inc1 + self.inc2) / 2.0
+        expected_total_mean = expected_inclusion_mean + self.skip
+        np.testing.assert_allclose(mod.counts, expected_inclusion_mean)
+        np.testing.assert_allclose(mod.denominator, expected_total_mean)
 
-old_counts = modality.counts.copy()
-modality.set_exon_aggregate_method('mean')
+    def test_change_blocked_after_technical_fit(self):
+        mod = self._make_modality('mean')
+        mod.mark_technical_fit_complete()
+        with self.assertRaises(ValueError):
+            mod.set_exon_aggregate_method('min')
 
-print(f"✓ New aggregation method: {modality.exon_aggregate_method}")
-print(f"✓ Counts changed: {not np.allclose(old_counts, modality.counts)}")
+    def test_override_after_technical_fit(self):
+        mod = self._make_modality('mean')
+        mod.mark_technical_fit_complete()
+        mod.set_exon_aggregate_method('min', allow_after_technical_fit=True)
+        self.assertEqual(mod.exon_aggregate_method, 'min')
+        expected_inclusion_min = np.minimum(self.inc1, self.inc2)
+        np.testing.assert_allclose(mod.counts, expected_inclusion_min)
 
-# Manually verify the mean calculation
-expected_inclusion_mean = (inc1 + inc2) / 2.0
-expected_total_mean = expected_inclusion_mean + skip
-print(f"✓ Inclusion matches expected: {np.allclose(modality.counts, expected_inclusion_mean)}")
-print(f"✓ Total matches expected: {np.allclose(modality.denominator, expected_total_mean)}")
+    def test_feature_subset_preserves_exon_data(self):
+        mod = self._make_modality('min')
+        subset = mod.get_feature_subset([0, 1, 2])
+        self.assertTrue(subset.is_exon_skipping())
+        self.assertEqual(subset.inc1.shape[0], 3)
+        self.assertEqual(subset.exon_aggregate_method, mod.exon_aggregate_method)
 
-print("\n" + "=" * 60)
-print("Test 3: Mark technical fit complete and try to change method")
-print("=" * 60)
+    def test_cell_subset_preserves_exon_data(self):
+        mod = self._make_modality('min')
+        subset = mod.get_cell_subset([0, 1, 2, 3, 4])
+        self.assertEqual(subset.inc1.shape[1], 5)
 
-modality.mark_technical_fit_complete()
-print(f"✓ Technical fit marked complete with method: {modality._technical_fit_aggregate_method}")
+    def test_regular_binomial_not_exon_skipping(self):
+        mod = self.Modality(
+            name='regular_binomial',
+            counts=self.inclusion_min.copy(),
+            feature_meta=self.feature_meta,
+            distribution='binomial',
+            denominator=self.total_min.copy(),
+        )
+        self.assertFalse(mod.is_exon_skipping())
+        with self.assertRaises(ValueError):
+            mod.set_exon_aggregate_method('mean')
 
-try:
-    modality.set_exon_aggregate_method('min')
-    print("✗ FAILED: Should have raised ValueError")
-except ValueError as e:
-    print(f"✓ Correctly prevented method change: {str(e)[:80]}...")
 
-print("\n" + "=" * 60)
-print("Test 4: Override with allow_after_technical_fit=True")
-print("=" * 60)
-
-modality.set_exon_aggregate_method('min', allow_after_technical_fit=True)
-print(f"✓ Changed to method: {modality.exon_aggregate_method}")
-
-# Verify it went back to min
-expected_inclusion_min = np.minimum(inc1, inc2)
-expected_total_min = expected_inclusion_min + skip
-print(f"✓ Inclusion matches min: {np.allclose(modality.counts, expected_inclusion_min)}")
-print(f"✓ Total matches min: {np.allclose(modality.denominator, expected_total_min)}")
-
-print("\n" + "=" * 60)
-print("Test 5: Subsetting preserves exon skipping data")
-print("=" * 60)
-
-# Subset to first 3 events
-subset = modality.get_feature_subset([0, 1, 2])
-print(f"✓ Subset created: {subset}")
-print(f"✓ Is exon skipping: {subset.is_exon_skipping()}")
-print(f"✓ Inc1 shape: {subset.inc1.shape}")
-print(f"✓ Aggregation method preserved: {subset.exon_aggregate_method}")
-
-# Subset to first 5 cells
-subset_cells = modality.get_cell_subset([0, 1, 2, 3, 4])
-print(f"✓ Cell subset created: {subset_cells}")
-print(f"✓ Inc1 shape: {subset_cells.inc1.shape}")
-
-print("\n" + "=" * 60)
-print("Test 6: Modality without exon skipping data")
-print("=" * 60)
-
-regular_mod = Modality(
-    name='regular_binomial',
-    counts=inclusion_min,
-    feature_meta=feature_meta,
-    distribution='binomial',
-    denominator=total_min
-)
-
-print(f"✓ Regular modality: {regular_mod}")
-print(f"✓ Is exon skipping: {regular_mod.is_exon_skipping()}")
-
-try:
-    regular_mod.set_exon_aggregate_method('mean')
-    print("✗ FAILED: Should have raised ValueError")
-except ValueError as e:
-    print(f"✓ Correctly rejected: {str(e)[:60]}...")
-
-print("\n" + "=" * 60)
-print("All tests passed!")
-print("=" * 60)
+if __name__ == '__main__':
+    unittest.main()

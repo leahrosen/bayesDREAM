@@ -1,110 +1,62 @@
-#!/usr/bin/env python
-"""
-Test script to verify all required dependencies can be imported.
-Run this after installing the conda environment to verify everything works.
-"""
+"""Test that all required dependencies can be imported."""
 
-import sys
+import unittest
 
-def test_imports():
-    """Test all required imports."""
-    errors = []
 
-    print("Testing core scientific computing packages...")
-    try:
-        import numpy as np
-        print(f"✓ numpy {np.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ numpy: {e}")
+class TestImports(unittest.TestCase):
+    """Verify all required packages are importable."""
 
-    try:
-        import scipy
-        print(f"✓ scipy {scipy.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ scipy: {e}")
+    def test_numpy(self):
+        import numpy  # noqa: F401
 
-    try:
-        import pandas as pd
-        print(f"✓ pandas {pd.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ pandas: {e}")
+    def test_scipy(self):
+        import scipy  # noqa: F401
 
-    try:
-        import sklearn
-        print(f"✓ scikit-learn {sklearn.__version__}")
-        from sklearn.preprocessing import SplineTransformer
-        from sklearn.linear_model import Ridge
-        from sklearn.pipeline import make_pipeline
-        print("  ✓ SplineTransformer, Ridge, make_pipeline")
-    except ImportError as e:
-        errors.append(f"✗ scikit-learn: {e}")
+    def test_pandas(self):
+        import pandas  # noqa: F401
 
-    print("\nTesting deep learning packages...")
-    try:
-        import torch
-        print(f"✓ torch {torch.__version__}")
-        print(f"  CUDA available: {torch.cuda.is_available()}")
-    except ImportError as e:
-        errors.append(f"✗ torch: {e}")
+    def test_scikit_learn(self):
+        import sklearn  # noqa: F401
+        from sklearn.preprocessing import SplineTransformer  # noqa: F401
+        from sklearn.linear_model import Ridge  # noqa: F401
+        from sklearn.pipeline import make_pipeline  # noqa: F401
 
-    try:
-        import pyro
-        print(f"✓ pyro-ppl {pyro.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ pyro-ppl: {e}")
+    def test_torch(self):
+        import torch  # noqa: F401
 
-    print("\nTesting visualization packages...")
-    try:
-        import matplotlib
-        print(f"✓ matplotlib {matplotlib.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ matplotlib: {e}")
+    def test_pyro(self):
+        import pyro  # noqa: F401
 
-    try:
-        import seaborn
-        print(f"✓ seaborn {seaborn.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ seaborn: {e}")
+    def test_matplotlib(self):
+        import matplotlib  # noqa: F401
 
-    print("\nTesting data I/O packages...")
-    try:
-        import h5py
-        print(f"✓ h5py {h5py.__version__}")
-    except ImportError as e:
-        errors.append(f"✗ h5py: {e}")
+    def test_seaborn(self):
+        import seaborn  # noqa: F401
 
-    print("\nTesting Jupyter packages (optional)...")
-    try:
-        import jupyterlab
-        print(f"✓ jupyterlab")
-    except ImportError as e:
-        print(f"  (optional) jupyterlab: {e}")
+    def test_h5py(self):
+        import h5py  # noqa: F401
 
-    try:
-        import ipywidgets
-        print(f"✓ ipywidgets {ipywidgets.__version__}")
-    except ImportError as e:
-        print(f"  (optional) ipywidgets: {e}")
+    def test_bayesdream_package(self):
+        from bayesDREAM import bayesDREAM, Modality  # noqa: F401
 
-    print("\nTesting bayesDREAM package...")
-    try:
-        from bayesDREAM import bayesDREAM, Modality
-        print("✓ bayesDREAM package")
-        print("  ✓ bayesDREAM class")
-        print("  ✓ Modality class")
-    except ImportError as e:
-        errors.append(f"✗ bayesDREAM: {e}")
+    def test_bayesdream_distribution_registry(self):
+        from bayesDREAM import (
+            get_observation_sampler,
+            requires_denominator,
+            is_3d_distribution,
+            DISTRIBUTION_REGISTRY,
+        )
+        self.assertIn('negbinom', DISTRIBUTION_REGISTRY)
+        self.assertIn('multinomial', DISTRIBUTION_REGISTRY)
+        self.assertIn('binomial', DISTRIBUTION_REGISTRY)
+        self.assertIn('normal', DISTRIBUTION_REGISTRY)
+        self.assertTrue(requires_denominator('binomial'))
+        self.assertFalse(requires_denominator('negbinom'))
+        self.assertTrue(is_3d_distribution('multinomial'))
+        self.assertFalse(is_3d_distribution('negbinom'))
+        sampler = get_observation_sampler('negbinom', 'trans')
+        self.assertTrue(callable(sampler))
 
-    # Print summary
-    print("\n" + "="*60)
-    if errors:
-        print("FAILED - The following imports failed:")
-        for error in errors:
-            print(f"  {error}")
-        return 1
-    else:
-        print("SUCCESS - All required packages can be imported!")
-        return 0
 
-if __name__ == "__main__":
-    sys.exit(test_imports())
+if __name__ == '__main__':
+    unittest.main()

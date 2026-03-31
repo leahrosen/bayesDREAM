@@ -1,85 +1,68 @@
-"""
-Test backward compatibility of fit_technical with negbinom distribution.
+"""Test backward compatibility of fit_technical with negbinom distribution."""
 
-This ensures the refactored code still works with the default negative binomial.
-"""
-
-import pandas as pd
+import unittest
 import numpy as np
-from bayesDREAM import bayesDREAM
+import pandas as pd
 
-print("Creating toy data...")
+import pytest
+pytestmark = pytest.mark.slow
 
-# Create minimal toy data
-np.random.seed(42)
-n_cells = 40
-n_genes = 15
 
-# Metadata - include both NTC and perturbed cells
-# IMPORTANT: All cell lines must have NTC cells for fit_technical
-meta = pd.DataFrame({
-    'cell': [f'cell_{i}' for i in range(n_cells)],
-    'guide': ['ntc'] * 20 + ['gRNA1'] * 20,
-    'target': ['ntc'] * 20 + ['GFI1B'] * 20,
-    'sum_factor': np.random.uniform(0.5, 1.5, n_cells),
-    'cell_line': ['K562'] * 10 + ['HEK293T'] * 10 + ['K562'] * 10 + ['HEK293T'] * 10
-})
-
-# Gene counts (including cis gene GFI1B)
-# Use higher counts to avoid numerical issues
-gene_names = ['GFI1B'] + [f'gene_{i}' for i in range(n_genes - 1)]
-counts = pd.DataFrame(
-    np.random.poisson(200, (n_genes, n_cells)),  # Higher counts for stability
-    index=gene_names,
-    columns=meta['cell']
-)
-
-print(f"  - Metadata: {n_cells} cells")
-print(f"  - Gene counts: {n_genes} genes × {n_cells} cells")
-print(f"  - Cell lines: {meta['cell_line'].unique()}")
-print(f"  - NTC cells: {(meta['target'] == 'ntc').sum()}")
-
-# Create model
-print("\nCreating bayesDREAM...")
-model = bayesDREAM(
-    meta=meta,
-    counts=counts,
-    cis_gene='GFI1B',
-    output_dir='./test_output',
-    label='technical_compat_test'
-)
-print(f"✓ Model created successfully")
-
-print("\nTesting fit_technical functionality...")
-try:
-    import torch
-
-    # Set up technical groups first (required)
-    print("  Setting up technical groups...")
-    model.set_technical_groups(['cell_line'])
-    print("  ✓ Technical groups set")
-
-    print("\n  Testing fit_technical with negbinom (short run)...")
-    model.fit_technical(
-        sum_factor_col='sum_factor',  # Required for negbinom
-        distribution='negbinom',  # Explicit
-        niters=50,  # Very short for testing
-        nsamples=10,  # Few samples for testing
-        lr=1e-2
+def _make_toy_data(n_cells=40, n_genes=15, seed=42):
+    np.random.seed(seed)
+    meta = pd.DataFrame({
+        'cell': [f'cell_{i}' for i in range(n_cells)],
+        'guide': ['ntc'] * 20 + ['gRNA1'] * 20,
+        'target': ['ntc'] * 20 + ['GFI1B'] * 20,
+        'sum_factor': np.random.uniform(0.5, 1.5, n_cells),
+        'cell_line': (['K562'] * 10 + ['HEK293T'] * 10) * 2,
+    })
+    gene_names = ['GFI1B'] + [f'gene_{i}' for i in range(n_genes - 1)]
+    counts = pd.DataFrame(
+        np.random.poisson(200, (n_genes, n_cells)),
+        index=gene_names,
+        columns=meta['cell'],
     )
-    print("  ✓ fit_technical completed successfully with negbinom")
+    return meta, counts
 
-    # Verify alpha_y_prefit was set in the modality
-    gene_modality = model.get_modality('gene')
-    assert hasattr(gene_modality, 'alpha_y_prefit'), "alpha_y_prefit not set in modality"
-    assert gene_modality.alpha_y_prefit is not None, "alpha_y_prefit is None"
-    print(f"  ✓ alpha_y_prefit shape: {gene_modality.alpha_y_prefit.shape}")
 
-except Exception as e:
-    print(f"✗ Test failed: {e}")
-    import traceback
-    traceback.print_exc()
+class TestTechnicalCompat(unittest.TestCase):
+    """Ensure fit_technical still works with negbinom (backward-compat check)."""
 
-print("\n" + "="*60)
-print("Technical fit backward compatibility test completed!")
-print("="*60)
+    @classmethod
+    def setUpClass(cls):
+        pytest.importorskip('torch')
+        pytest.importorskip('pyro')
+        from bayesDREAM import bayesDREAM
+        meta, counts = _make_toy_data()
+        cls.model = bayesDREAM(
+            meta=meta,
+            counts=counts,
+            cis_gene='GFI1B',
+            output_dir='./test_output',
+            label='technical_compat_test',
+        )
+        cls.model.set_technical_groups(['cell_line'])
+
+    def test_fit_technical_negbinom_runs(self):
+        self.model.fit_technical(
+            sum_factor_col='sum_factor',
+            distribution='negbinom',
+            niters=50,
+            nsamples=10,
+            lr=1e-2,
+        )
+
+    def test_alpha_y_prefit_set_in_modality(self):
+        gene_modality = self.model.get_modality('gene')
+        self.assertTrue(hasattr(gene_modality, 'alpha_y_prefit'))
+        self.assertIsNotNone(gene_modality.alpha_y_prefit)
+
+    def test_alpha_y_prefit_correct_shape(self):
+        gene_modality = self.model.get_modality('gene')
+        # Shape should be (n_samples, n_groups, n_genes)
+        self.assertEqual(len(gene_modality.alpha_y_prefit.shape), 3)
+
+
+if __name__ == '__main__':
+    unittest.main()

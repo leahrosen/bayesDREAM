@@ -1161,8 +1161,9 @@ class ModelSummarizer:
         guides = guide_meta.index.tolist()
 
         # Aggregate x_true from cell-level to guide-level (mean over cells per guide)
+        # Use positional indices (iloc) because meta.index may be cell-name strings
         guide_to_cell_indices = {
-            g: self.model.meta.index[self.model.meta['guide'] == g].tolist()
+            g: np.where(self.model.meta['guide'].values == g)[0].tolist()
             for g in guides
         }
 
@@ -2090,8 +2091,12 @@ class ModelSummarizer:
             alpha_mean = _broadcast_to_features(alpha_mean, n_features)
             alpha_lower = _broadcast_to_features(alpha_lower, n_features)
             alpha_upper = _broadcast_to_features(alpha_upper, n_features)
-            if alpha_full.ndim == 1 or alpha_full.shape[-1] == 1:
-                alpha_full = np.broadcast_to(alpha_full.reshape(-1, 1), (alpha_full.shape[0] if alpha_full.ndim > 1 else 1, n_features)).copy()
+            if alpha_full.ndim == 1:
+                # (n_features,) point estimate → (1, n_features)
+                alpha_full = alpha_full[np.newaxis, :]
+            elif alpha_full.shape[-1] == 1:
+                # (n_samples, 1) scalar → (n_samples, n_features)
+                alpha_full = np.broadcast_to(alpha_full, (alpha_full.shape[0], n_features)).copy()
         else:
             alpha_mean = np.ones(n_features)
             alpha_lower = np.ones(n_features)
@@ -2105,8 +2110,12 @@ class ModelSummarizer:
             beta_mean = _broadcast_to_features(beta_mean, n_features)
             beta_lower = _broadcast_to_features(beta_lower, n_features)
             beta_upper = _broadcast_to_features(beta_upper, n_features)
-            if beta_full.ndim == 1 or beta_full.shape[-1] == 1:
-                beta_full = np.broadcast_to(beta_full.reshape(-1, 1), (beta_full.shape[0] if beta_full.ndim > 1 else 1, n_features)).copy()
+            if beta_full.ndim == 1:
+                # (n_features,) point estimate → (1, n_features)
+                beta_full = beta_full[np.newaxis, :]
+            elif beta_full.shape[-1] == 1:
+                # (n_samples, 1) scalar → (n_samples, n_features)
+                beta_full = np.broadcast_to(beta_full, (beta_full.shape[0], n_features)).copy()
         else:
             beta_mean = np.ones(n_features)
             beta_lower = np.ones(n_features)
@@ -2518,9 +2527,12 @@ class ModelSummarizer:
                 else:
                     vals = []
                     for s in range(n_samples):
-                        alpha_s = float(alpha_full[s, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
-                        beta_s  = float(beta_full[s, i])  if beta_full.ndim > 1 else float(beta_full[i])
-                        A_s     = float(A_full[s, i])     if A_full.ndim > 1 else float(A_full[i])
+                        sa = s % alpha_full.shape[0] if alpha_full.ndim > 1 else None
+                        sb = s % beta_full.shape[0]  if beta_full.ndim > 1 else None
+                        sA = s % A_full.shape[0]     if A_full.ndim > 1 else None
+                        alpha_s = float(alpha_full[sa, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
+                        beta_s  = float(beta_full[sb, i])  if beta_full.ndim > 1 else float(beta_full[i])
+                        A_s     = float(A_full[sA, i])     if A_full.ndim > 1 else float(A_full[i])
 
                         Vmax_a_s = float(Vmax_a_full[s, i])
                         Vmax_b_s = float(Vmax_b_full[s, i])
@@ -2582,9 +2594,12 @@ class ModelSummarizer:
                     full_log2fc_upper_list.append(0.0)
                 else:
                     for s in range(n_samples):
-                        alpha_s = float(alpha_full[s, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
-                        beta_s  = float(beta_full[s, i])  if beta_full.ndim > 1 else float(beta_full[i])
-                        A_s     = float(A_full[s, i])     if A_full.ndim > 1 else float(A_full[i])
+                        sa = s % alpha_full.shape[0] if alpha_full.ndim > 1 else None
+                        sb = s % beta_full.shape[0]  if beta_full.ndim > 1 else None
+                        sA = s % A_full.shape[0]     if A_full.ndim > 1 else None
+                        alpha_s = float(alpha_full[sa, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
+                        beta_s  = float(beta_full[sb, i])  if beta_full.ndim > 1 else float(beta_full[i])
+                        A_s     = float(A_full[sA, i])     if A_full.ndim > 1 else float(A_full[i])
 
                         Vmax_a_s = float(Vmax_a_full[s, i])
                         Vmax_b_s = float(Vmax_b_full[s, i])

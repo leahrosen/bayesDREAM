@@ -135,6 +135,7 @@ def test_cli_run_local(tmp_path: Path):
     """Run full pipeline through local CLI entrypoint."""
     pytest.importorskip("torch")
     pytest.importorskip("pyro")
+    pytest.importorskip("typer")
 
     config_path, run_out = _write_cli_fixture(tmp_path, label="local_cli")
 
