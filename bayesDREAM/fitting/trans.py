@@ -676,7 +676,11 @@ class TransFitter:
                     # This gives Vmax_a direct gradient signal, not mediated through alpha
                     # Avoids chicken-and-egg: alpha needs signal → signal needs Vmax → Vmax needs alpha
                     Vmax_mean_clamped = Vmax_mean_tensor.clamp(min=0.01, max=0.99)
-                    concentration_vmax = self._t(10.0)
+                    # concentration=2 gives CV ≈ 0.6-1.0 depending on the mean —
+                    # much more diffuse than the previous 10, allowing the posterior
+                    # to explore Vmax values well above the data-driven estimate when
+                    # only part of the dose-response range is observed.
+                    concentration_vmax = self._t(2.0)
                     alpha_vmax = Vmax_mean_clamped * concentration_vmax
                     beta_vmax = (1 - Vmax_mean_clamped) * concentration_vmax
 
@@ -697,30 +701,26 @@ class TransFitter:
                         K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T]
 
                 else:
-                    # For negbinom/normal/studentt: Choose between Gamma and Log-Normal priors
-                    K_sigma = (K_max_tensor / (self._t(2.0) * torch.sqrt(K_alpha_tensor))) + epsilon_tensor
+                    # For negbinom/normal/studentt: Log-Normal priors for Vmax and K.
+                    # Log-Normal is symmetric in log-space and has better tail behaviour than
+                    # Gamma for scale parameters.  A minimum log_sigma floor of 1.0 keeps the
+                    # prior diffuse enough to accommodate one-sided subsets (CRISPRa-only or
+                    # CRISPRi-only) where the observed x-range may be 2-4× smaller than the
+                    # true Vmax — the data-driven Vmax_mean is used as the centre but the
+                    # prior still allows the posterior to move to much larger values.
+                    _Vmax_log_sigma_floor = self._t(1.0)
                     Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
+                    Vmax_log_sigma = torch.sqrt(
+                        torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
+                    ).clamp_min(_Vmax_log_sigma_floor)
+                    Vmax_log_mu = (torch.log(Vmax_prior_mean.clamp_min(epsilon_tensor))
+                                   - 0.5 * Vmax_log_sigma ** 2)
 
-                    if use_lognormal_priors:
-                        # Log-Normal priors (experimental) - use for comparison
-                        Vmax_log_mu = torch.log(Vmax_prior_mean) - 0.5 * torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
-                        Vmax_log_sigma = torch.sqrt(torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2))
-                        log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
-                        Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
+                    log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
+                    Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
 
-                        log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))
-                        K_a = pyro.deterministic("K_a", torch.exp(log_K_a))
-                    else:
-                        # Gamma priors (default, matching archive) - better convergence and sparsity
-                        # Gamma parameterization: shape = mean^2/var, rate = mean/var
-                        Vmax_a = pyro.sample("Vmax_a", dist.Gamma(
-                            (Vmax_prior_mean ** 2) / (Vmax_sigma ** 2),
-                            Vmax_prior_mean / (Vmax_sigma ** 2)
-                        ))
-                        K_a = pyro.sample("K_a", dist.Gamma(
-                            ((K_max_tensor / 2) ** 2) / (K_sigma ** 2),
-                            (K_max_tensor / 2) / (K_sigma ** 2)
-                        ))
+                    log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))
+                    K_a = pyro.deterministic("K_a", torch.exp(log_K_a))
 
                 # Sample all required parameters (additive_hill and nested_hill need second set)
                 if function_type in ['additive_hill', 'nested_hill']:
@@ -761,25 +761,13 @@ class TransFitter:
                             K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T]
 
                     else:
-                        # For negbinom/normal/studentt: Choose between Gamma and Log-Normal priors
-                        # K_sigma and Vmax_sigma were computed above in the Vmax_a/K_a section
-                        if use_lognormal_priors:
-                            # Log-Normal priors (experimental) - Vmax_log_mu/sigma computed in Vmax_a section
-                            log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
-                            Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
+                        # For negbinom/normal/studentt: Log-Normal priors.
+                        # Vmax_log_mu and Vmax_log_sigma were computed in the Vmax_a section above.
+                        log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
+                        Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
 
-                            log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))
-                            K_b = pyro.deterministic("K_b", torch.exp(log_K_b))
-                        else:
-                            # Gamma priors (default, matching archive) - better convergence and sparsity
-                            Vmax_b = pyro.sample("Vmax_b", dist.Gamma(
-                                (Vmax_prior_mean ** 2) / (Vmax_sigma ** 2),
-                                Vmax_prior_mean / (Vmax_sigma ** 2)
-                            ))
-                            K_b = pyro.sample("K_b", dist.Gamma(
-                                ((K_max_tensor / 2) ** 2) / (K_sigma ** 2),
-                                (K_max_tensor / 2) / (K_sigma ** 2)
-                            ))
+                        log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))
+                        K_b = pyro.deterministic("K_b", torch.exp(log_K_b))
                 
                 # Compute Hill function(s)
                 # Hill_based_positive returns values in [0, Vmax]
@@ -2590,12 +2578,17 @@ class TransFitter:
             n_mu_raw_prior = float((_half_n_p * torch.atanh(_ratio_n_p)).item())
 
             # Vmax prior (log-normal): Vmax_log_sigma is the same for all genes
-            # because sigma/mean = 1/sqrt(Vmax_alpha) regardless of Vmax_mean
+            # because sigma/mean = 1/sqrt(Vmax_alpha) regardless of Vmax_mean.
+            # Apply the same floor (1.0) that _model_y uses.
             if distribution not in ['binomial', 'multinomial']:
-                Vmax_alpha_val  = float(Vmax_alpha_tensor.item())
-                Vmax_log_sigma_p = float(np.sqrt(np.log1p(1.0 / Vmax_alpha_val)))
-                Vmax_log_mu_p   = (np.log(Vmax_mean_tensor.cpu().numpy())
-                                   - 0.5 * Vmax_log_sigma_p ** 2)  # [T]
+                Vmax_alpha_val   = float(Vmax_alpha_tensor.item())
+                _Vmax_log_sigma_floor_p = 1.0
+                Vmax_log_sigma_p = max(
+                    float(np.sqrt(np.log1p(1.0 / Vmax_alpha_val))),
+                    _Vmax_log_sigma_floor_p,
+                )
+                Vmax_log_mu_p    = (np.log(np.maximum(Vmax_mean_tensor.cpu().numpy(), 1e-12))
+                                    - 0.5 * Vmax_log_sigma_p ** 2)  # [T]
             else:
                 Vmax_log_sigma_p = None
                 Vmax_log_mu_p    = None
