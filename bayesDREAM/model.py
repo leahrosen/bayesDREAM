@@ -983,6 +983,32 @@ class bayesDREAM(
 
             gene_meta.index = range(len(gene_meta))  # Reset to numeric
 
+        # Pre-compute row standard deviations for all formats (dense, scipy sparse, pandas sparse).
+        # Vectorised: avoids 31K per-row conversions in the loop below.
+        if isinstance(counts, pd.DataFrame):
+            if isinstance(counts.dtypes.iloc[0], pd.SparseDtype):
+                # Pandas sparse DataFrame — convert to scipy sparse for vectorised std
+                _sp = counts.sparse.to_coo().tocsr().astype(float)
+                _mean = np.array(_sp.mean(axis=1)).flatten()
+                _sp2 = _sp.copy()
+                _sp2.data **= 2
+                _sq_mean = np.array(_sp2.mean(axis=1)).flatten()
+                row_stds = np.sqrt(np.maximum(_sq_mean - _mean ** 2, 0))
+            else:
+                # Regular dense DataFrame
+                row_stds = counts.std(axis=1).values
+        elif hasattr(counts, 'toarray'):
+            # Scipy sparse matrix
+            _sp = counts.astype(float)
+            _mean = np.array(_sp.mean(axis=1)).flatten()
+            _sp2 = _sp.copy()
+            _sp2.data **= 2
+            _sq_mean = np.array(_sp2.mean(axis=1)).flatten()
+            row_stds = np.sqrt(np.maximum(_sq_mean - _mean ** 2, 0))
+        else:
+            # Dense numpy array
+            row_stds = counts.std(axis=1)
+
         # Build list of features to keep
         features_to_keep = []
 
@@ -991,18 +1017,9 @@ class bayesDREAM(
             if i == cis_gene_idx:
                 continue
 
-            # Check for zero std
-            if isinstance(counts, pd.DataFrame):
-                gene_std = counts.iloc[i].std()
-            else:
-                # Array or sparse matrix
-                if hasattr(counts, 'toarray'):
-                    gene_std = np.std(counts[i, :].toarray())
-                else:
-                    gene_std = np.std(counts[i, :])
-
-            if gene_std == 0:
-                continue  # Skip zero-std genes
+            # Skip zero-std genes
+            if row_stds[i] == 0:
+                continue
 
             features_to_keep.append(i)
 
