@@ -18,16 +18,21 @@ loader_inputs/
 └── {type}/
     ├── cell_meta.tsv.gz       # cell identifiers
     ├── feature_meta.tsv.gz    # feature annotations
-    ├── counts.npz             # numerator counts  (features × cells, sparse)
-    └── denominator.npz        # denominator counts (binomial only)
+    └── counts.npz             # numerator counts  (features × cells, sparse)
 ```
 
 **Distribution detection:**
 
-| Files present                      | Distribution |
-|------------------------------------|--------------|
-| `counts.npz` + `denominator.npz`   | `binomial`   |
-| `counts.npz` only                  | `multinomial`|
+| Type         | Distribution  | Denominator source                                      |
+|--------------|---------------|---------------------------------------------------------|
+| binomial     | `binomial`    | `model.counts` gene expression (via `gene_for_denominator`) |
+| multinomial  | `multinomial` | none                                                    |
+
+> **Note**: Binomial types no longer ship a `denominator.npz`.  The denominator
+> is taken from `model.counts` using `feature_meta['gene_for_denominator']`,
+> which maps each SJ/event to the gene whose total counts serve as the
+> denominator.  This ensures the denominator is always consistent with the
+> gene expression data already in the model.
 
 Types in a typical run:
 
@@ -119,28 +124,35 @@ def reconstruct_multinomial_3d(counts_2d, feature_meta):
 
 ## Loading binomial types
 
-All binomial types share the same pattern.
+All binomial types share the same pattern.  The denominator is read from
+`model.counts` (gene expression) using `feature_meta['gene_for_denominator']`,
+so no `denominator.npz` file is needed.
 
 ```python
-def load_binomial_type(model, base_dir, stype, cell_col='cell',
+def load_binomial_type(model, base_dir, stype,
                        name_prefix='splicing', overwrite=False):
-    type_dir = os.path.join(base_dir, stype)
-    model_cells = model.meta[cell_col].tolist()
+    type_dir    = os.path.join(base_dir, stype)
+    model_cells = model.meta['L_cell_barcode'].tolist()
 
     # Cell order in file
     cell_meta  = pd.read_csv(os.path.join(type_dir, 'cell_meta.tsv.gz'), sep='\t')
-    file_cells = cell_meta[cell_col].tolist()
+    file_cells = cell_meta['cell_barcode'].tolist()
 
     # Feature metadata
     feature_meta = pd.read_csv(os.path.join(type_dir, 'feature_meta.tsv.gz'), sep='\t')
 
-    # Counts and denominator (features × file_cells)
-    counts      = load_npz(os.path.join(type_dir, 'counts.npz'))
-    denominator = load_npz(os.path.join(type_dir, 'denominator.npz'))
+    # Add a 'gene' alias so plot_xy_data can look up features by gene name
+    if 'gene' not in feature_meta.columns and 'gene_for_denominator' in feature_meta.columns:
+        feature_meta = feature_meta.assign(gene=feature_meta['gene_for_denominator'])
 
-    # Align to model cell order
-    counts      = align_cells(counts,      file_cells, model_cells)
-    denominator = align_cells(denominator, file_cells, model_cells)
+    # Counts (features × file_cells), aligned to model cell order
+    counts = align_cells(load_npz(os.path.join(type_dir, 'counts.npz')),
+                         file_cells, model_cells)
+
+    # Denominator: gene expression from model.counts, one row per feature.
+    # .loc with a list handles duplicates (multiple SJs per gene → same gene row repeated).
+    genes       = feature_meta['gene_for_denominator'].tolist()
+    denominator = model.counts.loc[genes, model_cells].values
 
     model.add_custom_modality(
         name=f'{name_prefix}_{stype}',
@@ -161,6 +173,13 @@ for stype in ['exon_skip', 'intron_retention', 'donor_efficiency',
               'acceptor_efficiency', 'sj', 'mxe', 'gene_velocity']:
     load_binomial_type(model, 'loader_inputs/', stype)
 ```
+
+### `feature_meta` requirements for `plot_xy_data`
+
+`plot_xy_data` can accept a gene name and return all matching features.  For
+this to work, `feature_meta` must contain a `gene`, `gene_name`, or `gene_id`
+column.  The loader above satisfies this by aliasing `gene_for_denominator` →
+`gene`.
 
 ---
 
@@ -309,7 +328,10 @@ def _load_type(stype, distribution):
     counts       = align_cells(load_npz(os.path.join(d, 'counts.npz')), file_cells, model_cells)
 
     if distribution == 'binomial':
-        denominator = align_cells(load_npz(os.path.join(d, 'denominator.npz')), file_cells, model_cells)
+        if 'gene' not in feature_meta.columns and 'gene_for_denominator' in feature_meta.columns:
+            feature_meta = feature_meta.assign(gene=feature_meta['gene_for_denominator'])
+        genes       = feature_meta['gene_for_denominator'].tolist()
+        denominator = model.counts.loc[genes, model_cells].values
         model.add_custom_modality(
             name=f'{PREFIX}_{stype}',
             counts=counts,
@@ -343,10 +365,16 @@ for stype in MULTINOMIAL_TYPES:
 
 ## Notes
 
-- **Cell alignment**: `align_cells` reorders columns to match `model.meta['cell']`
+- **Cell alignment**: `align_cells` reorders columns to match `model.meta['L_cell_barcode']`
   exactly.  Cells in the model but missing from the file are filled with zeros
-  (a warning is printed).  `add_custom_modality` will also drop any cells in the
-  passed `cell_names` that are not in the model's cell list.
+  (a warning is printed).  `add_custom_modality` will then drop any cells not
+  present in the model (intersection-only; no zero-filling by the model).
+- **Denominator**: Binomial denominators come from `model.counts` via
+  `feature_meta['gene_for_denominator']`.  `model.counts.loc[genes, model_cells]`
+  handles duplicates correctly (multiple features per gene each get their own row).
+- **Gene column for plotting**: `plot_xy_data` searches `gene`, `gene_name`, or
+  `gene_id` columns to look up features by gene.  The loader adds `gene` as an
+  alias for `gene_for_denominator` so gene-level lookups work out of the box.
 - **Zero-padding**: `reconstruct_multinomial_3d` pads shorter sites to
   `max_categories` with zeros.  The model's multinomial likelihood ignores
   zero-count categories automatically.
