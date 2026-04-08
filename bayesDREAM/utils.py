@@ -102,7 +102,10 @@ def Hill_based_positive_logK(x, Vmax, A, logK, n):
     x_safe = x.clamp_min(tiny)
     logit = n * (torch.log(x_safe) - logK)  # logK broadcasts across cells
     clamp_logit = default_sigmoid_clamp(logit.dtype)
-    logit = torch.clamp(logit, -clamp_logit, clamp_logit)
+    # Soft (tanh) squeeze instead of hard clamp: gradient is sech²(logit/c) ≥ sech²(1) ≈ 0.42
+    # at the "boundary" |logit| = clamp_logit, never zero — fixes dead gradient for extreme n.
+    # Behaviour is identical to hard clamp for |logit| << clamp_logit (typical operation).
+    logit = clamp_logit * torch.tanh(logit / clamp_logit)
     return Vmax * torch.sigmoid(logit) + A
 
 

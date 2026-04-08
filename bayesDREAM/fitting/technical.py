@@ -1544,6 +1544,12 @@ class TechnicalFitter:
         from torch.optim.lr_scheduler import OneCycleLR
         base_lr = 1e-3 if lr is None else lr
 
+        # OneCycleLR requires pct_start * total_steps > 1 to avoid ZeroDivisionError.
+        # With pct_start=0.1, minimum total_steps is 11 (0.1*11-1=0.1>0).
+        _pct_start = 0.1
+        _min_total_steps = int(1.0 / _pct_start) + 1  # = 11
+        _scheduler_total_steps = max(niters, _min_total_steps)
+
         optimizer = pyro.optim.PyroLRScheduler(
             scheduler_constructor=OneCycleLR,
             optim_args={
@@ -1555,8 +1561,8 @@ class TechnicalFitter:
                 },
                 # OneCycleLR hyperparameters
                 "max_lr":          base_lr * 10,  # peak at 10x base_lr
-                "total_steps":     niters,
-                "pct_start":       0.1,           # 10% warmup
+                "total_steps":     _scheduler_total_steps,
+                "pct_start":       _pct_start,    # 10% warmup
                 "div_factor":      25.0,          # initial_lr = max_lr/25
                 "final_div_factor": 1e4,          # final_lr = max_lr/1e4
             },
@@ -2011,22 +2017,19 @@ class TechnicalFitter:
                     )
 
                 if cis_idx_orig < full_alpha_y_mult.shape[-1]:
-                    # Extract cis gene alpha
-                    self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig]
-                    self.model.alpha_x_type = 'posterior'
+                    # Extract cis gene alpha (mean over samples → [C])
+                    self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
 
                     # Exclude cis from modality alpha_y
                     all_idx = list(range(full_alpha_y_mult.shape[-1]))
                     trans_idx = [i for i in all_idx if i != cis_idx_orig]
 
-                    # Set distribution-appropriate correction type only
-                    # negbinom: multiplicative, others: additive
-                    modality.alpha_y_type = 'posterior'
+                    # Store mean over samples → [C, T]
                     if modality.distribution == 'negbinom':
-                        modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx]
+                        modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
                         # Don't set alpha_y_prefit_add for negbinom
                     else:  # binomial, multinomial, normal, studentt use additive
-                        modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx]
+                        modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
                         # Don't set alpha_y_prefit_mult for additive modalities
 
                     # ========================================
@@ -2081,12 +2084,13 @@ class TechnicalFitter:
                     # ========================================
                     # Exclude cis gene from ALL primary modality posterior samples
                     # ========================================
-                    # Store distribution-appropriate alpha_y in posterior samples
-                    posterior_samples["alpha_y"] = modality.alpha_y_prefit  # Property returns correct one
+                    # Store full posteriors (not means) in posterior_samples dict
                     if modality.distribution == 'negbinom':
-                        posterior_samples["alpha_y_mult"] = modality.alpha_y_prefit_mult
+                        posterior_samples["alpha_y_mult"] = full_alpha_y_mult[..., trans_idx]
+                        posterior_samples["alpha_y"] = posterior_samples["alpha_y_mult"]
                     else:
-                        posterior_samples["alpha_y_add"] = modality.alpha_y_prefit_add
+                        posterior_samples["alpha_y_add"] = full_alpha_y_add[..., trans_idx]
+                        posterior_samples["alpha_y"] = posterior_samples["alpha_y_add"]
 
                     # CRITICAL: Also exclude cis gene from ALL raw posterior samples
                     # These raw samples are used for analysis/diagnostics, so they must match gene modality
@@ -2100,26 +2104,23 @@ class TechnicalFitter:
 
                     print(f"[INFO] Extracted alpha_x for cis '{self.model.cis_gene}' and excluded it from ALL primary modality posterior samples")
                 else:
-                    # Cis gene not present after filtering; store as-is
-                    modality.alpha_y_type = 'posterior'
+                    # Cis gene not present after filtering; store mean
                     if modality.distribution == 'negbinom':
-                        modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"]
+                        modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
                     else:
-                        modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"]
+                        modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
             else:
-                # Cis gene not in counts; store as-is
-                modality.alpha_y_type = 'posterior'
+                # Cis gene not in counts; store mean
                 if modality.distribution == 'negbinom':
-                    modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"]
+                    modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
                 else:
-                    modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"]
+                    modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
         else:
-            # Not primary modality or no cis gene, store as-is
-            modality.alpha_y_type = 'posterior'
+            # Not primary modality or no cis gene, store mean
             if modality.distribution == 'negbinom':
-                modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"]
+                modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
             else:
-                modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"]
+                modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
 
         modality.posterior_samples_technical = posterior_samples
 

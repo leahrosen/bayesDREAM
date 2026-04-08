@@ -10,7 +10,6 @@ import torch
 from typing import Optional, List, Union
 
 from ..modality import Modality
-from ..splicing import create_splicing_modality
 
 
 

@@ -459,13 +459,6 @@ class TransFitter:
         #################
         ## Hill-based: ##
         #################
-        if function_type in ['single_hill', 'additive_hill', 'nested_hill']:
-            # ----------------------------------------------------
-            # 1) Define global hyperparameters for n_a
-            # ----------------------------------------------------
-            sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(0.5))) #   -> controls how variable n_a can be across genes; Exp(1/2) has mean 2, allowing biological Hill coefficients ~0.5-8
-            if function_type in ['additive_hill', 'nested_hill']:
-                sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(0.5))) #   -> controls how variable n_b can be across genes; Exp(1/2) has mean 2, allowing biological Hill coefficients ~0.5-8
         if function_type in ['polynomial']:
             #sigma_coeff = pyro.sample("sigma_coeff", dist.Exponential(100)) #   -> controls how variable n_a can be across genes
             sigma_coeff = pyro.sample("sigma_coeff", dist.HalfCauchy(scale=self._t(1.0)))
@@ -570,12 +563,14 @@ class TransFitter:
                         upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper).expand([T]))  # [T]
 
             else:
-                # For negbinom: A must be positive count
-                # Use Amean_tensor directly (the 5th-quantile of guide means = estimated baseline).
-                # The weight-mixing with Vmax_mean_tensor (the fold-change range) was inflating
-                # the A prior mean, causing A to be overestimated—especially for CRISPRa/i subsets
-                # where the fold-change range is large.
-                Amean_adjusted = Amean_tensor.clamp_min(epsilon_tensor)
+                # For negbinom: A must be positive count.
+                # Blend Amean (5th-percentile of guide means) toward Vmax_mean using the
+                # overdispersion weight: for noisy/overdispersed genes o_y >> prior_mean, so
+                # weight → 1 and Amean_adjusted → Vmax_mean, giving a more robust (higher)
+                # lower-asymptote prior.  For Poisson-like genes weight → 0 and Amean_adjusted
+                # → Amean (the data-driven 5th percentile).
+                Amean_adjusted = ((1 - weight) * Amean_tensor + weight * Vmax_mean_tensor
+                                  ).clamp_min(epsilon_tensor)
                 A = pyro.sample("A", dist.Exponential(1 / Amean_adjusted))
 
             if use_alpha:
@@ -610,6 +605,11 @@ class TransFitter:
                 _half_n   = 0.5 * (nmax - nmin).clamp_min(epsilon_tensor)
                 _ratio_n  = ((n_mu_tensor - _center_n) / _half_n).clamp(-1 + 1e-6, 1 - 1e-6)
                 n_mu_raw_tensor = _half_n * torch.atanh(_ratio_n)
+
+                # Per-gene n scale: sampled inside trans_plate so each gene is
+                # independently regularised (prevents one noisy gene from inflating
+                # the global sigma and loosening the prior for all other genes).
+                sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(1.0)))
 
                 # For multinomial, we need per-category parameters (K-1 categories, Kth is residual)
                 if distribution == 'multinomial' and K is not None:
@@ -723,6 +723,7 @@ class TransFitter:
 
                 # Sample all required parameters (additive_hill and nested_hill need second set)
                 if function_type in ['additive_hill', 'nested_hill']:
+                    sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
                     beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))
 
                     # n_b: per-category for multinomial, single for others
@@ -1171,7 +1172,6 @@ class TransFitter:
         self,
         sum_factor_col: str = None,
         function_type: str = 'single_hill',  # or 'additive', 'nested'
-        use_posterior: bool = False,
         polynomial_degree: int = 6,
         lr: float = None,
         niters: int = None,
@@ -1214,11 +1214,6 @@ class TransFitter:
             If None, auto-detected from modality.
         sum_factor_col : str, optional
             Sum factor column name. Required for negbinom, ignored for others.
-        use_posterior : bool, default=False
-            If False (default), converts alpha_y_prefit and x_true from prior fits to
-            point estimates (mean over posterior samples) before fitting. This is faster
-            and usually sufficient. If True, uses full posterior samples for uncertainty
-            propagation (slower but more accurate).
         denominator : np.ndarray, optional
             Denominator array for binomial distribution (e.g., total counts for PSI)
             If None, auto-detected from modality.
@@ -1282,50 +1277,16 @@ class TransFitter:
         ...                 use_data_driven_priors=False)
         """
 
-        # Handle use_posterior flag - convert posteriors to point estimates if needed
-        # Check for x_true (from cis fit)
-        has_x_true = self.model.x_true is not None
-
-        if not has_x_true:
+        if self.model.x_true is None:
             warnings.warn(
                 "x_true not set. You should run fit_cis() before fit_trans(). "
                 "Proceeding without cis effects."
             )
 
-        if not use_posterior:
-            # Convert x_true to point estimate if it's a posterior
-            if has_x_true and getattr(self.model, 'x_true_type', None) == 'posterior':
-                print("[INFO] use_posterior=False: Converting x_true to point estimate (mean)")
-                self.model.x_true = self.model.x_true.mean(dim=0)
-                self.model.x_true_type = 'point'
-
-            # Convert log2_x_true to point estimate if it's a posterior
-            if hasattr(self.model, 'log2_x_true') and self.model.log2_x_true is not None:
-                if getattr(self.model, 'log2_x_true_type', None) == 'posterior':
-                    print("[INFO] use_posterior=False: Converting log2_x_true to point estimate (mean)")
-                    self.model.log2_x_true = self.model.log2_x_true.mean(dim=0)
-                    self.model.log2_x_true_type = 'point'
-
         # Determine which modality to use
         if modality_name is None:
             modality_name = self.model.primary_modality
         modality = self.model.get_modality(modality_name)
-
-        # Handle use_posterior flag for modality-specific alpha_y
-        if not use_posterior:
-            # Convert alpha_y_prefit_mult to point estimate if it's a posterior (negbinom)
-            if hasattr(modality, 'alpha_y_prefit_mult') and modality.alpha_y_prefit_mult is not None:
-                if getattr(modality, 'alpha_y_type', None) == 'posterior' and modality.alpha_y_prefit_mult.dim() >= 3:
-                    print(f"[INFO] use_posterior=False: Converting {modality_name}.alpha_y_prefit_mult to point estimate (mean)")
-                    modality.alpha_y_prefit_mult = modality.alpha_y_prefit_mult.mean(dim=0)
-                    modality.alpha_y_type = 'point'
-
-            # Convert alpha_y_prefit_add to point estimate if it's a posterior (normal, binomial, etc)
-            if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
-                if getattr(modality, 'alpha_y_type', None) == 'posterior' and modality.alpha_y_prefit_add.dim() >= 3:
-                    print(f"[INFO] use_posterior=False: Converting {modality_name}.alpha_y_prefit_add to point estimate (mean)")
-                    modality.alpha_y_prefit_add = modality.alpha_y_prefit_add.mean(dim=0)
-                    modality.alpha_y_type = 'point'
 
         # Auto-detect distribution from modality
         if distribution is None:
@@ -1391,8 +1352,8 @@ class TransFitter:
         #        lr = 1e-3
         #        print(f"[INFO] Using default lr=1e-3 for distribution '{distribution}'")
 
-        # Check that technical fit has been done for this modality
-        if modality.alpha_y_prefit is None and 'technical_group_code' in self.model.meta.columns:
+        if (modality.alpha_y_prefit is None
+                and 'technical_group_code' in self.model.meta.columns):
             raise ValueError(
                 f"Modality '{modality_name}' has not been fit with fit_technical(). "
                 f"Please run fit_technical(modality_name='{modality_name}') first."
@@ -1412,25 +1373,19 @@ class TransFitter:
         # DEFENSIVE: Use distribution-specific attributes first (like plot_xy_data does)
         # This is more robust than the generic alpha_y_prefit
         alpha_y_prefit = None
-        alpha_y_type = None
 
         if distribution == 'negbinom':
-            # For negbinom, use multiplicative correction
             if hasattr(modality, 'alpha_y_prefit_mult') and modality.alpha_y_prefit_mult is not None:
                 alpha_y_prefit = modality.alpha_y_prefit_mult
-                alpha_y_type = getattr(modality, 'alpha_y_type', 'posterior')
                 print(f"[INFO] Using distribution-specific alpha_y_prefit_mult for {distribution}")
         else:
-            # For binomial, multinomial, normal, studentt: use additive correction
             if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
                 alpha_y_prefit = modality.alpha_y_prefit_add
-                alpha_y_type = getattr(modality, 'alpha_y_type', 'posterior')
                 print(f"[INFO] Using distribution-specific alpha_y_prefit_add for {distribution}")
 
         # Fallback to generic attribute if distribution-specific not available
         if alpha_y_prefit is None and hasattr(modality, 'alpha_y_prefit') and modality.alpha_y_prefit is not None:
             alpha_y_prefit = modality.alpha_y_prefit
-            alpha_y_type = getattr(modality, 'alpha_y_type', 'posterior')
             print(f"[WARNING] Distribution-specific alpha_y not found, falling back to generic alpha_y_prefit. "
                   f"This may be incorrect if using old technical fit results. "
                   f"Consider re-running fit_technical with current code.")
@@ -1463,7 +1418,6 @@ class TransFitter:
         if not hasattr(self.model, "log2_x_true") or self.model.log2_x_true is None:
             if self.model.x_true is not None:
                 self.model.log2_x_true = torch.log2(self.model.x_true)
-                self.model.log2_x_true_type = self.model.x_true_type
 
         # Handle cell subsetting
         # CRITICAL: Preserve exact modality cell order when subsetting meta
@@ -1487,7 +1441,17 @@ class TransFitter:
             if alpha_y_prefit is None:
                 warnings.warn("no alpha_y_prefit and no technical_group_code, assuming no confounding effect.")
 
-        # All cells are already in correct order, no need for cell_indices
+        # Compute x_true subset for this modality's cells.
+        # Modalities may cover a strict subset of model cells; we index x_true
+        # by position in self.model.meta so the N-length x_true_subset aligns
+        # exactly with the N-length y_obs.
+        _all_model_cells = self.model.meta['cell'].tolist()
+        _cell_index_map = {c: i for i, c in enumerate(_all_model_cells)}
+        _cell_indices = [_cell_index_map[c] for c in modality_cells]
+        _cell_idx_tensor = torch.tensor(_cell_indices, dtype=torch.long, device=self.model.device)
+        x_true_subset = self.model.x_true[_cell_idx_tensor]
+        log2_x_true_subset = torch.log2(x_true_subset)
+
         N = len(modality_cells)
 
         # Modality counts are already in correct order matching modality_cells
@@ -1557,10 +1521,7 @@ class TransFitter:
                     K = y_obs.shape[2]  # Number of categories
             else:
                 raise ValueError(f"Distribution '{distribution}' requires 3D data but got shape {y_obs.shape}")
-        if self.model.x_true_type == 'point':
-            x_true_mean = self.model.x_true
-        elif self.model.x_true_type == 'posterior':
-            x_true_mean = self.model.x_true.mean(dim=0)
+        x_true_mean = x_true_subset
         beta_o_alpha_tensor = torch.tensor(beta_o_alpha, dtype=torch.float32, device=self.model.device)
         beta_o_beta_tensor = torch.tensor(beta_o_beta, dtype=torch.float32, device=self.model.device)
         alpha_alpha_mu_tensor = torch.tensor(alpha_alpha_mu, dtype=torch.float32, device=self.model.device)
@@ -1576,7 +1537,7 @@ class TransFitter:
 
         # --- robust, finite bounds for n to avoid overflow in x**n ---
         # use the same x_true sample type you use elsewhere
-        x_for_bounds = self.model.x_true if self.model.x_true_type == "posterior" else self.model.x_true
+        x_for_bounds = x_true_subset
         x_min = torch.clamp(x_for_bounds.min(), min=1e-12)  # strictly > 0 to avoid log(0)
         x_max = x_for_bounds.max()
 
@@ -1644,21 +1605,8 @@ class TransFitter:
         if correct_priors_for_technical and alpha_y_prefit is not None and groups_tensor is not None:
             print(f"[INFO] Correcting for technical effects before computing priors (distribution: {distribution})")
 
-            # Handle both point estimates (2D) and posterior samples (3D)
-            # Check actual tensor dimensions rather than just alpha_y_type (for robustness)
-            # Note: y_obs_for_prior is always [N, T] (cells × features)
-            if alpha_y_prefit.dim() >= 3:
-                # alpha_y_prefit is 3D/4D: [samples, groups, features] or [samples, groups, features, categories]
-                # Index groups dimension and average over samples
-                alpha_y_grouped = alpha_y_prefit[:, groups_tensor, ...]  # [S, N, ...] where ... is T or T,K
-                alpha_y_expanded = alpha_y_grouped.mean(dim=0)  # [N, ...] where ... is T or T,K
-                print(f"[INFO] Using posterior mean for technical correction (averaged over {alpha_y_prefit.shape[0]} samples)")
-            else:
-                # alpha_y_prefit is 2D: [groups, features] or 3D: [groups, features, categories]
-                # Just index groups dimension
-                alpha_y_expanded = alpha_y_prefit[groups_tensor, ...]  # [N, ...] where ... is T or T,K
-                if alpha_y_type == 'posterior':
-                    print(f"[WARNING] alpha_y_type='posterior' but tensor is only {alpha_y_prefit.dim()}D. Treating as point estimate.")
+            # alpha_y_prefit is always [C, T] (point estimate/mean), index groups dimension
+            alpha_y_expanded = alpha_y_prefit[groups_tensor, ...]  # [N, T] or [N, T, K]
 
             # alpha_y_expanded is now [N, T] (or [N, T, K] for multinomial), matching y_obs_for_prior
             # NO TRANSPOSE NEEDED - both are [N, T]
@@ -2078,8 +2026,8 @@ class TransFitter:
         # NTC mean of x_true: center K prior here so the P.O.I. starts within the observed range.
         # Any fold change within ±5 log2 of NTC covers the full CRISPR perturbation range.
         x_ntc_mean = None
-        if 'target' in self.model.meta.columns:
-            ntc_mask = self.model.meta['target'].str.lower() == 'ntc'
+        if 'target' in meta_subset.columns:
+            ntc_mask = meta_subset['target'].str.lower() == 'ntc'
             if ntc_mask.any():
                 ntc_idx = torch.tensor(ntc_mask.values, dtype=torch.bool, device=self.model.device)
                 x_ntc_mean = x_true_mean[ntc_idx].mean()
@@ -2132,13 +2080,11 @@ class TransFitter:
                 Amean_tensor,
                 p_n_logits_tensor,
                 epsilon_tensor,
-                x_true_sample = self.model.x_true.mean(dim=0) if self.model.x_true_type == "posterior" else self.model.x_true,
-                log2_x_true_sample = self.model.log2_x_true.mean(dim=0) if self.model.log2_x_true_type == "posterior" else self.model.log2_x_true,
+                x_true_sample = x_true_subset,
+                log2_x_true_sample = log2_x_true_subset,
                 nmin = nmin,
                 nmax = nmax,
-                alpha_y_sample = (
-                    alpha_y_prefit.mean(dim=0) if alpha_y_prefit.dim() >= 3 else alpha_y_prefit
-                ) if alpha_y_prefit is not None else None,
+                alpha_y_sample = alpha_y_prefit,
                 C = C,
                 groups_tensor=groups_tensor,
                 temperature=torch.tensor(init_temp, dtype=torch.float32, device=self.model.device),
@@ -2234,35 +2180,10 @@ class TransFitter:
             #    current_temp = 0.1 * (final_temp/0.1) ** ((step - 0.7 * niters) / (0.3 * niters))
 
 
-            # Sample from posterior - use alpha_y_prefit shape if available, otherwise x_true
-            if alpha_y_prefit is not None and alpha_y_type == "posterior":
-                samp = torch.randint(high=alpha_y_prefit.shape[0], size=(1,)).item()
-            elif self.model.x_true_type == "posterior":
-                samp = torch.randint(high=self.model.x_true.shape[0], size=(1,)).item()
-            else:
-                samp = 0  # No sampling needed if both are point estimates
-
-            # Sample from posterior
-            x_true_sample = (
-                (self.model.x_true[samp] if samp < self.model.x_true.shape[0] else self.model.x_true.mean(dim=0))
-                if self.model.x_true_type == "posterior" else self.model.x_true
-            )
-            log2_x_true_sample = (
-                (self.model.log2_x_true[samp] if samp < self.model.log2_x_true.shape[0] else self.model.log2_x_true.mean(dim=0))
-                if self.model.log2_x_true_type == "posterior" else self.model.log2_x_true
-            )
-            # For alpha_y_sample: check actual dimensions instead of just alpha_y_type
-            if alpha_y_prefit is not None:
-                if alpha_y_prefit.dim() >= 3:
-                    # Posterior samples: [S, C-1, T] - sample or average
-                    alpha_y_sample = (
-                        alpha_y_prefit[samp] if samp < alpha_y_prefit.shape[0] else alpha_y_prefit.mean(dim=0)
-                    )
-                else:
-                    # Point estimate: [C-1, T] - use as-is
-                    alpha_y_sample = alpha_y_prefit
-            else:
-                alpha_y_sample = None
+            # x_true, log2_x_true, alpha_y_prefit are always point estimates (means)
+            x_true_sample = x_true_subset
+            log2_x_true_sample = log2_x_true_subset
+            alpha_y_sample = alpha_y_prefit  # [C, T] point estimate or None
 
             #use_straight_through = step >= int(0.7 * niters)
             use_straight_through = False
@@ -2366,6 +2287,7 @@ class TransFitter:
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
 
         # Move to CPU if using too much GPU memory for Predictive
+        _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
         run_on_cpu = self.model.device.type != "cpu"
         if run_on_cpu:
             print("[INFO] Running Predictive on CPU to reduce GPU memory pressure...")
@@ -2388,14 +2310,11 @@ class TransFitter:
                 "Amean_tensor": self._to_cpu(Amean_tensor),
                 "p_n_logits_tensor": self._to_cpu(p_n_logits_tensor),
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
-                "x_true_sample": self._to_cpu(self.model.x_true.mean(dim=0) if self.model.x_true_type == "posterior" else self.model.x_true),
-                "log2_x_true_sample": self._to_cpu(self.model.log2_x_true.mean(dim=0) if self.model.log2_x_true_type == "posterior" else self.model.log2_x_true),
+                "x_true_sample": self._to_cpu(x_true_subset),
+                "log2_x_true_sample": self._to_cpu(log2_x_true_subset),
                 "nmin": self._to_cpu(nmin),
                 "nmax": self._to_cpu(nmax),
-                # Only move if not None:
-                "alpha_y_sample": self._to_cpu(
-                    alpha_y_prefit.mean(dim=0) if alpha_y_prefit.dim() >= 3 else alpha_y_prefit
-                ) if alpha_y_prefit is not None else None,
+                "alpha_y_sample": self._to_cpu(alpha_y_prefit) if alpha_y_prefit is not None else None,
                 "C": C,
                 "groups_tensor": self._to_cpu(groups_tensor) if groups_tensor is not None else None,
                 # create on CPU explicitly since we just set self.model.device="cpu"
@@ -2430,13 +2349,11 @@ class TransFitter:
                 "Amean_tensor": Amean_tensor,
                 "p_n_logits_tensor": p_n_logits_tensor,
                 "epsilon_tensor": epsilon_tensor,
-                "x_true_sample": self.model.x_true.mean(dim=0) if self.model.x_true_type == "posterior" else self.model.x_true,
-                "log2_x_true_sample": self.model.log2_x_true.mean(dim=0) if self.model.log2_x_true_type == "posterior" else self.model.log2_x_true,
+                "x_true_sample": x_true_subset,
+                "log2_x_true_sample": log2_x_true_subset,
                 "nmin": nmin,
                 "nmax": nmax,
-                "alpha_y_sample": (
-                    alpha_y_prefit.mean(dim=0) if alpha_y_prefit.dim() >= 3 else alpha_y_prefit
-                ) if alpha_y_prefit is not None else None,
+                "alpha_y_sample": alpha_y_prefit,
                 "C": C,
                 "groups_tensor": groups_tensor if groups_tensor is not None else None,
                 "temperature": torch.tensor(final_temp, dtype=torch.float32, device=self.model.device),
@@ -2501,7 +2418,7 @@ class TransFitter:
                 gc.collect()
 
         if run_on_cpu:
-            self.model.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.device = _original_device  # Restore exact original device (not generic "cuda")
             print("[INFO] Reset self.model.device to:", self.model.device)
 
         for k, v in posterior_samples_y.items():
@@ -2593,7 +2510,7 @@ class TransFitter:
                 'nmin':             float(nmin.item()),
                 'nmax':             float(nmax.item()),
                 'n_mu_raw':         n_mu_raw_prior,
-                'sigma_n_prior_rate': 0.5,           # Exp(0.5) prior → mean sigma = 2
+                'sigma_n_prior_rate': 1.0,           # Exp(1) prior per gene → mean sigma = 1
                 # Vmax_a / Vmax_b (log-normal)
                 'Vmax_log_mu':      Vmax_log_mu_p,   # [T] numpy array or None
                 'Vmax_log_sigma':   Vmax_log_sigma_p, # scalar or None
@@ -2618,7 +2535,6 @@ class TransFitter:
         # Update alpha_y_prefit in modality if it was None and alpha_y was sampled
         if modality.alpha_y_prefit is None and groups_tensor is not None and "alpha_y" in posterior_samples_y:
             modality.alpha_y_prefit = posterior_samples_y["alpha_y"].mean(dim=0)
-            modality.alpha_y_type = 'point'  # Mean of posterior -> point estimate
 
         # If primary modality, also store at model level (backward compatibility)
         if modality_name == self.model.primary_modality:

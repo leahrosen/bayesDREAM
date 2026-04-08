@@ -20,8 +20,9 @@ class ModelLoader:
         """
         self.model = model
 
-    def load_technical_fit(self, input_dir: str = None, use_posterior: bool = True,
-                          modalities: list = None, verbose: bool = False):
+    def load_technical_fit(self, input_dir: str = None,
+                          modalities: list = None, verbose: bool = False,
+                          load_model_level: bool = None):
         """
         Load fitted technical parameters.
 
@@ -29,8 +30,6 @@ class ModelLoader:
         ----------
         input_dir : str, optional
             Directory to load from. If None, uses self.model.output_dir.
-        use_posterior : bool
-            If True, loads full posterior samples. If False, uses posterior mean as point estimates.
         modalities : list of str, optional
             List of modality names to load. If None, attempts to load all existing modalities.
             Example: ['gene', 'atac']
@@ -58,8 +57,11 @@ class ModelLoader:
                 raise ValueError(f"Unknown modalities: {invalid}. Available: {list(self.model.modalities.keys())}")
             modalities_to_load = modalities
 
-        # Automatically load model-level parameters if primary modality is included
-        should_load_model_level = self.model.primary_modality in modalities_to_load
+        # Determine whether to load model-level parameters
+        if load_model_level is None:
+            should_load_model_level = self.model.primary_modality in modalities_to_load
+        else:
+            should_load_model_level = load_model_level
 
         # Load model-level parameters (when primary modality is being loaded)
         if should_load_model_level:
@@ -67,28 +69,24 @@ class ModelLoader:
             alpha_x_path = os.path.join(input_dir, 'alpha_x_prefit.pt')
             if os.path.exists(alpha_x_path):
                 alpha_x = torch.load(alpha_x_path)
-                if use_posterior:
-                    self.model.alpha_x_prefit = alpha_x
-                    self.model.alpha_x_type = 'posterior'
-                else:
-                    self.model.alpha_x_prefit = alpha_x.mean(dim=0)
-                    self.model.alpha_x_type = 'point'
+                # Backward compat: if saved as 3D posterior, collapse to mean
+                if isinstance(alpha_x, torch.Tensor) and alpha_x.ndim >= 2 and alpha_x.shape[0] > 1:
+                    alpha_x = alpha_x.mean(dim=0)
+                self.model.alpha_x_prefit = alpha_x.flatten()
                 loaded['alpha_x_prefit'] = True
                 loaded_summary.append('alpha_x')
                 if verbose:
-                    print(f"[LOAD] alpha_x_prefit ({self.model.alpha_x_type}) ← {alpha_x_path}")
+                    print(f"[LOAD] alpha_x_prefit ← {alpha_x_path}")
 
             # Load alpha_y_prefit (legacy model-level file → primary modality)
             alpha_y_path = os.path.join(input_dir, 'alpha_y_prefit.pt')
             if os.path.exists(alpha_y_path):
                 alpha_y = torch.load(alpha_y_path)
+                # Backward compat: if saved as 3D posterior, collapse to mean
+                if isinstance(alpha_y, torch.Tensor) and alpha_y.ndim >= 3:
+                    alpha_y = alpha_y.mean(dim=0)
                 primary_mod = self.model.get_modality(self.model.primary_modality)
-                if use_posterior:
-                    primary_mod.alpha_y_prefit = alpha_y  # Uses property to set distribution-specific attr
-                    primary_mod.alpha_y_type = 'posterior'
-                else:
-                    primary_mod.alpha_y_prefit = alpha_y.mean(dim=0)
-                    primary_mod.alpha_y_type = 'point'
+                primary_mod.alpha_y_prefit = alpha_y  # Uses property to set distribution-specific attr
                 loaded['alpha_y_prefit'] = True
                 if verbose:
                     print(f"[LOAD] alpha_y_prefit → {self.model.primary_modality} modality ← {alpha_y_path}")
@@ -100,29 +98,22 @@ class ModelLoader:
 
             mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
             if os.path.exists(mod_path):
-                alpha_y_mod = torch.load(mod_path)
-                if use_posterior:
-                    alpha_y_to_set = alpha_y_mod
-                    mod.alpha_y_type = 'posterior'
-                else:
-                    alpha_y_to_set = alpha_y_mod.mean(dim=0)
-                    mod.alpha_y_type = 'point'
+                alpha_y_to_set = torch.load(mod_path)
+                # Backward compat: if saved as 3D posterior, collapse to mean
+                if isinstance(alpha_y_to_set, torch.Tensor) and alpha_y_to_set.ndim >= 3:
+                    alpha_y_to_set = alpha_y_to_set.mean(dim=0)
 
-                # Set generic alpha_y_prefit
                 mod.alpha_y_prefit = alpha_y_to_set
 
-                # Also set distribution-specific attribute
                 if mod.distribution == 'negbinom':
-                    # For negbinom, saved value is multiplicative
                     mod.alpha_y_prefit_mult = alpha_y_to_set
                 else:
-                    # For normal, binomial, multinomial: additive
                     mod.alpha_y_prefit_add = alpha_y_to_set
 
                 loaded[f'alpha_y_prefit_{mod_name}'] = True
                 mod_loaded.append('alpha_y')
                 if verbose:
-                    print(f"[LOAD] {mod_name}.alpha_y_prefit ({mod.alpha_y_type}) ← {mod_path}")
+                    print(f"[LOAD] {mod_name}.alpha_y_prefit ← {mod_path}")
 
             # Load modality-specific posterior_samples_technical
             posterior_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
@@ -168,45 +159,29 @@ class ModelLoader:
                 if 'alpha_y_add' in mod.posterior_samples_technical:
                     if not hasattr(mod, 'alpha_y_prefit_add') or mod.alpha_y_prefit_add is None:
                         alpha_y_add = mod.posterior_samples_technical['alpha_y_add']
-                        if use_posterior:
-                            mod.alpha_y_prefit_add = alpha_y_add
-                            # Only set generic alpha_y_prefit if distribution uses additive correction
-                            if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
-                                if mod.distribution != 'negbinom':  # binomial, multinomial, normal, studentt
-                                    mod.alpha_y_prefit = alpha_y_add
-                            if not hasattr(mod, 'alpha_y_type') or mod.alpha_y_type is None:
-                                mod.alpha_y_type = 'posterior'
-                        else:
-                            mod.alpha_y_prefit_add = alpha_y_add.mean(dim=0)
-                            if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
-                                if mod.distribution != 'negbinom':
-                                    mod.alpha_y_prefit = alpha_y_add.mean(dim=0)
-                            if not hasattr(mod, 'alpha_y_type') or mod.alpha_y_type is None:
-                                mod.alpha_y_type = 'point'
+                        # Backward compat: collapse 3D posteriors to mean
+                        if isinstance(alpha_y_add, torch.Tensor) and alpha_y_add.ndim >= 3:
+                            alpha_y_add = alpha_y_add.mean(dim=0)
+                        mod.alpha_y_prefit_add = alpha_y_add
+                        if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
+                            if mod.distribution != 'negbinom':
+                                mod.alpha_y_prefit = alpha_y_add
                         if verbose:
-                            print(f"[LOAD] {mod_name}.alpha_y_prefit_add ({mod.alpha_y_type}) ← extracted from posterior_samples_technical")
+                            print(f"[LOAD] {mod_name}.alpha_y_prefit_add ← extracted from posterior_samples_technical")
 
                 if 'alpha_y_mult' in mod.posterior_samples_technical or 'alpha_y' in mod.posterior_samples_technical:
                     alpha_y_mult_key = 'alpha_y_mult' if 'alpha_y_mult' in mod.posterior_samples_technical else 'alpha_y'
                     if not hasattr(mod, 'alpha_y_prefit_mult') or mod.alpha_y_prefit_mult is None:
                         alpha_y_mult = mod.posterior_samples_technical[alpha_y_mult_key]
-                        if use_posterior:
-                            mod.alpha_y_prefit_mult = alpha_y_mult
-                            # Only set generic alpha_y_prefit if distribution uses multiplicative correction
-                            if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
-                                if mod.distribution == 'negbinom':
-                                    mod.alpha_y_prefit = alpha_y_mult
-                            if not hasattr(mod, 'alpha_y_type') or mod.alpha_y_type is None:
-                                mod.alpha_y_type = 'posterior'
-                        else:
-                            mod.alpha_y_prefit_mult = alpha_y_mult.mean(dim=0)
-                            if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
-                                if mod.distribution == 'negbinom':
-                                    mod.alpha_y_prefit = alpha_y_mult.mean(dim=0)
-                            if not hasattr(mod, 'alpha_y_type') or mod.alpha_y_type is None:
-                                mod.alpha_y_type = 'point'
+                        # Backward compat: collapse 3D posteriors to mean
+                        if isinstance(alpha_y_mult, torch.Tensor) and alpha_y_mult.ndim >= 3:
+                            alpha_y_mult = alpha_y_mult.mean(dim=0)
+                        mod.alpha_y_prefit_mult = alpha_y_mult
+                        if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
+                            if mod.distribution == 'negbinom':
+                                mod.alpha_y_prefit = alpha_y_mult
                         if verbose:
-                            print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ({mod.alpha_y_type}) ← extracted from posterior_samples_technical")
+                            print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ← extracted from posterior_samples_technical")
 
             if mod_loaded:
                 loaded_summary.append(f"{mod_name}: {', '.join(mod_loaded)}")
@@ -242,7 +217,7 @@ class ModelLoader:
 
         return loaded
 
-    def load_cis_fit(self, input_dir: str = None, use_posterior: bool = True, verbose: bool = False):
+    def load_cis_fit(self, input_dir: str = None, verbose: bool = False):
         """
         Load fitted cis parameters.
 
@@ -250,8 +225,6 @@ class ModelLoader:
         ----------
         input_dir : str, optional
             Directory to load from. If None, uses self.model.output_dir.
-        use_posterior : bool
-            If True, loads full posterior samples. If False, uses posterior mean as point estimate.
         verbose : bool
             If True, print detailed loading information. Default False (summary only).
 
@@ -270,31 +243,27 @@ class ModelLoader:
         x_true_path = os.path.join(input_dir, 'x_true.pt')
         if os.path.exists(x_true_path):
             x_true = torch.load(x_true_path)
-            if use_posterior:
-                self.model.x_true = x_true
-                self.model.x_true_type = 'posterior'
-            else:
-                self.model.x_true = x_true.mean(dim=0)
-                self.model.x_true_type = 'point'
+            # Backward compat: if saved as 2D/3D posterior, collapse to mean
+            if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
+                x_true = x_true.mean(dim=0)
+            self.model.x_true = x_true
             loaded['x_true'] = True
-            loaded_summary.append(f"x_true ({self.model.x_true_type})")
+            loaded_summary.append('x_true')
             if verbose:
-                print(f"[LOAD] x_true ({self.model.x_true_type}) ← {x_true_path}")
+                print(f"[LOAD] x_true ← {x_true_path}")
 
         # Load log2_x_true if saved separately
         log2_x_true_path = os.path.join(input_dir, 'log2_x_true.pt')
         if os.path.exists(log2_x_true_path):
             log2_x_true = torch.load(log2_x_true_path)
-            if use_posterior:
-                self.model.log2_x_true = log2_x_true
-                self.model.log2_x_true_type = 'posterior'
-            else:
-                self.model.log2_x_true = log2_x_true.mean(dim=0)
-                self.model.log2_x_true_type = 'point'
+            # Backward compat: if saved as 2D/3D posterior, collapse to mean
+            if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
+                log2_x_true = log2_x_true.mean(dim=0)
+            self.model.log2_x_true = log2_x_true
             loaded['log2_x_true'] = True
             loaded_summary.append('log2_x_true')
             if verbose:
-                print(f"[LOAD] log2_x_true ({self.model.log2_x_true_type}) ← {log2_x_true_path}")
+                print(f"[LOAD] log2_x_true ← {log2_x_true_path}")
 
         # Load posterior samples
         posterior_path = os.path.join(input_dir, 'posterior_samples_cis.pt')
@@ -338,22 +307,18 @@ class ModelLoader:
             if not hasattr(self.model, 'log2_x_true') or self.model.log2_x_true is None:
                 if 'log_x_true' in self.model.posterior_samples_cis:
                     log_x_true = self.model.posterior_samples_cis['log_x_true']
-                    if use_posterior:
-                        self.model.log2_x_true = log_x_true
-                        self.model.log2_x_true_type = 'posterior'
-                    else:
-                        self.model.log2_x_true = log_x_true.mean(dim=0)
-                        self.model.log2_x_true_type = 'point'
+                    # Backward compat: collapse 2D/3D posteriors to mean
+                    if isinstance(log_x_true, torch.Tensor) and log_x_true.ndim >= 2:
+                        log_x_true = log_x_true.mean(dim=0)
+                    self.model.log2_x_true = log_x_true
                     loaded['log2_x_true'] = True
                     if verbose:
-                        print(f"[LOAD] log2_x_true ({self.model.log2_x_true_type}) ← extracted from posterior_samples_cis")
+                        print(f"[LOAD] log2_x_true ← extracted from posterior_samples_cis")
                 elif hasattr(self.model, 'x_true') and self.model.x_true is not None:
-                    # Compute log2_x_true from x_true if not in posterior samples
                     self.model.log2_x_true = torch.log2(self.model.x_true)
-                    self.model.log2_x_true_type = getattr(self.model, 'x_true_type', 'posterior')
                     loaded['log2_x_true'] = True
                     if verbose:
-                        print(f"[LOAD] log2_x_true ({self.model.log2_x_true_type}) ← computed from x_true")
+                        print(f"[LOAD] log2_x_true ← computed from x_true")
 
         # Print summary
         print(f"[LOAD] Cis fit from {input_dir}")
@@ -428,6 +393,10 @@ class ModelLoader:
                     if loaded_data.get('losses_trans') is not None:
                         self.model.losses_trans = loaded_data['losses_trans']
 
+                    # Load trans_prior_params if present
+                    if loaded_data.get('trans_prior_params') is not None:
+                        self.model.trans_prior_params = loaded_data['trans_prior_params']
+
                     if verbose:
                         print(f"[LOAD] posterior_samples_trans (modality: {loaded_data.get('modality_name')}, {loaded_data.get('n_features')} features) ← {posterior_path}")
                 else:
@@ -462,6 +431,10 @@ class ModelLoader:
                     if loaded_data.get('losses_trans') is not None:
                         self.model.modalities[mod_name].losses_trans = loaded_data['losses_trans']
                         mod_loaded.append(f"loss({len(self.model.modalities[mod_name].losses_trans)})")
+
+                    # Load trans_prior_params if present
+                    if loaded_data.get('trans_prior_params') is not None:
+                        self.model.modalities[mod_name].trans_prior_params = loaded_data['trans_prior_params']
 
                     if verbose:
                         print(f"[LOAD] {mod_name}.posterior_samples_trans (distribution: {loaded_data.get('distribution')}, {n_features} features) ← {mod_path}")

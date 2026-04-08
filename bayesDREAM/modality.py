@@ -143,9 +143,8 @@ class Modality:
 
         # Per-modality fitting results storage
         # Distribution-specific alpha_y parameters (use these directly, not alpha_y_prefit)
-        self.alpha_y_prefit_mult = None     # For negbinom: multiplicative correction
-        self.alpha_y_prefit_add = None      # For normal/studentt/binomial/multinomial: additive correction
-        self.alpha_y_type = None            # 'point' (2D/3D) or 'posterior' (3D/4D with samples dim)
+        self.alpha_y_prefit_mult = None     # For negbinom: multiplicative correction [C, T]
+        self.alpha_y_prefit_add = None      # For normal/studentt/binomial/multinomial: additive correction [C, T]
         self.posterior_samples_technical = None  # Technical fit: full posterior samples
         self.posterior_samples_trans = None      # Trans fit: full posterior samples
 

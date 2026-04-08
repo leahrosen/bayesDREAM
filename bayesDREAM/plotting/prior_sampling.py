@@ -355,20 +355,13 @@ def sample_cis_priors(
 
     prior_samples['x_true'] = torch.stack(x_true_samples)  # (nsamples, N)
 
-    # alpha_x: if cell-line specific, would be similar to alpha_y
-    # For now, use scalar or simple prior (matching alpha_y structure)
+    # alpha_x_prefit is always [C] (1D point estimate, reference group at index 0)
     if hasattr(model, 'alpha_x_prefit') and model.alpha_x_prefit is not None:
-        if model.alpha_x_prefit.ndim >= 2:
-            # Cell-line specific (matches alpha_y prior)
-            C = model.meta['technical_group_code'].nunique()
-            log2_alpha_x = dist.StudentT(df=3, loc=0.0, scale=20.0).sample((nsamples, C - 1, 1))
-            alpha_x_mul = 2.0 ** log2_alpha_x
-            alpha_full_mul = torch.cat([torch.ones(nsamples, 1, 1), alpha_x_mul], dim=1)
-            prior_samples['alpha_x'] = alpha_full_mul.squeeze(-1)  # (nsamples, C)
-        else:
-            # Scalar
-            log2_alpha_x = dist.StudentT(df=3, loc=0.0, scale=20.0).sample((nsamples,))
-            prior_samples['alpha_x'] = 2.0 ** log2_alpha_x
+        C = model.alpha_x_prefit.shape[0]
+        log2_alpha_x = dist.StudentT(df=3, loc=0.0, scale=20.0).sample((nsamples, C - 1, 1))
+        alpha_x_mul = 2.0 ** log2_alpha_x
+        alpha_full_mul = torch.cat([torch.ones(nsamples, 1, 1), alpha_x_mul], dim=1)
+        prior_samples['alpha_x'] = alpha_full_mul.squeeze(-1)  # (nsamples, C)
 
     # beta_o, o_x for negbinom (same as technical model)
     beta_o_alpha = 9.0

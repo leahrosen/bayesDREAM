@@ -144,54 +144,46 @@ class CisFitter:
         ## Cell-level variables ##
         ##########################
         if alpha_x is not None:
-            # alpha_x can be either:
-            # - Shape [C] or [S, C]: already includes reference group (index 0 = 1.0)
-            # - Shape [C-1] or [S, C-1]: needs reference group prepended
+            # alpha_x shape [C]: already includes reference group (index 0 = 1.0)
+            # or shape [C-1]: needs reference group prepended
             if alpha_x.shape[-1] == C:
-                # Full shape - use directly
                 alpha_x_full = alpha_x
             else:
-                # Missing reference - prepend ones
-                ones_ = torch.ones(alpha_x.shape[:-1] + (1,), device=self.model.device)
-                alpha_x_full = torch.cat([ones_, alpha_x], dim=-1)  # shape = [C] or [S,C]
-            alpha_x_used = alpha_x_full[..., groups_tensor]     # shape = [N] or [S,N]
+                ones_ = torch.ones(1, device=self.model.device)
+                alpha_x_full = torch.cat([ones_, alpha_x], dim=-1)  # shape = [C]
+            alpha_x_used = alpha_x_full[groups_tensor]  # shape = [N]
         else:
             alpha_x_used = torch.ones_like(sum_factor_tensor)  # shape = [N] or [S,N]
 
         # Aggregate guide effects to cells
         if self.model.is_high_moi:
-            # High MOI: Apply weighted NTC centering to ensure proper fold-change behavior
+            # High MOI: effects are additive in log2FC space.
+            # log2FC for guide g = log2(x_eff_g[g]) - log2(NTC_mean)
+            # For a cell with guides A, B: log2FC_cell = log2FC_A + log2FC_B
+            # => log2(x_mean) = log2(NTC) + log2FC_cell
+            #                 = sum(log2(x_eff_g)) - (n_guides - 1) * log2(NTC)
+            # This is always finite since x_eff_g > 0 and NTC_mean > 0.
 
-            # Step 1: Identify NTC guides
+            # NTC reference: weighted mean of NTC guide effects
             ntc_mask = torch.tensor(
                 [self.model.guide_meta.iloc[g]['target'] == 'ntc' for g in range(x_eff_g.shape[-1])],
                 dtype=torch.bool,
                 device=self.model.device
             )
-
-            # Step 2: Compute weights for NTC guides (by uncertainty: n_cells / sigma_eff)
             cells_per_guide = self.model.guide_assignment_tensor.sum(dim=0)  # [G]
-            weights = cells_per_guide / sigma_eff.clamp(min=1e-6)  # [G]
-
-            # Step 3: Compute weighted mean of NTC guide effects
+            weights = cells_per_guide / sigma_eff.clamp(min=1e-6)            # [G]
             ntc_weights = weights[ntc_mask]
-            ntc_effects = x_eff_g[..., ntc_mask] if x_eff_g.ndim > 1 else x_eff_g[ntc_mask]
-
+            ntc_effects  = x_eff_g[ntc_mask]
             weighted_mean_NTC = (ntc_weights * ntc_effects).sum(dim=-1) / ntc_weights.sum()
-
-            # Store as deterministic site for easy access
             weighted_mean_NTC = pyro.deterministic("weighted_mean_NTC", weighted_mean_NTC)
 
-            # Step 4: Apply centering transformation
-            # x_true = weighted_mean_NTC + sum(x_eff_g - weighted_mean_NTC)
-            #        = weighted_mean_NTC + guide_effects - n_guides * weighted_mean_NTC
-            guide_effects = torch.matmul(self.model.guide_assignment_tensor, x_eff_g)  # [N]
-            guides_per_cell = self.model.guide_assignment_tensor.sum(dim=1).clamp(min=1)  # [N]
-
-            x_mean = weighted_mean_NTC + guide_effects - guides_per_cell * weighted_mean_NTC  # [N]
-
-            # For sigma: average across guides in each cell (unchanged)
-            sigma_mean = torch.matmul(self.model.guide_assignment_tensor, sigma_eff) / guides_per_cell  # [N]
+            log2_x_eff_g  = torch.log2(x_eff_g.clamp(min=1e-12))                               # [G]
+            log2_NTC      = torch.log2(weighted_mean_NTC.clamp(min=1e-12))                       # scalar
+            guides_per_cell = self.model.guide_assignment_tensor.sum(dim=1).clamp(min=1)         # [N]
+            sum_log2_effects = torch.matmul(self.model.guide_assignment_tensor, log2_x_eff_g)    # [N]
+            log2_x_mean   = sum_log2_effects - (guides_per_cell - 1) * log2_NTC                 # [N]
+            x_mean        = 2.0 ** log2_x_mean                                                   # [N]
+            sigma_mean    = torch.matmul(self.model.guide_assignment_tensor, sigma_eff) / guides_per_cell  # [N]
         else:
             # Single guide per cell: use indexing (unchanged)
             x_mean = x_eff_g[..., guides_tensor]  # [N]
@@ -203,7 +195,7 @@ class CisFitter:
         with pyro.plate("data_plate", N):
             log_x_true = pyro.sample( # use log2 of xtrue to allow small values of xtrue
                 "log_x_true",
-                dist.Normal(torch.log2(x_mean), sigma_mean)  # Use sigma_mean instead of indexing
+                dist.Normal(torch.log2(x_mean), sigma_mean)
             )
             x_true = pyro.deterministic("x_true", self._t(2.0) ** log_x_true)
             mu_obs = alpha_x_used * x_true * sum_factor_tensor
@@ -224,7 +216,6 @@ class CisFitter:
         cis_feature: str = None,
         manual_guide_effects: pd.DataFrame = None,
         prior_strength: float = 1.0,
-        use_posterior: bool = False,
         lr: float = 1e-3,
         niters: int = 100_000,
         nsamples: int = 1000,
@@ -266,11 +257,6 @@ class CisFitter:
         prior_strength : float
             Weight for manual guide effects (default: 1.0)
             0 = ignore manual effects, higher = trust more
-        use_posterior : bool, default=False
-            If False (default), converts alpha_x_prefit from technical fit to point
-            estimates (mean over posterior samples) before fitting. This is faster
-            and usually sufficient. If True, uses full posterior samples for
-            uncertainty propagation (slower but more accurate).
         lr : float
             Learning rate for Adam
         niters : int
@@ -290,21 +276,6 @@ class CisFitter:
             Additional arguments controlling priors, etc.
         """
         print("Running fit_cis...")
-
-        # Handle use_posterior flag - convert posteriors to point estimates if needed
-        has_alpha_x = self.model.alpha_x_prefit is not None
-
-        if not has_alpha_x:
-            # No prefit - warn if user explicitly set use_posterior
-            # (We can't detect if user explicitly set it vs default, so just note it)
-            pass  # Will warn below if technical_covariates provided but no prefit
-
-        if not use_posterior and has_alpha_x:
-            # Convert alpha_x_prefit to point estimate if it's a posterior
-            if getattr(self.model, 'alpha_x_type', None) == 'posterior':
-                print("[INFO] use_posterior=False: Converting alpha_x_prefit to point estimate (mean)")
-                self.model.alpha_x_prefit = self.model.alpha_x_prefit.mean(dim=0)
-                self.model.alpha_x_type = 'point'
 
         if self.model.cis_gene is None:
             raise ValueError("self.model.cis_gene must be set.")
@@ -419,7 +390,7 @@ class CisFitter:
         min_guides = 3
         min_cells_per_guide = 5
         if self.model.is_high_moi:
-            cells_per_guide = self.model.guide_assignment.sum(dim=0)  # [G]
+            cells_per_guide = self.model.guide_assignment.sum(axis=0)  # [G]
             n_adequate = int((cells_per_guide >= min_cells_per_guide).sum())
         else:
             guide_counts = self.model.meta['guide_code'].value_counts()
@@ -539,15 +510,8 @@ class CisFitter:
         x_obs_factored = x_obs_tensor / sum_factor_tensor
         
         if self.model.alpha_x_prefit is not None:
-            if self.model.alpha_x_type == 'posterior':
-                # Take mean over posterior samples (S, C) -> (C,)
-                # alpha_x_prefit contains ALL cell lines including reference
-                alpha_x_full = self.model.alpha_x_prefit.mean(dim=0)
-            else:
-                # Point estimate: already shape (C,) containing all cell lines
-                # Flatten in case it's (C, 1)
-                alpha_x_full = self.model.alpha_x_prefit.flatten()
-
+            # alpha_x_prefit is always a [C] point estimate (mean already taken at fit_technical time)
+            alpha_x_full = self.model.alpha_x_prefit.flatten()
             # Select the correct alpha_x for each observation (expand for broadcasting)
             alpha_x_used = alpha_x_full[groups_tensor]  # groups_tensor indexes into (C,)
 
@@ -647,16 +611,8 @@ class CisFitter:
         losses = []
         smoothed_loss = None
         for step in range(niters):
-            
-            if self.model.alpha_x_prefit is not None:
-                samp = torch.randint(high=self.model.alpha_x_prefit.shape[0], size=(1,)).item()
-            # alpha_x_prefit has shape [S, C] including reference group at index 0
-            # _model_x now accepts either [C] (full) or [C-1] (without reference)
-            # Pass full array - _model_x will detect and handle appropriately
-            alpha_x_sample = (
-                self.model.alpha_x_prefit[samp] if self.model.alpha_x_type == "posterior"
-                else self.model.alpha_x_prefit
-            ) if self.model.alpha_x_prefit is not None else None
+            # alpha_x_prefit is always [C] (mean point estimate)
+            alpha_x_sample = self.model.alpha_x_prefit if self.model.alpha_x_prefit is not None else None
             o_x_sample = None
             
             loss = svi.step(
@@ -718,7 +674,7 @@ class CisFitter:
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "C": C,
                 "groups_tensor": self._to_cpu(groups_tensor),
-                "alpha_x_sample": self._to_cpu(self.model.alpha_x_prefit.mean(dim=0)) if self.model.alpha_x_type == "posterior" else self._to_cpu(self.model.alpha_x_prefit),
+                "alpha_x_sample": self._to_cpu(self.model.alpha_x_prefit),
                 "o_x_sample": None,
                 "target_per_guide_tensor": self._to_cpu(target_per_guide_tensor),
                 "independent_mu_sigma": independent_mu_sigma,
@@ -741,7 +697,7 @@ class CisFitter:
                 "epsilon_tensor": epsilon_tensor,
                 "C": C,
                 "groups_tensor": groups_tensor,
-                "alpha_x_sample": self.model.alpha_x_prefit.mean(dim=0) if self.model.alpha_x_type == "posterior" else (self.model.alpha_x_prefit if self.model.alpha_x_prefit is not None else None),
+                "alpha_x_sample": self.model.alpha_x_prefit,
                 "o_x_sample": None,
                 "target_per_guide_tensor": target_per_guide_tensor if target_per_guide_tensor is not None else None,
                 "independent_mu_sigma": independent_mu_sigma,
@@ -801,13 +757,12 @@ class CisFitter:
         # Store full posterior on model (not just on CisFitter)
         self.model.posterior_samples_cis = posterior_samples_x
         self.posterior_samples_cis = posterior_samples_x  # Keep for backward compatibility
-        self.model.x_true = posterior_samples_x['x_true']
-        self.model.x_true_type = 'posterior'
-        self.model.log2_x_true = posterior_samples_x['log_x_true']
-        self.model.log2_x_true_type = 'posterior'
+        self.model.x_true = posterior_samples_x['x_true'].mean(dim=0)
+        self.model.log2_x_true = posterior_samples_x['log_x_true'].mean(dim=0)
         if self.model.alpha_x_prefit is None and technical_covariates:
-            self.model.alpha_x_prefit = posterior_samples_x["alpha_x"]
-            self.model.alpha_x_type = 'posterior'
+            alpha_x_mean = posterior_samples_x["alpha_x"].mean(dim=0)  # [C-1]
+            ones_ = torch.ones(1, device=alpha_x_mean.device)
+            self.model.alpha_x_prefit = torch.cat([ones_, alpha_x_mean])  # [C] with reference prepended
 
         if self.model.device.type == "cuda":
             torch.cuda.empty_cache()

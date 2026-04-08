@@ -84,7 +84,6 @@ class TestPerModalityFitting(unittest.TestCase):
 
         # Set dummy x_true for trans tests
         cls.model.x_true = torch.ones(cls.n_cells, dtype=torch.float32)
-        cls.model.x_true_type = 'point'
 
         # Fit trans on gene modality
         cls.model.fit_trans(
@@ -101,6 +100,7 @@ class TestPerModalityFitting(unittest.TestCase):
             modality_name='splicing_test',
             p0=0.01, gamma_threshold=0.01,
             niters=100, nsamples=10,
+            min_denominator=0,
         )
 
     # --- Technical fit checks ---
@@ -121,7 +121,9 @@ class TestPerModalityFitting(unittest.TestCase):
         self.assertIsNotNone(spl_mod.alpha_y_prefit)
 
     def test_model_level_technical_stored(self):
-        self.assertIsNotNone(self.model.posterior_samples_technical)
+        # posterior_samples_technical is stored per-modality, not at model level
+        gene_mod = self.model.get_modality('gene')
+        self.assertIsNotNone(gene_mod.posterior_samples_technical)
 
     # --- Trans fit checks ---
 

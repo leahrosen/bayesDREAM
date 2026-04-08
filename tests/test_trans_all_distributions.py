@@ -118,11 +118,12 @@ class TestTransAllDistributions(unittest.TestCase):
             name='exon_skip', counts=inclusion_counts, feature_meta=exon_meta,
             distribution='binomial', denominator=total_counts,
         )
-        model.set_technical_groups(['cell_line'])
-        model.fit_technical(sum_factor_col='sum_factor', num_steps=20)
+        # No set_technical_groups: binomial modality has no fit_technical path,
+        # so technical_group_code must not be present when fitting trans.
         model.fit_cis(sum_factor_col='sum_factor', num_steps=20)
         model.fit_trans(sum_factor_col=None, function_type='single_hill',
-                        modality_name='exon_skip', num_steps=20, learning_rate=0.01)
+                        modality_name='exon_skip', num_steps=20, learning_rate=0.01,
+                        min_denominator=0)
         A = model.posterior_samples_trans['A']
         Vmax_a = model.posterior_samples_trans['Vmax_a']
         self.assertTrue(torch.all(A >= 0) and torch.all(A <= 1))
@@ -136,11 +137,10 @@ class TestTransAllDistributions(unittest.TestCase):
             name='exon_skip', counts=inclusion_counts, feature_meta=exon_meta,
             distribution='binomial', denominator=total_counts,
         )
-        model.set_technical_groups(['cell_line'])
-        model.fit_technical(sum_factor_col='sum_factor', num_steps=20)
         model.fit_cis(sum_factor_col='sum_factor', num_steps=20)
         model.fit_trans(sum_factor_col=None, function_type='polynomial',
-                        modality_name='exon_skip', num_steps=20, learning_rate=0.01)
+                        modality_name='exon_skip', num_steps=20, learning_rate=0.01,
+                        min_denominator=0)
         self.assertTrue(any('poly_coeff' in k for k in model.posterior_samples_trans))
         A = model.posterior_samples_trans['A']
         self.assertTrue(torch.all(A >= 0) and torch.all(A <= 1))
@@ -156,11 +156,10 @@ class TestTransAllDistributions(unittest.TestCase):
             name='donor_usage', counts=multinomial_counts,
             feature_meta=donor_meta, distribution='multinomial',
         )
-        model.set_technical_groups(['cell_line'])
-        model.fit_technical(sum_factor_col='sum_factor', num_steps=20)
         model.fit_cis(sum_factor_col='sum_factor', num_steps=20)
         model.fit_trans(sum_factor_col=None, function_type='single_hill',
-                        modality_name='donor_usage', num_steps=20, learning_rate=0.01)
+                        modality_name='donor_usage', num_steps=20, learning_rate=0.01,
+                        min_denominator=0)
         n_a = model.posterior_samples_trans['n_a']
         self.assertEqual(n_a.shape[-1], K - 1)
 
@@ -175,11 +174,10 @@ class TestTransAllDistributions(unittest.TestCase):
             name='donor_usage', counts=multinomial_counts,
             feature_meta=donor_meta, distribution='multinomial',
         )
-        model.set_technical_groups(['cell_line'])
-        model.fit_technical(sum_factor_col='sum_factor', num_steps=20)
         model.fit_cis(sum_factor_col='sum_factor', num_steps=20)
         model.fit_trans(sum_factor_col=None, function_type='polynomial',
-                        modality_name='donor_usage', num_steps=20, learning_rate=0.01)
+                        modality_name='donor_usage', num_steps=20, learning_rate=0.01,
+                        min_denominator=0)
         poly_coeffs = {k: v for k, v in model.posterior_samples_trans.items()
                        if 'poly_coeff' in k}
         for name, samples in poly_coeffs.items():
@@ -193,8 +191,6 @@ class TestTransAllDistributions(unittest.TestCase):
             name='scores', counts=normal_scores,
             feature_meta=score_meta, distribution='normal',
         )
-        model.set_technical_groups(['cell_line'])
-        model.fit_technical(sum_factor_col='sum_factor', num_steps=20)
         model.fit_cis(sum_factor_col='sum_factor', num_steps=20)
         model.fit_trans(sum_factor_col=None, function_type='polynomial',
                         modality_name='scores', num_steps=20, learning_rate=0.01)

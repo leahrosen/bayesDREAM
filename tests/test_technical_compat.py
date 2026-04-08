@@ -43,15 +43,17 @@ class TestTechnicalCompat(unittest.TestCase):
             label='technical_compat_test',
         )
         cls.model.set_technical_groups(['cell_line'])
-
-    def test_fit_technical_negbinom_runs(self):
-        self.model.fit_technical(
+        cls.model.fit_technical(
             sum_factor_col='sum_factor',
             distribution='negbinom',
             niters=50,
             nsamples=10,
             lr=1e-2,
         )
+
+    def test_fit_technical_negbinom_runs(self):
+        gene_modality = self.model.get_modality('gene')
+        self.assertIsNotNone(gene_modality.alpha_y_prefit)
 
     def test_alpha_y_prefit_set_in_modality(self):
         gene_modality = self.model.get_modality('gene')

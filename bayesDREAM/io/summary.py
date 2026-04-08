@@ -1043,15 +1043,20 @@ class ModelSummarizer:
 
         # Get alpha_y for this modality (prefer distribution-specific versions)
         if hasattr(modality, 'alpha_y_prefit_mult') and modality.alpha_y_prefit_mult is not None:
-            alpha_y = modality.alpha_y_prefit_mult  # [n_samples, n_groups, n_features]
+            alpha_y = modality.alpha_y_prefit_mult  # [C, T] point estimate
         elif hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
-            alpha_y = modality.alpha_y_prefit_add  # [n_samples, n_groups, n_features]
+            alpha_y = modality.alpha_y_prefit_add  # [C, T] point estimate
         else:
-            alpha_y = modality.alpha_y_prefit  # [n_samples, n_groups, n_features]
+            alpha_y = modality.alpha_y_prefit  # [C, T] point estimate
 
         # Convert to numpy if tensor
         if isinstance(alpha_y, torch.Tensor):
             alpha_y = alpha_y.cpu().numpy()
+
+        # alpha_y is always 2D [C, T] — no samples dimension
+        if alpha_y.ndim == 3:
+            # Backward compat: collapse legacy 3D [S, C, T] to mean
+            alpha_y = alpha_y.mean(axis=0)
 
         # Get feature names - prefer modality.feature_names (what users see)
         if modality.feature_names is not None:
@@ -1059,12 +1064,11 @@ class ModelSummarizer:
         else:
             feature_names = modality.feature_meta.index.tolist()
         n_features = len(feature_names)
-        n_groups = alpha_y.shape[1]
+        n_groups = alpha_y.shape[0]  # [C, T] → C groups
 
-        # Compute mean and CI
-        alpha_mean = alpha_y.mean(axis=0)  # [n_groups, n_features]
-        alpha_lower = np.quantile(alpha_y, 0.025, axis=0)
-        alpha_upper = np.quantile(alpha_y, 0.975, axis=0)
+        alpha_mean = alpha_y  # [C, T]
+        alpha_lower = alpha_y  # no uncertainty (point estimate)
+        alpha_upper = alpha_y
 
         # Build DataFrame
         data = {
@@ -1474,7 +1478,9 @@ class ModelSummarizer:
         }
 
         # Get x_range from model (guide-level x_true values)
-        # This defines the "observed" x range as min to max of x_eff_g (guide-level x_true)
+        # This defines the "observed" x range as min to max of x_eff_g (guide-level x_true).
+        # If the modality covers fewer cells than the model, use only the modality's cells
+        # so x_obs_min/x_obs_max reflect the x values actually used during fitting.
         x_range = None
         x_obs_min = None
         x_obs_max = None
@@ -1484,12 +1490,15 @@ class ModelSummarizer:
                 x_true = x_true.cpu().numpy()
             if x_true.ndim > 1:
                 x_true = x_true.mean(axis=0)  # Average over posterior samples
+            # Subset to modality cells when the modality covers fewer cells than the model
+            if modality.cell_names is not None:
+                all_model_cells = self.model.meta['cell'].tolist()
+                _cidx_map = {c: i for i, c in enumerate(all_model_cells)}
+                _cidx = [_cidx_map[c] for c in modality.cell_names if c in _cidx_map]
+                x_true = x_true[_cidx]
             # Store observed x range (min to max of guide-level x_true)
             x_obs_min = max(x_true.min(), 1e-6)
             x_obs_max = x_true.max()
-            # Create evenly spaced points in log2 space for derivative root finding
-            log2_min = np.log2(x_obs_min)
-            log2_max = np.log2(x_obs_max)
             x_range, x_obs_min, x_obs_max = self._build_x_range_from_x_true(x_true, n_grid=6000, eps=1e-6)
             data['x_obs_min'] = x_obs_min
             data['x_obs_max'] = x_obs_max

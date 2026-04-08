@@ -533,7 +533,111 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
         log_odds = np.log(u / (1.0 - u))
         return 1.0 / (1.0 + np.exp(-(logits + log_odds) / temp))
 
+    elif param in ('alpha_y', 'log2_alpha_y', 'alpha_y_mult', 'alpha_y_add'):
+        # Prior on log2(alpha_y) for non-reference technical groups: StudentT(df=3, loc=0, scale=20)
+        # alpha_y_mult and alpha_y are displayed in log2 space; alpha_y_add is already additive
+        return rng.standard_t(3, n_samples) * 20.0
+
     return None
+
+
+# Parameters that come from posterior_samples_technical rather than posterior_samples_trans.
+# NOTE: o_y is sampled in BOTH technical and trans posteriors.
+#   'o_y'      → posterior_samples_trans  (trans fit overdispersion, the usual plotting target)
+#   'o_y_tech' → posterior_samples_technical  (NTC-only technical fit overdispersion)
+_TECHNICAL_PARAMS = frozenset({'alpha_y', 'alpha_y_mult', 'alpha_y_add', 'log2_alpha_y', 'mu_ntc', 'o_y_tech'})
+
+
+def _get_technical_param_samples(param, tech_posterior, technical_group):
+    """
+    Extract samples for a technical parameter from posterior_samples_technical.
+
+    Handles the C (technical group) dimension and log2 conversion for multiplicative params.
+
+    Parameters
+    ----------
+    param : str
+        Parameter name ('alpha_y', 'log2_alpha_y', 'alpha_y_mult', 'alpha_y_add', 'mu_ntc', 'o_y_tech')
+    tech_posterior : dict
+        posterior_samples_technical dict
+    technical_group : int
+        Which technical group index to display (1 = first non-reference group).
+        Index 0 is always the reference group (alpha=1 for mult, 0 for add).
+
+    Returns
+    -------
+    np.ndarray of shape [S, T]
+    """
+    if param == 'alpha_y':
+        # Try multiplicative first (negbinom), then additive
+        if 'alpha_y_mult' in tech_posterior:
+            raw = to_np(tech_posterior['alpha_y_mult'])
+            if raw.ndim == 3:
+                raw = raw[:, technical_group, :]
+            return np.log2(np.maximum(raw, 1e-10))
+        elif 'alpha_y_add' in tech_posterior:
+            raw = to_np(tech_posterior['alpha_y_add'])
+            if raw.ndim == 3:
+                raw = raw[:, technical_group, :]
+            return raw
+        elif 'alpha_y' in tech_posterior:
+            raw = to_np(tech_posterior['alpha_y'])
+            if raw.ndim == 3:
+                raw = raw[:, technical_group, :]
+            return raw
+        else:
+            raise KeyError(
+                f"'alpha_y' not found in posterior_samples_technical. "
+                f"Available: {list(tech_posterior.keys())}"
+            )
+
+    elif param == 'alpha_y_mult':
+        raw = to_np(tech_posterior['alpha_y_mult'])
+        if raw.ndim == 3:
+            raw = raw[:, technical_group, :]
+        return np.log2(np.maximum(raw, 1e-10))
+
+    elif param == 'alpha_y_add':
+        raw = to_np(tech_posterior['alpha_y_add'])
+        if raw.ndim == 3:
+            raw = raw[:, technical_group, :]
+        return raw
+
+    elif param == 'log2_alpha_y':
+        # Directly sampled in log2 space, shape [S, C-1, T] (no reference group)
+        raw = to_np(tech_posterior['log2_alpha_y'])
+        if raw.ndim == 3:
+            g_idx = technical_group - 1  # 1-based group → 0-based index into C-1 groups
+            if g_idx < 0 or g_idx >= raw.shape[1]:
+                raise ValueError(
+                    f"technical_group={technical_group} out of range for log2_alpha_y with "
+                    f"{raw.shape[1]} non-reference group(s). "
+                    f"Use technical_group between 1 and {raw.shape[1]}."
+                )
+            raw = raw[:, g_idx, :]
+        return raw
+
+    elif param == 'mu_ntc':
+        # mu_ntc has no C dimension ([S, T]), but handle 3D defensively
+        raw = to_np(tech_posterior['mu_ntc'])
+        if raw.ndim == 3:
+            raw = raw[:, technical_group, :]
+        return raw
+
+    elif param == 'o_y_tech':
+        # o_y from the technical fit (NTC-only). Use 'o_y' for the trans fit version.
+        # Shape [S, T] — no C dimension.
+        raw = to_np(tech_posterior['o_y'])
+        if raw.ndim == 3:
+            raw = raw[:, technical_group, :]
+        return raw
+
+    else:
+        # Generic fallback for any other key in technical posterior
+        raw = to_np(tech_posterior[param])
+        if raw.ndim == 3:
+            raw = raw[:, technical_group, :]
+        return raw
 
 
 def plot_parameter_ci_panel(
@@ -562,6 +666,7 @@ def plot_parameter_ci_panel(
     fdr_threshold: float = 0.05,
     hide_inactive: bool = False,
     show_prior: bool = False,
+    technical_group: int = 1,
 ):
     """
     Forest plot (dot + whisker CI) for posterior parameters across trans genes.
@@ -645,6 +750,12 @@ def plot_parameter_ci_panel(
         ``model.trans_prior_params`` to be set (automatically set by
         ``fit_trans()``).  Useful for assessing how much the posterior has moved
         away from the prior.
+    technical_group : int
+        Which technical group to display for technical parameters (``alpha_y``,
+        ``log2_alpha_y``, ``mu_ntc``, ``o_y``). Index 0 is the reference group
+        (always 0 in log2 space), so typically use 1 for the first non-reference
+        group (default: 1). For ``log2_alpha_y`` specifically, this is 1-based
+        into the C-1 non-reference groups.
 
     Returns
     -------
@@ -682,26 +793,58 @@ def plot_parameter_ci_panel(
         modality_name = model.primary_modality
     modality = model.get_modality(modality_name)
 
-    # Get posterior samples
-    if modality_name == model.primary_modality:
-        posterior = model.posterior_samples_trans
+    # Separate trans params from technical params (alpha_y, mu_ntc, o_y, etc.)
+    trans_params = [p for p in params if p not in _TECHNICAL_PARAMS]
+    tech_params  = [p for p in params if p in _TECHNICAL_PARAMS]
+
+    # Get trans posterior (only required when trans params are requested)
+    if trans_params:
+        if modality_name == model.primary_modality:
+            posterior = model.posterior_samples_trans
+        else:
+            posterior = modality.posterior_samples_trans
+
+        if posterior is None:
+            raise ValueError(
+                f"No posterior_samples_trans found for modality '{modality_name}'. "
+                "Must run fit_trans() first."
+            )
+
+        missing = [p for p in trans_params if p not in posterior]
+        if missing:
+            available = list(posterior.keys())
+            raise ValueError(
+                f"Parameters {missing} not found in posterior_samples_trans. "
+                f"Available: {available}"
+            )
     else:
-        posterior = modality.posterior_samples_trans
+        posterior = None
 
-    if posterior is None:
-        raise ValueError(
-            f"No posterior_samples_trans found for modality '{modality_name}'. "
-            "Must run fit_trans() first."
-        )
-
-    # Validate params exist
-    missing = [p for p in params if p not in posterior]
-    if missing:
-        available = list(posterior.keys())
-        raise ValueError(
-            f"Parameters {missing} not found in posterior. "
-            f"Available: {available}"
-        )
+    # Get technical posterior (required when technical params are requested)
+    tech_posterior = None
+    if tech_params:
+        tech_posterior = modality.posterior_samples_technical
+        if tech_posterior is None:
+            raise ValueError(
+                f"Parameters {tech_params} require posterior_samples_technical. "
+                "Must run fit_technical() first."
+            )
+        # Validate that needed keys are present
+        missing_tech = []
+        for p in tech_params:
+            if p == 'alpha_y':
+                if not any(k in tech_posterior for k in ('alpha_y_mult', 'alpha_y_add', 'alpha_y')):
+                    missing_tech.append(p)
+            elif p == 'o_y_tech':
+                if 'o_y' not in tech_posterior:
+                    missing_tech.append(p)
+            elif p not in tech_posterior:
+                missing_tech.append(p)
+        if missing_tech:
+            raise ValueError(
+                f"Technical parameters {missing_tech} not found in posterior_samples_technical. "
+                f"Available: {list(tech_posterior.keys())}"
+            )
 
     # Get gene names from modality
     gene_names = modality.feature_names
@@ -715,14 +858,17 @@ def plot_parameter_ci_panel(
         gene_names = [str(i) for i in range(modality.dims['n_features'])]
 
     # Extract samples for each parameter
-    # Shape: posterior[param] is typically (S, n_cis, T) where n_cis=1
+    # Trans params: posterior[param] is typically (S, n_cis, T) where n_cis=1
+    # Technical params: posterior_samples_technical[param] may be (S, C, T) or (S, T)
     samples_dict = {}
     for param in params:
-        samps = to_np(posterior[param])
-        # Handle different shapes
-        if samps.ndim == 3:
-            samps = samps[:, 0, :]  # (S, 1, T) -> (S, T)
-        elif samps.ndim == 1:
+        if param in _TECHNICAL_PARAMS:
+            samps = _get_technical_param_samples(param, tech_posterior, technical_group)
+        else:
+            samps = to_np(posterior[param])
+            if samps.ndim == 3:
+                samps = samps[:, 0, :]  # (S, 1, T) -> (S, T)
+        if samps.ndim == 1:
             samps = samps.reshape(-1, 1)  # (S,) -> (S, 1)
         samples_dict[param] = samps
 
@@ -882,6 +1028,11 @@ def plot_parameter_ci_panel(
               and hasattr(model, 'trans_prior_params')
               and model.trans_prior_params is not None):
             prior_params = model.trans_prior_params
+
+        # Technical params (alpha_y, log2_alpha_y, etc.) have analytic priors that don't
+        # need trans_prior_params. Use an empty dict so _sample_prior_for_param can handle them.
+        if prior_params is None and all(p in _TECHNICAL_PARAMS for p in params):
+            prior_params = {}
 
         if prior_params is not None:
             _rng = np.random.default_rng(0)

@@ -100,7 +100,9 @@ class TestHighMOIInitialization(unittest.TestCase):
         self.assertTrue(hasattr(self.model, 'guide_assignment_tensor'))
 
     def test_guide_meta_length(self):
-        self.assertEqual(len(self.model.guide_meta), self.n_guides)
+        # Only NTC and cis-gene guides are kept; MYB guides (C, D, E) are pruned
+        # guide_A (GFI1B), guide_B (GFI1B), ntc_1 (ntc) → 3 guides remain
+        self.assertEqual(len(self.model.guide_meta), 3)
 
     def test_target_column_created(self):
         self.assertIn('target', self.model.meta.columns)

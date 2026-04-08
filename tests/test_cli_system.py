@@ -103,7 +103,7 @@ def _write_cli_fixture(
             "save": True,
         },
         "cis": {
-            "load_technical": {"enabled": True, "args": {"use_posterior": False}},
+            "load_technical": {"enabled": True, "args": {}},
             "fit": {
                 "sum_factor_col": "sum_factor",
                 "niters": 100,
@@ -112,8 +112,8 @@ def _write_cli_fixture(
             "save": True,
         },
         "trans": {
-            "load_technical": {"enabled": True, "args": {"use_posterior": False}},
-            "load_cis": {"enabled": True, "args": {"use_posterior": False}},
+            "load_technical": {"enabled": True, "args": {}},
+            "load_cis": {"enabled": True, "args": {}},
             "fit": {
                 "modality_name": "gene",
                 "sum_factor_col": "sum_factor",

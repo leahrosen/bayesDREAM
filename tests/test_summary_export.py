@@ -49,11 +49,11 @@ class TestSummaryExport(unittest.TestCase):
         )
         cls.model.set_technical_groups(['cell_line'])
         cls.model.fit_technical(sum_factor_col='sum_factor', niters=5000, lr=0.001)
-        cls.model.fit_cis(sum_factor_col='sum_factor', n_steps=500, lr=0.01)
+        cls.model.fit_cis(sum_factor_col='sum_factor', niters=500, lr=0.01)
         cls.model.fit_trans(
-            sum_factor_col='sum_factor_adj',
+            sum_factor_col='sum_factor',
             function_type='additive_hill',
-            n_steps=500,
+            niters=500,
             lr=0.01,
         )
         cls.outdir = os.path.join(cls.tmpdir, 'summary_test')
@@ -95,9 +95,10 @@ class TestSummaryExport(unittest.TestCase):
             compute_inflection=True, compute_full_log2fc=True
         )
         for col in ('feature', 'modality', 'distribution', 'function_type',
-                    'observed_log2fc', 'observed_log2fc_se', 'B_pos_mean', 'K_pos_mean',
-                    'EC50_pos_mean', 'B_neg_mean', 'K_neg_mean', 'IC50_neg_mean',
-                    'inflection_pos_mean', 'inflection_neg_mean', 'full_log2fc_mean'):
+                    'observed_log2fc', 'observed_log2fc_lower', 'observed_log2fc_upper',
+                    'Vmax_a_mean', 'K_a_mean', 'EC50_a_mean',
+                    'Vmax_b_mean', 'K_b_mean', 'EC50_b_mean',
+                    'inflection_a_mean', 'inflection_b_mean', 'full_log2fc_mean'):
             self.assertIn(col, trans_df.columns)
 
     def test_trans_summary_csv(self):
@@ -108,9 +109,9 @@ class TestSummaryExport(unittest.TestCase):
 
     def test_trans_summary_polynomial_columns(self):
         self.model.fit_trans(
-            sum_factor_col='sum_factor_adj',
+            sum_factor_col='sum_factor',
             function_type='polynomial',
-            n_steps=500,
+            niters=500,
             lr=0.01,
         )
         poly_df = self.model.save_trans_summary(compute_inflection=False, compute_full_log2fc=True)

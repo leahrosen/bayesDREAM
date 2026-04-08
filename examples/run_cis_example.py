@@ -35,8 +35,6 @@ if __name__ == "__main__":
     parser.add_argument("--cis_gene", default="GFI1B", help="Cis gene name")
     parser.add_argument("--meta", required=True, help="Path to metadata CSV")
     parser.add_argument("--counts", required=True, help="Path to counts CSV")
-    parser.add_argument("--use_posterior", action='store_true',
-                       help="Use full posterior samples (default: point estimates)")
     parser.add_argument("--cores", type=int, default=1, help="Number of CPU cores")
     args = parser.parse_args()
 
@@ -72,9 +70,7 @@ if __name__ == "__main__":
 
     # Load technical fit
     print(f"\nLoading technical fit...")
-    model.load_technical_fit(use_posterior=args.use_posterior)
-    print(f"  alpha_x_type: {model.alpha_x_type}")
-    print(f"  alpha_y_type: {model.alpha_y_type}")
+    model.load_technical_fit()
 
     # Fit cis
     print(f"\nRunning fit_cis...")

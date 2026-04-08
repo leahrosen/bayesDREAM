@@ -120,8 +120,8 @@ def test_quick_system_pipeline_and_roundtrip(tmp_path):
     )
 
     model_loaded.set_technical_groups(["cell_line"])
-    model_loaded.load_technical_fit(use_posterior=False)
-    model_loaded.load_cis_fit(use_posterior=False)
+    model_loaded.load_technical_fit()
+    model_loaded.load_cis_fit()
     model_loaded.load_trans_fit()
 
     assert model_loaded.alpha_x_prefit is not None

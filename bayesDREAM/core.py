@@ -40,7 +40,6 @@ from .utils import (
     check_tensor
 )
 from .modality import Modality
-from .splicing import create_splicing_modality
 from .fitting.distributions import get_observation_sampler, requires_denominator, is_3d_distribution
 
 # Import fitters
@@ -479,21 +478,21 @@ class _BayesDREAMCore(PlottingMixin):
             cis_guide_indices = []
             exclude_guide_indices = []
 
-            for guide_idx, guide_row in self.guide_meta.iterrows():
+            for pos_idx, (guide_idx, guide_row) in enumerate(self.guide_meta.iterrows()):
                 guide_name = guide_row['guide']
                 targets = self.guide_targets_dict.get(guide_name, [])
 
                 # Check if this guide has ANY NTC target
                 if any(is_ntc_target(t) for t in targets):
-                    ntc_guide_indices.append(guide_idx)
+                    ntc_guide_indices.append(pos_idx)
 
                 # Check if this guide has ANY cis_gene target
                 if self.cis_gene in targets:
-                    cis_guide_indices.append(guide_idx)
+                    cis_guide_indices.append(pos_idx)
 
                 # Check if this guide has ANY excluded target
                 if exclude_targets is not None and any(t in exclude_targets for t in targets):
-                    exclude_guide_indices.append(guide_idx)
+                    exclude_guide_indices.append(pos_idx)
 
             ntc_guide_indices = np.array(ntc_guide_indices)
             cis_guide_indices = np.array(cis_guide_indices)
@@ -552,6 +551,13 @@ class _BayesDREAMCore(PlottingMixin):
             if exclude_targets is not None:
                 print(f"  Excluded cells (guides targeting {exclude_targets}): {excluded_count}")
 
+        # Save original cell order before subsetting (for guide_assignment row alignment in high MOI)
+        if self.is_high_moi:
+            if isinstance(self.counts, pd.DataFrame):
+                _ga_original_cell_names = list(self.counts.columns)
+            else:
+                _ga_original_cell_names = list(self._cell_names) if hasattr(self, '_cell_names') and self._cell_names else []
+
         # Subset meta and counts to relevant cells
         valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
         if len(valid_cells) < len(self.meta["cell"].unique()):
@@ -586,13 +592,13 @@ class _BayesDREAMCore(PlottingMixin):
                 ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
                 return target_name in ntc_variants
 
-            for guide_idx, guide_row in self.guide_meta.iterrows():
+            for pos_idx, (guide_idx, guide_row) in enumerate(self.guide_meta.iterrows()):
                 guide_name = guide_row['guide']
                 targets = self.guide_targets_dict.get(guide_name, [])
 
                 # Keep if ANY target is NTC or cis_gene
                 if any(is_ntc_target(t) for t in targets) or self.cis_gene in targets:
-                    keep_guide_indices.append(guide_idx)
+                    keep_guide_indices.append(pos_idx)
 
             keep_guide_indices = np.array(keep_guide_indices)
 
@@ -733,12 +739,10 @@ class _BayesDREAMCore(PlottingMixin):
             # High MOI: guide_used not needed, guide_code already set to -1
             self.meta["guide_used"] = "highmoi"  # Placeholder for compatibility
             # Convert guide_assignment to tensor and store after subsetting
-            # Need to subset guide_assignment to match the subsetted cells
-            if isinstance(self.counts, pd.DataFrame):
-                cell_indices = [list(self.counts.columns).index(cell) for cell in self.meta['cell']]
-            else:
-                # Use _cell_names for sparse/dense array compatibility
-                cell_indices = [self._cell_names.index(cell) for cell in self.meta['cell']]
+            # Need to subset guide_assignment rows to match the subsetted cells.
+            # Use the ORIGINAL cell order (saved before counts subsetting) so indices
+            # correctly reference the 100-row guide_assignment, not the 50-row subset.
+            cell_indices = [_ga_original_cell_names.index(cell) for cell in self.meta['cell']]
             self.guide_assignment = self.guide_assignment[cell_indices, :]
             self.guide_assignment_tensor = torch.tensor(
                 self.guide_assignment,
@@ -762,9 +766,8 @@ class _BayesDREAMCore(PlottingMixin):
         set_max_threads(cores)
 
         # Bookkeeping for results
-        self.alpha_x_prefit = None    # from step1
-        self.alpha_x_type = None    # from step1
-        # NOTE: alpha_y_prefit and alpha_y_type are stored per-modality, not on the model
+        self.alpha_x_prefit = None    # from step1: shape [C], always a mean point estimate
+        # NOTE: alpha_y_prefit is stored per-modality as a mean point estimate [C, T]
         self.trace_cellline = None    # from step1
         self.trace_x = None          # from step2
         self.trace_y = None          # from step3
@@ -848,12 +851,11 @@ class _BayesDREAMCore(PlottingMixin):
 
     def set_alpha_x(
         self,
-        alpha_x: float, # expected to be C x 1 point estimate or S x C x 1 posterior
-        is_posterior: bool,
-        covariates: list[str] = None # Technical group covariates (e.g., ["cell_line"]). NOT empty. The point is to fit to the covariates. Lane is typically not included as this tends to be corrected by sum factor adjustment alone
+        alpha_x,  # expected to be shape [C] or scalar point estimate
+        covariates: list[str] = None # Technical group covariates (e.g., ["cell_line"]). NOT empty.
     ):
         """
-        Sets alpha_x either as a point estimate (float/tensor) or as a Pyro posterior.
+        Sets alpha_x as a point estimate tensor of shape [C] (includes reference group at index 0).
         """
         if covariates:
             if "technical_group_code" in self.meta.columns:
@@ -863,30 +865,16 @@ class _BayesDREAMCore(PlottingMixin):
             raise ValueError(f"No column 'technical_group_code' found in meta, and no covariates provided.")
         else:
             warnings.warn("technical_group previously set. Assuming alpha_x corresponds.")
-        self.alpha_x_prefit = sample_or_use_point("alpha_x_posterior", alpha_x, self.device)
-        
-        if is_posterior:
-            if not (self.alpha_x_prefit.ndim == 2 or (self.alpha_x_prefit.ndim == 3 and self.alpha_x_prefit.shape[2] == 1)):
-                raise ValueError(
-                    f"when it is a posterior, alpha_x_prefit is expected to be of shape S x C or S x C x 1, "
-                    f"but got {self.alpha_x_prefit.shape}."
-                )
-            self.alpha_x_type = 'posterior'
-        else:
-            if not (self.alpha_x_prefit.ndim == 0 or  # Scalar case
-                    (self.alpha_x_prefit.ndim == 2 and self.alpha_x_prefit.shape[1] == 1)):  # C x 1 case
-                raise ValueError(
-                    f"when it is a point estimate, alpha_x_prefit is expected to be a scalar or of shape C x 1, "
-                    f"but got {self.alpha_x_prefit.shape}."
-                )
-            self.alpha_x_type = 'point'
+        self.alpha_x_prefit = sample_or_use_point("alpha_x_posterior", alpha_x, self.device).flatten()
 
     def set_alpha_y(
         self,
-        alpha_y,
-        is_posterior: bool,
-        covariates: list[str] = None # Technical group covariates (e.g., ["cell_line"]). NOT empty. The point is to fit to the covariates. Lane is typically not included as this tends to be corrected by sum factor adjustment alone
+        alpha_y,  # expected to be shape [C, T] point estimate (C includes reference group at index 0)
+        covariates: list[str] = None # Technical group covariates (e.g., ["cell_line"]). NOT empty.
     ):
+        """
+        Sets alpha_y as a point estimate tensor of shape [C, T] in the primary modality.
+        """
         if covariates:
             if "technical_group_code" in self.meta.columns:
                 warnings.warn("technical_group already set. Overwriting.")
@@ -896,141 +884,27 @@ class _BayesDREAMCore(PlottingMixin):
         else:
             warnings.warn("technical_group previously set. Assuming alpha_xy corresponds.")
 
-        # Determine T (number of response variables)
-        if self.cis_gene is not None:
-            # Count trans genes (all genes except cis) - works for DataFrame and arrays
-            if isinstance(self.counts, pd.DataFrame):
-                T = self.counts.drop([self.cis_gene]).shape[0]
-            else:
-                # For matrices/arrays: use self.trans_genes (already computed as numeric indices)
-                T = len(self.trans_genes)
-        else:
-            T = self.counts.shape[0]
-        C = self.meta["technical_group_code"].nunique() - 1
-    
         # Convert alpha_y to tensor
         alpha_y = sample_or_use_point("alpha_y_posterior", alpha_y, self.device)
-    
-        # Determine type based on shape
-        if is_posterior:
-            if not (alpha_y.ndim == 3 and alpha_y.shape[1] == C and alpha_y.shape[2] == T):
-                raise ValueError(
-                    f"When it is a posterior, alpha_y is expected to have shape S x C-1 x T, but got {alpha_y.shape}."
-                )
-            alpha_y_type = 'posterior'
-        else:
-            if not (alpha_y.ndim == 2 and alpha_y.shape[0] == C and alpha_y.shape[1] == T):
-                raise ValueError(
-                    f"When it is a point estimate, alpha_y must have shape C-1 x T, but got {alpha_y.shape}."
-                )
-            alpha_y_type = 'point'
 
         # Store in primary modality (not model-level)
         primary_mod = self.get_modality(self.primary_modality)
         primary_mod.alpha_y_prefit = alpha_y  # Uses property to store in distribution-specific attribute
-        primary_mod.alpha_y_type = alpha_y_type
-
-    def set_o_x_grouped(
-        self,
-        o_x,  # Expected to be C x 1 point estimate or S x C x 1 posterior
-        is_posterior: bool,
-        covariates: list[str] = None,  # Technical group covariates (e.g., ["cell_line"]) NOT empty if using
-    ):
-        """
-        Sets o_x either as a point estimate (float/tensor) or as a Pyro posterior.
-        """
-        if covariates:
-            if "technical_group_code" in self.meta.columns:
-                warnings.warn("technical_group already set. Overwriting.")
-            self.meta["technical_group_code"] = self.meta.groupby(covariates).ngroup()
-        elif "technical_group_code" not in self.meta.columns:
-            raise ValueError("No column 'technical_group_code' found in meta, and no covariates provided.")
-        else:
-            warnings.warn("technical_group previously set. Assuming o_x corresponds.")
-    
-        self.o_x_prefit = sample_or_use_point("o_x_posterior", o_x, self.device)
-    
-        if is_posterior:
-            if not (self.o_x_prefit.ndim == 2 or
-                    (self.o_x_prefit.ndim == 3 and self.o_x_prefit.shape[2] == 1)):
-                raise ValueError(
-                    f"When it is a posterior, o_x_prefit must be S x C or S x C x 1, "
-                    f"but got {self.o_x_prefit.shape}."
-                )
-            self.o_x_type = 'posterior'
-        else:
-            if not (self.o_x_prefit.ndim == 0 or
-                    (self.o_x_prefit.ndim == 2 and self.o_x_prefit.shape[1] == 1)):  # C x 1 case
-                raise ValueError(
-                    f"When it is a point estimate, o_x_prefit must be a scalar or of shape C x 1, "
-                    f"but got {self.o_x_prefit.shape}."
-                )
-            self.o_x_type = 'point'
-
-
-    def set_o_x(
-        self,
-        o_x,
-        is_posterior: bool
-    ):
-        """
-        Sets o_x either as a point estimate (float/tensor) or as a posterior.
-        
-        - If posterior: o_x should have shape S, S x 1, or S x 1 x 1.
-        - If point estimate: o_x should be a scalar or [scalar] (1-element tensor).
-        """
-        self.o_x = sample_or_use_point("o_x_posterior", o_x, self.device)
-    
-        if is_posterior:
-            if not (
-                (self.o_x.ndim == 1) or  # S
-                (self.o_x.ndim == 2 and self.o_x.shape[1] == 1) or  # S x 1
-                (self.o_x.ndim == 3 and self.o_x.shape[1] == 1 and self.o_x.shape[2] == 1)  # S x 1 x 1
-            ):
-                raise ValueError(
-                    f"When it is a posterior, o_x must have shape S, S x 1, or S x 1 x 1, but got {self.o_x.shape}."
-                )
-            self.o_x_type = "posterior"
-        else:
-            if not (self.o_x.ndim == 0 or (self.o_x.ndim == 1 and self.o_x.numel() == 1)):
-                raise ValueError(
-                    f"When it is a point estimate, o_x must be a scalar or a single-element tensor, but got {self.o_x.shape}."
-                )
-            self.o_x_type = "point"
 
     def set_x_true(
         self,
-        x_true,
-        is_posterior: bool
+        x_true
     ):
-
         """
-        Sets x_true either as a point estimate or as a posterior.
-        
-        - If posterior: x_true should have shape S x N or S x 1 x N.
-        - If point estimate: x_true should have shape N.
+        Sets x_true as a point estimate with shape [N] (one value per cell).
         """
-        # Determine N (number of observations)
         N = self.counts.shape[1]
-    
-        # Convert x_true to tensor
         x_true = sample_or_use_point("x_true_posterior", x_true, self.device)
-    
-        if is_posterior:
-            if not ((x_true.ndim == 2 and x_true.shape[1] == N) or
-                    (x_true.ndim == 3 and x_true.shape[1] == 1 and x_true.shape[2] == N)):
-                raise ValueError(
-                    f"When it is a posterior, x_true must have shape S x N or S x 1 x N, but got {x_true.shape}."
-                )
-            self.x_true_type = "posterior"
-        else:
-            if not (x_true.ndim == 1 and x_true.shape[0] == N):
-                raise ValueError(
-                    f"When it is a point estimate, x_true must have shape N ({N},), but got {x_true.shape}."
-                )
-            self.x_true_type = "point"
-    
-        self.x_true = x_true  # Store validated tensor
+        if not (x_true.ndim == 1 and x_true.shape[0] == N):
+            raise ValueError(
+                f"x_true must have shape N ({N},), but got {x_true.shape}."
+            )
+        self.x_true = x_true
 
 
     def adjust_ntc_sum_factor(
@@ -1222,7 +1096,7 @@ class _BayesDREAMCore(PlottingMixin):
 
         Requires:
         - self.x_true (or self.log2_x_true) must be set (from fit_cis())
-        - self.x_true_type must be 'posterior' or 'point'
+        - self.x_true must be set (shape [N], always a point estimate)
         """
         from scipy.stats import gaussian_kde
 
@@ -1241,27 +1115,16 @@ class _BayesDREAMCore(PlottingMixin):
             groups, group_id = np.array(["all"]), np.zeros(len(self.meta), dtype=int)
             n_groups = 1
 
-        # Get x_true values (optionally in log2 space)
+        # Get x_true values (optionally in log2 space); x_true is always [N] point estimate
         if use_log2:
-            # Use log2_x_true if available, otherwise compute from x_true
             if hasattr(self, 'log2_x_true') and self.log2_x_true is not None:
-                if self.x_true_type == 'posterior':
-                    X_true = self.log2_x_true.mean(dim=0).cpu().numpy()
-                else:
-                    X_true = self.log2_x_true.cpu().numpy() if hasattr(self.log2_x_true, 'cpu') else np.array(self.log2_x_true)
+                X_true = self.log2_x_true.cpu().numpy() if hasattr(self.log2_x_true, 'cpu') else np.array(self.log2_x_true)
             else:
-                # Compute log2 from x_true
-                if self.x_true_type == 'posterior':
-                    x_raw = self.x_true.mean(dim=0).cpu().numpy()
-                else:
-                    x_raw = self.x_true.cpu().numpy() if hasattr(self.x_true, 'cpu') else np.array(self.x_true)
-                X_true = np.log2(np.maximum(x_raw, 1e-6))  # Small epsilon to avoid log(0)
+                x_raw = self.x_true.cpu().numpy() if hasattr(self.x_true, 'cpu') else np.array(self.x_true)
+                X_true = np.log2(np.maximum(x_raw, 1e-6))
             print(f"[INFO] Using log2(x_true) for spline fitting (range: [{X_true.min():.2f}, {X_true.max():.2f}])")
         else:
-            if self.x_true_type == 'posterior':
-                X_true = self.x_true.mean(dim=0).cpu().numpy()
-            else:
-                X_true = self.x_true.cpu().numpy() if hasattr(self.x_true, 'cpu') else np.array(self.x_true)
+            X_true = self.x_true.cpu().numpy() if hasattr(self.x_true, 'cpu') else np.array(self.x_true)
             print(f"[INFO] Using x_true (linear scale) for spline fitting (range: [{X_true.min():.2f}, {X_true.max():.2f}])")
 
         # Check if we have NTC cells
@@ -1778,11 +1641,10 @@ class _BayesDREAMCore(PlottingMixin):
             # Copy technical fit parameters if they exist
             if self.alpha_x_prefit is not None:
                 model_new.alpha_x_prefit = self.alpha_x_prefit.clone() if isinstance(self.alpha_x_prefit, torch.Tensor) else self.alpha_x_prefit
-                model_new.alpha_x_type = self.alpha_x_type
 
             # Copy all fit attributes from original modalities to new modalities
             # (including 'gene' and 'cis' which were recreated during initialization)
-            # NOTE: alpha_y_type is now stored per-modality only, not at model level
+            # NOTE: alpha_y_prefit is stored per-modality as a [C, T] mean point estimate
 
             # Helper to clone tensors
             def _clone_attr(val):
@@ -1793,7 +1655,7 @@ class _BayesDREAMCore(PlottingMixin):
             # Modality-level attributes to copy from fit_technical and fit_trans
             # NOTE: alpha_y_prefit is a property, not an attribute - it derives from _mult/_add
             modality_attrs = [
-                'alpha_y_type', 'alpha_y_prefit_mult', 'alpha_y_prefit_add',
+                'alpha_y_prefit_mult', 'alpha_y_prefit_add',
                 'posterior_samples_technical', 'posterior_samples_trans', 'losses_trans'
             ]
             for mod_name in self.modalities:
@@ -1825,31 +1687,14 @@ class _BayesDREAMCore(PlottingMixin):
             )
 
             if hasattr(self, 'x_true') and self.x_true is not None:
-                # x_true needs to be subsetted to match new cells
+                # x_true is always shape [N] - subset to new cells
                 if isinstance(self.x_true, torch.Tensor):
-                    if self.x_true_type == 'posterior':
-                        # x_true shape: [S, N] or [S, 1, N]
-                        if self.x_true.ndim == 2:
-                            model_new.x_true = self.x_true[:, cell_indices_torch].clone()
-                        else:
-                            model_new.x_true = self.x_true[:, :, cell_indices_torch].clone()
-                    else:
-                        # Point estimate: shape [N]
-                        model_new.x_true = self.x_true[cell_indices_torch].clone()
-                    model_new.x_true_type = self.x_true_type
+                    model_new.x_true = self.x_true[cell_indices_torch].clone()
 
             # Copy log2_x_true (also needs subsetting)
             if hasattr(self, 'log2_x_true') and self.log2_x_true is not None:
                 if isinstance(self.log2_x_true, torch.Tensor):
-                    if hasattr(self, 'log2_x_true_type') and self.log2_x_true_type == 'posterior':
-                        if self.log2_x_true.ndim == 2:
-                            model_new.log2_x_true = self.log2_x_true[:, cell_indices_torch].clone()
-                        else:
-                            model_new.log2_x_true = self.log2_x_true[:, :, cell_indices_torch].clone()
-                    else:
-                        model_new.log2_x_true = self.log2_x_true[cell_indices_torch].clone()
-                    if hasattr(self, 'log2_x_true_type'):
-                        model_new.log2_x_true_type = self.log2_x_true_type
+                    model_new.log2_x_true = self.log2_x_true[cell_indices_torch].clone()
 
             # Copy posterior_samples_cis with cell-indexed tensors subsetted
             if hasattr(self, 'posterior_samples_cis') and self.posterior_samples_cis is not None:

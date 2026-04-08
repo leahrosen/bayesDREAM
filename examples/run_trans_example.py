@@ -39,8 +39,6 @@ if __name__ == "__main__":
                        choices=['single_hill', 'additive_hill', 'polynomial'],
                        help="Function type for trans effects")
     parser.add_argument("--modality", default='gene', help="Modality to fit trans on")
-    parser.add_argument("--use_posterior", action='store_true',
-                       help="Use full posterior samples (default: point estimates)")
     parser.add_argument("--cores", type=int, default=1, help="Number of CPU cores")
     args = parser.parse_args()
 
@@ -76,11 +74,10 @@ if __name__ == "__main__":
 
     # Load technical and cis fits
     print(f"\nLoading technical fit...")
-    model.load_technical_fit(use_posterior=args.use_posterior)
+    model.load_technical_fit()
 
     print(f"\nLoading cis fit...")
-    model.load_cis_fit(use_posterior=args.use_posterior)
-    print(f"  x_true_type: {model.x_true_type}")
+    model.load_cis_fit()
 
     # Fit trans
     print(f"\nRunning fit_trans...")

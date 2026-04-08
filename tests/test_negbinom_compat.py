@@ -49,9 +49,7 @@ class TestNegbinomCompat(unittest.TestCase):
         # Set dummy x_true for trans testing
         n_guides = len(cls.model.meta)
         cls.model.x_true = torch.ones(n_guides, device=cls.model.device)
-        cls.model.x_true_type = 'point'
         cls.model.log2_x_true = torch.log2(cls.model.x_true)
-        cls.model.log2_x_true_type = 'point'
 
     def test_fit_trans_negbinom_runs(self):
         self.model.fit_trans(

@@ -4521,6 +4521,22 @@ def _plot_multinomial_multifeature(
     """
     n_features = len(feature_indices)
 
+    # Compute proper cell alignment once for all features.
+    # modality may cover fewer cells than model.meta, and subset_mask (if any) is on model.meta.
+    # We combine both into y_indices (into modality cell order) and pre-aligned x_true / meta.
+    _model_cells_arr = (model.meta['cell'].values if 'cell' in model.meta.columns
+                        else model.meta.index.values)
+    _modality_cells = modality.cell_names
+    if _modality_cells is None:
+        raise ValueError(f"Modality '{modality.name}' does not have cell_names set.")
+    _modality_mask = np.isin(_model_cells_arr, _modality_cells)
+    _final_mask = _modality_mask & subset_mask if subset_mask is not None else _modality_mask
+    _final_cells = _model_cells_arr[_final_mask]
+    _mod_cell_to_idx = {c: i for i, c in enumerate(_modality_cells)}
+    y_indices = np.array([_mod_cell_to_idx[c] for c in _final_cells])
+    x_true_aligned = x_true[_final_mask]   # x_true is full model x_true
+    meta_aligned = model.meta[_final_mask].reset_index(drop=True)
+
     # Get number of categories (K) for each feature and identify non-zero categories
     # IMPORTANT: Must compute non-zero categories AFTER subsetting to get correct max_non_zero
     Ks = []
@@ -4528,11 +4544,7 @@ def _plot_multinomial_multifeature(
 
     for feat_idx in feature_indices:
         if modality.counts.ndim == 3:
-            counts_3d = modality.counts[feat_idx, :, :]  # (cells, K)
-
-            # Apply subset mask if provided (to get correct max_non_zero for figure sizing)
-            if subset_mask is not None:
-                counts_3d = counts_3d[subset_mask, :]
+            counts_3d = modality.counts[feat_idx, y_indices, :]  # (N_final, K) - cell-aligned
 
             K = counts_3d.shape[1]
             Ks.append(K)
@@ -4613,12 +4625,8 @@ def _plot_multinomial_multifeature(
         if len(non_zero_cats) == 0:
             continue  # Skip features with no non-zero categories
 
-        # Get counts for this feature
-        counts_3d = modality.counts[feat_idx, :, :]  # (cells, K)
-
-        # Apply subset mask if provided
-        if subset_mask is not None:
-            counts_3d = counts_3d[subset_mask, :]
+        # Get counts for this feature, already cell-aligned via y_indices
+        counts_3d = modality.counts[feat_idx, y_indices, :]  # (N_final, K)
 
         # Get category labels if available for this feature
         category_labels = None
@@ -4638,26 +4646,14 @@ def _plot_multinomial_multifeature(
         total_counts = counts_3d.sum(axis=1)
         valid_mask = total_counts >= min_counts
 
-        # Build dataframe
-        if subset_mask is not None:
-            meta_subset = model.meta[subset_mask]
-            df_data = {
-                'x_true': x_true[valid_mask],
-                'target': meta_subset['target'].values[valid_mask]
-            }
-            # Conditionally add technical_group_code if it exists
-            if 'technical_group_code' in meta_subset.columns:
-                df_data['technical_group_code'] = meta_subset['technical_group_code'].values[valid_mask]
-            df = pd.DataFrame(df_data)
-        else:
-            df_data = {
-                'x_true': x_true[valid_mask],
-                'target': model.meta['target'].values[valid_mask]
-            }
-            # Conditionally add technical_group_code if it exists
-            if 'technical_group_code' in model.meta.columns:
-                df_data['technical_group_code'] = model.meta['technical_group_code'].values[valid_mask]
-            df = pd.DataFrame(df_data)
+        # Build dataframe using pre-aligned x_true and meta
+        df_data = {
+            'x_true': x_true_aligned[valid_mask],
+            'target': meta_aligned['target'].values[valid_mask]
+        }
+        if 'technical_group_code' in meta_aligned.columns:
+            df_data['technical_group_code'] = meta_aligned['technical_group_code'].values[valid_mask]
+        df = pd.DataFrame(df_data)
 
         # Keep raw counts for binning (don't compute proportions per-cell)
         counts_filtered = counts_3d[valid_mask, :]
@@ -5193,16 +5189,13 @@ def plot_xy_data(
 
         # Special handling for multinomial - needs K subplots per feature
         if distribution == 'multinomial':
-            # Subset x_true if needed (multinomial path doesn't use _align_cells_to_modality)
-            x_true_plot = x_true[subset_mask] if subset_mask is not None else x_true
-
             return _plot_multinomial_multifeature(
                 model=model,
                 feature_indices=feature_indices,
                 feature_names=feature_names_resolved,
                 gene_name=feature,
                 modality=modality,
-                x_true=x_true_plot,
+                x_true=x_true,  # full model x_true; alignment to modality cells done inside
                 window=window,
                 min_counts=min_counts,
                 show_correction=show_correction,

@@ -51,12 +51,11 @@ class TestSummaryExportSimple(unittest.TestCase):
         )
         cls.model.set_technical_groups(['cell_line'])
 
-        # Inject mock technical fit posteriors
+        # Inject mock technical fit results (2D point estimate: [C, T])
         gene_mod = cls.model.modalities['gene']
         n_features = gene_mod.dims['n_features']
-        n_groups = 2
-        gene_mod.alpha_y_prefit = torch.randn((100, n_groups, n_features), device=cls.model.device)
-        gene_mod.alpha_y_type = 'posterior'
+        n_groups = 2  # C = number of technical groups (includes reference)
+        gene_mod.alpha_y_prefit = torch.ones((n_groups, n_features), device=cls.model.device)
 
         # Inject mock cis fit posteriors (x_true is cell-level: [n_samples, n_cells])
         n_cells_total = len(cls.model.meta)

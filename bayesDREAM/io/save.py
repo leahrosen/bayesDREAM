@@ -23,7 +23,8 @@ class ModelSaver:
     # Save/Load fitted parameters
     ########################################################
 
-    def save_technical_fit(self, output_dir: str = None, modalities: list = None, verbose: bool = False):
+    def save_technical_fit(self, output_dir: str = None, modalities: list = None, verbose: bool = False,
+                          save_model_level: bool = None):
         """
         Save fitted technical parameters from fit_technical().
 
@@ -70,8 +71,11 @@ class ModelSaver:
                 raise ValueError(f"Unknown modalities: {invalid}. Available: {list(self.model.modalities.keys())}")
             modalities_to_save = modalities
 
-        # Automatically save model-level parameters if primary modality is included
-        should_save_model_level = self.model.primary_modality in modalities_to_save
+        # Determine whether to save model-level parameters
+        if save_model_level is None:
+            should_save_model_level = self.model.primary_modality in modalities_to_save
+        else:
+            should_save_model_level = save_model_level
 
         # Save model-level parameters (when primary modality is being saved)
         if should_save_model_level:
@@ -81,7 +85,7 @@ class ModelSaver:
                 saved_files['alpha_x_prefit'] = path
                 saved_summary.append('alpha_x')
                 if verbose:
-                    print(f"[SAVE] alpha_x_prefit ({self.model.alpha_x_type}) → {path}")
+                    print(f"[SAVE] alpha_x_prefit → {path}")
 
             # NOTE: model.alpha_y_prefit is deprecated - alpha_y_prefit is stored per-modality
             # For backward compatibility, save primary modality's alpha_y_prefit as alpha_y_prefit.pt
@@ -205,10 +209,9 @@ class ModelSaver:
             path = os.path.join(output_dir, 'x_true.pt')
             torch.save(self.model.x_true, path)
             saved_files['x_true'] = path
-            x_type = getattr(self.model, 'x_true_type', 'posterior')
-            saved_summary.append(f'x_true ({x_type})')
+            saved_summary.append('x_true')
             if verbose:
-                print(f"[SAVE] x_true ({x_type}) → {path}")
+                print(f"[SAVE] x_true → {path}")
 
         # Save log2_x_true
         if hasattr(self.model, 'log2_x_true') and self.model.log2_x_true is not None:
@@ -217,8 +220,7 @@ class ModelSaver:
             saved_files['log2_x_true'] = path
             saved_summary.append('log2_x_true')
             if verbose:
-                log2_x_type = getattr(self.model, 'log2_x_true_type', 'posterior')
-                print(f"[SAVE] log2_x_true ({log2_x_type}) → {path}")
+                print(f"[SAVE] log2_x_true → {path}")
 
         # Save posterior samples
         if hasattr(self.model, 'posterior_samples_cis') and self.model.posterior_samples_cis is not None:
@@ -318,7 +320,8 @@ class ModelSaver:
                     'n_features': primary_mod.dims.get('n_features', None),
                     'feature_meta': primary_mod.feature_meta.to_dict('records') if hasattr(primary_mod, 'feature_meta') and primary_mod.feature_meta is not None else None,
                     'cis_gene': self.model.cis_gene,
-                    'losses_trans': self.model.losses_trans if hasattr(self.model, 'losses_trans') else None
+                    'losses_trans': self.model.losses_trans if hasattr(self.model, 'losses_trans') else None,
+                    'trans_prior_params': self.model.trans_prior_params if hasattr(self.model, 'trans_prior_params') else None,
                 }
 
                 # Include modality name in filename to prevent overwrites
@@ -346,7 +349,8 @@ class ModelSaver:
                     'n_features': n_features,
                     'feature_meta': mod.feature_meta.to_dict('records') if hasattr(mod, 'feature_meta') and mod.feature_meta is not None else None,
                     'cis_gene': self.model.cis_gene,
-                    'losses_trans': mod.losses_trans if hasattr(mod, 'losses_trans') else None
+                    'losses_trans': mod.losses_trans if hasattr(mod, 'losses_trans') else None,
+                    'trans_prior_params': mod.trans_prior_params if hasattr(mod, 'trans_prior_params') else None,
                 }
 
                 path = os.path.join(output_dir, f'posterior_samples_trans_{mod_name}.pt')
