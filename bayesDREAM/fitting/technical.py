@@ -601,6 +601,7 @@ class TechnicalFitter:
         denominator: np.ndarray = None,
         modality_name: str = None,
         use_all_cells: bool = False,
+        force_iaf: bool = False,
         **kwargs
     ):
         """
@@ -1479,7 +1480,11 @@ class TechnicalFitter:
                     # Reserve 10 GB for data, gradients, and other operations
                     available_for_guide_gb = total_memory_gb - 10.0
 
-                    if iaf_memory_gb < available_for_guide_gb:
+                    if force_iaf:
+                        use_iaf = True
+                        print(f"[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_memory_gb:.1f} GB, "
+                              f"{available_for_guide_gb:.1f} GB available — OOM risk if estimate is accurate)")
+                    elif iaf_memory_gb < available_for_guide_gb:
                         use_iaf = True
                         print(f"[INFO] Using AutoIAFNormal guide (estimated {iaf_memory_gb:.1f} GB < {available_for_guide_gb:.1f} GB available)")
                     else:
