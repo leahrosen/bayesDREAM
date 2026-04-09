@@ -409,18 +409,19 @@ class TechnicalFitter:
                 if distribution in ('normal', 'studentt'):
                     mu_ntc = pyro.sample("mu_ntc", dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor))
                 else:  # negbinom
-                    # Gamma(α, β) with α = μ²/σ², β = μ/σ²  => mean = μ, var = σ².
-                    # When σ >> μ (lowly-expressed genes), α < 1 → Gamma has
-                    # infinite density at 0 and gradient (α-1)/x → -∞ as x→0,
-                    # causing gradient explosion with AutoNormal.
-                    # Fix: clamp α ≥ 0.5 and adjust β = α/μ to preserve the mean.
-                    gamma_concentration = (
-                        (mu_x_mean_tensor ** 2) / (mu_x_sd_tensor ** 2)
-                    ).clamp(min=0.5)
-                    gamma_rate = gamma_concentration / mu_x_mean_tensor  # preserves mean=μ
+                    # LogNormal prior — same mean and variance as the old Gamma(μ²/σ², μ/σ²),
+                    # but parameterised natively in log-space so AutoNormal's unconstrained
+                    # transformation aligns naturally with no clamping required.
+                    # Matches the convention used by fit_trans for Vmax/K parameters.
+                    # Floor on log_sigma prevents the prior from collapsing to a point mass
+                    # when σ << μ (very stably expressed genes).
+                    log_sigma = torch.sqrt(
+                        torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
+                    ).clamp(min=0.1)
+                    log_mu = torch.log(mu_x_mean_tensor) - 0.5 * log_sigma ** 2
                     mu_ntc = pyro.sample(
                         "mu_ntc",
-                        dist.Gamma(gamma_concentration, gamma_rate)
+                        dist.LogNormal(log_mu, log_sigma)
                     )
             mu_y = mu_ntc  # [T]
     
