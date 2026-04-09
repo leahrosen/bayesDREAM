@@ -5311,6 +5311,7 @@ def plot_xy_data(
             modality=modality,
             x_true=x_true,
             window=window,
+            show_correction=show_correction,
             min_counts=min_counts,
             color_palette=color_palette,
             show_trans_function=show_hill_function,
