@@ -409,12 +409,18 @@ class TechnicalFitter:
                 if distribution in ('normal', 'studentt'):
                     mu_ntc = pyro.sample("mu_ntc", dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor))
                 else:  # negbinom
+                    # Gamma(α, β) with α = μ²/σ², β = μ/σ²  => mean = μ, var = σ².
+                    # When σ >> μ (lowly-expressed genes), α < 1 → Gamma has
+                    # infinite density at 0 and gradient (α-1)/x → -∞ as x→0,
+                    # causing gradient explosion with AutoNormal.
+                    # Fix: clamp α ≥ 0.5 and adjust β = α/μ to preserve the mean.
+                    gamma_concentration = (
+                        (mu_x_mean_tensor ** 2) / (mu_x_sd_tensor ** 2)
+                    ).clamp(min=0.5)
+                    gamma_rate = gamma_concentration / mu_x_mean_tensor  # preserves mean=μ
                     mu_ntc = pyro.sample(
                         "mu_ntc",
-                        dist.Gamma(
-                            (mu_x_mean_tensor**2) / (mu_x_sd_tensor**2),
-                            mu_x_mean_tensor / (mu_x_sd_tensor**2)
-                        )
+                        dist.Gamma(gamma_concentration, gamma_rate)
                     )
             mu_y = mu_ntc  # [T]
     
@@ -1601,6 +1607,16 @@ class TechnicalFitter:
             losses.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {mu_x_mean_tensor.device}")
+            # Detect NaN/Inf loss early and give an actionable message
+            import math
+            if not math.isfinite(loss):
+                raise RuntimeError(
+                    f"fit_technical: loss became {loss} at step {step}. "
+                    "This usually indicates numerical instability. Try: "
+                    "(1) lower learning rate (e.g. lr=1e-4), "
+                    "(2) check for extreme values in sum_factor, "
+                    "(3) reduce OneCycleLR peak (pass lr=3e-4 to use a smaller cycle)."
+                )
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
