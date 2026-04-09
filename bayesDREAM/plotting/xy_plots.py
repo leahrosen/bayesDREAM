@@ -5089,98 +5089,91 @@ def plot_xy_data(
 
     # Filter to only dependent features if requested (multifeature mode only)
     if only_dependent and is_gene and len(feature_indices) > 1:
-        # Check that trans model is fitted
-        if modality_name == model.primary_modality:
-            # Primary modality: check model-level posterior
-            if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
+        n_before = len(feature_indices)
+
+        if fdr_df is not None:
+            # FDR-based filtering: use min(fdr_alpha, fdr_beta) per feature.
+            # fdr_beta is NaN for single_hill/polynomial — nanmin treats NaN as inf.
+            fdr_lookup = {}
+            if 'feature' not in fdr_df.columns:
                 warnings.warn(
-                    "only_dependent=True requires fit_trans() to have been run. "
+                    "fdr_df must have a 'feature' column matching modality feature names. "
                     "Showing all features instead.",
                     UserWarning
                 )
             else:
-                posterior = model.posterior_samples_trans
-                # Check if this is an additive_hill model (has n_a and n_b)
-                if 'n_a' not in posterior or 'n_b' not in posterior:
+                for _, row in fdr_df.iterrows():
+                    fa = row.get('fdr_alpha', np.nan)
+                    fb = row.get('fdr_beta', np.nan)
+                    fdr_lookup[row['feature']] = float(np.nanmin([fa, fb]))
+
+                kept_indices = []
+                kept_names = []
+                for idx, name in zip(feature_indices, feature_names_resolved):
+                    fdr_val = fdr_lookup.get(name, np.nan)
+                    if np.isfinite(fdr_val) and fdr_val <= fdr_threshold:
+                        kept_indices.append(idx)
+                        kept_names.append(name)
+
+                if len(kept_indices) == 0:
                     warnings.warn(
-                        "only_dependent=True requires fit_trans() with function_type='additive_hill'. "
-                        "Showing all features instead.",
+                        f"No features passed FDR <= {fdr_threshold} for '{feature}'. "
+                        f"Showing all {n_before} features instead.",
                         UserWarning
                     )
                 else:
-                    # Extract n_a and n_b samples
-                    n_a_samps = posterior['n_a'].detach().cpu().numpy()
-                    n_b_samps = posterior['n_b'].detach().cpu().numpy()
+                    feature_indices = kept_indices
+                    feature_names_resolved = kept_names
+                    print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
+                          f"(FDR <= {fdr_threshold})")
 
-                    # Compute dependency masks
-                    dep_mask_a = dependency_mask_from_n(n_a_samps, ci=ci_level)
-                    dep_mask_b = dependency_mask_from_n(n_b_samps, ci=ci_level)
-                    dep_mask = dep_mask_a | dep_mask_b
-
-                    # Filter features
-                    n_before = len(feature_indices)
-                    filtered_indices = [idx for i, idx in enumerate(feature_indices) if dep_mask[idx]]
-                    filtered_names = [name for i, name in enumerate(feature_names_resolved) if dep_mask[feature_indices[i]]]
-
-                    if len(filtered_indices) == 0:
-                        warnings.warn(
-                            f"No dependent features found for '{feature}' (all n_a and n_b CIs include 0). "
-                            f"Showing all {n_before} features instead.",
-                            UserWarning
-                        )
-                    else:
-                        feature_indices = filtered_indices
-                        feature_names_resolved = filtered_names
-                        print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
-                              f"(CI={ci_level}%, {dep_mask_a.sum()} positive, {dep_mask_b.sum()} negative)")
         else:
-            # Non-primary modality: check modality-level posterior
-            if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
+            # Fallback: CI-based filtering on n_a / n_b from posterior samples.
+            # Requires fit_trans() with function_type='additive_hill'.
+            if modality_name == model.primary_modality:
+                posterior = getattr(model, 'posterior_samples_trans', None)
+            else:
+                posterior = getattr(modality, 'posterior_samples_trans', None)
+
+            if posterior is None:
                 warnings.warn(
-                    f"only_dependent=True requires fit_trans() to have been run for modality '{modality_name}'. "
+                    "only_dependent=True requires fit_trans() to have been run "
+                    f"(modality='{modality_name}'). Showing all features instead.",
+                    UserWarning
+                )
+            elif 'n_a' not in posterior or 'n_b' not in posterior:
+                warnings.warn(
+                    "only_dependent=True without fdr_df requires fit_trans() with "
+                    "function_type='additive_hill' (needs n_a/n_b). "
                     "Showing all features instead.",
                     UserWarning
                 )
             else:
-                posterior = modality.posterior_samples_trans
-                # Check if this is an additive_hill model
-                if 'n_a' not in posterior or 'n_b' not in posterior:
+                n_a_samps = posterior['n_a'].detach().cpu().numpy()
+                n_b_samps = posterior['n_b'].detach().cpu().numpy()
+                if n_a_samps.ndim == 3:
+                    n_a_samps = n_a_samps.squeeze(1)
+                    n_b_samps = n_b_samps.squeeze(1)
+
+                dep_mask_a = dependency_mask_from_n(n_a_samps, ci=ci_level)
+                dep_mask_b = dependency_mask_from_n(n_b_samps, ci=ci_level)
+                dep_mask = dep_mask_a | dep_mask_b
+
+                filtered_indices = [idx for idx in feature_indices if dep_mask[idx]]
+                filtered_names = [name for idx, name in zip(feature_indices, feature_names_resolved)
+                                  if dep_mask[idx]]
+
+                if len(filtered_indices) == 0:
                     warnings.warn(
-                        "only_dependent=True requires fit_trans() with function_type='additive_hill'. "
-                        "Showing all features instead.",
+                        f"No dependent features found for '{feature}' (all n CIs include 0). "
+                        f"Showing all {n_before} features instead.",
                         UserWarning
                     )
                 else:
-                    # Extract n_a and n_b samples (modality posteriors are 3D: samples × cis_genes × trans_features)
-                    n_a_samps = posterior['n_a'].detach().cpu().numpy()
-                    n_b_samps = posterior['n_b'].detach().cpu().numpy()
-
-                    # Squeeze out cis gene dimension (should be 1)
-                    if n_a_samps.ndim == 3:
-                        n_a_samps = n_a_samps.squeeze(1)  # (S, 1, T) → (S, T)
-                        n_b_samps = n_b_samps.squeeze(1)
-
-                    # Compute dependency masks
-                    dep_mask_a = dependency_mask_from_n(n_a_samps, ci=ci_level)
-                    dep_mask_b = dependency_mask_from_n(n_b_samps, ci=ci_level)
-                    dep_mask = dep_mask_a | dep_mask_b
-
-                    # Filter features
-                    n_before = len(feature_indices)
-                    filtered_indices = [idx for i, idx in enumerate(feature_indices) if dep_mask[idx]]
-                    filtered_names = [name for i, name in enumerate(feature_names_resolved) if dep_mask[feature_indices[i]]]
-
-                    if len(filtered_indices) == 0:
-                        warnings.warn(
-                            f"No dependent features found for '{feature}' (all n_a and n_b CIs include 0). "
-                            f"Showing all {n_before} features instead.",
-                            UserWarning
-                        )
-                    else:
-                        feature_indices = filtered_indices
-                        feature_names_resolved = filtered_names
-                        print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
-                              f"(CI={ci_level}%, {dep_mask_a.sum()} positive, {dep_mask_b.sum()} negative)")
+                    feature_indices = filtered_indices
+                    feature_names_resolved = filtered_names
+                    print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
+                          f"(CI={ci_level}%, {dep_mask_a.sum()} positive, {dep_mask_b.sum()} negative)")
 
     # If multiple features (gene input), create multi-panel figure
     if is_gene and len(feature_indices) > 1:
