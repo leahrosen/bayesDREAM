@@ -563,15 +563,18 @@ class TransFitter:
                         upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper).expand([T]))  # [T]
 
             else:
-                # For negbinom: A must be positive count.
-                # Blend Amean (5th-percentile of guide means) toward Vmax_mean using the
-                # overdispersion weight: for noisy/overdispersed genes o_y >> prior_mean, so
-                # weight → 1 and Amean_adjusted → Vmax_mean, giving a more robust (higher)
-                # lower-asymptote prior.  For Poisson-like genes weight → 0 and Amean_adjusted
-                # → Amean (the data-driven 5th percentile).
-                Amean_adjusted = ((1 - weight) * Amean_tensor + weight * Vmax_mean_tensor
-                                  ).clamp_min(epsilon_tensor)
-                A = pyro.sample("A", dist.Exponential(1 / Amean_adjusted))
+                # For negbinom: log-normal prior on A spanning two orders of magnitude.
+                # The ±2σ interval in log space is [0.01×Q05, Q05], where Q05 = Amean_tensor
+                # (5th percentile of guide means).  This places the median at 0.1×Q05 and
+                # allows A to be orders of magnitude below the observed guide means — necessary
+                # for large-effect genes (e.g. LCP1) where the Hill curve never saturates within
+                # the observed x_true range and the true floor is far below any guide mean.
+                # σ = ln(100)/4 so that exactly ±2σ spans [0.01×Q05, Q05] (a factor of 100).
+                log_A_sigma = torch.log(self._t(100.0)) / 4  # ≈ 1.151
+                log_A_mu = (torch.log(Amean_tensor.clamp_min(epsilon_tensor))
+                            - 2 * log_A_sigma)  # = log(0.1 × Q05)
+                log_A = pyro.sample("log_A", dist.Normal(log_A_mu, log_A_sigma))
+                A = pyro.deterministic("A", torch.exp(log_A))
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
@@ -1855,10 +1858,11 @@ class TransFitter:
                 # Ensure A_mean >= 1e-3
                 Amean_tensor = Amean_tensor.clamp_min(self._t(1e-3))
 
-                # Vmax is the RANGE (amplitude), not the absolute value
-                # Model: y = A + Vmax_a * Hill_a, so Vmax_a = y_max - A
-                Vmax_mean_tensor = upper_quantile - Amean_tensor  # [T] or [T, K]
-                Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))  # Ensure positive
+                # Vmax prior is centred at the ceiling (Q95), not the range (Q95 - Q05).
+                # When A is small the true alpha×Vmax ≈ ceiling - A ≈ ceiling, so using the
+                # ceiling as the prior mean allows Vmax to reach the true amplitude for
+                # large-effect genes without being anchored to the (too-small) observed range.
+                Vmax_mean_tensor = upper_quantile.clamp_min(self._t(1e-3))  # [T] or [T, K]
 
                 print(f"[INFO] Using guide-based priors (percentile method): {len(unique_guides)} guides, 5th/95th percentiles")
 
@@ -1921,10 +1925,8 @@ class TransFitter:
             # Ensure A_mean >= 1e-3
             Amean_tensor = Amean_tensor.clamp_min(self._t(1e-3))
 
-            # Vmax is the RANGE (amplitude), not the absolute value
-            # Model: y = A + Vmax_a * Hill_a, so Vmax_a = y_max - A
-            # (upper_quantile is stored in Vmax_mean_tensor before this line)
-            Vmax_mean_tensor = Vmax_mean_tensor - Amean_tensor  # [T] or [T, K]
+            # Vmax prior centred at Q95 (ceiling), not the range Q95 - Q05.
+            # (Vmax_mean_tensor already holds the 95th quantile from the loop above.)
             Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))  # Ensure positive
 
         # For binomial/multinomial: clamp Vmax_mean to valid Beta range
