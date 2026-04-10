@@ -2283,29 +2283,32 @@ class ModelSummarizer:
             third_roots_mean = []
 
             if compute_derivative_roots and x_range is not None:
-                # First derivative roots (where dy/dx = 0)
-                def first_deriv_func(x):
-                    return self._additive_hill_first_derivative(
-                        x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                        beta_i, Vmax_b_i, K_b_i, n_b_i
-                    )
-                first_roots_mean = self._find_roots_empirical_loose(first_deriv_func, x_range)
+                # Skip root-finding for FDR-inactive features (both components flat)
+                _is_flat = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
+                if not _is_flat:
+                    # First derivative roots (where dy/dx = 0)
+                    def first_deriv_func(x):
+                        return self._additive_hill_first_derivative(
+                            x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
+                            beta_i, Vmax_b_i, K_b_i, n_b_i
+                        )
+                    first_roots_mean = self._find_roots_empirical_loose(first_deriv_func, x_range)
 
-                # Second derivative roots (inflection points of combined function)
-                def second_deriv_func(x):
-                    return self._additive_hill_second_derivative(
-                        x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                        beta_i, Vmax_b_i, K_b_i, n_b_i
-                    )
-                second_roots_mean = self._find_roots_empirical_loose(second_deriv_func, x_range)
+                    # Second derivative roots (inflection points of combined function)
+                    def second_deriv_func(x):
+                        return self._additive_hill_second_derivative(
+                            x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
+                            beta_i, Vmax_b_i, K_b_i, n_b_i
+                        )
+                    second_roots_mean = self._find_roots_empirical_loose(second_deriv_func, x_range)
 
-                # Third derivative roots (where d³y/dx³ = 0)
-                def third_deriv_func(x):
-                    return self._additive_hill_third_derivative(
-                        x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                        beta_i, Vmax_b_i, K_b_i, n_b_i
-                    )
-                third_roots_mean = self._find_roots_empirical_loose(third_deriv_func, x_range)
+                    # Third derivative roots (where d³y/dx³ = 0)
+                    def third_deriv_func(x):
+                        return self._additive_hill_third_derivative(
+                            x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
+                            beta_i, Vmax_b_i, K_b_i, n_b_i
+                        )
+                    third_roots_mean = self._find_roots_empirical_loose(third_deriv_func, x_range)
                 
             # --- roots in log2FC x-space (u-space) ---
             # For negbinom: dg/du=0, d2g/du2=0, d3g/du3=0 where g = log2(y) - log2(y_ntc)
@@ -3322,6 +3325,11 @@ class ModelSummarizer:
             n_third = []
     
             for i in range(n_features):
+                if q_active[i] >= fdr_threshold:
+                    # FDR-inactive: skip expensive root-finding, emit empty roots
+                    first_roots.append([]); second_roots.append([]); third_roots.append([])
+                    n_first.append(0); n_second.append(0); n_third.append(0)
+                    continue
                 r1, r2, r3 = self._single_hill_derivative_roots(
                     alpha=float(alpha_mean[i]),
                     Vmax=float(Vmax_mean[i]),
