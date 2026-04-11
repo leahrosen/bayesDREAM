@@ -2490,13 +2490,18 @@ def predict_trans_function(
         return None
 
 
-def predict_hill_from_summary_row(row, x_range: np.ndarray) -> Optional[np.ndarray]:
+def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float = 0.05) -> Optional[np.ndarray]:
     """
     Compute a Hill curve from a trans_summary DataFrame row.
 
     Supports both additive_hill (has Vmax_b_mean) and single_hill rows.
     Parameters are read from columns named A_mean, alpha_mean, Vmax_a_mean,
     K_a_mean, n_a_mean, beta_mean, Vmax_b_mean, K_b_mean, n_b_mean.
+
+    FDR gating: components with fdr_alpha > fdr_threshold (or fdr_beta) are zeroed
+    out so the curve reflects only statistically significant effects. Without gating,
+    alpha/beta for null components are ~0.4-0.5 (RelaxedBernoulli prior) rather than 0,
+    producing a spurious partial Hill contribution.
 
     Returns y values at x_range, or None if required columns are missing.
     """
@@ -2516,6 +2521,11 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray) -> Optional[np.ndarr
     if Vmax_a is None or K_a is None or n_a is None:
         return None
 
+    # Apply FDR gating to alpha component
+    fdr_alpha = _g('fdr_alpha')
+    if fdr_alpha is not None and fdr_alpha > fdr_threshold:
+        alpha = 0.0
+
     Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
     y_pred = A + alpha * Hill_a
 
@@ -2523,6 +2533,12 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray) -> Optional[np.ndarr
     Vmax_b = _g('Vmax_b_mean')
     K_b    = _g('K_b_mean')
     n_b    = _g('n_b_mean')
+
+    # Apply FDR gating to beta component
+    fdr_beta = _g('fdr_beta')
+    if fdr_beta is not None and fdr_beta > fdr_threshold:
+        beta = 0.0
+
     if Vmax_b is not None and K_b is not None and n_b is not None and beta != 0.0:
         Hill_b = Hill_based_positive(x_range, Vmax=Vmax_b, A=0, K=K_b, n=n_b)
         y_pred = y_pred + beta * Hill_b
@@ -3610,7 +3626,7 @@ def plot_negbinom_xy(
                         _x_ref = x_range if 'x_range' in dir() else (
                             2 ** np.linspace(np.log2(max(x_true.min(), 1e-6)),
                                              np.log2(x_true.max()), 2000))
-                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref)
+                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref, fdr_threshold=fdr_threshold)
                         if _y_ref is not None:
                             _valid_ref = _y_ref > 0
                             if _valid_ref.any():

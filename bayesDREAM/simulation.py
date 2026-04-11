@@ -11,6 +11,7 @@ downstream fitting. After simulation, recalculate sum factors from the simulated
 counts (e.g., via scran::calculateSumFactors) before fitting bayesDREAM.
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 from typing import Optional, Union
@@ -35,6 +36,7 @@ def simulate_from_trans_summary(
     genes: Optional[list] = None,
     group_col: str = 'technical_group_code',
     seed: Optional[int] = None,
+    fdr_threshold: Optional[float] = 0.05,
 ) -> pd.DataFrame:
     """
     Simulate NegBin count data from fitted trans summary parameters.
@@ -72,14 +74,36 @@ def simulate_from_trans_summary(
         simulated data. Can be:
         - float: same value for all cells (default: 1.0)
         - array of shape (n_cells,): per-cell values
-        This is NOT the sum factor for downstream fitting. Recalculate sum
-        factors from the simulated counts before fitting bayesDREAM.
+
+        IMPORTANT — scale consistency: for simulated data to visually align with
+        the reference curve in ``plot_xy_data``, ``sim_sum_factor`` must equal
+        the per-cell sum factor column used by ``plot_xy_data`` for correction
+        (typically the same column that was passed to ``fit_trans``, e.g.
+        ``'sum_factor_new'`` from ``refit_sumfactor``)::
+
+            sim_sum_factor = model.meta['sum_factor_new'].values
+
+        Mathematically, ``plot_xy_data`` displays ``y / (sum_factor_plot * alpha_y)``
+        and overlays ``A_mean + alpha * Hill(x)``.  For these to match in
+        expectation you need ``sim_sum_factor = sum_factor_plot`` (per cell).
+        Using the default ``sim_sum_factor=1.0`` only works when the plotting
+        sum factor is also ≈ 1.0 for all cells.
+
+        This is NOT the sum factor for downstream fitting. After simulation,
+        recalculate sum factors from the simulated counts before re-fitting
+        bayesDREAM (e.g., via scran::calculateSumFactors or similar).
     genes : list of str, optional
         Subset of genes to simulate. Default: all genes in trans_summary_df.
     group_col : str
         Column in meta for technical group codes (default: 'technical_group_code').
     seed : int, optional
         Random seed for reproducibility.
+    fdr_threshold : float or None, optional
+        FDR threshold for gating Hill components (default: 0.05).
+        When set, components with fdr_alpha > fdr_threshold (or fdr_beta > fdr_threshold
+        for additive_hill) are zeroed out, so the simulation reflects only the
+        statistically significant effects. Set to None to use raw posterior means
+        for all components regardless of FDR.
 
     Returns
     -------
@@ -103,7 +127,8 @@ def simulate_from_trans_summary(
         )
 
     # Handle sim_sum_factor
-    if np.isscalar(sim_sum_factor):
+    _sim_sum_factor_is_scalar = np.isscalar(sim_sum_factor)
+    if _sim_sum_factor_is_scalar:
         sum_factors = np.full(n_cells, float(sim_sum_factor))
     else:
         sum_factors = np.asarray(sim_sum_factor, dtype=float)
@@ -152,6 +177,18 @@ def simulate_from_trans_summary(
         n_b = df['n_b_mean'].values
         beta = df['beta_mean'].values
 
+        # Apply FDR gating: zero out components that are not statistically significant.
+        # Without gating, beta_mean for a null component is ~0.4-0.5 (from the
+        # RelaxedBernoulli prior) rather than 0, which adds a spurious Hill_b
+        # contribution to the simulated data.
+        if fdr_threshold is not None:
+            if 'fdr_alpha' in df.columns:
+                fdr_a = df['fdr_alpha'].values
+                alpha = np.where(np.isfinite(fdr_a) & (fdr_a <= fdr_threshold), alpha, 0.0)
+            if 'fdr_beta' in df.columns:
+                fdr_b = df['fdr_beta'].values
+                beta = np.where(np.isfinite(fdr_b) & (fdr_b <= fdr_threshold), beta, 0.0)
+
         # x_true is (n_cells,), broadcast with gene params (n_genes,)
         # Expand: x -> (1, n_cells), params -> (n_genes, 1)
         x_exp = x_true[np.newaxis, :]  # (1, n_cells)
@@ -172,6 +209,11 @@ def simulate_from_trans_summary(
         K_a = df['K_a_mean'].values
         n_a = df['n_a_mean'].values
         alpha = df['alpha_mean'].values
+
+        # Apply FDR gating: for null genes, alpha_mean is ~0.5 (prior) rather than 0.
+        if fdr_threshold is not None and 'fdr_alpha' in df.columns:
+            fdr_a = df['fdr_alpha'].values
+            alpha = np.where(np.isfinite(fdr_a) & (fdr_a <= fdr_threshold), alpha, 0.0)
 
         x_exp = x_true[np.newaxis, :]
         hill_a = _hill(x_exp, Vmax_a[:, np.newaxis], K_a[:, np.newaxis], n_a[:, np.newaxis])
@@ -203,6 +245,19 @@ def simulate_from_trans_summary(
         [c for c in df.columns if c.startswith('group_') and c.endswith('_alpha_y_mean')],
         key=lambda c: int(c.split('_')[1])
     )
+
+    if _sim_sum_factor_is_scalar and float(sim_sum_factor) == 1.0:
+        warnings.warn(
+            "sim_sum_factor=1.0 (default scalar). For simulated data to visually "
+            "align with the reference curve in plot_xy_data, sim_sum_factor must "
+            "equal the sum factor column that plot_xy_data will use for correction "
+            "(typically the same column passed to fit_trans, e.g. 'sum_factor_new'). "
+            "If you see a systematic scale offset (e.g. A_true below A_lower), pass "
+            "the per-cell sum factors that match your plotting correction:\n"
+            "    sim_sum_factor=model.meta['sum_factor_new'].values",
+            UserWarning,
+            stacklevel=2,
+        )
 
     if alpha_y_cols and group_col in meta.columns:
         groups = meta[group_col].values.astype(int)

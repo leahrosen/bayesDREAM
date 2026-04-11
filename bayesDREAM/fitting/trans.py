@@ -466,8 +466,6 @@ class TransFitter:
         # Now enter the trans_plate (T dimension)
         with trans_plate:
 
-            weight = o_y / (o_y + (beta_o_beta_tensor / beta_o_alpha_tensor)).clamp_min(epsilon_tensor)
-
             # For multinomial, Amean_tensor and Vmax_mean_tensor are already [T, K] shaped
             # For binomial, they are [T] shaped
             # We keep them in their native shape for per-category priors in multinomial
@@ -477,12 +475,16 @@ class TransFitter:
             # - negbinom: positive count
             # - binomial/multinomial: probability in [0,1], using NEW reparameterization
             if distribution in ['normal', 'studentt']:
-                # For continuous distributions: average of min and max
-                Amean_for_A = Amean_tensor  # [T]
-                Vmax_for_A = Vmax_mean_tensor  # [T]
-                Amean_adjusted = ((1 - weight) * Amean_for_A) + (weight * Vmax_for_A) + epsilon_tensor
-                # Use Normal distribution to allow negative baseline values
-                A = pyro.sample("A", dist.Normal(Amean_adjusted, Amean_adjusted.abs()))
+                # A prior: Normal centred below Q05 so the prior is concentrated below
+                # the observed floor — analogous to the log-normal ±2σ fix for negbinom.
+                # With Δ = Q95 − Q05: mean_A = Q05 − Δ (= 2·Q05 − Q95), σ_A = Δ/2.
+                # This places Q05 at exactly +2σ from the prior mean, so ~97.7% of prior
+                # mass is below Q05.  For large-effect genes the true A lies well below
+                # any observed guide mean; this prior allows the posterior to find it.
+                delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
+                sigma_A = delta_A / 2
+                mean_A  = Amean_tensor - delta_A    # Q05 − Δ
+                A = pyro.sample("A", dist.Normal(mean_A, sigma_A))
 
             elif distribution in ['binomial', 'multinomial']:
                 # SIMPLIFIED Beta/Dirichlet priors with weak regularization
@@ -505,9 +507,9 @@ class TransFitter:
 
                     # For multinomial: use Dirichlet priors over K categories
                     if use_data_driven_priors:
-                        # Data-driven Dirichlet: concentration proportional to mean probabilities
-                        # Normalize means to sum to 1
-                        A_mean_clamped = Amean_tensor.clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                        # Data-driven Dirichlet: shift A mean to 0.1×Q05 — concentrated below
+                        # observed PSI floor, analogous to the log-normal ±2σ fix for negbinom.
+                        A_mean_clamped = (0.1 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
                         A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
 
                         Vmax_clamped = Vmax_mean_tensor.clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
@@ -531,12 +533,11 @@ class TransFitter:
                 else:
                     # For binomial: Beta priors
                     if use_data_driven_priors:
-                        # Data-driven Beta priors with α=1 or β=1
-                        # A ~ Beta(α=1, β) with mean = A_mean
-                        #   mean = α/(α+β) = 1/(1+β) = A_mean
-                        #   β = (1-A_mean)/A_mean
-                        beta_A = (1.0 - Amean_tensor) / Amean_tensor  # [T]
-                        alpha_A = self._t(1.0)  # [scalar] or could be torch.ones_like(beta_A)
+                        # A ~ Beta(1, β) with mean = 0.1×Q05 — concentrated below observed
+                        # PSI floor, analogous to the log-normal ±2σ fix for negbinom.
+                        A_mean_shifted = (0.1 * Amean_tensor).clamp_min(epsilon_tensor)
+                        beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
+                        alpha_A = self._t(1.0)
 
                         # upper_limit ~ Beta(α, β=1) with mean = Vmax_mean
                         #   mean = α/(α+1) = Vmax_mean
@@ -703,23 +704,24 @@ class TransFitter:
                         K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T]
 
                 else:
-                    # For negbinom/normal/studentt: Log-Normal priors for Vmax and K.
-                    # Log-Normal is symmetric in log-space and has better tail behaviour than
-                    # Gamma for scale parameters.  A minimum log_sigma floor of 1.0 keeps the
-                    # prior diffuse enough to accommodate one-sided subsets (CRISPRa-only or
-                    # CRISPRi-only) where the observed x-range may be 2-4× smaller than the
-                    # true Vmax — the data-driven Vmax_mean is used as the centre but the
-                    # prior still allows the posterior to move to much larger values.
-                    _Vmax_log_sigma_floor = self._t(1.0)
-                    Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
-                    Vmax_log_sigma = torch.sqrt(
-                        torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
-                    ).clamp_min(_Vmax_log_sigma_floor)
-                    Vmax_log_mu = (torch.log(Vmax_prior_mean.clamp_min(epsilon_tensor))
-                                   - 0.5 * Vmax_log_sigma ** 2)
-
-                    log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
-                    Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
+                    # Vmax prior depends on distribution:
+                    # - normal/studentt: Normal(0, Q95) — Vmax can be negative for
+                    #   downward-going genes; Q95 (ceiling) sets the scale.
+                    # - negbinom: Log-Normal centred at Q95 — Vmax must stay positive;
+                    #   sigma floor of 1.0 keeps the prior diffuse enough for one-sided
+                    #   subsets (CRISPRa-only or CRISPRi-only).
+                    if distribution in ['normal', 'studentt']:
+                        Vmax_a = pyro.sample("Vmax_a", dist.Normal(self._t(0.0), Vmax_prior_mean))
+                    else:
+                        _Vmax_log_sigma_floor = self._t(1.0)
+                        Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
+                        Vmax_log_sigma = torch.sqrt(
+                            torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
+                        ).clamp_min(_Vmax_log_sigma_floor)
+                        Vmax_log_mu = (torch.log(Vmax_prior_mean.clamp_min(epsilon_tensor))
+                                       - 0.5 * Vmax_log_sigma ** 2)
+                        log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
+                        Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
 
                     log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))
                     K_a = pyro.deterministic("K_a", torch.exp(log_K_a))
@@ -764,10 +766,13 @@ class TransFitter:
                             K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T]
 
                     else:
-                        # For negbinom/normal/studentt: Log-Normal priors.
-                        # Vmax_log_mu and Vmax_log_sigma were computed in the Vmax_a section above.
-                        log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
-                        Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
+                        # Vmax_b: same prior choice as Vmax_a.
+                        if distribution in ['normal', 'studentt']:
+                            Vmax_b = pyro.sample("Vmax_b", dist.Normal(self._t(0.0), Vmax_prior_mean))
+                        else:
+                            # Vmax_log_mu / Vmax_log_sigma computed in the Vmax_a block above.
+                            log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
+                            Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
 
                         log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))
                         K_b = pyro.deterministic("K_b", torch.exp(log_K_b))
@@ -1843,8 +1848,8 @@ class TransFitter:
                 Amean_tensor = nanmin(guide_means, dim=0)  # [T] or [T, K]
                 Vmax_mean_tensor = nanmax(guide_means, dim=0)  # [T] or [T, K]
 
-                # Ensure positive
-                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-3))
+                # Ensure positive (1e-12 floor allows A to be very small)
+                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
                 Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))
 
                 print(f"[INFO] Using guide-based priors (archive method): {len(unique_guides)} guides, min/max")
@@ -1855,8 +1860,8 @@ class TransFitter:
                 Amean_tensor = nanquantile(guide_means, 0.05, dim=0)  # [T] or [T, K]
                 upper_quantile = nanquantile(guide_means, 0.95, dim=0)  # [T] or [T, K]
 
-                # Ensure A_mean >= 1e-3
-                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-3))
+                # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
+                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
 
                 # Vmax prior is centred at the ceiling (Q95), not the range (Q95 - Q05).
                 # When A is small the true alpha×Vmax ≈ ceiling - A ≈ ceiling, so using the
@@ -1922,8 +1927,8 @@ class TransFitter:
                 Vmax_mean_tensor = torch.stack(Vmax_mean_tensor)  # [T, K]
                 mean_within_guide_var = torch.stack(overall_vars)  # [T, K]
 
-            # Ensure A_mean >= 1e-3
-            Amean_tensor = Amean_tensor.clamp_min(self._t(1e-3))
+            # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
+            Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
 
             # Vmax prior centred at Q95 (ceiling), not the range Q95 - Q05.
             # (Vmax_mean_tensor already holds the 95th quantile from the loop above.)
