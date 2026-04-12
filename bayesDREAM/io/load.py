@@ -3,8 +3,27 @@ Load methods for bayesDREAM fitted parameters.
 """
 
 import os
+import pickle
 import torch
 import pandas as pd
+
+
+def _torch_load(path, map_location=None):
+    """
+    Load a torch checkpoint, falling back to weights_only=False for files
+    that contain numpy arrays or other non-tensor globals.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Old checkpoints saved with numpy arrays (e.g. via torch.save on a dict
+    containing numpy arrays) will fail with weights_only=True.  We retry
+    with weights_only=False when that happens.
+    """
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError as e:
+        if "Weights only load failed" in str(e):
+            return torch.load(path, map_location=map_location, weights_only=False)
+        raise
 
 class ModelLoader:
     """Handles loading fitted parameters."""
@@ -68,7 +87,7 @@ class ModelLoader:
             # Load alpha_x_prefit
             alpha_x_path = os.path.join(input_dir, 'alpha_x_prefit.pt')
             if os.path.exists(alpha_x_path):
-                alpha_x = torch.load(alpha_x_path)
+                alpha_x = _torch_load(alpha_x_path)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_x, torch.Tensor) and alpha_x.ndim >= 2 and alpha_x.shape[0] > 1:
                     alpha_x = alpha_x.mean(dim=0)
@@ -81,7 +100,7 @@ class ModelLoader:
             # Load alpha_y_prefit (legacy model-level file → primary modality)
             alpha_y_path = os.path.join(input_dir, 'alpha_y_prefit.pt')
             if os.path.exists(alpha_y_path):
-                alpha_y = torch.load(alpha_y_path)
+                alpha_y = _torch_load(alpha_y_path)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_y, torch.Tensor) and alpha_y.ndim >= 3:
                     alpha_y = alpha_y.mean(dim=0)
@@ -98,7 +117,7 @@ class ModelLoader:
 
             mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
             if os.path.exists(mod_path):
-                alpha_y_to_set = torch.load(mod_path)
+                alpha_y_to_set = _torch_load(mod_path)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_y_to_set, torch.Tensor) and alpha_y_to_set.ndim >= 3:
                     alpha_y_to_set = alpha_y_to_set.mean(dim=0)
@@ -118,7 +137,7 @@ class ModelLoader:
             # Load modality-specific posterior_samples_technical
             posterior_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
             if os.path.exists(posterior_path):
-                loaded_data = torch.load(posterior_path)
+                loaded_data = _torch_load(posterior_path)
                 n_features = None
 
                 # Check if new format (with metadata) or old format (just dict)
@@ -242,7 +261,7 @@ class ModelLoader:
         # Load x_true
         x_true_path = os.path.join(input_dir, 'x_true.pt')
         if os.path.exists(x_true_path):
-            x_true = torch.load(x_true_path)
+            x_true = _torch_load(x_true_path)
             # Backward compat: if saved as 2D/3D posterior, collapse to mean
             if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
                 x_true = x_true.mean(dim=0)
@@ -255,7 +274,7 @@ class ModelLoader:
         # Load log2_x_true if saved separately
         log2_x_true_path = os.path.join(input_dir, 'log2_x_true.pt')
         if os.path.exists(log2_x_true_path):
-            log2_x_true = torch.load(log2_x_true_path)
+            log2_x_true = _torch_load(log2_x_true_path)
             # Backward compat: if saved as 2D/3D posterior, collapse to mean
             if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
                 log2_x_true = log2_x_true.mean(dim=0)
@@ -268,7 +287,7 @@ class ModelLoader:
         # Load posterior samples
         posterior_path = os.path.join(input_dir, 'posterior_samples_cis.pt')
         if os.path.exists(posterior_path):
-            loaded_data = torch.load(posterior_path)
+            loaded_data = _torch_load(posterior_path)
             cis_gene = None
 
             # Check if new format (with metadata) or old format (just dict)
@@ -375,7 +394,7 @@ class ModelLoader:
                 posterior_path = os.path.join(input_dir, 'posterior_samples_trans.pt')
 
             if os.path.exists(posterior_path):
-                loaded_data = torch.load(posterior_path)
+                loaded_data = _torch_load(posterior_path)
                 # Check if new format (with metadata) or old format (just dict)
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                     # New format with metadata
@@ -410,7 +429,7 @@ class ModelLoader:
         for mod_name in modalities_to_load:
             mod_path = os.path.join(input_dir, f'posterior_samples_trans_{mod_name}.pt')
             if os.path.exists(mod_path):
-                loaded_data = torch.load(mod_path)
+                loaded_data = _torch_load(mod_path)
                 mod_loaded = []
                 n_features = None
 
