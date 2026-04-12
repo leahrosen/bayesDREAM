@@ -3582,28 +3582,6 @@ def plot_negbinom_xy(
                                 color='black', linestyle='--', linewidth=2,
                                 label='Fitted Trans Function')
 
-                # Add baseline (only when not using full mark_params)
-                if not mark_params:
-                    if hasattr(model, 'posterior_samples_trans') and 'A' in model.posterior_samples_trans:
-                        A_samples = model.posterior_samples_trans['A']
-                        trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
-                        if feature in trans_genes:
-                            gene_idx = trans_genes.index(feature)
-                            if hasattr(A_samples, 'mean'):
-                                A_mean = A_samples.mean(dim=0)
-                                if A_mean.ndim == 2:
-                                    A = A_mean[0, gene_idx].item()
-                                else:
-                                    A = A_mean[gene_idx].item()
-                            else:
-                                A_mean = A_samples.mean(axis=0)
-                                if A_mean.ndim == 2:
-                                    A = A_mean[0, gene_idx]
-                                else:
-                                    A = A_mean[gene_idx]
-                            if A > 0:
-                                ax_plot.axhline(np.log2(A) - y_offset, color='red', linestyle=':',
-                                                linewidth=1, label='log2(A) baseline')
 
             # Full parameter markers (replaces simple A baseline)
             # Use reference_df as FDR source if no explicit fdr_df provided
