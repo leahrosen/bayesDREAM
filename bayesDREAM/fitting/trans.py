@@ -704,9 +704,12 @@ class TransFitter:
                     # - normal/studentt: Normal(0, Q95-Q05) — Vmax can be negative for
                     #   downward-going genes; Q95-Q05 (the observed amplitude range) sets
                     #   the scale.  Replaces the old LogNormal which forced positivity.
-                    # - negbinom: Log-Normal centred at Q95-0.1×Q05 ≈ Q95 — Vmax must
-                    #   stay positive; sigma floor of 1.0 keeps the prior diffuse enough
-                    #   for one-sided subsets (CRISPRa-only or CRISPRi-only).
+                    # - negbinom: Log-Normal centred at Q95-Q05 — Vmax must stay positive;
+                    #   sigma floor of 1.0 keeps the prior diffuse enough for one-sided
+                    #   subsets (CRISPRa-only or CRISPRi-only).  Note: A's prior is
+                    #   centered at Q05/2, so the prior ceiling is Q05/2+(Q95-Q05)=Q95-Q05/2,
+                    #   slightly below Q95.  The wide log_sigma (≥1.0) means the likelihood
+                    #   can push Vmax up the remaining Q05/2 without significant resistance.
                     if distribution in ['normal', 'studentt']:
                         Vmax_a = pyro.sample("Vmax_a", dist.Normal(self._t(0.0), Vmax_prior_mean))
                     else:
