@@ -508,9 +508,11 @@ class TransFitter:
 
                     # For multinomial: use Dirichlet priors over K categories
                     if use_data_driven_priors:
-                        # Data-driven Dirichlet: shift A mean to 0.1×Q05 — concentrated below
-                        # observed PSI floor, consistent with the negbinom/binomial approach.
-                        A_mean_clamped = (0.1 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                        # Data-driven Dirichlet: shift A mean to 0.5×Q05.
+                        # This gives P(A ≥ Q05) ≈ 13.5%, consistent with the negbinom A prior.
+                        # (The previous 0.1× gave P(A ≥ Q05) ≈ 0%, causing false positives
+                        # by forcing A near 0 and inflating effective Vmax.)
+                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
                         A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
 
                         Vmax_clamped = Vmax_mean_tensor.clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
@@ -534,9 +536,11 @@ class TransFitter:
                 else:
                     # For binomial: Beta priors
                     if use_data_driven_priors:
-                        # A ~ Beta(1, β) with mean = 0.1×Q05 — concentrated below observed
-                        # PSI floor, consistent with the negbinom/multinomial approach.
-                        A_mean_shifted = (0.1 * Amean_tensor).clamp_min(epsilon_tensor)
+                        # A ~ Beta(1, β) with mean = 0.5×Q05.
+                        # Gives P(A ≥ Q05) ≈ 13.5%, consistent with the negbinom A prior.
+                        # (The previous 0.1× gave P(A ≥ Q05) ≈ 0%, causing false positives
+                        # by forcing A near 0 and inflating effective Vmax.)
+                        A_mean_shifted = (0.5 * Amean_tensor).clamp_min(epsilon_tensor)
                         beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
                         alpha_A = self._t(1.0)
 
