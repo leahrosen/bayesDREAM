@@ -565,9 +565,13 @@ class TransFitter:
                         upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper).expand([T]))  # [T]
 
             else:
-                # For negbinom: exponential prior on A.
-                # Rate = 1/Amean_tensor where Amean_tensor is the 5th percentile of guide means.
-                A = pyro.sample("A", dist.Exponential(1.0 / Amean_tensor))
+                # For negbinom: exponential prior on A centred at Q05/2.
+                # Exponential(rate=2/Q05) has mean = Q05/2, so in log-space the prior equilibrium
+                # is at A = Q05/2 rather than Q05. This gives the likelihood more room to push A
+                # below Q05 for genes where the curve clearly saturates (e.g. the floor is visible
+                # in the data), while not being as extreme as the 0.1× scaling that caused
+                # underestimation for null genes.
+                A = pyro.sample("A", dist.Exponential(2.0 / Amean_tensor))
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
