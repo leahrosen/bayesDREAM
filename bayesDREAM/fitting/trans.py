@@ -476,11 +476,12 @@ class TransFitter:
             # - binomial/multinomial: probability in [0,1], using NEW reparameterization
             if distribution in ['normal', 'studentt']:
                 # A prior: Normal centred below Q05 so the prior is concentrated below
-                # the observed floor — analogous to the log-normal ±2σ fix for negbinom.
-                # With Δ = Q95 − Q05: mean_A = Q05 − Δ (= 2·Q05 − Q95), σ_A = Δ/2.
-                # This places Q05 at exactly +2σ from the prior mean, so ~97.7% of prior
-                # mass is below Q05.  For large-effect genes the true A lies well below
-                # any observed guide mean; this prior allows the posterior to find it.
+                # the observed floor.  With Δ = Q95 − Q05: mean_A = Q05 − Δ (= 2·Q05 − Q95),
+                # σ_A = Δ/2.  This places Q05 at exactly +2σ from the prior mean, so ~97.7%
+                # of prior mass is below Q05.  The variance is bounded by the data range
+                # (σ ≤ Q95/2), keeping the ELBO landscape well-conditioned.  For
+                # large-effect genes where the true floor lies below any observed guide mean,
+                # this prior allows the posterior to find it.
                 delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
                 sigma_A = delta_A / 2
                 mean_A  = Amean_tensor - delta_A    # Q05 − Δ
@@ -508,7 +509,7 @@ class TransFitter:
                     # For multinomial: use Dirichlet priors over K categories
                     if use_data_driven_priors:
                         # Data-driven Dirichlet: shift A mean to 0.1×Q05 — concentrated below
-                        # observed PSI floor, analogous to the log-normal ±2σ fix for negbinom.
+                        # observed PSI floor, consistent with the 0.1×Q05 Exponential compromise for negbinom.
                         A_mean_clamped = (0.1 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
                         A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
 
@@ -534,7 +535,7 @@ class TransFitter:
                     # For binomial: Beta priors
                     if use_data_driven_priors:
                         # A ~ Beta(1, β) with mean = 0.1×Q05 — concentrated below observed
-                        # PSI floor, analogous to the log-normal ±2σ fix for negbinom.
+                        # PSI floor, consistent with the 0.1×Q05 Exponential compromise for negbinom.
                         A_mean_shifted = (0.1 * Amean_tensor).clamp_min(epsilon_tensor)
                         beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
                         alpha_A = self._t(1.0)
@@ -696,11 +697,12 @@ class TransFitter:
 
                 else:
                     # Vmax prior depends on distribution:
-                    # - normal/studentt: Normal(0, Q95) — Vmax can be negative for
-                    #   downward-going genes; Q95 (ceiling) sets the scale.
-                    # - negbinom: Log-Normal centred at Q95 — Vmax must stay positive;
-                    #   sigma floor of 1.0 keeps the prior diffuse enough for one-sided
-                    #   subsets (CRISPRa-only or CRISPRi-only).
+                    # - normal/studentt: Normal(0, Q95-Q05) — Vmax can be negative for
+                    #   downward-going genes; Q95-Q05 (the observed amplitude range) sets
+                    #   the scale.  Replaces the old LogNormal which forced positivity.
+                    # - negbinom: Log-Normal centred at Q95-0.1×Q05 ≈ Q95 — Vmax must
+                    #   stay positive; sigma floor of 1.0 keeps the prior diffuse enough
+                    #   for one-sided subsets (CRISPRa-only or CRISPRi-only).
                     if distribution in ['normal', 'studentt']:
                         Vmax_a = pyro.sample("Vmax_a", dist.Normal(self._t(0.0), Vmax_prior_mean))
                     else:
@@ -757,7 +759,7 @@ class TransFitter:
                             K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T]
 
                     else:
-                        # Vmax_b: same prior choice as Vmax_a.
+                        # Vmax_b: same prior as Vmax_a (Normal for continuous, LogNormal for negbinom).
                         if distribution in ['normal', 'studentt']:
                             Vmax_b = pyro.sample("Vmax_b", dist.Normal(self._t(0.0), Vmax_prior_mean))
                         else:
