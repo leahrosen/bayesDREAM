@@ -508,9 +508,9 @@ class TransFitter:
 
                     # For multinomial: use Dirichlet priors over K categories
                     if use_data_driven_priors:
-                        # Data-driven Dirichlet: Amean_tensor is already scaled to 0.1×Q05
-                        # (applied in data derivation, consistent with negbinom/binomial).
-                        A_mean_clamped = Amean_tensor.clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                        # Data-driven Dirichlet: shift A mean to 0.1×Q05 — concentrated below
+                        # observed PSI floor, consistent with the negbinom/binomial approach.
+                        A_mean_clamped = (0.1 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
                         A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
 
                         Vmax_clamped = Vmax_mean_tensor.clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
@@ -534,9 +534,9 @@ class TransFitter:
                 else:
                     # For binomial: Beta priors
                     if use_data_driven_priors:
-                        # A ~ Beta(1, β): Amean_tensor is already scaled to 0.1×Q05
-                        # (applied in data derivation, consistent with negbinom/multinomial).
-                        A_mean_shifted = Amean_tensor.clamp_min(epsilon_tensor)
+                        # A ~ Beta(1, β) with mean = 0.1×Q05 — concentrated below observed
+                        # PSI floor, consistent with the negbinom/multinomial approach.
+                        A_mean_shifted = (0.1 * Amean_tensor).clamp_min(epsilon_tensor)
                         beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
                         alpha_A = self._t(1.0)
 
@@ -1843,8 +1843,6 @@ class TransFitter:
 
                 # Ensure positive (1e-12 floor allows A to be very small)
                 Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-                if distribution not in ['normal', 'studentt']:
-                    Amean_tensor = Amean_tensor * self._t(0.1)
                 Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))
 
                 print(f"[INFO] Using guide-based priors (archive method): {len(unique_guides)} guides, min/max")
@@ -1857,13 +1855,6 @@ class TransFitter:
 
                 # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
                 Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-
-                # For negbinom: lower A prior mean from Q05 to 0.1×Q05.
-                # Exponential(rate=1/(0.1×Q05)) has 100× less variance than Exponential(rate=1/Q05),
-                # while putting ~32% of mass below values as low as LCP1's true A (0.038×Q05 vs 3.7%
-                # with the original prior). Vmax adjusts to Q95 - 0.1×Q05 ≈ Q95 accordingly.
-                if distribution not in ['normal', 'studentt']:
-                    Amean_tensor = Amean_tensor * self._t(0.1)
 
                 Vmax_mean_tensor = (upper_quantile - Amean_tensor).clamp_min(self._t(1e-3))  # [T] or [T, K]
 
@@ -1927,8 +1918,6 @@ class TransFitter:
 
             # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
             Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-            if distribution not in ['normal', 'studentt']:
-                Amean_tensor = Amean_tensor * self._t(0.1)
 
             Vmax_mean_tensor = (Vmax_mean_tensor - Amean_tensor).clamp_min(self._t(1e-3))
 
