@@ -564,18 +564,9 @@ class TransFitter:
                         upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper).expand([T]))  # [T]
 
             else:
-                # For negbinom: log-normal prior on A spanning two orders of magnitude.
-                # The ±2σ interval in log space is [0.01×Q05, Q05], where Q05 = Amean_tensor
-                # (5th percentile of guide means).  This places the median at 0.1×Q05 and
-                # allows A to be orders of magnitude below the observed guide means — necessary
-                # for large-effect genes (e.g. LCP1) where the Hill curve never saturates within
-                # the observed x_true range and the true floor is far below any guide mean.
-                # σ = ln(100)/4 so that exactly ±2σ spans [0.01×Q05, Q05] (a factor of 100).
-                log_A_sigma = torch.log(self._t(100.0)) / 4  # ≈ 1.151
-                log_A_mu = (torch.log(Amean_tensor.clamp_min(epsilon_tensor))
-                            - 2 * log_A_sigma)  # = log(0.1 × Q05)
-                log_A = pyro.sample("log_A", dist.Normal(log_A_mu, log_A_sigma))
-                A = pyro.deterministic("A", torch.exp(log_A))
+                # For negbinom: exponential prior on A.
+                # Rate = 1/Amean_tensor where Amean_tensor is the 5th percentile of guide means.
+                A = pyro.sample("A", dist.Exponential(1.0 / Amean_tensor))
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
@@ -1850,6 +1841,8 @@ class TransFitter:
 
                 # Ensure positive (1e-12 floor allows A to be very small)
                 Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
+                if distribution not in ['binomial', 'multinomial', 'normal', 'studentt']:
+                    Amean_tensor = Amean_tensor * self._t(0.1)
                 Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))
 
                 print(f"[INFO] Using guide-based priors (archive method): {len(unique_guides)} guides, min/max")
@@ -1863,11 +1856,14 @@ class TransFitter:
                 # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
                 Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
 
-                # Vmax prior is centred at the ceiling (Q95), not the range (Q95 - Q05).
-                # When A is small the true alpha×Vmax ≈ ceiling - A ≈ ceiling, so using the
-                # ceiling as the prior mean allows Vmax to reach the true amplitude for
-                # large-effect genes without being anchored to the (too-small) observed range.
-                Vmax_mean_tensor = upper_quantile.clamp_min(self._t(1e-3))  # [T] or [T, K]
+                # For negbinom: lower A prior mean from Q05 to 0.1×Q05.
+                # Exponential(rate=1/(0.1×Q05)) has 100× less variance than Exponential(rate=1/Q05),
+                # while putting ~32% of mass below values as low as LCP1's true A (0.038×Q05 vs 3.7%
+                # with the original prior). Vmax adjusts to Q95 - 0.1×Q05 ≈ Q95 accordingly.
+                if distribution not in ['binomial', 'multinomial', 'normal', 'studentt']:
+                    Amean_tensor = Amean_tensor * self._t(0.1)
+
+                Vmax_mean_tensor = (upper_quantile - Amean_tensor).clamp_min(self._t(1e-3))  # [T] or [T, K]
 
                 print(f"[INFO] Using guide-based priors (percentile method): {len(unique_guides)} guides, 5th/95th percentiles")
 
@@ -1929,10 +1925,10 @@ class TransFitter:
 
             # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
             Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
+            if distribution not in ['binomial', 'multinomial', 'normal', 'studentt']:
+                Amean_tensor = Amean_tensor * self._t(0.1)
 
-            # Vmax prior centred at Q95 (ceiling), not the range Q95 - Q05.
-            # (Vmax_mean_tensor already holds the 95th quantile from the loop above.)
-            Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))  # Ensure positive
+            Vmax_mean_tensor = (Vmax_mean_tensor - Amean_tensor).clamp_min(self._t(1e-3))
 
         # For binomial/multinomial: clamp Vmax_mean to valid Beta range
         if distribution in ['binomial', 'multinomial']:
