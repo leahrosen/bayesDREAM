@@ -1776,8 +1776,10 @@ class ModelSummarizer:
             param = posterior[key]
             if isinstance(param, torch.Tensor):
                 param = param.cpu().numpy()
-            # Squeeze trailing size-1 dims: [S, 1, T] -> [S, T]
-            if param.ndim == 3 and param.shape[1] == 1:
+            # Squeeze cis-gene dim (axis 1 when size 1):
+            # [S, 1, T]      → [S, T]       (standard non-multinomial alpha)
+            # [S, 1, T, K-1] → [S, T, K-1]  (multinomial per-category alpha)
+            if param.ndim >= 3 and param.shape[1] == 1:
                 param = param.squeeze(1)
             return param
 
@@ -1864,6 +1866,79 @@ class ModelSummarizer:
             }
 
         if function_type in ('additive_hill', 'nested_hill'):
+            # Detect per-category (multinomial) alpha: shape [S, T, K-1] where K-1 > 1
+            # (after _to_numpy, [S, 1, T] would have been squeezed to [S, T], so ndim==3
+            # with shape[1] != 1 uniquely identifies the per-category multinomial case)
+            alpha_raw_fdr = _to_numpy('alpha')
+            _is_multinomial_fdr = (
+                alpha_raw_fdr is not None and alpha_raw_fdr.ndim == 3
+                and alpha_raw_fdr.shape[1] != 1
+            )
+
+            if _is_multinomial_fdr:
+                # Per-category FDR for multinomial.
+                # alpha: [S, T, K-1], Vmax_a: [S, T, K-1], A: [S, T, K] (Dirichlet)
+                vmax_a_raw_fdr = _to_numpy('Vmax_a')  # [S, T, K-1]
+                vmax_b_raw_fdr = _to_numpy('Vmax_b')  # [S, T, K-1] or None
+                beta_raw_fdr   = _to_numpy('beta')    # [S, T, K-1] or None
+                A_raw_fdr      = _to_numpy('A')       # [S, T, K]
+
+                n_alpha_cats = alpha_raw_fdr.shape[2]
+
+                def _p_active_cat_k(alpha_arr, vmax_arr, A_arr, k):
+                    """P(alpha_k * Vmax_k / A_k > epsilon) for category k."""
+                    if alpha_arr is None or vmax_arr is None or alpha_arr.ndim < 3:
+                        return np.ones(n_features, dtype=float)
+                    ak = alpha_arr[:, :, k]   # [S, T]
+                    vk = vmax_arr[:, :, k]    # [S, T]
+                    if A_arr is not None and A_arr.ndim == 3 and k < A_arr.shape[2]:
+                        Ak = A_arr[:, :, k]   # [S, T] — kth Dirichlet baseline
+                        ratio = ak * vk / np.maximum(Ak, 1e-12)
+                    else:
+                        ratio = ak * vk
+                    return (ratio > activity_epsilon).mean(axis=0)
+
+                p_active_a_cats = [_p_active_cat_k(alpha_raw_fdr, vmax_a_raw_fdr, A_raw_fdr, k)
+                                   for k in range(n_alpha_cats)]
+
+                has_beta_fdr = (beta_raw_fdr is not None and vmax_b_raw_fdr is not None
+                                and beta_raw_fdr.ndim == 3)
+                n_beta_cats = beta_raw_fdr.shape[2] if has_beta_fdr else 0
+                p_active_b_cats = ([_p_active_cat_k(beta_raw_fdr, vmax_b_raw_fdr, A_raw_fdr, k)
+                                    for k in range(n_beta_cats)]
+                                   if has_beta_fdr else [])
+
+                # Pool all categories into one BH family
+                all_p_active = np.concatenate(p_active_a_cats + p_active_b_cats)
+                qvals_cat = _qvalues(1.0 - all_p_active)
+                qvals_cat = np.where(all_p_active < 1e-9, 1.0, qvals_cat)
+
+                # Split back into per-category arrays and build result dict
+                result = {}
+                offset = 0
+                q_per_cat_a = []
+                for k in range(n_alpha_cats):
+                    qk = qvals_cat[offset:offset + n_features]
+                    result[f'fdr_alpha_cat{k}'] = qk
+                    q_per_cat_a.append(qk)
+                    offset += n_features
+                q_per_cat_b = []
+                for k in range(n_beta_cats):
+                    qk = qvals_cat[offset:offset + n_features]
+                    result[f'fdr_beta_cat{k}'] = qk
+                    q_per_cat_b.append(qk)
+                    offset += n_features
+
+                # Feature-level summary: significant if ANY category is significant
+                result['fdr_alpha'] = (np.stack(q_per_cat_a, axis=0).min(axis=0)
+                                       if q_per_cat_a else np.ones(n_features))
+                result['fdr_beta']  = (np.stack(q_per_cat_b, axis=0).min(axis=0)
+                                       if q_per_cat_b else nan_col.copy())
+                # Kth residual category: affected iff any K-1 category is affected
+                result['fdr_alpha_K'] = result['fdr_alpha']
+                return result
+
+            # Standard (non-multinomial) path: pool alpha + beta into one family
             p_active_a = _p_active('alpha', 'Vmax_a')
             p_active_b = _p_active('beta',  'Vmax_b')
 
@@ -2167,6 +2242,49 @@ class ModelSummarizer:
         data['A_lower'] = A_lower
         data['A_upper'] = A_upper
 
+        # Multinomial: add per-category alpha/beta columns and A_K (Kth residual baseline)
+        # For multinomial, alpha/beta have shape [S, T, K-1] after model sampling.
+        # extract_param averages over category dim, so we add per-category summaries here.
+        is_multinomial = (distribution == 'multinomial')
+        if is_multinomial:
+            def _extract_cat_param(name):
+                """Return raw numpy [S, T, K-1] for a per-category parameter."""
+                if name not in posterior:
+                    return None
+                p = posterior[name]
+                if isinstance(p, torch.Tensor):
+                    p = p.cpu().numpy()
+                # Shape [S, 1, T, K-1] → [S, T, K-1] (squeeze cis-gene dim if present)
+                if p.ndim == 4 and p.shape[1] == 1:
+                    p = p.squeeze(1)
+                # Only return if genuinely [S, T, K-1]
+                if p.ndim == 3 and p.shape[1] == n_features:
+                    return p
+                return None
+
+            for param_name, prefix in [('alpha', 'alpha'), ('beta', 'beta')]:
+                cat_arr = _extract_cat_param(param_name)
+                if cat_arr is not None:
+                    n_cats = cat_arr.shape[2]
+                    for k in range(n_cats):
+                        ck = cat_arr[:, :, k]  # [S, T]
+                        data[f'{prefix}_cat{k}_mean'] = ck.mean(axis=0)
+                        data[f'{prefix}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'{prefix}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
+
+            # A_K: Kth (residual) category of Dirichlet A, shape [S, T, K]
+            if 'A' in posterior:
+                A_raw = posterior['A']
+                if isinstance(A_raw, torch.Tensor):
+                    A_raw = A_raw.cpu().numpy()
+                if A_raw.ndim == 4 and A_raw.shape[1] == 1:
+                    A_raw = A_raw.squeeze(1)
+                if A_raw.ndim == 3 and A_raw.shape[1] == n_features:
+                    AK = A_raw[:, :, -1]  # [S, T] — last (residual) category
+                    data['A_K_mean'] = AK.mean(axis=0)
+                    data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
+                    data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)
+
         # Get full posterior samples (needed for FDR and per-sample CI computations)
         Vmax_a_full = extract_param_full('Vmax_a')
         K_a_full = extract_param_full('K_a')
@@ -2263,6 +2381,14 @@ class ModelSummarizer:
         observed_log2fc_list = []
         observed_log2fc_lower_list = []
         observed_log2fc_upper_list = []
+
+        # Multinomial: skip per-feature derived columns (classification, log2fc, derivative roots).
+        # These assume scalar alpha/beta and a scalar dose-response curve; they are not
+        # meaningful when alpha and beta are per-category vectors.
+        # All core parameters (A, Vmax_a, K_a, n_a, alpha_cat{k}, etc.) and FDR columns
+        # are already written to `data` above; derived columns will simply be absent.
+        if is_multinomial:
+            return
 
         # Process each feature
         for i in range(n_features):
