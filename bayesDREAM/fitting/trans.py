@@ -485,16 +485,22 @@ class TransFitter:
             # - negbinom: positive count
             # - binomial/multinomial: probability in [0,1], using NEW reparameterization
             if distribution in ['normal', 'studentt']:
-                # A prior: Normal centred below Q05 so the prior is concentrated below
-                # the observed floor.  With Δ = Q95 − Q05: mean_A = Q05 − Δ (= 2·Q05 − Q95),
-                # σ_A = Δ/2.  This places Q05 at exactly +2σ from the prior mean, so ~97.7%
-                # of prior mass is below Q05.  The variance is bounded by the data range
-                # (σ ≤ Q95/2), keeping the ELBO landscape well-conditioned.  For
-                # large-effect genes where the true floor lies below any observed guide mean,
-                # this prior allows the posterior to find it.
+                # A prior: Normal with noise-adaptive shift, matching negbinom's 13.5% criterion.
+                #
+                # delta_A = amplitude = Vmax_mean − Amean (≈ Q95 − 2·Q05)
+                # sigma_A = delta_A  (Option B: 1× amplitude — wider than the old 0.5×,
+                #                     so the prior allows A to be well above Q05 if data
+                #                     support it; a gene with range 0.2 gets sigma=0.2
+                #                     rather than 0.1)
+                # shift   = (1 − o_y_weight) × 0.55  ∈ [0, 0.55]
+                #   o_y_weight → 0 (quiet gene): shift = 0.55  → P(A ≥ Q05) ≈ 13.5%
+                #   o_y_weight → 1 (noisy gene):  shift = 0     → P(A ≥ Q05) = 50%  (uninformative)
+                # Note: for normal/studentt, o_y IS the residual standard deviation (sigma_y = o_y),
+                # so _o_y_weight is the natural noise measure (already computed above).
                 delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
-                sigma_A = delta_A / 2
-                mean_A  = Amean_tensor - delta_A    # Q05 − Δ
+                sigma_A = delta_A  # 1× amplitude (wider than old 0.5×)
+                _shift_A = (1.0 - _o_y_weight) * 0.55  # [T]: 0.55 quiet → 0 noisy
+                mean_A  = Amean_tensor - _shift_A * delta_A
                 A = pyro.sample("A", dist.Normal(mean_A, sigma_A))
 
             elif distribution in ['binomial', 'multinomial']:
@@ -724,30 +730,22 @@ class TransFitter:
                         K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T]
 
                 else:
-                    # Vmax prior depends on distribution:
-                    # - normal/studentt: Normal(0, Q95-Q05) — Vmax can be negative for
-                    #   downward-going genes; Q95-Q05 (the observed amplitude range) sets
-                    #   the scale.  Replaces the old LogNormal which forced positivity.
-                    # - negbinom: Log-Normal centred at Q95-Q05 — Vmax must stay positive;
-                    #   sigma floor of 1.0 keeps the prior diffuse enough for one-sided
-                    #   subsets (CRISPRa-only or CRISPRi-only).  Note: A's prior is
-                    #   centered at Q05/2, so the prior ceiling is Q05/2+(Q95-Q05)=Q95-Q05/2,
-                    #   slightly below Q95.  The wide log_sigma (≥1.0) means the likelihood
-                    #   can push Vmax up the remaining Q05/2 without significant resistance.
-                    if distribution in ['normal', 'studentt']:
-                        Vmax_a = pyro.sample("Vmax_a", dist.Normal(self._t(0.0), Vmax_prior_mean))
-                    else:
-                        _Vmax_log_sigma_floor = (vmax_log_sigma_floor_tensor
-                                                 if vmax_log_sigma_floor_tensor is not None
-                                                 else self._t(1.5))
-                        Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
-                        Vmax_log_sigma = torch.sqrt(
-                            torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
-                        ).clamp_min(_Vmax_log_sigma_floor)
-                        Vmax_log_mu = (torch.log(Vmax_prior_mean.clamp_min(epsilon_tensor))
-                                       - 0.5 * Vmax_log_sigma ** 2)
-                        log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
-                        Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
+                    # Vmax prior: LogNormal for negbinom, normal, and studentt alike.
+                    # Direction of effect is carried by n (negative n = repressor Hill),
+                    # so Vmax must be strictly positive for all three distributions.
+                    # Wide log_sigma (floor ≥ 1.5, ≈ 20× range) keeps the prior diffuse
+                    # enough for one-sided subsets (CRISPRa-only or CRISPRi-only).
+                    _Vmax_log_sigma_floor = (vmax_log_sigma_floor_tensor
+                                             if vmax_log_sigma_floor_tensor is not None
+                                             else self._t(1.5))
+                    Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
+                    Vmax_log_sigma = torch.sqrt(
+                        torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
+                    ).clamp_min(_Vmax_log_sigma_floor)
+                    Vmax_log_mu = (torch.log(Vmax_prior_mean.clamp_min(epsilon_tensor))
+                                   - 0.5 * Vmax_log_sigma ** 2)
+                    log_Vmax_a = pyro.sample("log_Vmax_a", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
+                    Vmax_a = pyro.deterministic("Vmax_a", torch.exp(log_Vmax_a))
 
                     log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))
                     K_a = pyro.deterministic("K_a", torch.exp(log_K_a))
@@ -792,13 +790,9 @@ class TransFitter:
                             K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T]
 
                     else:
-                        # Vmax_b: same prior as Vmax_a (Normal for continuous, LogNormal for negbinom).
-                        if distribution in ['normal', 'studentt']:
-                            Vmax_b = pyro.sample("Vmax_b", dist.Normal(self._t(0.0), Vmax_prior_mean))
-                        else:
-                            # Vmax_log_mu / Vmax_log_sigma computed in the Vmax_a block above.
-                            log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
-                            Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
+                        # Vmax_b: same LogNormal prior as Vmax_a (parameters computed above).
+                        log_Vmax_b = pyro.sample("log_Vmax_b", dist.Normal(Vmax_log_mu, Vmax_log_sigma))
+                        Vmax_b = pyro.deterministic("Vmax_b", torch.exp(log_Vmax_b))
 
                         log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))
                         K_b = pyro.deterministic("K_b", torch.exp(log_K_b))
