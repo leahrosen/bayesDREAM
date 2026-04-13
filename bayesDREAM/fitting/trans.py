@@ -583,9 +583,20 @@ class TransFitter:
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
-                alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))
+                # For multinomial: per-category gate — each of the K-1 categories can
+                # independently be "on" or "off". This allows, e.g., only one acceptor to
+                # respond while others remain flat. The Kth (residual) category is affected
+                # iff at least one K-1 category is on (conservation of probability).
+                if distribution == 'multinomial' and K is not None:
+                    with pyro.plate("category_plate_alpha", K - 1, dim=-1):
+                        alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T, K-1]
+                else:
+                    alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
             else:
-                alpha = torch.ones((T,), device=self.model.device)
+                if distribution == 'multinomial' and K is not None:
+                    alpha = torch.ones((T, K - 1), device=self.model.device)
+                else:
+                    alpha = torch.ones((T,), device=self.model.device)
             
             if function_type in ['single_hill', 'additive_hill', 'nested_hill']:
 
@@ -736,7 +747,11 @@ class TransFitter:
                 # Sample all required parameters (additive_hill and nested_hill need second set)
                 if function_type in ['additive_hill', 'nested_hill']:
                     sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
-                    beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))
+                    if distribution == 'multinomial' and K is not None:
+                        with pyro.plate("category_plate_beta", K - 1, dim=-1):
+                            beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T, K-1]
+                    else:
+                        beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
 
                     # n_b: per-category for multinomial, single for others
                     if distribution == 'multinomial' and K is not None:
@@ -813,8 +828,9 @@ class TransFitter:
                             Hilla_list.append(hill_k.unsqueeze(-1))  # [N, T, 1]
                         Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
 
-                        # Combine: y = A + alpha * Hill_a(Vmax=Vmax_a)
-                        combined_hill = alpha.unsqueeze(0).unsqueeze(-1) * Hilla_kminus1  # [N, T, K-1]
+                        # Combine: y = A + alpha_k * Hill_a_k(Vmax=Vmax_a_k)
+                        # alpha is [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        combined_hill = alpha.unsqueeze(0) * Hilla_kminus1  # [N, T, K-1]
                         y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
 
                     elif function_type == 'additive_hill':
@@ -831,9 +847,10 @@ class TransFitter:
                         Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
                         Hillb_kminus1 = torch.cat(Hillb_list, dim=-1)  # [N, T, K-1]
 
-                        # Combine: y = A + (alpha * Hill_a) + (beta * Hill_b)
-                        combined_hill = (alpha.unsqueeze(0).unsqueeze(-1) * Hilla_kminus1 +
-                                       beta.unsqueeze(0).unsqueeze(-1) * Hillb_kminus1)  # [N, T, K-1]
+                        # Combine: y = A + (alpha_k * Hill_a_k) + (beta_k * Hill_b_k)
+                        # alpha, beta are [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        combined_hill = (alpha.unsqueeze(0) * Hilla_kminus1 +
+                                       beta.unsqueeze(0) * Hillb_kminus1)  # [N, T, K-1]
                         y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
 
                     elif function_type == 'nested_hill':
@@ -849,7 +866,8 @@ class TransFitter:
                             Hillb_list.append(hill_b_k.unsqueeze(-1))  # [N, T, 1]
                         Hillb_kminus1 = torch.cat(Hillb_list, dim=-1)  # [N, T, K-1]
 
-                        combined_hill = alpha.unsqueeze(0).unsqueeze(-1) * Hillb_kminus1  # [N, T, K-1]
+                        # alpha is [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        combined_hill = alpha.unsqueeze(0) * Hillb_kminus1  # [N, T, K-1]
                         y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
 
                     # Clamp K-1 probabilities to [epsilon, 1-epsilon] to ensure valid residual
