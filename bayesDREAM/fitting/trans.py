@@ -504,18 +504,14 @@ class TransFitter:
                 A = pyro.sample("A", dist.Normal(mean_A, sigma_A))
 
             elif distribution in ['binomial', 'multinomial']:
-                # SIMPLIFIED Beta/Dirichlet priors with weak regularization
-                # For binomial:
-                #   A ~ Beta with α=1 (pushes toward 0, mean = A_mean)
-                #   upper_limit ~ Beta with β=1 (pushes toward 1, mean = Vmax_mean)
-                # For multinomial:
-                #   A ~ Dirichlet with concentration = mean * K (weak prior)
-                #   upper_limit ~ Dirichlet with concentration = mean * K
+                # Beta/Dirichlet priors for bounded [0, 1] likelihoods.
+                # For binomial:    A ~ Beta(1, β) with mean = 0.5×Q05
+                # For multinomial: A ~ Dirichlet with mean = 0.5×Q05 (row-normalized)
 
                 # Amean_tensor: [T] for binomial, [T, K] for multinomial
                 # Vmax_mean_tensor: [T] for binomial, [T, K] for multinomial
 
-                # Sample A and upper_limit
+                # Sample A
                 if distribution == 'multinomial' and Amean_tensor.ndim > 1:
                     # For multinomial: Use Dirichlet with weak concentration
                     # concentration = mean_normalized * K (where K = number of categories)
@@ -531,23 +527,15 @@ class TransFitter:
                         A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
                         A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
 
-                        Vmax_clamped = Vmax_mean_tensor.clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
-                        upper_mean_normalized = Vmax_clamped / Vmax_clamped.sum(dim=-1, keepdim=True)  # [T, K]
-
                         # Weak concentration: mean_normalized * K gives ~1 per category
                         concentration_A = A_mean_normalized * K_dim  # [T, K]
-                        concentration_upper = upper_mean_normalized * K_dim  # [T, K]
-
-                        #print(f"[INFO] Dirichlet data-driven concentration: A={concentration_A.mean().item():.2f}, upper={concentration_upper.mean().item():.2f}")
                     else:
                         # Uniform Dirichlet: all categories have equal concentration=1
                         concentration_A = self._t(1.0).expand([T, K_dim])  # [T, K] with all 1s
-                        concentration_upper = self._t(1.0).expand([T, K_dim])  # [T, K] with all 1s
 
                     # Sample K-dimensional probability vectors from Dirichlet
                     # Each row sums to 1
                     A = pyro.sample("A", dist.Dirichlet(concentration_A))  # [T, K]
-                    upper_limit = pyro.sample("upper_limit", dist.Dirichlet(concentration_upper))  # [T, K]
 
                 else:
                     # For binomial: Beta priors
@@ -560,29 +548,13 @@ class TransFitter:
                         beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
                         alpha_A = self._t(1.0)
 
-                        # upper_limit ~ Beta(α, β=1) with mean = Vmax_mean
-                        #   mean = α/(α+1) = Vmax_mean
-                        #   α = Vmax_mean/(1-Vmax_mean)
-                        alpha_upper = Vmax_mean_tensor / (1.0 - Vmax_mean_tensor)  # [T]
-                        beta_upper = self._t(1.0)  # [scalar]
-
-                        #print(f"[INFO] Beta data-driven priors: A (α=1, β̄={beta_A.mean().item():.2f}), upper (ᾱ={alpha_upper.mean().item():.2f}, β=1)")
                     else:
-                        # Uniform priors: Beta(1, 1) for both A and upper_limit
+                        # Uniform priors: Beta(1, 1) for A
                         alpha_A = self._t(1.0)
                         beta_A = self._t(1.0)
-                        alpha_upper = self._t(1.0)
-                        beta_upper = self._t(1.0)
 
                     # Sample per-feature [T]
-                    # Note: When using uniform priors, these become scalars broadcast to [T]
-                    if use_data_driven_priors:
-                        A = pyro.sample("A", dist.Beta(alpha_A, beta_A))  # [T]
-                        upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper))  # [T]
-                    else:
-                        # Uniform priors - need to expand to match shape [T]
-                        A = pyro.sample("A", dist.Beta(alpha_A, beta_A).expand([T]))  # [T]
-                        upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper).expand([T]))  # [T]
+                    A = pyro.sample("A", dist.Beta(alpha_A, beta_A).expand([T]))  # [T]
 
             else:
                 # For negbinom: adaptive Exponential prior on A driven by per-gene overdispersion.
