@@ -507,6 +507,17 @@ class TransFitter:
                 # Beta/Dirichlet priors for bounded [0, 1] likelihoods.
                 # For binomial:    A ~ Beta(1, β) with mean = 0.5×Q05
                 # For multinomial: A ~ Dirichlet with mean = 0.5×Q05 (row-normalized)
+                #
+                # POTENTIAL IMPROVEMENT: noise-adaptive shift (not yet implemented).
+                # Analogous to the o_y weighting for negbinom/normal/studentt, the A prior
+                # shift could be attenuated for low-coverage features where PSI estimates
+                # are unreliable. The natural noise proxy is mean denominator read depth:
+                #   _binom_weight = n_ref / (n_ref + mean_denom)   ∈ (0, 1)
+                #   shift = 0.5 * (1 - _binom_weight)              (0.5 → 0 as reads increase)
+                # where mean_denom = obs_denom.mean(cells) for binomial, or
+                # obs_counts.sum(categories).mean(cells) for multinomial.
+                # A data-adaptive n_ref = median(mean_denom) across features would be
+                # more principled than a fixed count threshold.
 
                 # Amean_tensor: [T] for binomial, [T, K] for multinomial
                 # Vmax_mean_tensor: [T] for binomial, [T, K] for multinomial
