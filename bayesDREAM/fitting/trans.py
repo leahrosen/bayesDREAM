@@ -410,6 +410,8 @@ class TransFitter:
         x_ntc_mean=None,
         use_data_driven_priors=True,
         use_epsilon=True,
+        vmax_log_sigma_floor_tensor=None,
+        k_log_sigma_min_tensor=None,
     ):
 
         if use_alpha:
@@ -662,7 +664,9 @@ class TransFitter:
                 # Minimum prior width: K_log_sigma >= 5*ln(2)/2 ≈ 1.73
                 # This guarantees the lower end of the 95% CI extends at least 2^{-5} (1/32x)
                 # below the prior centre, matching the NTC-centred branch below.
-                _K_log_sigma_min = self._t(5.0 * 0.6931 / 2.0)  # 5 * ln(2) / 2 ≈ 1.733
+                _K_log_sigma_min = (k_log_sigma_min_tensor
+                                    if k_log_sigma_min_tensor is not None
+                                    else self._t(5.0 * 0.6931 / 2.0))
 
                 if x_ntc_mean is not None:
                     # Centre K prior at NTC mean with ±5 log2FC (95% CI) coverage.
@@ -729,7 +733,9 @@ class TransFitter:
                     if distribution in ['normal', 'studentt']:
                         Vmax_a = pyro.sample("Vmax_a", dist.Normal(self._t(0.0), Vmax_prior_mean))
                     else:
-                        _Vmax_log_sigma_floor = self._t(1.0)
+                        _Vmax_log_sigma_floor = (vmax_log_sigma_floor_tensor
+                                                 if vmax_log_sigma_floor_tensor is not None
+                                                 else self._t(1.5))
                         Vmax_sigma = (Vmax_prior_mean / torch.sqrt(Vmax_alpha_tensor)) + epsilon_tensor
                         Vmax_log_sigma = torch.sqrt(
                             torch.log1p((Vmax_sigma / Vmax_prior_mean) ** 2)
@@ -1224,6 +1230,8 @@ class TransFitter:
         use_epsilon: bool = False,
         warmup: bool = True,
         warmup_T_min: float = 0.5,
+        vmax_log_sigma_floor: float = 1.5,
+        k_log_sigma_min: float = None,
         **kwargs
     ):
         """
@@ -1277,6 +1285,18 @@ class TransFitter:
             warmup_steps + niters. Default 0.5 (roughly half the annealing range,
             saves ~44% of a full single_hill run while still reaching the separation
             point where active and null genes are clearly distinguished).
+        vmax_log_sigma_floor : float, optional
+            Minimum log-sigma for the Vmax LogNormal prior (negbinom only).
+            The data-driven log-sigma (≈ sqrt(log(1 + 1/Vmax_alpha))) is typically
+            ≈0.65 and is always below this floor, so this parameter directly controls
+            prior width. Default 1.5 (95% CI spans ≈exp(±3) ≈ 20× range).
+            Previous default was 1.0 (7× range). Increase to allow Vmax to range
+            more freely; set to 1.0 to restore the old behavior.
+        k_log_sigma_min : float, optional
+            Minimum log-sigma for the K LogNormal prior. Default None, which uses
+            5*ln(2)/2 ≈ 1.733 (±5 log2FC = 32× range). Increase sparingly — K is
+            already very wide, and wider K worsens the EC50 drift problem for genes
+            where the Hill hasn't saturated within the observed x-range.
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
         **kwargs
@@ -1552,6 +1572,9 @@ class TransFitter:
         K_alpha_tensor = torch.tensor(K_alpha, dtype=torch.float32, device=self.model.device)
         Vmax_alpha_tensor = torch.tensor(Vmax_alpha, dtype=torch.float32, device=self.model.device)
         n_mu_tensor = torch.tensor(n_mu, dtype=torch.float32, device=self.model.device)
+        _k_log_sigma_min_val = k_log_sigma_min if k_log_sigma_min is not None else 5.0 * 0.6931 / 2.0
+        vmax_log_sigma_floor_tensor = torch.tensor(vmax_log_sigma_floor, dtype=torch.float32, device=self.model.device)
+        k_log_sigma_min_tensor = torch.tensor(_k_log_sigma_min_val, dtype=torch.float32, device=self.model.device)
         y_obs_tensor = torch.tensor(y_obs, dtype=torch.float32, device=self.model.device)
         epsilon_tensor = torch.tensor(epsilon, dtype=torch.float32, device=self.model.device)
         p_n_tensor = torch.tensor(p_n, dtype=torch.float32, device=self.model.device)
@@ -1839,49 +1862,39 @@ class TransFitter:
             guide_means = torch.stack(guide_means, dim=0)  # [G, T] or [G, T, K]
             guide_vars = torch.stack(guide_vars, dim=0)    # [G, T] or [G, T, K]
 
+            # Helper: minimum of strictly-positive (non-zero, non-NaN) guide means
+            def min_nonzero(x, dim):
+                """Minimum of positive, non-NaN values; returns NaN if all non-positive."""
+                x_filled = torch.where(
+                    (x > 0) & ~torch.isnan(x),
+                    x,
+                    torch.full_like(x, float('inf'))
+                )
+                result = torch.min(x_filled, dim=dim)[0]
+                all_nonpositive = ~((x > 0) & ~torch.isnan(x)).any(dim=dim)
+                return torch.where(all_nonpositive, torch.full_like(result, float('nan')), result)
+
+            Q05 = nanquantile(guide_means, 0.05, dim=0)  # [T] or [T, K]
+            Q95 = nanquantile(guide_means, 0.95, dim=0)  # [T] or [T, K]
+            min_nz = min_nonzero(guide_means, dim=0)     # [T] or [T, K]
+
+            # Amean: Q05 if positive; fall back to min nonzero for sparse genes where Q05=0
+            q05_positive = (Q05 > 0) & ~torch.isnan(Q05)
+            Amean_tensor = torch.where(q05_positive, Q05, min_nz)
+
+            # Vmax: Q95 - Q05 normally (when Q05=0, this equals Q95 — no min_nonzero subtracted)
+            # Fall back to min nonzero when Q95=0 (gene unexpressed in all guides)
+            q95_positive = (Q95 > 0) & ~torch.isnan(Q95)
+            Vmax_mean_tensor = torch.where(q95_positive, Q95 - Q05, min_nz)
+
+            # Absolute safety floor
+            Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
+            Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))
+
             if use_archive_prior_computation:
-                # ARCHIVE METHOD: Use min/max of guide means (matching archive behavior)
-                # This uses the actual min and max observed guide means per feature
-                # Handle NaN values by using nanmin/nanmax
-                def nanmin(x, dim):
-                    """Compute min ignoring NaN values."""
-                    # Replace NaN with +inf so they don't affect min
-                    x_filled = torch.where(torch.isnan(x), torch.full_like(x, float('inf')), x)
-                    result = torch.min(x_filled, dim=dim)[0]
-                    # If all values were NaN, result will be inf - replace with nan
-                    all_nan = torch.all(torch.isnan(x), dim=dim)
-                    return torch.where(all_nan, torch.full_like(result, float('nan')), result)
-
-                def nanmax(x, dim):
-                    """Compute max ignoring NaN values."""
-                    # Replace NaN with -inf so they don't affect max
-                    x_filled = torch.where(torch.isnan(x), torch.full_like(x, float('-inf')), x)
-                    result = torch.max(x_filled, dim=dim)[0]
-                    # If all values were NaN, result will be -inf - replace with nan
-                    all_nan = torch.all(torch.isnan(x), dim=dim)
-                    return torch.where(all_nan, torch.full_like(result, float('nan')), result)
-
-                Amean_tensor = nanmin(guide_means, dim=0)  # [T] or [T, K]
-                Vmax_mean_tensor = nanmax(guide_means, dim=0)  # [T] or [T, K]
-
-                # Ensure positive (1e-12 floor allows A to be very small)
-                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-                Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))
-
-                print(f"[INFO] Using guide-based priors (archive method): {len(unique_guides)} guides, min/max")
-
+                print(f"[INFO] Using guide-based priors (archive method): {len(unique_guides)} guides, Q05-fallback/Q95-Q05")
             else:
-                # PERCENTILE METHOD: Use 5th and 95th percentiles of guide means
-                # This is more robust to outliers but computes Vmax as range (amplitude)
-                Amean_tensor = nanquantile(guide_means, 0.05, dim=0)  # [T] or [T, K]
-                upper_quantile = nanquantile(guide_means, 0.95, dim=0)  # [T] or [T, K]
-
-                # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
-                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-
-                Vmax_mean_tensor = (upper_quantile - Amean_tensor).clamp_min(self._t(1e-3))  # [T] or [T, K]
-
-                print(f"[INFO] Using guide-based priors (percentile method): {len(unique_guides)} guides, 5th/95th percentiles")
+                print(f"[INFO] Using guide-based priors (percentile method): {len(unique_guides)} guides, Q05-fallback/Q95-Q05")
 
             # For variances: use mean variance across guides (average within-guide variability)
             # This captures how much variability exists around each guide's mean
@@ -2118,6 +2131,8 @@ class TransFitter:
                 x_ntc_mean=x_ntc_mean,
                 use_data_driven_priors=use_data_driven_priors,
                 use_epsilon=use_epsilon,
+                vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
+                k_log_sigma_min_tensor=k_log_sigma_min_tensor,
             )
             # OneCycleLR for polynomial only
             base_lr = 1e-3 if lr is None else lr
@@ -2274,6 +2289,8 @@ class TransFitter:
                     x_true_CV=x_true_CV,
                     use_data_driven_priors=use_data_driven_priors,
                     use_epsilon=use_epsilon,
+                    vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
+                    k_log_sigma_min_tensor=k_log_sigma_min_tensor,
                 )
             except FloatingPointError as e:
                 print(f"[STOP] {e} at step {step}")
@@ -2348,6 +2365,8 @@ class TransFitter:
                 "x_true_CV": self._to_cpu(x_true_CV) if x_true_CV is not None else None,
                 "use_data_driven_priors": use_data_driven_priors,
                 "use_epsilon": use_epsilon,
+                "vmax_log_sigma_floor_tensor": self._to_cpu(vmax_log_sigma_floor_tensor),
+                "k_log_sigma_min_tensor": self._to_cpu(k_log_sigma_min_tensor),
             }
         else:
             model_inputs = {
@@ -2386,6 +2405,8 @@ class TransFitter:
                 "x_true_CV": x_true_CV,
                 "use_data_driven_priors": use_data_driven_priors,
                 "use_epsilon": use_epsilon,
+                "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
+                "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
             }
 
         if self.model.device.type == "cuda":
@@ -2482,7 +2503,7 @@ class TransFitter:
         # These let plot_parameter_ci_panel overlay prior distributions as violins
         trans_prior_params = None
         if function_type in ['single_hill', 'additive_hill']:
-            _K_log_sigma_min_val = 5.0 * 0.6931 / 2.0  # 5*ln(2)/2 ≈ 1.733
+            _K_log_sigma_min_val = float(k_log_sigma_min_tensor.item())  # parameterized, default 5*ln(2)/2 ≈ 1.733
 
             # n prior: unconstrained mean (maps to n_mu=0 in constrained space)
             _half_n_p   = 0.5 * (nmax - nmin).clamp_min(epsilon_tensor)
@@ -2492,10 +2513,10 @@ class TransFitter:
 
             # Vmax prior (log-normal): Vmax_log_sigma is the same for all genes
             # because sigma/mean = 1/sqrt(Vmax_alpha) regardless of Vmax_mean.
-            # Apply the same floor (1.0) that _model_y uses.
+            # Apply the same floor that _model_y uses (parameterized via vmax_log_sigma_floor).
             if distribution not in ['binomial', 'multinomial']:
                 Vmax_alpha_val   = float(Vmax_alpha_tensor.item())
-                _Vmax_log_sigma_floor_p = 1.0
+                _Vmax_log_sigma_floor_p = float(vmax_log_sigma_floor_tensor.item())
                 Vmax_log_sigma_p = max(
                     float(np.sqrt(np.log1p(1.0 / Vmax_alpha_val))),
                     _Vmax_log_sigma_floor_p,
