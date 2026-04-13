@@ -445,6 +445,13 @@ class TransFitter:
             phi_y = 1 / (o_y**2)
         phi_y_used = phi_y.unsqueeze(-2)
 
+        # Per-gene overdispersion weight for the adaptive negbinom A prior.
+        # weight → 1 for noisier genes (o_y >> prior mean), → 0 for quieter genes.
+        # Computed here (outside the second trans_plate) since o_y is already a [T] tensor.
+        # prior_mean_o_y = E[o_y] ≈ beta_o_beta / beta_o_alpha (marginal prior mean).
+        _prior_mean_o_y = (beta_o_beta_tensor / beta_o_alpha_tensor).clamp_min(epsilon_tensor)
+        _o_y_weight = o_y / (o_y + _prior_mean_o_y)  # [T], values in (0, 1)
+
         # Degrees of freedom for Student-t distribution (nu_y)
         # Only needed if using studentt distribution
         nu_y = None
@@ -569,13 +576,18 @@ class TransFitter:
                         upper_limit = pyro.sample("upper_limit", dist.Beta(alpha_upper, beta_upper).expand([T]))  # [T]
 
             else:
-                # For negbinom: exponential prior on A centred at Q05/2.
-                # Exponential(rate=2/Q05) has mean = Q05/2, so in log-space the prior equilibrium
-                # is at A = Q05/2 rather than Q05. This gives the likelihood more room to push A
-                # below Q05 for genes where the curve clearly saturates (e.g. the floor is visible
-                # in the data), while not being as extreme as the 0.1× scaling that caused
-                # underestimation for null genes.
-                A = pyro.sample("A", dist.Exponential(2.0 / Amean_tensor))
+                # For negbinom: adaptive Exponential prior on A driven by per-gene overdispersion.
+                # rate = (2 - _o_y_weight) / Q05, where _o_y_weight ∈ (0, 1).
+                #
+                # For quiet genes (o_y → 0, weight → 0): rate → 2/Q05, P(A ≥ Q05) ≈ 13.5%.
+                #   Likelihood is informative about the floor → allow A to go well below Q05.
+                # For noisy genes (o_y >> prior_mean, weight → 1): rate → 1/Q05, P(A ≥ Q05) ≈ 36.8%.
+                #   Likelihood is weak → stay near the original less-aggressive prior.
+                #
+                # This replaces the old Vmax-blending approach (which inflated A for large-range
+                # genes) with a rate-based interpolation that never pushes A above Q05.
+                rate_A = (2.0 - _o_y_weight) / Amean_tensor
+                A = pyro.sample("A", dist.Exponential(rate_A))
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
