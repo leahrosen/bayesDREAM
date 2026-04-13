@@ -1629,6 +1629,7 @@ class TechnicalFitter:
         # ---------------------------
         # Predictive (optionally on CPU)
         # ---------------------------
+        _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
         run_on_cpu = self.model.device.type != "cpu"
         if run_on_cpu:
             guide_cellline.to("cpu")
@@ -1759,7 +1760,7 @@ class TechnicalFitter:
                 gc.collect()
     
         if run_on_cpu:
-            self.model.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.device = _original_device  # Restore exact original device (not generic "cuda")
     
         for k, v in posterior_samples.items():
             posterior_samples[k] = v.cpu()
