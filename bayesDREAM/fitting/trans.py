@@ -412,6 +412,7 @@ class TransFitter:
         use_epsilon=True,
         vmax_log_sigma_floor_tensor=None,
         k_log_sigma_min_tensor=None,
+        k_center_tensor=None,
     ):
 
         if use_alpha:
@@ -678,9 +679,12 @@ class TransFitter:
                     K_log_sigma = _K_log_sigma_min  # = 5*ln(2)/2
                     K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor)) - 0.5 * K_log_sigma ** 2
                 else:
-                    # Fallback: centre at half the max observed x, width from CV.
+                    # Fallback: centre at user-specified quantile of x_true (k_prior_center).
+                    # Default: middle of observed range (K_max/2). Width from CV.
                     # Floor sigma so the prior always spans at least ±5 log2FC.
-                    K_mean_prior = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
+                    _k_fallback = (k_center_tensor if k_center_tensor is not None
+                                   else K_max_tensor / 2.0)
+                    K_mean_prior = _k_fallback.clamp_min(epsilon_tensor)
                     if x_true_CV is not None:
                         K_std_prior = K_mean_prior * x_true_CV
                     else:
@@ -1232,6 +1236,7 @@ class TransFitter:
         warmup_T_min: float = 0.5,
         vmax_log_sigma_floor: float = 1.5,
         k_log_sigma_min: float = None,
+        k_prior_center: str = 'middle',
         **kwargs
     ):
         """
@@ -1297,6 +1302,17 @@ class TransFitter:
             5*ln(2)/2 ≈ 1.733 (±5 log2FC = 32× range). Increase sparingly — K is
             already very wide, and wider K worsens the EC50 drift problem for genes
             where the Hill hasn't saturated within the observed x-range.
+        k_prior_center : str, optional
+            Where to centre the K (EC50) LogNormal prior when NTC cells are absent.
+            Has no effect when NTC cells are present (prior is always centred at the
+            NTC mean). Options:
+            - 'lower'  : 5th percentile of x_true guide means. Use when the EC50 is
+                         expected near baseline (e.g. strong activators where
+                         half-maximum is reached at low cis expression).
+            - 'middle' : half the maximum observed x_true (default, current behaviour).
+            - 'upper'  : 95th percentile of x_true guide means. Use when the EC50 is
+                         expected near the top of the observed range (e.g. repressors
+                         where the effect only kicks in at high cis expression).
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
         **kwargs
@@ -2062,11 +2078,26 @@ class TransFitter:
                 ntc_idx = torch.tensor(ntc_mask.values, dtype=torch.bool, device=self.model.device)
                 x_ntc_mean = x_true_mean[ntc_idx].mean()
 
+        # K prior center tensor for no-NTC fallback (ignored when x_ntc_mean is present)
+        _valid_k_prior_centers = ('lower', 'middle', 'upper')
+        if k_prior_center not in _valid_k_prior_centers:
+            raise ValueError(
+                f"k_prior_center must be one of {_valid_k_prior_centers}, got {k_prior_center!r}"
+            )
+        _x_for_kcenter = x_true_mean  # per-guide (or per-cell) means of x_true
+        if k_prior_center == 'lower':
+            k_center_tensor = torch.quantile(_x_for_kcenter, 0.05).clamp_min(epsilon_tensor)
+        elif k_prior_center == 'upper':
+            k_center_tensor = torch.quantile(_x_for_kcenter, 0.95).clamp_min(epsilon_tensor)
+        else:  # 'middle'
+            k_center_tensor = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
+
         print("[DEBUG] Amean:", Amean_tensor.min().item(), Amean_tensor.max().item())
         print("[DEBUG] Vmax_mean:", Vmax_mean_tensor.min().item(), Vmax_mean_tensor.max().item())
         print("[DEBUG] Mean within-guide variance:", mean_within_guide_var.min().item(), mean_within_guide_var.max().item())
         print("[DEBUG] x_true CV:", x_true_CV.item(), "K_max:", K_max_tensor.item(),
-              "x_ntc_mean:", x_ntc_mean.item() if x_ntc_mean is not None else "N/A")
+              "x_ntc_mean:", x_ntc_mean.item() if x_ntc_mean is not None else "N/A",
+              "k_center:", k_center_tensor.item(), f"(k_prior_center={k_prior_center!r})")
 
         # Diagnostic: Verify alpha_y_prefit is correctly structured
         if alpha_y_prefit is not None and groups_tensor is not None:
@@ -2133,6 +2164,7 @@ class TransFitter:
                 use_epsilon=use_epsilon,
                 vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                 k_log_sigma_min_tensor=k_log_sigma_min_tensor,
+                k_center_tensor=k_center_tensor,
             )
             # OneCycleLR for polynomial only
             base_lr = 1e-3 if lr is None else lr
@@ -2291,6 +2323,7 @@ class TransFitter:
                     use_epsilon=use_epsilon,
                     vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                     k_log_sigma_min_tensor=k_log_sigma_min_tensor,
+                    k_center_tensor=k_center_tensor,
                 )
             except FloatingPointError as e:
                 print(f"[STOP] {e} at step {step}")
@@ -2367,6 +2400,7 @@ class TransFitter:
                 "use_epsilon": use_epsilon,
                 "vmax_log_sigma_floor_tensor": self._to_cpu(vmax_log_sigma_floor_tensor),
                 "k_log_sigma_min_tensor": self._to_cpu(k_log_sigma_min_tensor),
+                "k_center_tensor": self._to_cpu(k_center_tensor),
             }
         else:
             model_inputs = {
@@ -2407,6 +2441,7 @@ class TransFitter:
                 "use_epsilon": use_epsilon,
                 "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
                 "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
+                "k_center_tensor": k_center_tensor,
             }
 
         if self.model.device.type == "cuda":
@@ -2533,7 +2568,7 @@ class TransFitter:
                 K_log_mu_p    = float(torch.log(x_ntc_mean.clamp_min(epsilon_tensor)).item()
                                       - 0.5 * K_log_sigma_p ** 2)
             else:
-                _K_mean_p  = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
+                _K_mean_p  = k_center_tensor.clamp_min(epsilon_tensor)
                 _K_std_p   = (_K_mean_p * x_true_CV if x_true_CV is not None
                               else K_max_tensor / (2.0 * torch.sqrt(K_alpha_tensor)))
                 _ratio_K_p = (_K_std_p / _K_mean_p).clamp_min(self._t(1e-6))
