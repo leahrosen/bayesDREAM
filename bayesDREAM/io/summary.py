@@ -1919,8 +1919,11 @@ class ModelSummarizer:
                                     for k in range(n_beta_cats)]
                                    if has_beta_fdr else [])
 
-                # Build phantom mask: category k is phantom for feature t when
-                # k >= K_actual[t] - 1  (K_actual - 1 real explicit Hills; remainder padded).
+                # Build phantom mask: after Modality.__init__ reordering, the tensor layout is
+                #   columns 0 .. K_actual-2     : real explicit Hills
+                #   columns K_actual-1 .. K_max-2 : phantom (padded, zero data)
+                #   column  K_max-1              : real residual (not an explicit Hill)
+                # So explicit Hill k is phantom for feature t when k >= K_actual[t] - 1.
                 # Phantom entries are excluded from BH pooling by setting p_active = 0
                 # so the floor (p_active < 1e-9 → q = 1) removes them cleanly.
                 if n_cats_per_feature is not None:
@@ -2303,8 +2306,9 @@ class ModelSummarizer:
                         data[f'{prefix}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
             # A_K: the implicit Kth (residual) category baseline from Dirichlet A, shape [S, T, K].
-            # For feature t, the residual is at column n_cats_per_feature[t] - 1 (the last
-            # actual category, not the padded end).  Falls back to column -1 if unknown.
+            # Modality.__init__ ensures column K_max-1 is always a real category (by swapping
+            # the last real category there for features with K_actual < K_max), so [:, :, -1]
+            # is always the correct residual baseline.
             if 'A' in posterior:
                 A_raw = posterior['A']
                 if isinstance(A_raw, torch.Tensor):
@@ -2312,13 +2316,7 @@ class ModelSummarizer:
                 if A_raw.ndim == 4 and A_raw.shape[1] == 1:
                     A_raw = A_raw.squeeze(1)
                 if A_raw.ndim == 3 and A_raw.shape[1] == n_features:
-                    K_max = A_raw.shape[2]
-                    if n_cats_per_feature is not None:
-                        # Per-feature residual index: K_actual - 1, clamped to valid range
-                        cat_idx = np.clip(n_cats_per_feature - 1, 0, K_max - 1)
-                        AK = A_raw[:, np.arange(n_features), cat_idx]  # [S, T]
-                    else:
-                        AK = A_raw[:, :, -1]  # fallback: last column (correct when K_actual == K_max)
+                    AK = A_raw[:, :, -1]  # [S, T] — residual always at K_max-1
                     data['A_K_mean'] = AK.mean(axis=0)
                     data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
                     data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)

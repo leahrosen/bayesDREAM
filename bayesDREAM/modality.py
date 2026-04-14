@@ -118,17 +118,47 @@ class Modality:
 
         self.feature_meta = feature_meta.copy()
 
-        # For multinomial: add n_categories (actual non-padded categories per feature).
-        # Inferred from the counts tensor: count category columns that have at least one
-        # non-zero entry across all cells.  This is the canonical source of per-feature
-        # category count and is used downstream (e.g. FDR masking, A_K extraction).
-        # Only added if not already present (user-provided values take precedence).
-        if distribution == 'multinomial' and 'n_categories' not in self.feature_meta.columns:
+        # For multinomial: ensure the implicit Kth residual slot (position K_max-1) is
+        # always a REAL category, not a padded zero.
+        #
+        # Background: the K-1 residual parameterization computes
+        #   p_{K_max-1} = 1 - sum(p_0 .. p_{K_max-2})
+        # For features with K_actual < K_max the last slot is padded (zero observations).
+        # If the real categories together already account for all probability mass (~1),
+        # then p_{K_max-1} ≈ 0 or negative, and the Dirichlet prior on A inappropriately
+        # assigns mass to the phantom categories that compete with real ones.
+        #
+        # Fix: swap the last real category (column K_actual-1) into the residual slot
+        # (column K_max-1) for any feature where K_actual < K_max.  After reordering:
+        #   columns 0 .. K_actual-2  : real explicit Hills
+        #   columns K_actual-1 .. K_max-2 : phantom (padded, zero data)
+        #   column  K_max-1              : real residual category  ✓
+        #
+        # n_categories (= K_actual per feature) is computed before reordering and is
+        # unaffected by it (still counts non-zero columns, just at different positions).
+        if distribution == 'multinomial':
             counts_arr = np.asarray(self.counts)  # safe: multinomial must be dense 3D
             if counts_arr.ndim == 3:
-                # counts: (features, cells, categories) — sum over cells, count non-zero
+                # Compute per-feature actual category count (before reordering)
                 n_cats = (counts_arr.sum(axis=1) > 0).sum(axis=1).astype(int)
-                self.feature_meta['n_categories'] = n_cats
+
+                # Add n_categories to feature_meta if not already present
+                if 'n_categories' not in self.feature_meta.columns:
+                    self.feature_meta['n_categories'] = n_cats
+
+                # Reorder: swap last real category to residual position for any feature
+                # with K_actual < K_max.  Work on a copy so original input is untouched.
+                K_max = counts_arr.shape[2]
+                if K_max > 1 and np.any(n_cats < K_max):
+                    counts_arr = counts_arr.copy()
+                    for i in range(counts_arr.shape[0]):
+                        K_actual = int(n_cats[i])
+                        if 0 < K_actual < K_max:
+                            # Swap col K_actual-1 (last real) with col K_max-1 (padded residual slot)
+                            tmp = counts_arr[i, :, K_actual - 1].copy()
+                            counts_arr[i, :, K_actual - 1] = 0.0  # was real, now becomes padding
+                            counts_arr[i, :, K_max - 1] = tmp     # residual slot now real
+                    self.counts = counts_arr
 
         # Handle denominator (can also be sparse)
         if denominator is not None:
