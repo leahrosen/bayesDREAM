@@ -139,12 +139,12 @@ class Modality:
         if distribution == 'multinomial':
             counts_arr = np.asarray(self.counts)  # safe: multinomial must be dense 3D
             if counts_arr.ndim == 3:
-                # Compute per-feature actual category count (before reordering)
+                # Compute per-feature actual category count from non-zero data (before reordering).
+                # This always overwrites any user-provided n_categories to ensure it is
+                # consistent with the reordering performed below.  Zero-count categories
+                # (present in the tensor but with no reads in any cell) are treated as phantom.
                 n_cats = (counts_arr.sum(axis=1) > 0).sum(axis=1).astype(int)
-
-                # Add n_categories to feature_meta if not already present
-                if 'n_categories' not in self.feature_meta.columns:
-                    self.feature_meta['n_categories'] = n_cats
+                self.feature_meta['n_categories'] = n_cats
 
                 # Reorder: swap last real category to residual position for any feature
                 # with K_actual < K_max.  Work on a copy so original input is untouched.
