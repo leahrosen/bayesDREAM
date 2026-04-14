@@ -160,6 +160,57 @@ class Modality:
                             counts_arr[i, :, K_max - 1] = tmp     # residual slot now real
                     self.counts = counts_arr
 
+                # ---- Filter: drop multinomial features with ≤1 real category or
+                #              zero ratio-variance across cells ----
+                #
+                # Filter 1: Features with ≤1 real category cannot have multinomial
+                #           proportions (no structure to model).
+                # Filter 2: Features where all real-category ratios (count/cell_total)
+                #           have zero std across cells carry no fitting signal.
+                keep = n_cats > 1  # [T] bool, Filter 1
+
+                for i in range(len(n_cats)):
+                    if not keep[i]:
+                        continue
+                    feat = counts_arr[i]  # [n_cells, K_max]
+                    cell_totals = feat.sum(axis=1, keepdims=True)  # [n_cells, 1]
+                    real_cat_mask = feat.sum(axis=0) > 0  # [K_max]
+                    real_counts = feat[:, real_cat_mask]  # [n_cells, K_actual]
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        ratios = np.where(
+                            cell_totals > 0,
+                            real_counts / cell_totals,
+                            0.0,
+                        )  # [n_cells, K_actual]
+                    if np.all(ratios.std(axis=0) == 0):
+                        keep[i] = False  # Filter 2: zero ratio variance
+
+                n_dropped = int((~keep).sum())
+                if n_dropped > 0:
+                    import warnings
+                    n_le1_cat = int((n_cats <= 1).sum())
+                    n_zero_var = n_dropped - n_le1_cat
+                    warnings.warn(
+                        f"[Modality '{name}'] Dropped {n_dropped} multinomial feature(s): "
+                        f"{n_le1_cat} with ≤1 real category, "
+                        f"{n_zero_var} with zero category-ratio variance across cells.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    counts_arr = counts_arr[keep]
+                    if counts_arr.shape[0] == 0:
+                        raise ValueError(
+                            f"[Modality '{name}'] All multinomial features were filtered out "
+                            f"(≤1 real category or zero ratio variance). Check input data."
+                        )
+                    self.feature_meta = self.feature_meta[keep].reset_index(drop=True)
+                    self.feature_meta['n_categories'] = n_cats[keep]
+                    self.counts = counts_arr
+                    if self.feature_names is not None:
+                        self.feature_names = [
+                            fn for fn, k in zip(self.feature_names, keep) if k
+                        ]
+
         # Handle denominator (can also be sparse)
         if denominator is not None:
             if sparse.issparse(denominator):

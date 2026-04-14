@@ -1666,6 +1666,30 @@ class TransFitter:
             y_obs_factored = y_obs_tensor
             y_obs_for_prior = y_obs_factored
 
+        # ---- Multinomial zero-category mask (analogous to fit_technical zero_cat_mask) ----
+        # Identifies categories structurally absent across ALL trans cells.
+        # These phantom positions are already masked inline inside _model_y; this block
+        # performs an early diagnostic check and warns when features have ≤1 active
+        # category (which should have been filtered at Modality initialisation).
+        if distribution == 'multinomial' and y_obs_tensor.ndim == 3:
+            _obs_total_per_cat = y_obs_tensor.sum(dim=0)  # [T, K]
+            zero_cat_mask_trans = (_obs_total_per_cat == 0)  # [T, K] bool
+            _active_k = (~zero_cat_mask_trans).sum(dim=-1)  # [T]
+            if (_active_k <= 1).any():
+                import warnings as _warnings
+                _bad_t = torch.nonzero(_active_k <= 1, as_tuple=False).squeeze(-1).tolist()
+                _warnings.warn(
+                    f"[fit_trans] {len(_bad_t)} multinomial feature(s) have ≤1 active "
+                    f"category in the trans data (feature indices: "
+                    f"{_bad_t[:10]}{'...' if len(_bad_t) > 10 else ''}). "
+                    f"These features should be filtered before fitting (at Modality "
+                    f"initialisation). Fitting will be unreliable for these features.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+        else:
+            zero_cat_mask_trans = None
+
         # ===================================================================
         # CORRECT FOR TECHNICAL EFFECTS BEFORE COMPUTING PRIORS
         # ===================================================================
