@@ -459,6 +459,13 @@ class TechnicalFitter:
             # ---- Baseline category probabilities per feature: DO NOT wrap in a plate ----
             # Use reference group counts for more accurate baseline (concentration is [T, K])
             concentration = total_counts_ref + 1.0  # [T, K], strictly > 0
+            # Zero concentration for phantom categories (masked in zero_cat_mask) so the
+            # Dirichlet prior doesn't leak mass to padding positions and bias real categories.
+            concentration = torch.where(
+                zero_cat_mask,
+                torch.full_like(concentration, 1e-6),
+                concentration,
+            )
             #assert concentration.shape == (T, K), f"concentration {concentration.shape} != ({T},{K})"
             with f_plate:
                 probs0 = pyro.sample("probs_baseline_raw", dist.Dirichlet(concentration))  # [T, K]
