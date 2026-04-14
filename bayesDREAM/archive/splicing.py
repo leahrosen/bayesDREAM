@@ -197,6 +197,7 @@ def process_donor_usage(sj_counts: pd.DataFrame,
             'donor': donor,
             'acceptors': acceptors,
             'n_acceptors': n_acceptors,
+            'n_categories': n_acceptors,  # generic canonical column for multinomial
             'gene_name': gene_name,
             'gene_id': gene_id
         })
@@ -243,7 +244,7 @@ def process_donor_usage(sj_counts: pd.DataFrame,
         warnings.warn("No donors with multiple acceptors found after filtering!")
         # Return empty arrays
         return (np.zeros((0, n_cells, 0), dtype=float),
-                pd.DataFrame(columns=['chrom', 'strand', 'donor', 'acceptors', 'n_acceptors', 'gene_name', 'gene_id']),
+                pd.DataFrame(columns=['chrom', 'strand', 'donor', 'acceptors', 'n_acceptors', 'n_categories', 'gene_name', 'gene_id']),
                 cell_names)
 
     # Stack into 3D array: (n_donors, n_cells, max_acceptors)
@@ -358,6 +359,7 @@ def process_acceptor_usage(sj_counts: pd.DataFrame,
             'acceptor': acceptor,
             'donors': donors,
             'n_donors': n_donors,
+            'n_categories': n_donors,  # generic canonical column for multinomial
             'gene_name': gene_name,
             'gene_id': gene_id
         })
@@ -404,7 +406,7 @@ def process_acceptor_usage(sj_counts: pd.DataFrame,
         warnings.warn("No acceptors with multiple donors found after filtering!")
         # Return empty arrays
         return (np.zeros((0, n_cells, 0), dtype=float),
-                pd.DataFrame(columns=['chrom', 'strand', 'acceptor', 'donors', 'n_donors', 'gene_name', 'gene_id']),
+                pd.DataFrame(columns=['chrom', 'strand', 'acceptor', 'donors', 'n_donors', 'n_categories', 'gene_name', 'gene_id']),
                 cell_names)
 
     # Stack into 3D array: (n_acceptors, n_cells, max_donors)

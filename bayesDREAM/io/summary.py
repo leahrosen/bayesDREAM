@@ -1422,6 +1422,14 @@ class ModelSummarizer:
 
         # Get feature names - prefer modality.feature_names (what users see and use)
         feature_meta = modality.feature_meta
+
+        # Extract per-feature actual category count for multinomial masking.
+        # Used to identify phantom (padded) category slots so they are excluded
+        # from FDR computation and the correct A_K (residual baseline) is selected.
+        n_cats_per_feature = None
+        if modality.distribution == 'multinomial' and feature_meta is not None and len(feature_meta) > 0:
+            if 'n_categories' in feature_meta.columns:
+                n_cats_per_feature = feature_meta['n_categories'].values.astype(int)
         if modality.feature_names is not None:
             # First priority: use modality.feature_names (this is what users see)
             feature_names = modality.feature_names
@@ -1555,7 +1563,8 @@ class ModelSummarizer:
                 compute_inflection, compute_full_log2fc,
                 compute_derivative_roots, x_range,
                 compute_log2fc_params, _x_ntc, _y_ntc,
-                x_obs_min, x_obs_max
+                x_obs_min, x_obs_max,
+                n_cats_per_feature=n_cats_per_feature
             )
         elif function_type == 'single_hill':
             data = self._add_single_hill_params(
@@ -1581,7 +1590,8 @@ class ModelSummarizer:
             )
 
         # Compute Bayesian q-values (FDR columns) for Hill components
-        fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features)
+        fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features,
+                                              n_cats_per_feature=n_cats_per_feature)
         data.update(fdr_cols)
 
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
@@ -1708,6 +1718,7 @@ class ModelSummarizer:
         function_type: str,
         n_features: int,
         activity_epsilon: float = 0.01,
+        n_cats_per_feature: Optional[np.ndarray] = None,
     ) -> dict:
         """
         Compute per-component Bayesian q-values (FDR-equivalents) for Hill components.
@@ -1908,12 +1919,27 @@ class ModelSummarizer:
                                     for k in range(n_beta_cats)]
                                    if has_beta_fdr else [])
 
-                # Pool all categories into one BH family
+                # Build phantom mask: category k is phantom for feature t when
+                # k >= K_actual[t] - 1  (K_actual - 1 real explicit Hills; remainder padded).
+                # Phantom entries are excluded from BH pooling by setting p_active = 0
+                # so the floor (p_active < 1e-9 → q = 1) removes them cleanly.
+                if n_cats_per_feature is not None:
+                    for k, pa in enumerate(p_active_a_cats):
+                        # feature t is phantom for cat k when k >= n_cats_per_feature[t] - 1
+                        phantom_mask = k >= (n_cats_per_feature - 1)
+                        p_active_a_cats[k] = np.where(phantom_mask, 0.0, pa)
+                    for k, pb in enumerate(p_active_b_cats):
+                        phantom_mask = k >= (n_cats_per_feature - 1)
+                        p_active_b_cats[k] = np.where(phantom_mask, 0.0, pb)
+
+                # Pool all non-phantom categories into one BH family
                 all_p_active = np.concatenate(p_active_a_cats + p_active_b_cats)
                 qvals_cat = _qvalues(1.0 - all_p_active)
+                # Floor: phantom (p_active=0) and truly null (p_active≈0) → q=1
                 qvals_cat = np.where(all_p_active < 1e-9, 1.0, qvals_cat)
 
-                # Split back into per-category arrays and build result dict
+                # Split back into per-category arrays and build result dict.
+                # Phantom entries already have q=1 from the floor above.
                 result = {}
                 offset = 0
                 q_per_cat_a = []
@@ -1929,7 +1955,8 @@ class ModelSummarizer:
                     q_per_cat_b.append(qk)
                     offset += n_features
 
-                # Feature-level summary: significant if ANY category is significant
+                # Feature-level summary: min over REAL categories only.
+                # Phantom categories have q=1 and will never drive the min below 1.
                 result['fdr_alpha'] = (np.stack(q_per_cat_a, axis=0).min(axis=0)
                                        if q_per_cat_a else np.ones(n_features))
                 result['fdr_beta']  = (np.stack(q_per_cat_b, axis=0).min(axis=0)
@@ -1961,7 +1988,8 @@ class ModelSummarizer:
     def _add_additive_hill_params(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
                                     compute_derivative_roots=True, x_range=None,
                                     compute_log2fc_params=False, x_ntc=None, y_ntc=None,
-                                    x_obs_min=None, x_obs_max=None, fdr_threshold=0.05):
+                                    x_obs_min=None, x_obs_max=None, fdr_threshold=0.05,
+                                    n_cats_per_feature=None):
         """
         Add additive Hill parameters to data dict.
 
@@ -1987,7 +2015,8 @@ class ModelSummarizer:
             data, posterior, n_features, compute_inflection, compute_full_log2fc,
             compute_derivative_roots, x_range,
             compute_log2fc_params, x_ntc, y_ntc, x_obs_min, x_obs_max,
-            fdr_threshold=fdr_threshold
+            fdr_threshold=fdr_threshold,
+            n_cats_per_feature=n_cats_per_feature
         )
 
     # Helper function to compute y(x) given parameters
@@ -2011,7 +2040,8 @@ class ModelSummarizer:
     def _add_additive_hill_params_individual(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
                                               compute_derivative_roots=True, x_range=None,
                                               compute_log2fc_params=False, x_ntc=None, y_ntc=None,
-                                              x_obs_min=None, x_obs_max=None, fdr_threshold=0.05):
+                                              x_obs_min=None, x_obs_max=None, fdr_threshold=0.05,
+                                              n_cats_per_feature=None):
         """
         Add additive Hill parameters from individual parameter architecture (Vmax_a, K_a, n_a, etc.).
 
@@ -2272,7 +2302,9 @@ class ModelSummarizer:
                         data[f'{prefix}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
                         data[f'{prefix}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
-            # A_K: Kth (residual) category of Dirichlet A, shape [S, T, K]
+            # A_K: the implicit Kth (residual) category baseline from Dirichlet A, shape [S, T, K].
+            # For feature t, the residual is at column n_cats_per_feature[t] - 1 (the last
+            # actual category, not the padded end).  Falls back to column -1 if unknown.
             if 'A' in posterior:
                 A_raw = posterior['A']
                 if isinstance(A_raw, torch.Tensor):
@@ -2280,7 +2312,13 @@ class ModelSummarizer:
                 if A_raw.ndim == 4 and A_raw.shape[1] == 1:
                     A_raw = A_raw.squeeze(1)
                 if A_raw.ndim == 3 and A_raw.shape[1] == n_features:
-                    AK = A_raw[:, :, -1]  # [S, T] — last (residual) category
+                    K_max = A_raw.shape[2]
+                    if n_cats_per_feature is not None:
+                        # Per-feature residual index: K_actual - 1, clamped to valid range
+                        cat_idx = np.clip(n_cats_per_feature - 1, 0, K_max - 1)
+                        AK = A_raw[:, np.arange(n_features), cat_idx]  # [S, T]
+                    else:
+                        AK = A_raw[:, :, -1]  # fallback: last column (correct when K_actual == K_max)
                     data['A_K_mean'] = AK.mean(axis=0)
                     data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
                     data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)

@@ -118,6 +118,18 @@ class Modality:
 
         self.feature_meta = feature_meta.copy()
 
+        # For multinomial: add n_categories (actual non-padded categories per feature).
+        # Inferred from the counts tensor: count category columns that have at least one
+        # non-zero entry across all cells.  This is the canonical source of per-feature
+        # category count and is used downstream (e.g. FDR masking, A_K extraction).
+        # Only added if not already present (user-provided values take precedence).
+        if distribution == 'multinomial' and 'n_categories' not in self.feature_meta.columns:
+            counts_arr = np.asarray(self.counts)  # safe: multinomial must be dense 3D
+            if counts_arr.ndim == 3:
+                # counts: (features, cells, categories) — sum over cells, count non-zero
+                n_cats = (counts_arr.sum(axis=1) > 0).sum(axis=1).astype(int)
+                self.feature_meta['n_categories'] = n_cats
+
         # Handle denominator (can also be sparse)
         if denominator is not None:
             if sparse.issparse(denominator):
