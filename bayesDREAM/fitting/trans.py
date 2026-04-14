@@ -544,6 +544,18 @@ class TransFitter:
                         # Uniform Dirichlet: all categories have equal concentration=1
                         concentration_A = self._t(1.0).expand([T, K_dim])  # [T, K] with all 1s
 
+                    # Zero concentration for phantom categories (zero total observations
+                    # across all cells). Without this, the Dirichlet prior leaks mass to
+                    # padding positions, biasing real-category A values downward.
+                    if y_obs_tensor.dim() == 3:  # multinomial: [N, T, K]
+                        obs_total = y_obs_tensor.sum(dim=0)  # [T, K]
+                        phantom_conc_mask = (obs_total == 0)  # [T, K]
+                        concentration_A = torch.where(
+                            phantom_conc_mask,
+                            torch.full_like(concentration_A, 1e-6),
+                            concentration_A,
+                        )
+
                     # Sample K-dimensional probability vectors from Dirichlet
                     # Each row sums to 1
                     A = pyro.sample("A", dist.Dirichlet(concentration_A))  # [T, K]
@@ -1095,7 +1107,10 @@ class TransFitter:
             # Sampler expects: mu_y = baseline probabilities [N, T, K]
             # y_dose_response is already [N, T, K] probabilities that sum to 1
             # Sampler will apply technical groups on logit scale per category
-            mu_y = y_dose_response  # [N, T, K] - probabilities per category
+            # Zero out phantom categories so _masked_softmax in sample_multinomial_trans
+            # correctly excludes them (it detects masked positions via mu_y == 0).
+            obs_total = y_obs_tensor.sum(dim=0, keepdim=True)  # [1, T, K]
+            mu_y = y_dose_response.masked_fill(obs_total == 0, 0.0)  # [N, T, K]
 
         elif distribution in ['normal', 'studentt']:
             # Sampler expects: mu_y = natural value space
