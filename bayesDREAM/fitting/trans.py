@@ -600,8 +600,7 @@ class TransFitter:
                 # respond while others remain flat. The Kth (residual) category is affected
                 # iff at least one K-1 category is on (conservation of probability).
                 if distribution == 'multinomial' and K is not None:
-                    with pyro.plate("category_plate_alpha", K - 1, dim=-1):
-                        alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T, K-1]
+                    alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor).expand([K - 1]).to_event(1))  # [T, K-1]
                 else:
                     alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
             else:
@@ -647,12 +646,12 @@ class TransFitter:
                     K_minus_1 = K - 1
                     # Sample parameters for K-1 categories
                     # Each category gets its own Hill function parameters
-                    with pyro.plate("category_plate_n_a", K_minus_1, dim=-1):
-                        n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a))  # [T, K-1]
-                        n_a = pyro.deterministic(
-                            "n_a",
-                            _soft_clamp(n_a_raw, nmin, nmax)
-                        )  # [T, K-1]
+                    # Use .to_event(1) instead of a nested plate to avoid dim=-1 collision with trans_plate
+                    n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a.unsqueeze(-1).expand(T, K_minus_1)).to_event(1))  # [T, K-1]
+                    n_a = pyro.deterministic(
+                        "n_a",
+                        _soft_clamp(n_a_raw, nmin, nmax)
+                    )  # [T, K-1]
                 else:
                     # For non-multinomial: single set of parameters per feature
                     n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a))
@@ -721,14 +720,13 @@ class TransFitter:
 
                     if distribution == 'multinomial' and K is not None:
                         # For multinomial: Sample Vmax_a for K-1 categories (Kth is residual)
+                        # Use .to_event(1) instead of nested plates to avoid dim=-1 collision with trans_plate
                         K_minus_1 = K - 1
-                        with pyro.plate("category_plate_Vmax_a", K_minus_1, dim=-1):
-                            Vmax_a = pyro.sample("Vmax_a", dist.Beta(alpha_vmax, beta_vmax))  # [T, K-1]
+                        Vmax_a = pyro.sample("Vmax_a", dist.Beta(alpha_vmax[:, :K_minus_1], beta_vmax[:, :K_minus_1]).to_event(1))  # [T, K-1]
 
                         # K_a: Log-Normal for K-1 categories
-                        with pyro.plate("category_plate_K_a", K_minus_1, dim=-1):
-                            log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))  # [T, K-1]
-                            K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T, K-1]
+                        log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma).expand([K_minus_1]).to_event(1))  # [T, K-1]
+                        K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T, K-1]
                     else:
                         # For binomial: per-feature Vmax_a and K_a
                         Vmax_a = pyro.sample("Vmax_a", dist.Beta(alpha_vmax, beta_vmax))  # [T]
@@ -760,20 +758,20 @@ class TransFitter:
                 if function_type in ['additive_hill', 'nested_hill']:
                     sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
                     if distribution == 'multinomial' and K is not None:
-                        with pyro.plate("category_plate_beta", K - 1, dim=-1):
-                            beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T, K-1]
+                        # Use .to_event(1) instead of nested plate to avoid dim=-1 collision with trans_plate
+                        beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor).expand([K - 1]).to_event(1))  # [T, K-1]
                     else:
                         beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
 
                     # n_b: per-category for multinomial, single for others
                     if distribution == 'multinomial' and K is not None:
+                        # Use .to_event(1) instead of nested plate to avoid dim=-1 collision with trans_plate
                         K_minus_1 = K - 1
-                        with pyro.plate("category_plate_n_b", K_minus_1, dim=-1):
-                            n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b))  # [T, K-1]
-                            n_b = pyro.deterministic(
-                                "n_b",
-                                _soft_clamp(n_b_raw, nmin, nmax)
-                            )  # [T, K-1]
+                        n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b.unsqueeze(-1).expand(T, K_minus_1)).to_event(1))  # [T, K-1]
+                        n_b = pyro.deterministic(
+                            "n_b",
+                            _soft_clamp(n_b_raw, nmin, nmax)
+                        )  # [T, K-1]
                     else:
                         n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b))
                         n_b = pyro.deterministic(
@@ -785,14 +783,13 @@ class TransFitter:
                     if distribution in ['binomial', 'multinomial']:
                         if distribution == 'multinomial' and K is not None:
                             # For multinomial: Sample Vmax_b for K-1 categories (Kth is residual)
+                            # Use .to_event(1) instead of nested plates to avoid dim=-1 collision with trans_plate
                             K_minus_1 = K - 1
-                            with pyro.plate("category_plate_Vmax_b", K_minus_1, dim=-1):
-                                Vmax_b = pyro.sample("Vmax_b", dist.Beta(alpha_vmax, beta_vmax))  # [T, K-1]
+                            Vmax_b = pyro.sample("Vmax_b", dist.Beta(alpha_vmax[:, :K_minus_1], beta_vmax[:, :K_minus_1]).to_event(1))  # [T, K-1]
 
                             # K_b: Log-Normal for K-1 categories
-                            with pyro.plate("category_plate_K_b", K_minus_1, dim=-1):
-                                log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))  # [T, K-1]
-                                K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T, K-1]
+                            log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma).expand([K_minus_1]).to_event(1))  # [T, K-1]
+                            K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T, K-1]
                         else:
                             # For binomial: per-feature Vmax_b and K_b
                             Vmax_b = pyro.sample("Vmax_b", dist.Beta(alpha_vmax, beta_vmax))  # [T]
