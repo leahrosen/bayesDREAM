@@ -261,9 +261,16 @@ class TechnicalFitter:
         
             # Force α to 0 where category is structurally absent
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-        
-            # Center across categories; re-apply the mask to keep zeros exactly 0
-            alpha_logits_y = alpha_logits_y - alpha_logits_y.mean(dim=-1, keepdim=True)
+
+            # Center over ACTIVE categories only.
+            # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
+            # Dividing by n_active (not K) gives the correct softmax centering constraint
+            # (sum of active alphas = 0).  Dividing by K would leave a residual constant
+            # shift in the active alphas, breaking identifiability for features with
+            # many phantom categories.
+            n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
+            active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
+            alpha_logits_y = alpha_logits_y - active_mean
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
             alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
         
