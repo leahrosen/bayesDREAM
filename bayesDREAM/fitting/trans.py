@@ -2133,7 +2133,7 @@ class TransFitter:
         # Diagnostic: Verify alpha_y_prefit is correctly structured
         if alpha_y_prefit is not None and groups_tensor is not None:
             print(f"[INFO] Technical correction setup: alpha_y_prefit.shape={alpha_y_prefit.shape}, C={C}")
-            if alpha_y_prefit.shape[0] == C if alpha_y_prefit.ndim == 2 else alpha_y_prefit.shape[1] == C:
+            if alpha_y_prefit.shape[0] == C:
                 print(f"[INFO] alpha_y_prefit already includes reference group (correct!)")
             else:
                 print(f"[WARNING] alpha_y_prefit shape mismatch - may need to add reference group")
