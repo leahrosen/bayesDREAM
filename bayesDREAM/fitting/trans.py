@@ -618,10 +618,10 @@ class TransFitter:
                 # Reduce over group dimension if necessary
                 K_sigma = (K_max_tensor / (self._t(2) * torch.sqrt(K_alpha_tensor))) + epsilon_tensor
 
-                # For multinomial, use reduced Vmax_for_A (without category dimension) for priors
+                # For multinomial, reduce [T, K] → [T] for the Hill function amplitude prior
                 # For other distributions, use Vmax_mean_tensor directly
                 if distribution == 'multinomial' and Vmax_mean_tensor.ndim > 1:
-                    Vmax_prior_mean = Vmax_for_A  # [T] - already reduced
+                    Vmax_prior_mean = Vmax_mean_tensor.mean(dim=-1)  # [T]
                 else:
                     Vmax_prior_mean = Vmax_mean_tensor  # [T]
 
