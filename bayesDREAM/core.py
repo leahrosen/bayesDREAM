@@ -1801,3 +1801,7 @@ class _BayesDREAMCore(PlottingMixin):
     def save_trans_summary(self, *args, **kwargs):
         """Delegate to ModelSummarizer."""
         return self._summarizer.save_trans_summary(*args, **kwargs)
+
+    def classify_second_deriv_roots(self, *args, **kwargs):
+        """Delegate to ModelSummarizer.classify_second_deriv_roots."""
+        return self._summarizer.classify_second_deriv_roots(*args, **kwargs)
