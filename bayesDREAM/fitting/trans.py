@@ -524,46 +524,54 @@ class TransFitter:
 
                 # Sample A
                 if distribution == 'multinomial' and Amean_tensor.ndim > 1:
-                    # For multinomial: Use Dirichlet with weak concentration
-                    # concentration = mean_normalized * K (where K = number of categories)
-                    # This gives each category concentration ≈ 1 on average (weak prior)
+                    # For multinomial: LogisticNormal prior on A (Normal in logit space + softmax).
+                    #
+                    # We previously used dist.Dirichlet, but Pyro's autoguide represents the
+                    # K-simplex via a stick-breaking transform from R^(K-1).  With K=65 and
+                    # many phantom (all-zero) categories, float32 rounding in the stick-breaking
+                    # product chain makes the sample sum drift away from 1.0 beyond PyTorch's
+                    # 1e-6 Simplex tolerance, raising a ValueError in both compute_log_prob and
+                    # compute_score_parts — even with validate_args=False on the model, the
+                    # guide's TransformedDistribution re-validates the same sample.
+                    #
+                    # LogisticNormal sidesteps this entirely: the guide uses an unconstrained
+                    # Normal site (no simplex constraint, no stick-breaking), and softmax
+                    # guarantees a valid probability vector in the model.
                     K_dim = Amean_tensor.shape[-1]
 
-                    # For multinomial: use Dirichlet priors over K categories
-                    if use_data_driven_priors:
-                        # Data-driven Dirichlet: shift A mean to 0.5×Q05.
-                        # This gives P(A ≥ Q05) ≈ 13.5%, consistent with the negbinom A prior.
-                        # (The previous 0.1× gave P(A ≥ Q05) ≈ 0%, causing false positives
-                        # by forcing A near 0 and inflating effective Vmax.)
-                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
-                        A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
-
-                        # Weak concentration: mean_normalized * K gives ~1 per category
-                        concentration_A = A_mean_normalized * K_dim  # [T, K]
-                    else:
-                        # Uniform Dirichlet: all categories have equal concentration=1
-                        concentration_A = self._t(1.0).expand([T, K_dim])  # [T, K] with all 1s
-
-                    # Zero concentration for phantom categories (zero total observations
-                    # across all cells). Without this, the Dirichlet prior leaks mass to
-                    # padding positions, biasing real-category A values downward.
+                    # Build phantom mask (categories with zero observations across all cells)
+                    phantom_conc_mask = None
                     if y_obs_tensor.dim() == 3:  # multinomial: [N, T, K]
                         obs_total = y_obs_tensor.sum(dim=0)  # [T, K]
                         phantom_conc_mask = (obs_total == 0)  # [T, K]
-                        concentration_A = torch.where(
-                            phantom_conc_mask,
-                            torch.full_like(concentration_A, 1e-6),
-                            concentration_A,
-                        )
 
-                    # Sample K-dimensional probability vectors from Dirichlet
-                    # Each row sums to 1.
-                    # validate_args=False: Pyro's autoguide uses stick-breaking to parameterise
-                    # the K-simplex, and float32 rounding across K=65 categories can push the
-                    # sample sum outside the 1e-6 tolerance used by PyTorch's Simplex check,
-                    # raising a spurious ValueError.  The log_prob formula is still numerically
-                    # valid; we only suppress the overly-strict support check.
-                    A = pyro.sample("A", dist.Dirichlet(concentration_A, validate_args=False))  # [T, K]
+                    # Logit-space prior mean
+                    if use_data_driven_priors:
+                        # Shift A mean to 0.5×Q05 (→ P(A ≥ Q05) ≈ 13.5%, consistent with
+                        # the negbinom A prior), normalise, then take log as the logit mean.
+                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                        A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
+                        A_logit_mean = torch.log(A_mean_normalized.clamp(min=1e-10))  # [T, K]
+                    else:
+                        # Uniform prior: equal logits → uniform simplex after softmax
+                        A_logit_mean = torch.zeros(T, K_dim, device=self.model.device)
+
+                    # Push phantom categories to -inf in prior mean so the guide learns
+                    # to assign them zero probability.
+                    if phantom_conc_mask is not None:
+                        A_logit_mean = A_logit_mean.masked_fill(phantom_conc_mask, -1e4)
+
+                    # σ=1.0 in logit space ≈ weakly informative (comparable to Dirichlet α≈1)
+                    sigma_A_logit = self._t(1.0)
+
+                    # Sample in unconstrained logit space — the autoguide uses Normal here,
+                    # no simplex constraint, no stick-breaking transform.
+                    A_logit = pyro.sample("A", dist.Normal(A_logit_mean, sigma_A_logit).to_event(1))  # [T, K]
+
+                    # Softmax with phantom masking → valid probability vector [T, K]
+                    if phantom_conc_mask is not None:
+                        A_logit = A_logit.masked_fill(phantom_conc_mask, -1e9)
+                    A = torch.softmax(A_logit, dim=-1)  # [T, K]
 
                 else:
                     # For binomial: Beta priors
