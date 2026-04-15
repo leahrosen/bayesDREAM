@@ -557,8 +557,13 @@ class TransFitter:
                         )
 
                     # Sample K-dimensional probability vectors from Dirichlet
-                    # Each row sums to 1
-                    A = pyro.sample("A", dist.Dirichlet(concentration_A))  # [T, K]
+                    # Each row sums to 1.
+                    # validate_args=False: Pyro's autoguide uses stick-breaking to parameterise
+                    # the K-simplex, and float32 rounding across K=65 categories can push the
+                    # sample sum outside the 1e-6 tolerance used by PyTorch's Simplex check,
+                    # raising a spurious ValueError.  The log_prob formula is still numerically
+                    # valid; we only suppress the overly-strict support check.
+                    A = pyro.sample("A", dist.Dirichlet(concentration_A, validate_args=False))  # [T, K]
 
                 else:
                     # For binomial: Beta priors
