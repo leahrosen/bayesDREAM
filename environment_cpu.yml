@@ -34,6 +34,9 @@ dependencies:
   - pip:
     - pyro-ppl>=1.9.0
 
+  # Statistical modeling (GAMs for systematic shift test)
+  - statsmodels>=0.14.0
+
   # Data I/O
   - h5py>=3.8.0
 

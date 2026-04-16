@@ -31,6 +31,9 @@ dependencies:
   # Pip (PyTorch and Pyro will be installed via pip in separate step)
   - pip
 
+  # Statistical modeling (GAMs for systematic shift test)
+  - statsmodels>=0.14.0
+
   # Data I/O
   - h5py>=3.8.0
 
