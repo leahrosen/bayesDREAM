@@ -949,11 +949,23 @@ class _BayesDREAMCore(PlottingMixin):
         - Adjustment factor = mean_ntc / mean_guide
         - Adjusted sum factor = sum_factor * adjustment_factor
         """
+        primary_mod = self.get_modality(self.primary_modality)
+
         meta_out = self.meta.copy()
         meta_out["original_index"] = np.arange(len(meta_out))
 
+        # Prefer sum_factors on the modality; fall back to meta for the initial
+        # 'sum_factor' column (present in meta from initialisation).
         if sum_factor_col_old not in meta_out.columns:
-            raise ValueError(f"No column '{sum_factor_col_old}' found in meta. Provide a precomputed sum_factor.")
+            if (primary_mod.sum_factors is not None
+                    and sum_factor_col_old in primary_mod.sum_factors.columns):
+                meta_out[sum_factor_col_old] = primary_mod.sum_factors.loc[
+                    meta_out['cell'].values, sum_factor_col_old
+                ].values
+            else:
+                raise ValueError(
+                    f"No column '{sum_factor_col_old}' found in meta or modality sum_factors."
+                )
 
         # Drop existing adjustment_factor column if it exists (prevents merge conflicts)
         if "adjustment_factor" in meta_out.columns:
@@ -1021,8 +1033,13 @@ class _BayesDREAMCore(PlottingMixin):
 
         meta_out.sort_values("original_index", inplace=True)
         meta_out.drop(columns="original_index", inplace=True)
-        self.meta = meta_out
-        print(f"[INFO] Created '{sum_factor_col_adj}' in meta with NTC-based guide-level adjustment.")
+
+        # Write adjusted sum factor to modality, not back to meta
+        if primary_mod.sum_factors is None:
+            primary_mod.sum_factors = pd.DataFrame(index=meta_out['cell'].values)
+        primary_mod.sum_factors[sum_factor_col_adj] = meta_out.set_index('cell')[sum_factor_col_adj]
+
+        print(f"[INFO] Created '{sum_factor_col_adj}' in modality sum_factors with NTC-based guide-level adjustment.")
 
     def refit_sumfactor(
         self,
@@ -1100,7 +1117,21 @@ class _BayesDREAMCore(PlottingMixin):
         """
         from scipy.stats import gaussian_kde
 
-        sum_factor_data = self.meta[sum_factor_col_old].values  # shape (N,)
+        primary_mod = self.get_modality(self.primary_modality)
+
+        # Read sum factor from modality sum_factors, falling back to meta for the
+        # initial 'sum_factor' column that was present at model initialisation.
+        if (primary_mod.sum_factors is not None
+                and sum_factor_col_old in primary_mod.sum_factors.columns):
+            sum_factor_data = primary_mod.sum_factors.loc[
+                self.meta['cell'].values, sum_factor_col_old
+            ].values.astype(float)  # shape (N,)
+        elif sum_factor_col_old in self.meta.columns:
+            sum_factor_data = self.meta[sum_factor_col_old].values.astype(float)
+        else:
+            raise ValueError(
+                f"No column '{sum_factor_col_old}' found in modality sum_factors or meta."
+            )
 
         if covariates is None:
             covariates = []
@@ -1270,9 +1301,11 @@ class _BayesDREAMCore(PlottingMixin):
                 # The adjusted sum factor removes the x_true-dependent trend
                 # We want to keep the baseline level, so add back the global mean predicted value
                 global_baseline = np.mean(y_pred)
-                self.meta[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
+                if primary_mod.sum_factors is None:
+                    primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+                primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
 
-                print(f"[INFO] Created '{sum_factor_col_refit}' using per-group spline alignment.")
+                print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors using per-group spline alignment.")
                 return
 
         # =========================================================================
@@ -1319,8 +1352,12 @@ class _BayesDREAMCore(PlottingMixin):
 
         # Predict and adjust
         y_pred = model_spline_ridge.predict(X_true.reshape(-1, 1))
-        self.meta[sum_factor_col_refit] = np.maximum(0, leftover_data - y_pred + baseline_ntc_of_group[group_id])
-        print(f"[INFO] Created '{sum_factor_col_refit}' in meta with x_true-based adjustment.")
+        if primary_mod.sum_factors is None:
+            primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+        primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(
+            0, leftover_data - y_pred + baseline_ntc_of_group[group_id]
+        )
+        print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors with x_true-based adjustment.")
 
     def permute_genes(
         self,
@@ -1341,8 +1378,16 @@ class _BayesDREAMCore(PlottingMixin):
             Technical group covariates used to group cells for permutation (e.g., ['cell_line', 'lane']).
         """
 
-        if sum_factor_col not in self.meta.columns:
-            raise ValueError(f"No column '{sum_factor_col}' found in meta. Provide a precomputed sum_factor.")
+        primary_mod = self.get_modality(self.primary_modality)
+        _sf_available = (
+            primary_mod.sum_factors is not None
+            and sum_factor_col in primary_mod.sum_factors.columns
+        )
+        if not _sf_available:
+            raise ValueError(
+                f"No column '{sum_factor_col}' found in modality sum_factors. "
+                "Run adjust_ntc_sum_factor() first."
+            )
             
         print("Running gene permutation...")
 
@@ -1404,10 +1449,9 @@ class _BayesDREAMCore(PlottingMixin):
                         # Dense array
                         gene_counts_ntc = counts_sub[gene_idx, my_ntc_indices]
 
-                    # Get sum factors
-                    meta_indexed = meta_sub.set_index("cell")
-                    ntc_sum_factors = meta_indexed.loc[my_ntc_cells, sum_factor_col].values
-                    mycell_sum_factors = meta_indexed.loc[mycells, sum_factor_col].values
+                    # Get sum factors from modality
+                    ntc_sum_factors = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
+                    mycell_sum_factors = primary_mod.sum_factors.loc[mycells.values, sum_factor_col].values
 
                     # Sample values from NTC distribution
                     sampled_values = np.random.choice(
@@ -1452,9 +1496,8 @@ class _BayesDREAMCore(PlottingMixin):
                     # Get column indices for NTC cells
                     my_ntc_indices = [cell_to_col_idx[cell] for cell in my_ntc_cells]
 
-                    # Get sum factors
-                    meta_indexed = meta_sub.set_index("cell")
-                    ntc_sum_factor = meta_indexed.loc[my_ntc_cells, sum_factor_col].values
+                    # Get sum factors from modality
+                    ntc_sum_factor = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
 
                     # Get cis gene expression for NTC cells
                     if isinstance(self.counts, pd.DataFrame):

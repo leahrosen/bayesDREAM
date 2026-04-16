@@ -1105,7 +1105,8 @@ class TechnicalFitter:
 
         # Size-factor use only for NB; otherwise ignore
         if distribution == 'negbinom' and sum_factor_col is not None:
-            y_obs_ntc_factored = y_obs_ntc_for_priors / meta_ntc[sum_factor_col].values.reshape(-1, 1)
+            ntc_sf = modality.sum_factors.loc[meta_ntc['cell'].values, sum_factor_col].values
+            y_obs_ntc_factored = y_obs_ntc_for_priors / ntc_sf.reshape(-1, 1)
         else:
             y_obs_ntc_factored = y_obs_ntc_for_priors
 
@@ -1233,7 +1234,9 @@ class TechnicalFitter:
         del mu_x_mean, mu_x_sd  # Free numpy arrays
 
         if sum_factor_col is not None and distribution == 'negbinom':
-            sum_factor_np = meta_ntc[sum_factor_col].values.astype(np.float32)
+            sum_factor_np = modality.sum_factors.loc[
+                meta_ntc['cell'].values, sum_factor_col
+            ].values.astype(np.float32)
             sum_factor_ntc_tensor = torch.from_numpy(sum_factor_np).to(self.model.device)
             del sum_factor_np
         else:

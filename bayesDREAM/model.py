@@ -349,6 +349,48 @@ class bayesDREAM(
         for name, mod in self.modalities.items():
             print(f"  - {name}: {mod}")
 
+        # Initialise sum_factors on all negbinom modalities from meta.
+        # Must run AFTER super().__init__() and cell subsetting so self.meta is final.
+        self._init_sum_factors(sum_factor_col)
+
+    def _init_sum_factors(self, sum_factor_col: str = 'sum_factor'):
+        """
+        Initialise sum_factors DataFrame on negbinom modalities from self.meta.
+
+        Copies every column whose name contains 'sum_factor' into a cell-indexed
+        DataFrame stored on each negbinom modality.  The 'cis' modality (when
+        present) receives a reference to the *same* DataFrame as the primary
+        modality — not a copy — so that writes made via adjust_ntc_sum_factor()
+        or refit_sumfactor() are immediately visible to both.
+
+        Called once at the end of __init__, after super().__init__() and cell
+        subsetting so self.meta is in its final, filtered state.
+        """
+        if self.primary_modality not in self.modalities:
+            return
+
+        primary_mod = self.modalities[self.primary_modality]
+        if primary_mod.distribution != 'negbinom':
+            return
+
+        # Collect all sum-factor columns present in meta
+        sf_cols = [c for c in self.meta.columns if 'sum_factor' in c.lower()]
+        if sum_factor_col not in sf_cols and sum_factor_col in self.meta.columns:
+            sf_cols.append(sum_factor_col)
+
+        if not sf_cols:
+            primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+        else:
+            sf_df = self.meta.set_index('cell')[sf_cols].copy()
+            primary_mod.sum_factors = sf_df
+
+        # The 'cis' modality is a view of the primary — share the same DataFrame.
+        if 'cis' in self.modalities:
+            self.modalities['cis'].sum_factors = primary_mod.sum_factors
+
+        print(f"[INIT] sum_factors initialised on '{self.primary_modality}' "
+              f"with columns: {list(primary_mod.sum_factors.columns)}")
+
     def _filter_features(self, counts, feature_meta, features_to_keep):
         """
         Filter features (rows) from counts matrix and feature_meta.

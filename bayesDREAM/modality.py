@@ -241,6 +241,13 @@ class Modality:
         self.posterior_samples_technical = None  # Technical fit: full posterior samples
         self.posterior_samples_trans = None      # Trans fit: full posterior samples
 
+        # Sum factors DataFrame (negbinom modalities only).
+        # Index: cell barcode. Columns: named sum factor variants
+        # (e.g. 'sum_factor', 'sum_factor_adj', 'sum_factor_new').
+        # Populated by bayesDREAM._init_sum_factors() after model init.
+        # The 'cis' modality holds a reference to the same object as the primary modality.
+        self.sum_factors: Optional[pd.DataFrame] = None
+
         # Validate shapes
         self._validate()
 

@@ -3364,22 +3364,24 @@ def plot_negbinom_xy(
     else:
         y_obs = modality.counts[:, feature_idx]
 
-    # Check if sum_factor_col exists
-    if sum_factor_col not in model.meta.columns:
-        raise ValueError(f"Sum factor column '{sum_factor_col}' not found in model.meta. "
-                        f"Available columns: {list(model.meta.columns)}")
+    # Check if sum_factor_col exists on modality sum_factors
+    if modality.sum_factors is None or sum_factor_col not in modality.sum_factors.columns:
+        raise ValueError(
+            f"Sum factor column '{sum_factor_col}' not found in modality sum_factors. "
+            f"Available columns: {list(modality.sum_factors.columns) if modality.sum_factors is not None else '(none)'}"
+        )
 
     # Align cells between model.meta and modality
     x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(
         model, modality, x_true, y_obs, subset_mask
     )
 
-    # Build dataframe
+    # Build dataframe — read sum factors from modality, not from meta_aligned
     df_data = {
         'x_true': x_true_aligned,
         'y_obs': y_obs_aligned,
         'target': meta_aligned['target'].values,
-        'sum_factor': meta_aligned[sum_factor_col].values
+        'sum_factor': modality.sum_factors.loc[meta_aligned['cell'].values, sum_factor_col].values
     }
 
     # Conditionally add technical_group_code if it exists

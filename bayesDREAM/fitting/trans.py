@@ -1552,7 +1552,10 @@ class TransFitter:
 
         # Handle sum factors for modality cells
         if sum_factor_col is not None:
-            sum_factor_tensor = torch.tensor(meta_subset[sum_factor_col].values, dtype=torch.float32, device=self.model.device)
+            sum_factor_tensor = torch.tensor(
+                modality.sum_factors.loc[meta_subset['cell'].values, sum_factor_col].values,
+                dtype=torch.float32, device=self.model.device
+            )
         else:
             sum_factor_tensor = torch.ones(N, dtype=torch.float32, device=self.model.device)
 

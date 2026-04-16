@@ -78,9 +78,10 @@ def _compute_data_driven_priors(model, modality, distribution, epsilon=1e-6):
     if modality.cells_axis == 1:
         y_obs_ntc_for_priors = y_obs_ntc_for_priors.T
 
-    # Apply size factors for negbinom
-    if distribution == 'negbinom' and 'sum_factor' in meta_ntc.columns:
-        y_obs_ntc_factored = y_obs_ntc_for_priors / meta_ntc['sum_factor'].values.reshape(-1, 1)
+    # Apply size factors for negbinom — read from modality.sum_factors
+    if distribution == 'negbinom' and modality.sum_factors is not None and 'sum_factor' in modality.sum_factors.columns:
+        ntc_sf = modality.sum_factors.loc[meta_ntc['cell'].values, 'sum_factor'].values
+        y_obs_ntc_factored = y_obs_ntc_for_priors / ntc_sf.reshape(-1, 1)
     else:
         y_obs_ntc_factored = y_obs_ntc_for_priors
 
