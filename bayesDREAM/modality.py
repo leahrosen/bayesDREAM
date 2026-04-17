@@ -45,6 +45,7 @@ class Modality:
         denominator: Optional[np.ndarray] = None,
         cells_axis: int = 1,  # 0 if cells are rows, 1 if cells are columns
         cell_names: Optional[list] = None,  # Explicit cell names (when counts is ndarray)
+        min_count: int = 1,
         # Exon skipping specific parameters
         inc1: Optional[np.ndarray] = None,
         inc2: Optional[np.ndarray] = None,
@@ -248,6 +249,8 @@ class Modality:
         # The 'cis' modality holds a reference to the same object as the primary modality.
         self.sum_factors: Optional[pd.DataFrame] = None
 
+        self.min_count = min_count
+
         # Validate shapes
         self._validate()
 
@@ -261,7 +264,7 @@ class Modality:
 
     def _filter_zero_features(self) -> None:
         """
-        Remove features with zero total counts or zero standard deviation across cells.
+        Remove features with total counts below min_count or zero std across cells.
 
         Called at the end of __init__, so it also fires automatically after any cell
         subsetting (get_cell_subset returns a new Modality which calls __init__).
@@ -270,16 +273,16 @@ class Modality:
 
         Per-distribution logic
         ----------------------
-        negbinom   : drop feature if total counts == 0 OR std across cells == 0
+        negbinom   : drop feature if total counts < min_count OR std across cells == 0
         normal/
         studentt   : drop feature if std across cells == 0
-                     (total can legitimately be zero for centred data)
-        binomial   : drop feature if denominator sum == 0 (no observations)
+                     (sum of values < min_count is also checked for consistency)
+        binomial   : drop feature if denominator sum < min_count (too few observations)
                      OR ratio std (numer/denom) across cells == 0
-        multinomial: drop feature if total counts (summed over cells+categories) == 0
+        multinomial: drop feature if total counts (summed over cells+categories) < min_count
                      (zero-ratio-variance is already handled earlier in __init__)
         """
-        import warnings as _warnings
+        min_count = self.min_count
 
         # ------------------------------------------------------------------ #
         # 1. Compute keep mask per distribution                               #
@@ -287,7 +290,7 @@ class Modality:
         if self.distribution == 'multinomial':
             counts_arr = np.asarray(self.counts)          # (T, C, K)
             totals = counts_arr.sum(axis=(1, 2))          # (T,)
-            keep = totals > 0
+            keep = totals >= min_count
 
         elif self.distribution == 'binomial':
             cell_ax = self.cells_axis
@@ -301,7 +304,7 @@ class Modality:
                 denom = counts_num
 
             denom_sums = denom.sum(axis=cell_ax)
-            has_data = denom_sums > 0
+            has_data = denom_sums >= min_count
 
             with np.errstate(divide='ignore', invalid='ignore'):
                 ratios = np.where(denom > 0, counts_num / denom, np.nan)
@@ -326,10 +329,7 @@ class Modality:
                 totals = counts_arr.sum(axis=cell_ax)
                 stds = counts_arr.std(axis=cell_ax)
 
-            if self.distribution == 'negbinom':
-                keep = (totals > 0) & (stds > 0)
-            else:
-                keep = stds > 0
+            keep = (totals >= min_count) & (stds > 0)
 
         n_removed = int((~keep).sum())
         if n_removed == 0:
@@ -338,11 +338,9 @@ class Modality:
         keep_idx = np.where(keep)[0]
         n_before = self.dims['n_features']
 
-        _warnings.warn(
+        print(
             f"[Modality '{self.name}'] Removed {n_removed}/{n_before} feature(s) "
-            f"with zero total counts or zero variance across cells.",
-            UserWarning,
-            stacklevel=3,
+            f"with total counts < {min_count} or zero variance across cells."
         )
 
         # ------------------------------------------------------------------ #
@@ -517,7 +515,8 @@ class Modality:
             distribution=self.distribution,
             denominator=new_denom,
             cells_axis=self.cells_axis,
-            feature_names=new_feature_names,   # <---
+            feature_names=new_feature_names,
+            min_count=self.min_count,
             inc1=new_inc1,
             inc2=new_inc2,
             skip=new_skip,
@@ -580,6 +579,7 @@ class Modality:
             cells_axis=self.cells_axis,
             feature_names=self.feature_names,  # Preserve feature names during cell subsetting
             cell_names=new_cell_names,
+            min_count=self.min_count,
             inc1=new_inc1,
             inc2=new_inc2,
             skip=new_skip,
