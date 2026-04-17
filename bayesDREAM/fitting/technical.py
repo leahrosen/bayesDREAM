@@ -638,7 +638,7 @@ class TechnicalFitter:
 
             **When NOT to use use_all_cells=True (use default NTC-only):**
             - Technical groups correlate with cis gene expression
-              Example: CRISPRi vs CRISPRa cell lines targeting the cis gene
+              Example: cell lines that differ in perturbation type
             - Low MOI experiments with clear NTC vs perturbed distinction
             - When technical correction should be based solely on unperturbed cells
 
@@ -766,7 +766,7 @@ class TechnicalFitter:
             warnings.warn(
                 "[WARNING] use_all_cells=True: Fitting technical effects on ALL cells. "
                 "Only use this mode if technical effects are independent of perturbation effects. "
-                "If technical groups (e.g., CRISPRi vs CRISPRa) correlate with cis gene expression, "
+                "If technical groups correlate with cis gene expression, "
                 "use the default NTC-only mode to avoid over-correction.",
                 UserWarning
             )

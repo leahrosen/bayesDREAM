@@ -1532,14 +1532,14 @@ class _BayesDREAMCore(PlottingMixin):
         Create a new model instance with a subset of cells.
 
         Useful for testing without technical correction by subsetting to a single
-        cell_line (e.g., CRISPRi or CRISPRa only).
+        technical group (e.g., one cell line only).
 
         Parameters
         ----------
         cell_mask : np.ndarray, pd.Series, or list, optional
             Boolean mask or list of cell names to keep. If None, must provide query.
         query : str, optional
-            Pandas query string to filter cells (e.g., "cell_line == 'CRISPRa'").
+            Pandas query string to filter cells (e.g., "cell_line == 'K562'").
             Applied to self.meta. If None, must provide cell_mask.
         preserve_fits : bool
             If True (default), copy fitted parameters (alpha_x_prefit, alpha_y_prefit,
@@ -1553,15 +1553,15 @@ class _BayesDREAMCore(PlottingMixin):
         Examples
         --------
         # Subset by query
-        model_crispra = model.subset_cells(query="cell_line == 'CRISPRa'")
+        model_k562 = model.subset_cells(query="cell_line == 'K562'")
 
         # Subset by mask
-        mask = model.meta['cell_line'].str.contains('CRISPRa')
-        model_crispra = model.subset_cells(cell_mask=mask)
+        mask = model.meta['cell_line'].str.contains('K562')
+        model_k562 = model.subset_cells(cell_mask=mask)
 
         # Subset by cell list
-        cells = model.meta[model.meta['cell_line'] == 'CRISPRa']['cell'].tolist()
-        model_crispra = model.subset_cells(cell_mask=cells)
+        cells = model.meta[model.meta['cell_line'] == 'K562']['cell'].tolist()
+        model_k562 = model.subset_cells(cell_mask=cells)
         """
         if cell_mask is None and query is None:
             raise ValueError("Must provide either cell_mask or query")

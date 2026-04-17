@@ -695,7 +695,7 @@ class TransFitter:
 
                 if x_ntc_mean is not None:
                     # Centre K prior at NTC mean with ±5 log2FC (95% CI) coverage.
-                    # Note: for one-sided fits (CRISPRi-only or CRISPRa-only), K is not
+                    # Note: for one-sided fits (single technical group), K is not
                     # identifiable from the data when the true EC50 lies outside the observed
                     # x-range.  The NTC-centred prior then dominates and will under/over-shoot
                     # the true K.  This is a data limitation, not a code bug — the full dataset
@@ -751,7 +751,7 @@ class TransFitter:
                     # Direction of effect is carried by n (negative n = repressor Hill),
                     # so Vmax must be strictly positive for all three distributions.
                     # Wide log_sigma (floor ≥ 1.5, ≈ 20× range) keeps the prior diffuse
-                    # enough for one-sided subsets (CRISPRa-only or CRISPRi-only).
+                    # enough for one-sided subsets (single technical group).
                     _Vmax_log_sigma_floor = (vmax_log_sigma_floor_tensor
                                              if vmax_log_sigma_floor_tensor is not None
                                              else self._t(1.5))
