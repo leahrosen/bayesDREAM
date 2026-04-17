@@ -82,7 +82,8 @@ class bayesDREAM(
         random_seed: int = 2402,
         cores: int = 1,
         exclude_targets: list = None,
-        require_ntc: bool = True
+        require_ntc: bool = True,
+        min_count: int = 1,
     ):
         """
         Initialize bayesDREAM.
@@ -232,6 +233,9 @@ class bayesDREAM(
                 )
             cis_feature = cis_gene
 
+        # Store min_count for use in modality creation
+        self.min_count = min_count
+
         # Store original counts for base class initialization
         counts_for_base = counts
 
@@ -254,10 +258,10 @@ class bayesDREAM(
             if modality_name == 'gene':
                 # Use gene-specific creation (with gene_meta handling)
                 # Pass both the name and numeric index for exclusion
-                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta)
+                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta, min_count=min_count)
             else:
                 # Generic negbinom modality creation
-                self._create_negbinom_modality(counts, modality_name, cis_feature, cis_numeric_idx, feature_meta, meta)
+                self._create_negbinom_modality(counts, modality_name, cis_feature, cis_numeric_idx, feature_meta, meta, min_count=min_count)
 
         # Store primary modality name
         self.primary_modality = modality_name
@@ -644,7 +648,8 @@ class bayesDREAM(
             feature_meta=cis_feature_meta,
             cell_names=cell_names,
             distribution='negbinom',
-            cells_axis=1
+            cells_axis=1,
+            min_count=self.min_count,
         )
 
         return cis_gene, numeric_idx
@@ -780,7 +785,8 @@ class bayesDREAM(
             feature_meta=cis_feature_meta,
             cell_names=cell_names,
             distribution='negbinom',
-            cells_axis=1
+            cells_axis=1,
+            min_count=self.min_count,
         )
 
         return cis_feature, numeric_idx
@@ -792,7 +798,8 @@ class bayesDREAM(
         cis_feature: Optional[str] = None,
         cis_feature_idx: Optional[int] = None,
         feature_meta: Optional[pd.DataFrame] = None,
-        meta: Optional[pd.DataFrame] = None
+        meta: Optional[pd.DataFrame] = None,
+        min_count: int = 1,
     ):
         """
         Create a generic negbinom modality (excluding cis feature if specified).
@@ -940,7 +947,8 @@ class bayesDREAM(
             cell_names=cell_names,
             distribution='negbinom',
             cells_axis=1,
-            feature_names=feature_names_for_modality
+            feature_names=feature_names_for_modality,
+            min_count=min_count,
         )
 
     def _create_gene_modality(
@@ -949,7 +957,8 @@ class bayesDREAM(
         cis_gene: Optional[str] = None,
         cis_gene_idx: Optional[int] = None,
         gene_meta: Optional[pd.DataFrame] = None,
-        meta: Optional[pd.DataFrame] = None
+        meta: Optional[pd.DataFrame] = None,
+        min_count: int = 1,
     ):
         """
         Create 'gene' modality from gene counts (excluding cis gene if specified).
@@ -1112,7 +1121,8 @@ class bayesDREAM(
             cell_names=cell_names,
             distribution='negbinom',
             cells_axis=1,
-            feature_names=gene_names_for_modality
+            feature_names=gene_names_for_modality,
+            min_count=min_count,
         )
 
     def add_modality(
