@@ -109,7 +109,7 @@ class Modality:
             self.count_df = None
             self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
-            print(f"[SPARSE] Modality '{name}': Keeping counts as sparse matrix (shape: {counts.shape}, sparsity: {1 - counts.nnz / (counts.shape[0] * counts.shape[1]):.2%} zeros)")
+            pass  # sparse matrix stored as-is
         else:
             # Dense array: convert to numpy array
             self.counts = np.asarray(counts)

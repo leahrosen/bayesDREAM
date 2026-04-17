@@ -158,7 +158,7 @@ class _BayesDREAMCore(PlottingMixin):
                 # counts is sparse array - will extract names from gene_meta and meta later
                 self._gene_names = None
                 self._cell_names = None
-            print(f"[SPARSE] Keeping counts as sparse matrix (shape: {counts.shape}, sparsity: {1 - counts.nnz / (counts.shape[0] * counts.shape[1]):.2%} zeros)")
+            pass  # sparse matrix stored as-is
         else:
             # DataFrame or dense array
             if isinstance(counts, pd.DataFrame):
@@ -190,7 +190,6 @@ class _BayesDREAMCore(PlottingMixin):
                     )
                 )
             self.is_high_moi = True
-            print("[INFO] High MOI mode detected")
 
             # Validate guide_assignment shape
             if guide_assignment.ndim != 2:
@@ -274,7 +273,6 @@ class _BayesDREAMCore(PlottingMixin):
 
                 # Store for later use
                 self.guide_targets_dict = guide_targets_dict
-                print(f"[INFO] Using guide_target DataFrame: {len(guide_target)} guide-target relationships")
 
             elif 'target' in guide_meta.columns:
                 # Use simple one-to-one mapping from guide_meta
@@ -283,15 +281,13 @@ class _BayesDREAMCore(PlottingMixin):
                     for _, row in guide_meta.iterrows()
                 }
                 self.guide_targets_dict = guide_targets_dict
-                print(f"[INFO] Using guide_meta['target'] for one-to-one guide-target mapping")
             else:
                 raise ValueError(
                     "Either guide_target DataFrame or guide_meta['target'] column must be provided "
                     "to specify guide-target relationships in high MOI mode."
                 )
 
-            print(f"[INFO] High MOI: {N_cells_assignment} cells (from guide_assignment), {G_guides} guides")
-            print(f"[INFO] Average guides per cell: {guide_assignment.sum(axis=1).mean():.2f}")
+            print(f"[INFO] High MOI: {G_guides} guides, avg {guide_assignment.sum(axis=1).mean():.2f} per cell")
 
         else:
             self.is_high_moi = False
@@ -299,7 +295,6 @@ class _BayesDREAMCore(PlottingMixin):
         # Handle gene metadata and extract gene names
         if gene_meta is None:
             # Create minimal gene metadata from counts
-            print("[INFO] No gene_meta provided - creating minimal metadata")
             if isinstance(counts, pd.DataFrame):
                 # DataFrame: use string index from DataFrame
                 gene_names = counts.index.tolist()
@@ -314,7 +309,6 @@ class _BayesDREAMCore(PlottingMixin):
                     'feature_id': range(n_features)
                 }, index=range(n_features))
                 self._gene_names = None  # No string names for matrices
-                print(f"[INFO] Using numeric feature indices [0..{n_features-1}] for matrix/array")
         else:
             # Validate and process provided gene_meta
             gene_meta = gene_meta.copy()
@@ -338,13 +332,10 @@ class _BayesDREAMCore(PlottingMixin):
                 if not has_gene_col:
                     if gene_meta.index.name is not None:
                         gene_meta['gene'] = gene_meta.index
-                        print(f"[INFO] Using gene_meta index ('{gene_meta.index.name}') as 'gene' column")
                     elif has_gene_name:
                         gene_meta['gene'] = gene_meta['gene_name']
-                        print("[INFO] Using 'gene_name' column as 'gene' identifier")
                     elif has_gene_id:
                         gene_meta['gene'] = gene_meta['gene_id']
-                        print("[INFO] Using 'gene_id' column as 'gene' identifier")
 
                 counts_gene_names = counts.index.tolist()
 
@@ -400,15 +391,10 @@ class _BayesDREAMCore(PlottingMixin):
                             f"For matrix/array counts, gene_meta must have exactly {n_features} rows."
                         )
                     gene_meta.index = range(n_features)
-                    print(f"[INFO] Reset gene_meta to numeric index [0..{n_features-1}] to match matrix/array")
 
                 self._gene_names = None  # No string names for matrices
 
             self.gene_meta = gene_meta
-
-            # Print summary
-            meta_cols = [c for c in ['gene', 'gene_name', 'gene_id', 'feature_id'] if c in self.gene_meta.columns]
-            print(f"[INFO] Feature metadata loaded with {len(self.gene_meta)} features and columns: {meta_cols}")
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -560,12 +546,9 @@ class _BayesDREAMCore(PlottingMixin):
 
         # Subset meta and counts to relevant cells
         valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
-        if len(valid_cells) < len(self.meta["cell"].unique()):
-            warnings.warn(
-                f"Subsetting reduced the number of cells in the metadata from {len(self.meta['cell'].unique())} to {len(valid_cells)}. "
-                "This may impact downstream analysis.",
-                UserWarning
-            )
+        n_cells_before = len(self.meta["cell"].unique())
+        if len(valid_cells) < n_cells_before:
+            print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
         self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
 
         # Subset counts by cells - works for both DataFrame and sparse
@@ -685,7 +668,6 @@ class _BayesDREAMCore(PlottingMixin):
             # CRITICAL: Reset index to [0, 1, 2, ..., n_remaining-1]
             # This ensures row i in counts corresponds to row i in gene_meta
             self.gene_meta.index = range(len(self.gene_meta))
-            print(f"[INFO] After filtering: reset gene_meta index to [0..{len(self.gene_meta)-1}]")
 
             # _gene_names remains None for matrices
             self._gene_names = None
@@ -713,11 +695,7 @@ class _BayesDREAMCore(PlottingMixin):
                 # No cis gene - all rows are trans
                 self.trans_genes = list(range(len(self.gene_meta)))
 
-        if num_removed > 0:
-            warnings.warn(
-                f"[WARNING] {num_removed} gene(s) had zero counts after subsetting and were removed from the counts matrix.",
-                UserWarning
-            )
+        # zero-count genes removed here from self.counts; Modality.__init__ reports its own filtering
         
         # Ensure same order of meta and counts
         # Use _cell_names for sparse/dense array compatibility
@@ -783,7 +761,7 @@ class _BayesDREAMCore(PlottingMixin):
         from .io.summary import ModelSummarizer
         self._summarizer = ModelSummarizer(self)
 
-        print(f"[INIT] bayesDREAM core: label={self.label}, device={self.device}")
+        pass  # init summary printed by bayesDREAM.__init__ after modality setup
 
     def cis_init_loc_fn(
         self,
@@ -1667,8 +1645,6 @@ class _BayesDREAMCore(PlottingMixin):
             require_ntc=False  # Allow subsetting without NTC cells
         )
 
-        print(f"[DEBUG] Original modalities: {list(self.modalities.keys())}")
-        print(f"[DEBUG] New model modalities: {list(model_new.modalities.keys())}")
 
         # Copy additional modalities (beyond the primary 'gene' modality)
         if hasattr(self, 'modalities'):
