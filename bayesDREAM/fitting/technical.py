@@ -254,19 +254,10 @@ class TechnicalFitter:
                 )
         
             # ---- Cell-line logits α for NON-baseline groups (baseline=0 implicit) ----
-            # Use empirical Bayes prior loc if precomputed (data-driven centering).
-            # Falls back to loc=0 if not set (e.g. first call before precomputation).
-            alpha_prior_loc_multi = getattr(self, '_multinomial_alpha_prior_loc', None)
-            if alpha_prior_loc_multi is not None:
-                _alpha_loc = alpha_prior_loc_multi.to(self.model.device)   # [C-1, T, K]
-                _alpha_scale = self._t(2.0)
-            else:
-                _alpha_loc = self._t(0.0)
-                _alpha_scale = self._t(20.0)
             with pyro.plate("c_plate_multi", C - 1, dim=-3), \
                  pyro.plate("f_plate_multi", T, dim=-2), \
                  pyro.plate("k_plate", K, dim=-1):
-                alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=_alpha_loc, scale=_alpha_scale))
+                alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=self._t(0.0), scale=self._t(20.0)))
         
             # Force α to 0 where category is structurally absent
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
@@ -1302,30 +1293,9 @@ class TechnicalFitter:
             _ref_props = _ref_counts / _ref_counts.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             _log_p_init = torch.log(_ref_props.clamp(min=1e-8))              # [T, K]
 
-            # Empirical Bayes prior loc for alpha_logits_y: log(P_group / P_ref)
-            # Centred over active categories so it aligns with the post-sample centring.
-            _ref_props_safe = _ref_props.clamp(1e-6, 1.0)
-            _alpha_prior_loc = torch.zeros(C - 1, T_fit, K, device=self.model.device)
-            _non_ref = sorted(set(groups_ntc_tensor.cpu().tolist()) - {0})
-            for _idx, _g in enumerate(_non_ref[:C - 1]):
-                _gm = (groups_ntc_tensor == _g)
-                if _gm.sum() > 0:
-                    _gc = y_obs_ntc_tensor[_gm].sum(dim=0).float() + 0.5     # [T, K]
-                    _gp = _gc / _gc.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                    _alpha_prior_loc[_idx] = torch.log(_gp.clamp(1e-6, 1.0) / _ref_props_safe)
-            # Centre over active categories (mirrors post-sample centring in the model)
-            _n_active = (~_zmask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)
-            _active_sum = (_alpha_prior_loc * (~_zmask).float().unsqueeze(0)).sum(dim=-1, keepdim=True)
-            _alpha_prior_loc = _alpha_prior_loc - _active_sum / _n_active
-            _alpha_prior_loc = _alpha_prior_loc.masked_fill(_zmask.unsqueeze(0), 0.0)
-
-            # Store for _model_technical and the guide closure
-            self._multinomial_alpha_prior_loc = _alpha_prior_loc             # [C-1, T, K]
-            self._multinomial_zero_cat_mask   = _zmask                       # [T, K]
-            self._multinomial_log_p_init      = _log_p_init                  # [T, K]
-        else:
-            # Clear any stale multinomial state from a previous call
-            self._multinomial_alpha_prior_loc = None
+            # Store for the guide closure
+            self._multinomial_zero_cat_mask = _zmask                         # [T, K]
+            self._multinomial_log_p_init    = _log_p_init                    # [T, K]
 
         # ---------------------------
         # Guide + init functions
