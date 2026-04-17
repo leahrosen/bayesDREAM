@@ -254,6 +254,144 @@ class Modality:
         # Store dimensionality info
         self.dims = self._compute_dims()
 
+        # Drop features with zero total counts or zero variance across cells.
+        # This runs at creation and automatically re-runs after cell subsetting
+        # (get_cell_subset returns a new Modality, triggering __init__).
+        self._filter_zero_features()
+
+    def _filter_zero_features(self) -> None:
+        """
+        Remove features with zero total counts or zero standard deviation across cells.
+
+        Called at the end of __init__, so it also fires automatically after any cell
+        subsetting (get_cell_subset returns a new Modality which calls __init__).
+        Modifies self in place; updates counts, feature_meta, feature_names, denominator,
+        inc1/inc2/skip, and dims.
+
+        Per-distribution logic
+        ----------------------
+        negbinom   : drop feature if total counts == 0 OR std across cells == 0
+        normal/
+        studentt   : drop feature if std across cells == 0
+                     (total can legitimately be zero for centred data)
+        binomial   : drop feature if denominator sum == 0 (no observations)
+                     OR ratio std (numer/denom) across cells == 0
+        multinomial: drop feature if total counts (summed over cells+categories) == 0
+                     (zero-ratio-variance is already handled earlier in __init__)
+        """
+        import warnings as _warnings
+
+        # ------------------------------------------------------------------ #
+        # 1. Compute keep mask per distribution                               #
+        # ------------------------------------------------------------------ #
+        if self.distribution == 'multinomial':
+            counts_arr = np.asarray(self.counts)          # (T, C, K)
+            totals = counts_arr.sum(axis=(1, 2))          # (T,)
+            keep = totals > 0
+
+        elif self.distribution == 'binomial':
+            cell_ax = self.cells_axis
+
+            counts_num = (self.counts.toarray() if sparse.issparse(self.counts)
+                          else np.asarray(self.counts))
+            if self.denominator is not None:
+                denom = (self.denominator.toarray() if sparse.issparse(self.denominator)
+                         else np.asarray(self.denominator))
+            else:
+                denom = counts_num
+
+            denom_sums = denom.sum(axis=cell_ax)
+            has_data = denom_sums > 0
+
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratios = np.where(denom > 0, counts_num / denom, np.nan)
+            ratio_stds = np.nanstd(ratios, axis=cell_ax)
+            has_variance = ratio_stds > 0
+
+            keep = has_data & has_variance
+
+        else:  # negbinom, normal, studentt
+            cell_ax = self.cells_axis
+
+            if self.is_sparse:
+                _sp = self.counts.astype(float)
+                totals = np.array(_sp.sum(axis=cell_ax)).flatten()
+                _mean = np.array(_sp.mean(axis=cell_ax)).flatten()
+                _sp2 = _sp.copy()
+                _sp2.data **= 2
+                _sq_mean = np.array(_sp2.mean(axis=cell_ax)).flatten()
+                stds = np.sqrt(np.maximum(_sq_mean - _mean ** 2, 0))
+            else:
+                counts_arr = np.asarray(self.counts)
+                totals = counts_arr.sum(axis=cell_ax)
+                stds = counts_arr.std(axis=cell_ax)
+
+            if self.distribution == 'negbinom':
+                keep = (totals > 0) & (stds > 0)
+            else:
+                keep = stds > 0
+
+        n_removed = int((~keep).sum())
+        if n_removed == 0:
+            return
+
+        keep_idx = np.where(keep)[0]
+        n_before = self.dims['n_features']
+
+        _warnings.warn(
+            f"[Modality '{self.name}'] Removed {n_removed}/{n_before} feature(s) "
+            f"with zero total counts or zero variance across cells.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+        # ------------------------------------------------------------------ #
+        # 2. Apply mask to counts and auxiliary arrays                        #
+        # ------------------------------------------------------------------ #
+        if self.distribution == 'multinomial':
+            self.counts = np.asarray(self.counts)[keep_idx, :, :]
+
+        elif self.cells_axis == 1:
+            if self.is_sparse:
+                self.counts = self.counts[keep_idx, :]
+            else:
+                self.counts = np.asarray(self.counts)[keep_idx, :]
+
+            if self.denominator is not None:
+                if sparse.issparse(self.denominator):
+                    self.denominator = self.denominator[keep_idx, :]
+                else:
+                    self.denominator = np.asarray(self.denominator)[keep_idx, :]
+
+            for _attr in ('inc1', 'inc2', 'skip'):
+                _val = getattr(self, _attr)
+                if _val is not None:
+                    setattr(self, _attr, _val[keep_idx, :])
+
+        else:  # cells_axis == 0
+            if self.is_sparse:
+                self.counts = self.counts[:, keep_idx]
+            else:
+                self.counts = np.asarray(self.counts)[:, keep_idx]
+
+            if self.denominator is not None:
+                if sparse.issparse(self.denominator):
+                    self.denominator = self.denominator[:, keep_idx]
+                else:
+                    self.denominator = np.asarray(self.denominator)[:, keep_idx]
+
+        # count_df is now stale — drop it to avoid inconsistency
+        self.count_df = None
+
+        # ------------------------------------------------------------------ #
+        # 3. Update metadata and dims                                         #
+        # ------------------------------------------------------------------ #
+        self.feature_meta = self.feature_meta.iloc[keep_idx].reset_index(drop=True)
+        if self.feature_names is not None:
+            self.feature_names = [self.feature_names[i] for i in keep_idx]
+
+        self.dims = self._compute_dims()
+
     def _validate(self):
         """Validate data shapes and requirements."""
         # Get ndim and shape (sparse matrices have these attributes too)
