@@ -696,8 +696,10 @@ class TechnicalFitter:
                     f"Cannot perform cis modeling with '{distribution}' distribution."
                 )
 
-        # Always use the modality's filtered counts directly
+        # Always use the modality's filtered counts directly (densify if sparse)
         counts_to_fit = modality.counts
+        if hasattr(counts_to_fit, 'toarray'):
+            counts_to_fit = counts_to_fit.toarray()
         if modality.cell_names is not None:
             modality_cells = modality.cell_names
         else:

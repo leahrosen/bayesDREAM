@@ -1439,8 +1439,10 @@ class TransFitter:
                 f"Please run fit_technical(modality_name='{modality_name}') first."
             )
 
-        # Get counts from modality
+        # Get counts from modality (densify if sparse)
         counts_to_fit = modality.counts
+        if hasattr(counts_to_fit, 'toarray'):
+            counts_to_fit = counts_to_fit.toarray()
 
         # Get cell names from modality
         if modality.cell_names is not None:

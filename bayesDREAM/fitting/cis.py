@@ -325,12 +325,15 @@ class CisFitter:
         if isinstance(cis_modality.counts, pd.DataFrame):
             cis_counts = cis_modality.counts.loc[cis_feature].values
         else:
-            # numpy array - need to find index
+            # numpy/sparse array - need to find index
             feature_idx = cis_modality.feature_meta.index.get_loc(cis_feature)
             if cis_modality.cells_axis == 1:
                 cis_counts = cis_modality.counts[feature_idx, :]
             else:
                 cis_counts = cis_modality.counts[:, feature_idx]
+            # Densify if sparse (slicing sparse returns sparse row/col matrix)
+            if hasattr(cis_counts, 'toarray'):
+                cis_counts = cis_counts.toarray().ravel()
 
         # convert to gpu for fitting
         if self.model.alpha_x_prefit is not None and self.model.alpha_x_prefit.device != self.model.device:
