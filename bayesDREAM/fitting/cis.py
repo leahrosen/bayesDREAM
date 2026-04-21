@@ -165,11 +165,8 @@ class CisFitter:
             # This is always finite since x_eff_g > 0 and NTC_mean > 0.
 
             # NTC reference: weighted mean of NTC guide effects
-            ntc_mask = torch.tensor(
-                [self.model.guide_meta.iloc[g]['target'] == 'ntc' for g in range(x_eff_g.shape[-1])],
-                dtype=torch.bool,
-                device=self.model.device
-            )
+            # Use pre-computed mask (set in fit_cis before SVI loop to avoid pandas access here)
+            ntc_mask = self.model._ntc_guide_mask
             cells_per_guide = self.model.guide_assignment_tensor.sum(dim=0)  # [G]
             weights = cells_per_guide / sigma_eff.clamp(min=1e-6)            # [G]
             ntc_weights = weights[ntc_mask]
@@ -624,6 +621,25 @@ class CisFitter:
                 return sigma_eff_mean_tensor.clamp(min=1e-2).expand(G)
         
             return pyro.infer.autoguide.initialization.init_to_median(site)
+
+        # Pre-compute NTC guide mask for high MOI mode (avoids pandas access inside Pyro model)
+        if self.model.is_high_moi:
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            if 'target' in self.model.guide_meta.columns:
+                ntc_flags = [self.model.guide_meta.iloc[g]['target'] in _ntc_variants
+                             for g in range(G)]
+            elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
+                ntc_flags = [
+                    any(t in _ntc_variants for t in self.model.guide_targets_dict.get(row['guide'], []))
+                    for _, row in self.model.guide_meta.iterrows()
+                ]
+            else:
+                raise ValueError(
+                    "High MOI mode requires either guide_meta['target'] or guide_targets_dict "
+                    "to identify NTC guides."
+                )
+            self.model._ntc_guide_mask = torch.tensor(ntc_flags, dtype=torch.bool,
+                                                       device=self.model.device)
 
         guide_x = pyro.infer.autoguide.AutoNormalMessenger(self._model_x, init_loc_fn=init_loc_fn)
         guide_x.to(self.model.device)
