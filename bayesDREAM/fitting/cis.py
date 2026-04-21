@@ -480,15 +480,35 @@ class CisFitter:
 
             ### BUILD target_per_guide_tensor [G] based on guide → target
             if self.model.is_high_moi:
-                # High MOI: use guide_meta to get target for each guide
-                # guide_meta has 'target' column, and guides are in order by guide_code
-                if 'target' not in self.model.guide_meta.columns:
-                    raise ValueError("independent_mu_sigma is True, but guide_meta missing 'target' column.")
+                # High MOI: derive one target label per guide for grouping mu/sigma.
+                # Two sources: guide_meta['target'] (simple) or guide_targets_dict (many-to-many).
+                _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
 
-                # Factorize targets to get unique target codes
-                target_factorized, target_unique = pd.factorize(self.model.guide_meta['target'])
+                if 'target' in self.model.guide_meta.columns:
+                    guide_target_labels = self.model.guide_meta['target'].tolist()
+                elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
+                    # Derive a single representative target per guide.
+                    # Priority: cis_gene > any NTC variant > first target.
+                    def _primary_target(targets):
+                        if self.model.cis_gene and self.model.cis_gene in targets:
+                            return self.model.cis_gene
+                        for t in targets:
+                            if t in _ntc_variants:
+                                return 'ntc'
+                        return targets[0] if targets else 'ntc'
+
+                    guide_target_labels = [
+                        _primary_target(self.model.guide_targets_dict.get(row['guide'], ['ntc']))
+                        for _, row in self.model.guide_meta.iterrows()
+                    ]
+                else:
+                    raise ValueError(
+                        "independent_mu_sigma=True in high MOI mode requires either "
+                        "guide_meta['target'] or guide_targets_dict."
+                    )
+
+                target_factorized, target_unique = pd.factorize(guide_target_labels)
                 target_per_guide_tensor = torch.tensor(target_factorized, dtype=torch.long, device=self.model.device)
-
                 print(f"[INFO] independent_mu_sigma (high MOI): {len(target_unique)} unique targets")
             else:
                 # Single-guide mode: use existing logic
