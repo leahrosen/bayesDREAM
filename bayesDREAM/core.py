@@ -921,11 +921,18 @@ class _BayesDREAMCore(PlottingMixin):
 
         Notes
         -----
-        For each guide within each covariate group:
+        **Single-guide mode** (low MOI): for each guide within each covariate group:
         - Compute mean NTC sum factor: mean_ntc
         - Compute mean guide sum factor: mean_guide
         - Adjustment factor = mean_ntc / mean_guide
         - Adjusted sum factor = sum_factor * adjustment_factor
+
+        **High MOI mode**: guide effects are assumed additive in log-space (same as fit_cis).
+        For each guide g within each covariate group:
+        - mean_log_sf_g = mean(log(sum_factor)) over cells containing guide g
+        - weighted_NTC = weighted mean of mean_log_sf_g for NTC guides (weights = cells_per_guide)
+        - delta_g = mean_log_sf_g - weighted_NTC
+        For each cell c: log(sf_adj_c) = log(sf_c) - sum(delta_g for guides in cell c)
         """
         primary_mod = self.get_modality(self.primary_modality)
 
@@ -958,22 +965,71 @@ class _BayesDREAMCore(PlottingMixin):
                     f"Available columns are: {list(meta_out.columns)}"
             )
         
-        if not covariates:
+        if self.is_high_moi:
+            # High MOI: guide effects are additive in log-space (same assumption as fit_cis).
+            # For a cell with guides g1, g2: log(sf_adj) = log(sf) - delta_g1 - delta_g2
+            # where delta_g = mean_log_sf_g - weighted_NTC_log_sf (per covariate group).
+            # Weights for NTC mean = cells_per_guide, matching fit_cis.
+
+            guide_assignment = self.guide_assignment  # (n_cells, n_guides)
+            is_ntc_guide = (self.guide_meta['target'] == 'ntc').values  # (n_guides,)
+
+            log_sf = np.log(meta_out[sum_factor_col_old].values.astype(float))
+            log_sf_adj = log_sf.copy()
+
+            def _apply_highmoi_correction(pos_indices):
+                ga = guide_assignment[pos_indices]   # (n_sub, n_guides)
+                lsf = log_sf[pos_indices]            # (n_sub,)
+
+                cells_per_guide = ga.sum(axis=0).astype(float)  # (n_guides,)
+
+                # (1) Mean log(sf) per guide via matrix multiply
+                mean_log_sf_g = np.where(
+                    cells_per_guide > 0,
+                    (ga.T @ lsf) / np.maximum(cells_per_guide, 1.0),
+                    np.nan
+                )  # (n_guides,)
+
+                # (2) Weighted NTC mean (weights = cells_per_guide, matching fit_cis)
+                ntc_means = mean_log_sf_g[is_ntc_guide]
+                ntc_counts = cells_per_guide[is_ntc_guide]
+                valid = ~np.isnan(ntc_means) & (ntc_counts > 0)
+                if valid.sum() == 0:
+                    return  # No NTC guides in group; skip correction
+                weighted_NTC_log_sf = np.average(ntc_means[valid], weights=ntc_counts[valid])
+
+                # (3) Per-guide delta; guides with no cells in this group get delta=0
+                delta_g = np.where(~np.isnan(mean_log_sf_g), mean_log_sf_g - weighted_NTC_log_sf, 0.0)
+
+                # (4) Additive correction per cell in log-space
+                log_sf_adj[pos_indices] -= ga @ delta_g
+
+            if not covariates:
+                _apply_highmoi_correction(np.arange(len(meta_out)))
+            else:
+                meta_out["_pos"] = np.arange(len(meta_out))
+                for _, group_df in meta_out.groupby(covariates):
+                    _apply_highmoi_correction(group_df["_pos"].values)
+                meta_out.drop(columns=["_pos"], inplace=True)
+
+            meta_out[sum_factor_col_adj] = np.exp(log_sf_adj)
+
+        elif not covariates:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
             mean_ntc_value = meta_out.loc[meta_out['target'] == 'ntc', sum_factor_col_old].mean()
-    
+
             # (2) Mean sum_factor among *all* guides, grouped by covariates + [guide_col]
             df_guide = (
                 meta_out.groupby(["guide_used"])[sum_factor_col_old]
                 .mean()
                 .reset_index(name="mean_SumFacs_guide")
             )
-    
+
             # (3) Merge them and compute ratio = mean_NTC / mean_guide
             df_guide["adjustment_factor"] = (
                 mean_ntc_value / (df_guide["mean_SumFacs_guide"])
             )
-    
+
             # (4) Merge that ratio back onto meta_out
             meta_out = pd.merge(
                 meta_out,
@@ -981,6 +1037,9 @@ class _BayesDREAMCore(PlottingMixin):
                 on="guide_used",
                 how="left"
             )
+
+            # (5) Multiply original sum_factor by ratio
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
 
         else:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
@@ -990,24 +1049,24 @@ class _BayesDREAMCore(PlottingMixin):
                 .mean()
                 .reset_index(name="mean_SumFacs_ntc")
             )
-    
+
             # (2) Mean sum_factor among *all* guides, grouped by covariates + [guide_col]
             df_guide = (
                 meta_out.groupby(covariates + ["guide_used"])[sum_factor_col_old]
                 .mean()
                 .reset_index(name="mean_SumFacs_guide")
             )
-    
+
             # (3) Merge them and compute ratio = mean_NTC / mean_guide
             merged = pd.merge(df_guide, df_ntc, on=covariates, how="left")
             merged["adjustment_factor"] = merged["mean_SumFacs_ntc"] / merged["mean_SumFacs_guide"]
-    
+
             # (4) Merge that ratio back onto meta_out
             merge_cols = covariates + ["guide_used", "adjustment_factor"]
             meta_out = pd.merge(meta_out, merged[merge_cols], on=covariates + ["guide_used"], how="left")
-            
-        # (5) Multiply original sum_factor by ratio
-        meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
+
+            # (5) Multiply original sum_factor by ratio
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
 
         meta_out.sort_values("original_index", inplace=True)
         meta_out.drop(columns="original_index", inplace=True)
