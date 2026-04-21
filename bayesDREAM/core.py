@@ -811,7 +811,21 @@ class _BayesDREAMCore(PlottingMixin):
             # Weights for NTC mean = cells_per_guide, matching fit_cis.
 
             guide_assignment = self.guide_assignment  # (n_cells, n_guides)
-            is_ntc_guide = (self.guide_meta['target'] == 'ntc').values  # (n_guides,)
+
+            # Determine which guides are NTC — works for both guide_meta['target'] and guide_targets_dict
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            if 'target' in self.guide_meta.columns:
+                is_ntc_guide = self.guide_meta['target'].isin(_ntc_variants).values
+            elif hasattr(self, 'guide_targets_dict') and self.guide_targets_dict:
+                is_ntc_guide = np.array([
+                    any(t in _ntc_variants for t in self.guide_targets_dict.get(row['guide'], []))
+                    for _, row in self.guide_meta.iterrows()
+                ])
+            else:
+                raise ValueError(
+                    "adjust_ntc_sum_factor (high MOI): cannot identify NTC guides — "
+                    "guide_meta has no 'target' column and guide_targets_dict is unavailable."
+                )
 
             log_sf = np.log(meta_out[sum_factor_col_old].values.astype(float))
             log_sf_adj = log_sf.copy()

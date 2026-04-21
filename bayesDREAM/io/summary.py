@@ -1203,9 +1203,27 @@ class ModelSummarizer:
                 raw_counts_mean.append(np.nan)
 
         # Build guide-level DataFrame
+        # 'target' column may be absent in high MOI mode when guide_targets_dict is used;
+        # fall back to deriving the primary target from guide_targets_dict.
+        if 'target' in guide_meta.columns:
+            guide_targets_col = guide_meta['target'].values
+        elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            def _primary(g):
+                ts = self.model.guide_targets_dict.get(g, [])
+                if self.model.cis_gene and self.model.cis_gene in ts:
+                    return self.model.cis_gene
+                for t in ts:
+                    if t in _ntc_variants:
+                        return 'ntc'
+                return ts[0] if ts else 'unknown'
+            guide_targets_col = [_primary(g) for g in guides]
+        else:
+            guide_targets_col = ['unknown'] * len(guides)
+
         guide_df = pd.DataFrame({
             'guide': guides,
-            'target': guide_meta['target'].values,
+            'target': guide_targets_col,
             'n_cells': guide_meta['n_cells'].values,
             'x_true_mean': x_true_mean,
             'x_true_lower': x_true_lower,
