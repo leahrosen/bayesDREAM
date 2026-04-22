@@ -1257,6 +1257,7 @@ class TransFitter:
         vmax_log_sigma_floor: float = 1.5,
         k_log_sigma_min: float = None,
         k_prior_center: str = 'middle',
+        subset_features: bool = False,
         **kwargs
     ):
         """
@@ -1444,6 +1445,38 @@ class TransFitter:
         if hasattr(counts_to_fit, 'toarray'):
             counts_to_fit = counts_to_fit.toarray()
 
+        # subset_features: drop features not present in the saved technical fit
+        # (i.e. where modality.fitted_feature_mask is False)
+        _original_feature_names = (list(modality.feature_names)
+                                   if modality.feature_names is not None else None)
+        if subset_features and hasattr(modality, 'fitted_feature_mask') and modality.fitted_feature_mask is not None:
+            feat_mask = modality.fitted_feature_mask
+            if not feat_mask.all():
+                mask_np = feat_mask.numpy()
+                n_before = mask_np.shape[0]
+                n_after = int(mask_np.sum())
+                if modality.cells_axis == 1:
+                    counts_to_fit = counts_to_fit[mask_np, :]   # [T, N] → [T_sub, N]
+                else:
+                    counts_to_fit = counts_to_fit[:, mask_np]   # [N, T] → [N, T_sub]
+                # Also subset denominator (binomial)
+                if denominator is None and modality.denominator is not None:
+                    denominator = modality.denominator
+                if denominator is not None:
+                    import numpy as _np
+                    if hasattr(denominator, 'toarray'):
+                        denominator = denominator.toarray()
+                    if modality.cells_axis == 1:
+                        denominator = denominator[mask_np, :]
+                    else:
+                        denominator = denominator[:, mask_np]
+                # Temporarily update modality.feature_names so posteriors are saved correctly
+                if modality.feature_names is not None:
+                    modality.feature_names = [modality.feature_names[i]
+                                              for i, m in enumerate(mask_np) if m]
+                print(f"[INFO] subset_features=True: fitting {n_after}/{n_before} features "
+                      f"(dropped {n_before - n_after} without a technical fit).")
+
         # Get cell names from modality
         if modality.cell_names is not None:
             modality_cells = modality.cell_names
@@ -1471,6 +1504,21 @@ class TransFitter:
             print(f"[WARNING] Distribution-specific alpha_y not found, falling back to generic alpha_y_prefit. "
                   f"This may be incorrect if using old technical fit results. "
                   f"Consider re-running fit_technical with current code.")
+
+        # Apply feature subsetting to alpha_y_prefit if subset_features was triggered
+        if (subset_features and alpha_y_prefit is not None
+                and hasattr(modality, 'fitted_feature_mask')
+                and modality.fitted_feature_mask is not None
+                and not modality.fitted_feature_mask.all()):
+            mask_np = modality.fitted_feature_mask.numpy()
+            from bayesDREAM.io.load import _detect_feature_dim
+            n_saved = mask_np.shape[0]
+            dim = _detect_feature_dim(alpha_y_prefit, n_saved)
+            if dim is not None:
+                # Move feature axis to last, index, move back
+                ap = alpha_y_prefit.transpose(dim, alpha_y_prefit.ndim - 1)
+                ap = ap[..., mask_np]
+                alpha_y_prefit = ap.transpose(dim, alpha_y_prefit.ndim - 1)
 
         print(f"[INFO] Fitting trans model for modality '{modality_name}' (distribution: {distribution})")
 
@@ -2673,6 +2721,10 @@ class TransFitter:
         import gc
         gc.collect()
         pyro.clear_param_store()
+
+        # Restore feature_names if subset_features temporarily modified them
+        if subset_features and _original_feature_names is not None:
+            modality.feature_names = _original_feature_names
 
         print("Finished fit_trans.")
 

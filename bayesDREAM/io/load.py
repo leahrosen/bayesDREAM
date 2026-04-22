@@ -138,6 +138,137 @@ def _report_alignment(label, saved_names, target_names, mask):
     print(f"[LOAD] {label}: {n_matched}/{n_target} matched; {', '.join(parts)}")
 
 
+def _check_nan_features(feat_mask, mod_name, mask_features):
+    """
+    Raise or warn when alignment would introduce NaN feature values.
+
+    Parameters
+    ----------
+    feat_mask : torch.BoolTensor | None
+    mod_name  : str
+    mask_features : bool
+        If False, raise an error.  If True, proceed silently (caller will fill NaNs).
+    """
+    if feat_mask is None or feat_mask.all():
+        return
+    n_missing = int((~feat_mask).sum())
+    if not mask_features:
+        raise ValueError(
+            f"[LOAD] {mod_name}: {n_missing} feature(s) in the current modality were not present "
+            f"in the saved technical fit and would be filled with NaN.\n"
+            f"Options:\n"
+            f"  • load_technical_fit(..., mask_features=True)  — fill missing features with "
+            f"the per-group median alpha_y and mark them in modality.fitted_feature_mask; "
+            f"then use fit_trans(..., subset_features=True) to exclude them from fitting.\n"
+            f"  • Rerun fit_technical() on the current feature set to produce a matching fit."
+        )
+
+
+def _fill_nan_with_median(tensor, feat_mask):
+    """
+    Replace NaN positions (where feat_mask is False) along the last matching dimension
+    with the nanmedian of the non-NaN positions (per leading dimension slice).
+    Works for 2D [C, T] and 3D [C, T, K] tensors.
+    """
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return tensor
+    if feat_mask.all():
+        return tensor
+    t = tensor.clone()
+    # Identify the feature axis (last dim or second-to-last)
+    feat_dim = _detect_feature_dim(t, len(feat_mask))
+    if feat_dim is None:
+        return t
+    # Move feature axis to last for uniform treatment
+    t = t.transpose(feat_dim, t.ndim - 1)  # [..., T]
+    # Flatten leading dims, fill row-wise
+    leading = t.shape[:-1]
+    t_flat = t.reshape(-1, t.shape[-1])         # [L, T]
+    for row in t_flat:
+        finite = row[feat_mask]
+        if finite.numel() > 0:
+            med = finite.nanmedian().item() if hasattr(finite, 'nanmedian') else float(torch.nanmedian(finite))
+            row[~feat_mask] = med
+    t = t_flat.reshape(*leading, -1)
+    return t.transpose(feat_dim, tensor.ndim - 1)
+
+
+def _check_nan_cells(cell_mask, subset_cells):
+    """
+    Raise when alignment would introduce NaN cell values and subset_cells is False.
+    """
+    if cell_mask is None or cell_mask.all():
+        return
+    n_missing = int((~cell_mask).sum())
+    if not subset_cells:
+        raise ValueError(
+            f"[LOAD] {n_missing} cell(s) in the current model were not present in the saved "
+            f"cis fit and would receive NaN x_true values.\n"
+            f"Options:\n"
+            f"  • load_cis_fit(..., subset_cells=True)  — drop those cells from the model so "
+            f"every cell has a fitted x_true.\n"
+            f"  • Rerun fit_cis() on the current cell set to produce a matching fit."
+        )
+
+
+def _subset_model_cells_inplace(model, keep_cells):
+    """
+    Drop all cells not in `keep_cells` from model.meta and every modality in-place.
+
+    This is used by load_cis_fit(subset_cells=True) to shrink the model so that
+    every remaining cell has a fitted x_true value.
+    """
+    import numpy as np
+    keep_set = set(keep_cells)
+
+    # Subset model.meta
+    model.meta = model.meta[model.meta['cell'].isin(keep_set)].reset_index(drop=True)
+
+    # Subset each modality
+    for mod in model.modalities.values():
+        if mod.counts is None:
+            continue
+        # Build boolean index aligned to current cell_names or positional order
+        if mod.cell_names is not None:
+            keep_idx = [i for i, c in enumerate(mod.cell_names) if c in keep_set]
+            mod.cell_names = [mod.cell_names[i] for i in keep_idx]
+        else:
+            # No explicit cell names — assume same positional order as model.meta
+            n_cells = (mod.counts.shape[1] if mod.cells_axis == 1
+                       else mod.counts.shape[0])
+            keep_idx = list(range(min(n_cells, len(keep_cells))))
+
+        # Subset counts array
+        if hasattr(mod.counts, 'toarray'):
+            arr = mod.counts.toarray()
+        else:
+            arr = mod.counts
+        if mod.cells_axis == 1:
+            mod.counts = arr[:, keep_idx]
+        else:
+            mod.counts = arr[keep_idx, :]
+
+        # Subset denominator (binomial)
+        if mod.denominator is not None:
+            if mod.cells_axis == 1:
+                mod.denominator = mod.denominator[:, keep_idx]
+            else:
+                mod.denominator = mod.denominator[keep_idx, :]
+
+        # Subset sum_factors DataFrame
+        if hasattr(mod, 'sum_factors') and mod.sum_factors is not None:
+            if hasattr(mod.sum_factors, 'loc'):
+                mod.sum_factors = mod.sum_factors.loc[
+                    mod.sum_factors.index.isin(keep_set)
+                ].copy()
+
+    # Also subset guide-level info if it lives on meta
+    if hasattr(model, 'guide_meta') and 'cell' in model.guide_meta.columns:
+        model.guide_meta = model.guide_meta[
+            model.guide_meta['cell'].isin(keep_set)
+        ].reset_index(drop=True)
+
+
 def _torch_load(path, map_location=None):
     """
     Load a torch checkpoint, falling back to weights_only=False for files
@@ -171,7 +302,8 @@ class ModelLoader:
 
     def load_technical_fit(self, input_dir: str = None,
                           modalities: list = None, verbose: bool = False,
-                          load_model_level: bool = None):
+                          load_model_level: bool = None,
+                          mask_features: bool = False):
         """
         Load fitted technical parameters.
 
@@ -273,8 +405,20 @@ class ModelLoader:
                             posterior_raw, saved_feature_names, current_feature_names, n_features_saved)
                         _report_alignment(f"{mod_name} technical posterior",
                                           saved_feature_names, current_feature_names, feat_mask)
+                        _check_nan_features(feat_mask, mod_name, mask_features)
                         if feat_mask is not None:
                             mod.fitted_feature_mask = feat_mask
+                            if mask_features and not feat_mask.all():
+                                # Fill NaN positions with per-group median — same effective
+                                # treatment as zero-NTC-count genes in fit_technical
+                                for k in list(posterior_raw.keys()):
+                                    if isinstance(posterior_raw[k], torch.Tensor):
+                                        posterior_raw[k] = _fill_nan_with_median(
+                                            posterior_raw[k], feat_mask)
+                                n_missing = int((~feat_mask).sum())
+                                print(f"[LOAD] {mod_name}: {n_missing} missing feature(s) filled "
+                                      f"with per-group median alpha_y (mask_features=True). "
+                                      f"Use fit_trans(..., subset_features=True) to exclude them.")
                     mod.posterior_samples_technical = posterior_raw
 
                     # Reconstruct feature_meta DataFrame if present
@@ -349,8 +493,12 @@ class ModelLoader:
                             alpha_y_to_set, saved_feature_names, current_feature_names, dim)
                         _report_alignment(f"{mod_name} alpha_y_prefit",
                                           saved_feature_names, current_feature_names, feat_mask)
-                        if feat_mask is not None and not hasattr(mod, 'fitted_feature_mask'):
-                            mod.fitted_feature_mask = feat_mask
+                        _check_nan_features(feat_mask, mod_name, mask_features)
+                        if feat_mask is not None:
+                            if not hasattr(mod, 'fitted_feature_mask'):
+                                mod.fitted_feature_mask = feat_mask
+                            if mask_features and not feat_mask.all():
+                                alpha_y_to_set = _fill_nan_with_median(alpha_y_to_set, feat_mask)
 
                 mod.alpha_y_prefit = alpha_y_to_set
                 if mod.distribution == 'negbinom':
@@ -397,7 +545,8 @@ class ModelLoader:
 
         return loaded
 
-    def load_cis_fit(self, input_dir: str = None, verbose: bool = False):
+    def load_cis_fit(self, input_dir: str = None, verbose: bool = False,
+                     subset_cells: bool = False):
         """
         Load fitted cis parameters.
 
@@ -439,18 +588,37 @@ class ModelLoader:
                 # Align per-cell tensors in the posterior (x_true, log_x_true)
                 if (current_cell_names is not None and saved_cell_names is not None
                         and current_cell_names != saved_cell_names):
-                    n_cells_saved = len(saved_cell_names)
-                    per_cell_keys = [k for k, v in posterior_raw.items()
-                                     if isinstance(v, torch.Tensor) and v.shape[-1] == n_cells_saved]
-                    cell_mask = None
-                    for k in per_cell_keys:
-                        posterior_raw[k], cell_mask = _align_tensor(
-                            posterior_raw[k], saved_cell_names, current_cell_names,
-                            dim=posterior_raw[k].ndim - 1)
-                    if cell_mask is not None:
-                        _report_alignment("cis posterior cells",
-                                          saved_cell_names, current_cell_names, cell_mask)
-                        self.model.fitted_cell_mask = cell_mask
+                    # Pre-compute cell mask to check for missing cells
+                    _saved_set = set(saved_cell_names)
+                    _cell_mask_preview = torch.tensor(
+                        [c in _saved_set for c in current_cell_names], dtype=torch.bool)
+
+                    # Error or subset before doing any NaN alignment
+                    _check_nan_cells(_cell_mask_preview, subset_cells)
+
+                    if subset_cells and not _cell_mask_preview.all():
+                        # Reduce model to only cells present in the saved fit
+                        keep_cells = [c for c in current_cell_names if c in _saved_set]
+                        _subset_model_cells_inplace(self.model, keep_cells)
+                        current_cell_names = keep_cells
+                        print(f"[LOAD] subset_cells=True: model reduced to "
+                              f"{len(keep_cells)} cells present in saved cis fit.")
+
+                    # Now align (if sets still differ, e.g. saved has cells not in current)
+                    if current_cell_names != saved_cell_names:
+                        n_cells_saved = len(saved_cell_names)
+                        per_cell_keys = [k for k, v in posterior_raw.items()
+                                         if isinstance(v, torch.Tensor)
+                                         and v.shape[-1] == n_cells_saved]
+                        cell_mask = None
+                        for k in per_cell_keys:
+                            posterior_raw[k], cell_mask = _align_tensor(
+                                posterior_raw[k], saved_cell_names, current_cell_names,
+                                dim=posterior_raw[k].ndim - 1)
+                        if cell_mask is not None:
+                            _report_alignment("cis posterior cells",
+                                              saved_cell_names, current_cell_names, cell_mask)
+                            self.model.fitted_cell_mask = cell_mask
 
                 self.model.posterior_samples_cis = posterior_raw
 
@@ -478,6 +646,7 @@ class ModelLoader:
             loaded_summary.append("posterior_cis" + (f" ({cis_gene})" if cis_gene else ""))
 
         # Load x_true (standalone file — align by cell if names available)
+        # Note: if subset_cells=True was applied above, current_cell_names is already reduced
         x_true_path = os.path.join(input_dir, 'x_true.pt')
         if os.path.exists(x_true_path):
             x_true = _torch_load(x_true_path)
@@ -486,6 +655,10 @@ class ModelLoader:
             if (current_cell_names is not None and saved_cell_names is not None
                     and current_cell_names != saved_cell_names
                     and x_true.ndim == 1 and x_true.shape[0] == len(saved_cell_names)):
+                # Check only — subset was already handled above (or will raise)
+                _saved_set = set(saved_cell_names)
+                _mask = torch.tensor([c in _saved_set for c in current_cell_names], dtype=torch.bool)
+                _check_nan_cells(_mask, subset_cells)
                 x_true, cell_mask = _align_cell_tensor(x_true, saved_cell_names, current_cell_names)
                 _report_alignment("x_true cells", saved_cell_names, current_cell_names, cell_mask)
                 if cell_mask is not None and not hasattr(self.model, 'fitted_cell_mask'):
