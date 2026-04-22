@@ -652,6 +652,17 @@ class PlottingMixin:
             Plot title
         legend : bool
             Show legend (default: True)
+        overlay_roots : pd.DataFrame, pd.Series, dict, or None
+            Summary DataFrame (or single row) from ``save_trans_summary``.
+            When provided, draws dashed vertical lines at derivative roots on
+            each subplot.  See ``plot_trans_functions`` in ``xy_plots.py`` for
+            full documentation of the root overlay behaviour.
+        overlay_roots_lw : float
+            Line width for root vlines (default 1.0).
+        overlay_roots_alpha : float
+            Transparency for root vlines (default 0.8).
+        overlay_roots_also_on_function : bool
+            If True (default), also draw roots on the function subplot.
 
         Returns
         -------
@@ -663,6 +674,15 @@ class PlottingMixin:
         >>> # Plot function and derivatives for one gene
         >>> model.plot_trans_functions('TET2', show_first_derivative=True,
         ...                            show_second_derivative=True)
+
+        >>> # Overlay derivative roots from summary df
+        >>> df = model.save_trans_summary(compute_derivative_roots=True)
+        >>> model.plot_trans_functions('TET2', use_log2fc=True,
+        ...                            show_function=True,
+        ...                            show_first_derivative=True,
+        ...                            show_second_derivative=True,
+        ...                            show_third_derivative=True,
+        ...                            overlay_roots=df)
 
         >>> # Plot first derivative of multiple genes
         >>> model.plot_trans_functions(['TET2', 'MYB', 'GFI1B'],

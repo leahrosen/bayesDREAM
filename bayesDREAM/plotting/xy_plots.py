@@ -1726,6 +1726,10 @@ def plot_trans_functions(
     title: Optional[str] = None,
     legend: bool = True,
     ax: Optional[plt.Axes] = None,
+    overlay_roots=None,
+    overlay_roots_lw: float = 1.0,
+    overlay_roots_alpha: float = 0.8,
+    overlay_roots_also_on_function: bool = True,
 ) -> plt.Figure:
     """
     Plot fitted trans functions and/or their derivatives.
@@ -1805,6 +1809,26 @@ def plot_trans_functions(
         Show legend (default: True)
     ax : plt.Axes, optional
         Existing axes to plot on. If None, creates new figure.
+    overlay_roots : pd.DataFrame, pd.Series, dict, or None
+        If provided, draws dashed vertical lines at derivative roots on each
+        subplot.  Accepted forms:
+
+        - **pd.DataFrame** (full summary from ``save_trans_summary``): for each
+          feature being plotted, the matching row is looked up by the ``feature``
+          column.
+        - **pd.Series / dict** (a single row): used as-is for every feature.
+        - **None** (default): no overlay.
+
+        Root columns are selected automatically to match the plot's x-axis space:
+        ``*_log2fc_mean`` when ``use_log2fc=True``, ``*_delta_p_mean`` when
+        ``use_delta_p=True``, and ``*_mean`` (x-space, converted to log2 if
+        ``use_log2_x=True``) otherwise.
+    overlay_roots_lw : float
+        Line width for root vlines (default 1.0).
+    overlay_roots_alpha : float
+        Transparency for root vlines (default 0.8).
+    overlay_roots_also_on_function : bool
+        If True (default), draw all root sets also on the function subplot.
 
     Returns
     -------
@@ -1825,6 +1849,15 @@ def plot_trans_functions(
     >>> # Plot function and derivatives for one gene
     >>> model.plot_trans_functions('TET2', show_first_derivative=True,
     ...                            show_second_derivative=True)
+
+    >>> # Plot with derivative roots overlaid from summary df
+    >>> df = model.save_trans_summary(compute_derivative_roots=True)
+    >>> model.plot_trans_functions('TET2', use_log2fc=True,
+    ...                            show_function=True,
+    ...                            show_first_derivative=True,
+    ...                            show_second_derivative=True,
+    ...                            show_third_derivative=True,
+    ...                            overlay_roots=df)
 
     >>> # Plot first derivative of multiple genes
     >>> model.plot_trans_functions(['TET2', 'MYB', 'GFI1B'],
@@ -2170,6 +2203,69 @@ def plot_trans_functions(
 
                 ax_curr.plot(x_plot_feat, third_deriv, color=color, alpha=alpha,
                            linewidth=linewidth, label=feature if feat_idx < 20 else None)
+
+        # ---- Root overlay ------------------------------------------------
+        if overlay_roots is not None:
+            import pandas as _pd
+            from bayesDREAM.io.summary import ModelSummarizer as _MS
+
+            # Resolve the row for this feature
+            if isinstance(overlay_roots, _pd.DataFrame):
+                if 'feature' in overlay_roots.columns:
+                    _matches = overlay_roots[overlay_roots['feature'] == feature]
+                    _row = _matches.iloc[0] if len(_matches) > 0 else None
+                else:
+                    _row = None
+            else:
+                # Series or dict — use directly for every feature
+                _row = overlay_roots
+
+            if _row is not None:
+                _parse = _MS._parse_semicolon_roots
+
+                if use_log2fc:
+                    _r1 = _parse(_row.get('first_deriv_roots_log2fc_mean',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_log2fc_mean', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_log2fc_mean',  None))
+                    _to_plot_x = lambda v: v  # already u-space
+                elif use_delta_p:
+                    _r1 = _parse(_row.get('first_deriv_roots_delta_p_mean',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_delta_p_mean', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_delta_p_mean',  None))
+                    _to_plot_x = lambda v: v  # already u-space
+                else:
+                    _r1 = _parse(_row.get('first_deriv_roots_mean',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_mean', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_mean',  None))
+                    _to_plot_x = (lambda v: np.log2(max(v, 1e-300))) if use_log2_x else (lambda v: v)
+
+                # Build a map: plot_type → (ax, roots, label)
+                _ax_for = {pt: axes[i] for i, (pt, _) in enumerate(plot_types)}
+                _root_sets = [
+                    ('first_deriv',  _r1, 'roots: 1st deriv'),
+                    ('second_deriv', _r2, 'roots: 2nd deriv'),
+                    ('third_deriv',  _r3, 'roots: 3rd deriv'),
+                ]
+
+                def _draw_vlines(ax, roots, label):
+                    first = True
+                    for v in roots:
+                        xv = _to_plot_x(v)
+                        if np.isfinite(xv):
+                            ax.axvline(xv, linestyle='--',
+                                       linewidth=overlay_roots_lw,
+                                       alpha=overlay_roots_alpha,
+                                       label=(label if first else None))
+                            first = False
+
+                for _pt, _roots, _lbl in _root_sets:
+                    if _pt in _ax_for:
+                        _draw_vlines(_ax_for[_pt], _roots, _lbl)
+
+                if overlay_roots_also_on_function and 'function' in _ax_for:
+                    for _pt, _roots, _lbl in _root_sets:
+                        _draw_vlines(_ax_for['function'], _roots, _lbl)
+        # ------------------------------------------------------------------
 
     if not successful_features:
         raise ValueError(f"Could not plot any of the requested features: {features}")

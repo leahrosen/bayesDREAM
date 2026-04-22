@@ -46,11 +46,12 @@ from .fitting.distributions import get_observation_sampler, requires_denominator
 from .fitting import TechnicalFitter, CisFitter, TransFitter
 from .io import ModelSaver, ModelLoader
 from .plotting.model_plots import PlottingMixin
+from .diagnostics import DiagnosticsMixin
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-class _BayesDREAMCore(PlottingMixin):
+class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
     """
     Internal core class for the three-step Bayesian Dosage Response Effects Across Modalities framework:
 
@@ -1879,3 +1880,7 @@ class _BayesDREAMCore(PlottingMixin):
     def save_trans_summary(self, *args, **kwargs):
         """Delegate to ModelSummarizer."""
         return self._summarizer.save_trans_summary(*args, **kwargs)
+
+    def classify_second_deriv_roots(self, *args, **kwargs):
+        """Delegate to ModelSummarizer.classify_second_deriv_roots."""
+        return self._summarizer.classify_second_deriv_roots(*args, **kwargs)
