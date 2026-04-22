@@ -8,6 +8,136 @@ import torch
 import pandas as pd
 
 
+# ---------------------------------------------------------------------------
+# Alignment helpers
+# ---------------------------------------------------------------------------
+
+def _align_tensor(tensor, saved_names, target_names, dim):
+    """
+    Align one dimension of `tensor` from `saved_names` ordering to `target_names`.
+
+    Features present in target_names but absent from saved_names are filled with
+    NaN (float tensors) or 0 (integer tensors).  Features present in saved_names
+    but absent from target_names are dropped.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+    saved_names : list of str
+    target_names : list of str
+    dim : int  (may be negative)
+
+    Returns
+    -------
+    aligned : torch.Tensor  shape has target_names length along `dim`
+    mask    : torch.BoolTensor  shape (len(target_names),)
+              True for positions that were present in the saved fit
+    """
+    if dim < 0:
+        dim = tensor.ndim + dim
+
+    saved_idx = {n: i for i, n in enumerate(saved_names)}
+    n_target = len(target_names)
+    mapping = [saved_idx.get(n, -1) for n in target_names]
+    mask = torch.tensor([i >= 0 for i in mapping], dtype=torch.bool)
+
+    # Move feature axis to last, do the reindex, move back
+    t = tensor.transpose(dim, tensor.ndim - 1)        # [..., T_saved]
+    out_shape = t.shape[:-1] + (n_target,)
+    if t.is_floating_point():
+        out = torch.full(out_shape, float('nan'), dtype=t.dtype)
+    else:
+        out = torch.zeros(out_shape, dtype=t.dtype)
+    for ci, si in enumerate(mapping):
+        if si >= 0:
+            out[..., ci] = t[..., si]
+    aligned = out.transpose(dim, tensor.ndim - 1)     # restore original axis order
+
+    return aligned, mask
+
+
+def _detect_feature_dim(tensor, n_features_saved):
+    """
+    Return the dimension index that corresponds to features, or None.
+
+    Checks last dim first, then second-to-last (for multinomial [C, T, K] tensors).
+    Returns None when no dimension matches n_features_saved (scalars, per-group
+    tensors, etc.).
+    """
+    if tensor.ndim >= 1 and tensor.shape[-1] == n_features_saved:
+        return tensor.ndim - 1
+    if tensor.ndim >= 2 and tensor.shape[-2] == n_features_saved:
+        return tensor.ndim - 2
+    return None
+
+
+def _align_posterior_features(posterior_dict, saved_names, target_names, n_features_saved):
+    """
+    Align every tensor in `posterior_dict` whose feature dimension equals
+    `n_features_saved`, reindexing from `saved_names` to `target_names`.
+
+    Returns
+    -------
+    aligned_dict : dict
+    mask         : torch.BoolTensor | None   (None when no tensor needed aligning)
+    """
+    if saved_names is None or target_names is None:
+        return posterior_dict, None
+    if list(saved_names) == list(target_names):
+        return posterior_dict, torch.ones(len(target_names), dtype=torch.bool)
+
+    aligned = {}
+    mask = None
+    for k, v in posterior_dict.items():
+        if not isinstance(v, torch.Tensor):
+            aligned[k] = v
+            continue
+        dim = _detect_feature_dim(v, n_features_saved)
+        if dim is None:
+            aligned[k] = v
+        else:
+            av, m = _align_tensor(v, saved_names, target_names, dim)
+            aligned[k] = av
+            if mask is None:
+                mask = m
+    return aligned, mask
+
+
+def _align_cell_tensor(tensor, saved_cell_names, target_cell_names):
+    """
+    Align a 1-D per-cell tensor from `saved_cell_names` to `target_cell_names`.
+
+    Returns
+    -------
+    aligned : torch.Tensor  shape (len(target_cell_names),)
+    mask    : torch.BoolTensor  shape (len(target_cell_names),)
+    """
+    if saved_cell_names is None or target_cell_names is None:
+        return tensor, None
+    if list(saved_cell_names) == list(target_cell_names):
+        return tensor, torch.ones(len(target_cell_names), dtype=torch.bool)
+    return _align_tensor(tensor, saved_cell_names, target_cell_names, dim=0)
+
+
+def _report_alignment(label, saved_names, target_names, mask):
+    """Print a one-line alignment summary."""
+    if mask is None:
+        return
+    n_matched = int(mask.sum())
+    n_target = len(target_names)
+    n_saved = len(saved_names)
+    n_dropped = n_saved - n_matched       # in saved but not in target → dropped
+    n_missing = n_target - n_matched      # in target but not in saved  → NaN
+    if n_dropped == 0 and n_missing == 0:
+        return  # perfect match, nothing to report
+    parts = []
+    if n_dropped:
+        parts.append(f"{n_dropped} dropped (not in current modality)")
+    if n_missing:
+        parts.append(f"{n_missing} missing → NaN")
+    print(f"[LOAD] {label}: {n_matched}/{n_target} matched; {', '.join(parts)}")
+
+
 def _torch_load(path, map_location=None):
     """
     Load a torch checkpoint, falling back to weights_only=False for files
@@ -115,45 +245,41 @@ class ModelLoader:
             mod = self.model.modalities[mod_name]
             mod_loaded = []
 
-            mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
-            if os.path.exists(mod_path):
-                alpha_y_to_set = _torch_load(mod_path)
-                # Backward compat: collapse old multi-sample posteriors to point estimate.
-                # Valid point-estimate shapes: [C, T, K] (3D) for multinomial, [C, T] (2D) for others.
-                # Old saved format: [S, C, T, K] (4D) for multinomial, [S, C, T] (3D) for others.
-                if isinstance(alpha_y_to_set, torch.Tensor):
-                    collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
-                    if alpha_y_to_set.ndim >= collapse_threshold:
-                        alpha_y_to_set = alpha_y_to_set.mean(dim=0)
+            # Resolve current feature names for alignment
+            current_feature_names = (mod.feature_names
+                                     if mod.feature_names is not None
+                                     else (list(mod.feature_meta.index)
+                                           if mod.feature_meta is not None else None))
 
-                mod.alpha_y_prefit = alpha_y_to_set
+            # ── posterior_samples_technical (load first to get saved feature names) ──
+            saved_feature_names = None
+            n_features_saved = None
 
-                if mod.distribution == 'negbinom':
-                    mod.alpha_y_prefit_mult = alpha_y_to_set
-                else:
-                    mod.alpha_y_prefit_add = alpha_y_to_set
-
-                loaded[f'alpha_y_prefit_{mod_name}'] = True
-                mod_loaded.append('alpha_y')
-                if verbose:
-                    print(f"[LOAD] {mod_name}.alpha_y_prefit ← {mod_path}")
-
-            # Load modality-specific posterior_samples_technical
             posterior_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
             if os.path.exists(posterior_path):
                 loaded_data = _torch_load(posterior_path)
                 n_features = None
 
-                # Check if new format (with metadata) or old format (just dict)
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
-                    # New format with metadata
-                    mod.posterior_samples_technical = loaded_data['posterior_samples']
+                    posterior_raw = loaded_data['posterior_samples']
                     n_features = loaded_data.get('n_features')
+                    saved_feature_names = loaded_data.get('feature_names')
+                    n_features_saved = n_features
+
+                    # Align posteriors to current modality's feature set
+                    if (current_feature_names is not None and saved_feature_names is not None
+                            and current_feature_names != saved_feature_names):
+                        posterior_raw, feat_mask = _align_posterior_features(
+                            posterior_raw, saved_feature_names, current_feature_names, n_features_saved)
+                        _report_alignment(f"{mod_name} technical posterior",
+                                          saved_feature_names, current_feature_names, feat_mask)
+                        if feat_mask is not None:
+                            mod.fitted_feature_mask = feat_mask
+                    mod.posterior_samples_technical = posterior_raw
 
                     # Reconstruct feature_meta DataFrame if present
-                    feature_meta_df = None
                     if loaded_data.get('feature_meta') is not None:
-                        feature_meta_df = pd.DataFrame(loaded_data['feature_meta'])
+                        _ = pd.DataFrame(loaded_data['feature_meta'])  # available if needed
 
                     loaded[f'posterior_samples_technical_{mod_name}_metadata'] = {
                         'modality_name': loaded_data.get('modality_name'),
@@ -161,7 +287,6 @@ class ModelLoader:
                         'n_features': n_features
                     }
 
-                    # Load loss_technical if present
                     if loaded_data.get('loss_technical') is not None:
                         mod.loss_technical = loaded_data['loss_technical']
                         mod_loaded.append(f'loss({len(mod.loss_technical)})')
@@ -169,7 +294,7 @@ class ModelLoader:
                     if verbose:
                         print(f"[LOAD] {mod_name}.posterior_samples_technical ({n_features} features) ← {posterior_path}")
                 else:
-                    # Old format (backward compatibility)
+                    # Old format (backward compatibility) — no alignment possible
                     mod.posterior_samples_technical = loaded_data
                     if verbose:
                         print(f"[LOAD] {mod_name}.posterior_samples_technical (legacy format) ← {posterior_path}")
@@ -177,13 +302,10 @@ class ModelLoader:
                 loaded[f'posterior_samples_technical_{mod_name}'] = True
                 mod_loaded.append(f'posterior({n_features or "?"} features)')
 
-                # Also extract and set specific alpha attributes from posterior_samples
-                # This ensures backward compatibility even if files were saved without the specific attributes
+                # Extract and set specific alpha attributes from posterior_samples
                 if 'alpha_y_add' in mod.posterior_samples_technical:
                     if not hasattr(mod, 'alpha_y_prefit_add') or mod.alpha_y_prefit_add is None:
                         alpha_y_add = mod.posterior_samples_technical['alpha_y_add']
-                        # Backward compat: collapse old multi-sample posteriors to point estimate.
-                        # Valid shapes: [C, T, K] (3D) for multinomial, [C, T] (2D) for others.
                         if isinstance(alpha_y_add, torch.Tensor):
                             collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
                             if alpha_y_add.ndim >= collapse_threshold:
@@ -199,7 +321,6 @@ class ModelLoader:
                     alpha_y_mult_key = 'alpha_y_mult' if 'alpha_y_mult' in mod.posterior_samples_technical else 'alpha_y'
                     if not hasattr(mod, 'alpha_y_prefit_mult') or mod.alpha_y_prefit_mult is None:
                         alpha_y_mult = mod.posterior_samples_technical[alpha_y_mult_key]
-                        # Backward compat: collapse 3D posteriors to mean
                         if isinstance(alpha_y_mult, torch.Tensor) and alpha_y_mult.ndim >= 3:
                             alpha_y_mult = alpha_y_mult.mean(dim=0)
                         mod.alpha_y_prefit_mult = alpha_y_mult
@@ -208,6 +329,39 @@ class ModelLoader:
                                 mod.alpha_y_prefit = alpha_y_mult
                         if verbose:
                             print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ← extracted from posterior_samples_technical")
+
+            # ── alpha_y_prefit standalone file (align using names from posterior file) ──
+            mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
+            if os.path.exists(mod_path):
+                alpha_y_to_set = _torch_load(mod_path)
+                if isinstance(alpha_y_to_set, torch.Tensor):
+                    collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
+                    if alpha_y_to_set.ndim >= collapse_threshold:
+                        alpha_y_to_set = alpha_y_to_set.mean(dim=0)
+
+                # Align if we have both saved and current feature names
+                if (current_feature_names is not None and saved_feature_names is not None
+                        and current_feature_names != saved_feature_names
+                        and n_features_saved is not None):
+                    dim = _detect_feature_dim(alpha_y_to_set, n_features_saved)
+                    if dim is not None:
+                        alpha_y_to_set, feat_mask = _align_tensor(
+                            alpha_y_to_set, saved_feature_names, current_feature_names, dim)
+                        _report_alignment(f"{mod_name} alpha_y_prefit",
+                                          saved_feature_names, current_feature_names, feat_mask)
+                        if feat_mask is not None and not hasattr(mod, 'fitted_feature_mask'):
+                            mod.fitted_feature_mask = feat_mask
+
+                mod.alpha_y_prefit = alpha_y_to_set
+                if mod.distribution == 'negbinom':
+                    mod.alpha_y_prefit_mult = alpha_y_to_set
+                else:
+                    mod.alpha_y_prefit_add = alpha_y_to_set
+
+                loaded[f'alpha_y_prefit_{mod_name}'] = True
+                mod_loaded.append('alpha_y')
+                if verbose:
+                    print(f"[LOAD] {mod_name}.alpha_y_prefit ← {mod_path}")
 
             if mod_loaded:
                 loaded_summary.append(f"{mod_name}: {', '.join(mod_loaded)}")
@@ -265,55 +419,49 @@ class ModelLoader:
         loaded = {}
         loaded_summary = []
 
-        # Load x_true
-        x_true_path = os.path.join(input_dir, 'x_true.pt')
-        if os.path.exists(x_true_path):
-            x_true = _torch_load(x_true_path)
-            # Backward compat: if saved as 2D/3D posterior, collapse to mean
-            if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
-                x_true = x_true.mean(dim=0)
-            self.model.x_true = x_true
-            loaded['x_true'] = True
-            loaded_summary.append('x_true')
-            if verbose:
-                print(f"[LOAD] x_true ← {x_true_path}")
+        # Current cell names for alignment
+        current_cell_names = (self.model.meta['cell'].tolist()
+                              if 'cell' in self.model.meta.columns else None)
 
-        # Load log2_x_true if saved separately
-        log2_x_true_path = os.path.join(input_dir, 'log2_x_true.pt')
-        if os.path.exists(log2_x_true_path):
-            log2_x_true = _torch_load(log2_x_true_path)
-            # Backward compat: if saved as 2D/3D posterior, collapse to mean
-            if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
-                log2_x_true = log2_x_true.mean(dim=0)
-            self.model.log2_x_true = log2_x_true
-            loaded['log2_x_true'] = True
-            loaded_summary.append('log2_x_true')
-            if verbose:
-                print(f"[LOAD] log2_x_true ← {log2_x_true_path}")
+        # Load posterior samples first so we have saved_cell_names for aligning x_true files
+        saved_cell_names = None
+        cis_gene = None
 
-        # Load posterior samples
         posterior_path = os.path.join(input_dir, 'posterior_samples_cis.pt')
         if os.path.exists(posterior_path):
             loaded_data = _torch_load(posterior_path)
-            cis_gene = None
 
-            # Check if new format (with metadata) or old format (just dict)
             if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
-                # New format with metadata
-                self.model.posterior_samples_cis = loaded_data['posterior_samples']
+                posterior_raw = loaded_data['posterior_samples']
                 cis_gene = loaded_data.get('cis_gene')
+                saved_cell_names = loaded_data.get('cell_names')
 
-                # Reconstruct feature_meta DataFrame if present
-                feature_meta_df = None
+                # Align per-cell tensors in the posterior (x_true, log_x_true)
+                if (current_cell_names is not None and saved_cell_names is not None
+                        and current_cell_names != saved_cell_names):
+                    n_cells_saved = len(saved_cell_names)
+                    per_cell_keys = [k for k, v in posterior_raw.items()
+                                     if isinstance(v, torch.Tensor) and v.shape[-1] == n_cells_saved]
+                    cell_mask = None
+                    for k in per_cell_keys:
+                        posterior_raw[k], cell_mask = _align_tensor(
+                            posterior_raw[k], saved_cell_names, current_cell_names,
+                            dim=posterior_raw[k].ndim - 1)
+                    if cell_mask is not None:
+                        _report_alignment("cis posterior cells",
+                                          saved_cell_names, current_cell_names, cell_mask)
+                        self.model.fitted_cell_mask = cell_mask
+
+                self.model.posterior_samples_cis = posterior_raw
+
                 if loaded_data.get('feature_meta') is not None:
-                    feature_meta_df = pd.DataFrame(loaded_data['feature_meta'])
+                    _ = pd.DataFrame(loaded_data['feature_meta'])  # available if needed
 
                 loaded['posterior_samples_cis_metadata'] = {
                     'cis_gene': cis_gene,
                     'modality_name': loaded_data.get('modality_name'),
                 }
 
-                # Load loss_x if present
                 if loaded_data.get('loss_x') is not None:
                     self.model.loss_x = loaded_data['loss_x']
                     loaded_summary.append(f"loss_x({len(self.model.loss_x)})")
@@ -321,30 +469,66 @@ class ModelLoader:
                 if verbose:
                     print(f"[LOAD] posterior_samples_cis (cis_gene: {cis_gene}) ← {posterior_path}")
             else:
-                # Old format (backward compatibility)
+                # Old format (backward compatibility) — no alignment possible
                 self.model.posterior_samples_cis = loaded_data
                 if verbose:
                     print(f"[LOAD] posterior_samples_cis (legacy format) ← {posterior_path}")
 
             loaded['posterior_samples_cis'] = True
-            loaded_summary.append(f"posterior_cis" + (f" ({cis_gene})" if cis_gene else ""))
+            loaded_summary.append("posterior_cis" + (f" ({cis_gene})" if cis_gene else ""))
 
-            # Extract log2_x_true from posterior_samples_cis if not already loaded
-            if not hasattr(self.model, 'log2_x_true') or self.model.log2_x_true is None:
-                if 'log_x_true' in self.model.posterior_samples_cis:
-                    log_x_true = self.model.posterior_samples_cis['log_x_true']
-                    # Backward compat: collapse 2D/3D posteriors to mean
-                    if isinstance(log_x_true, torch.Tensor) and log_x_true.ndim >= 2:
-                        log_x_true = log_x_true.mean(dim=0)
-                    self.model.log2_x_true = log_x_true
-                    loaded['log2_x_true'] = True
-                    if verbose:
-                        print(f"[LOAD] log2_x_true ← extracted from posterior_samples_cis")
-                elif hasattr(self.model, 'x_true') and self.model.x_true is not None:
-                    self.model.log2_x_true = torch.log2(self.model.x_true)
-                    loaded['log2_x_true'] = True
-                    if verbose:
-                        print(f"[LOAD] log2_x_true ← computed from x_true")
+        # Load x_true (standalone file — align by cell if names available)
+        x_true_path = os.path.join(input_dir, 'x_true.pt')
+        if os.path.exists(x_true_path):
+            x_true = _torch_load(x_true_path)
+            if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
+                x_true = x_true.mean(dim=0)
+            if (current_cell_names is not None and saved_cell_names is not None
+                    and current_cell_names != saved_cell_names
+                    and x_true.ndim == 1 and x_true.shape[0] == len(saved_cell_names)):
+                x_true, cell_mask = _align_cell_tensor(x_true, saved_cell_names, current_cell_names)
+                _report_alignment("x_true cells", saved_cell_names, current_cell_names, cell_mask)
+                if cell_mask is not None and not hasattr(self.model, 'fitted_cell_mask'):
+                    self.model.fitted_cell_mask = cell_mask
+            self.model.x_true = x_true
+            loaded['x_true'] = True
+            loaded_summary.append('x_true')
+            if verbose:
+                print(f"[LOAD] x_true ← {x_true_path}")
+
+        # Load log2_x_true (standalone file — align by cell if names available)
+        log2_x_true_path = os.path.join(input_dir, 'log2_x_true.pt')
+        if os.path.exists(log2_x_true_path):
+            log2_x_true = _torch_load(log2_x_true_path)
+            if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
+                log2_x_true = log2_x_true.mean(dim=0)
+            if (current_cell_names is not None and saved_cell_names is not None
+                    and current_cell_names != saved_cell_names
+                    and log2_x_true.ndim == 1 and log2_x_true.shape[0] == len(saved_cell_names)):
+                log2_x_true, _ = _align_cell_tensor(log2_x_true, saved_cell_names, current_cell_names)
+            self.model.log2_x_true = log2_x_true
+            loaded['log2_x_true'] = True
+            loaded_summary.append('log2_x_true')
+            if verbose:
+                print(f"[LOAD] log2_x_true ← {log2_x_true_path}")
+
+        # Extract log2_x_true from posterior_samples_cis if not already loaded
+        if not hasattr(self.model, 'log2_x_true') or self.model.log2_x_true is None:
+            if (hasattr(self.model, 'posterior_samples_cis')
+                    and self.model.posterior_samples_cis is not None
+                    and 'log_x_true' in self.model.posterior_samples_cis):
+                log_x_true = self.model.posterior_samples_cis['log_x_true']
+                if isinstance(log_x_true, torch.Tensor) and log_x_true.ndim >= 2:
+                    log_x_true = log_x_true.mean(dim=0)
+                self.model.log2_x_true = log_x_true
+                loaded['log2_x_true'] = True
+                if verbose:
+                    print(f"[LOAD] log2_x_true ← extracted from posterior_samples_cis")
+            elif hasattr(self.model, 'x_true') and self.model.x_true is not None:
+                self.model.log2_x_true = torch.log2(self.model.x_true.clamp(min=1e-12))
+                loaded['log2_x_true'] = True
+                if verbose:
+                    print(f"[LOAD] log2_x_true ← computed from x_true")
 
         # Print summary
         print(f"[LOAD] Cis fit from {input_dir}")
@@ -392,41 +576,66 @@ class ModelLoader:
         # Automatically load model-level parameters if primary modality is included
         should_load_model_level = self.model.primary_modality in modalities_to_load
 
+        def _load_trans_posterior(loaded_data, label, n_features_hint=None):
+            """
+            Parse a trans posterior file and align features to current modality.
+            Returns (posterior_dict, n_features, feat_mask, extra_meta).
+            """
+            if not (isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data):
+                # Old format — no alignment possible
+                return loaded_data, None, None, {}
+
+            posterior_raw = loaded_data['posterior_samples']
+            n_features = loaded_data.get('n_features') or n_features_hint
+            saved_names = loaded_data.get('feature_names')
+            mod_name_saved = loaded_data.get('modality_name')
+            feat_mask = None
+
+            # Align to current modality features if possible
+            if mod_name_saved and mod_name_saved in self.model.modalities:
+                mod = self.model.modalities[mod_name_saved]
+                cur_names = (mod.feature_names
+                             if mod.feature_names is not None
+                             else (list(mod.feature_meta.index)
+                                   if mod.feature_meta is not None else None))
+                if (cur_names is not None and saved_names is not None
+                        and cur_names != saved_names and n_features is not None):
+                    posterior_raw, feat_mask = _align_posterior_features(
+                        posterior_raw, saved_names, cur_names, n_features)
+                    _report_alignment(f"{label} features", saved_names, cur_names, feat_mask)
+                    if feat_mask is not None:
+                        mod.fitted_feature_mask = feat_mask
+
+            extra = {
+                'modality_name': mod_name_saved,
+                'distribution': loaded_data.get('distribution'),
+                'n_features': n_features,
+                'cis_gene': loaded_data.get('cis_gene'),
+            }
+            return posterior_raw, n_features, feat_mask, extra
+
         # Load model-level posterior samples (when primary modality is being loaded)
         if should_load_model_level:
-            # Try new filename pattern first (includes modality name)
             posterior_path = os.path.join(input_dir, f'posterior_samples_trans_{self.model.primary_modality}.pt')
             if not os.path.exists(posterior_path):
-                # Fall back to old filename pattern (backward compatibility)
                 posterior_path = os.path.join(input_dir, 'posterior_samples_trans.pt')
 
             if os.path.exists(posterior_path):
                 loaded_data = _torch_load(posterior_path)
-                # Check if new format (with metadata) or old format (just dict)
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
-                    # New format with metadata
-                    self.model.posterior_samples_trans = loaded_data['posterior_samples']
+                    posterior_dict, n_features, _, extra = _load_trans_posterior(
+                        loaded_data, f"trans {self.model.primary_modality}")
+                    self.model.posterior_samples_trans = posterior_dict
                     loaded['posterior_samples_trans'] = True
-
-                    loaded['posterior_samples_trans_metadata'] = {
-                        'modality_name': loaded_data.get('modality_name'),
-                        'distribution': loaded_data.get('distribution'),
-                        'n_features': loaded_data.get('n_features'),
-                        'cis_gene': loaded_data.get('cis_gene'),
-                    }
-
-                    # Load losses_trans if present
+                    loaded['posterior_samples_trans_metadata'] = extra
                     if loaded_data.get('losses_trans') is not None:
                         self.model.losses_trans = loaded_data['losses_trans']
-
-                    # Load trans_prior_params if present
                     if loaded_data.get('trans_prior_params') is not None:
                         self.model.trans_prior_params = loaded_data['trans_prior_params']
-
                     if verbose:
-                        print(f"[LOAD] posterior_samples_trans (modality: {loaded_data.get('modality_name')}, {loaded_data.get('n_features')} features) ← {posterior_path}")
+                        print(f"[LOAD] posterior_samples_trans (modality: {extra.get('modality_name')}, "
+                              f"{extra.get('n_features')} features) ← {posterior_path}")
                 else:
-                    # Old format (backward compatibility)
                     self.model.posterior_samples_trans = loaded_data
                     loaded['posterior_samples_trans'] = True
                     if verbose:
@@ -440,32 +649,22 @@ class ModelLoader:
                 mod_loaded = []
                 n_features = None
 
-                # Check if new format (with metadata) or old format (just dict)
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
-                    # New format with metadata
-                    self.model.modalities[mod_name].posterior_samples_trans = loaded_data['posterior_samples']
-                    n_features = loaded_data.get('n_features')
+                    posterior_dict, n_features, _, extra = _load_trans_posterior(
+                        loaded_data, f"trans {mod_name}")
+                    self.model.modalities[mod_name].posterior_samples_trans = posterior_dict
+                    loaded[f'posterior_samples_trans_{mod_name}_metadata'] = extra
 
-                    loaded[f'posterior_samples_trans_{mod_name}_metadata'] = {
-                        'modality_name': loaded_data.get('modality_name'),
-                        'distribution': loaded_data.get('distribution'),
-                        'n_features': n_features,
-                        'cis_gene': loaded_data.get('cis_gene'),
-                    }
-
-                    # Load losses_trans if present
                     if loaded_data.get('losses_trans') is not None:
                         self.model.modalities[mod_name].losses_trans = loaded_data['losses_trans']
                         mod_loaded.append(f"loss({len(self.model.modalities[mod_name].losses_trans)})")
-
-                    # Load trans_prior_params if present
                     if loaded_data.get('trans_prior_params') is not None:
                         self.model.modalities[mod_name].trans_prior_params = loaded_data['trans_prior_params']
 
                     if verbose:
-                        print(f"[LOAD] {mod_name}.posterior_samples_trans (distribution: {loaded_data.get('distribution')}, {n_features} features) ← {mod_path}")
+                        print(f"[LOAD] {mod_name}.posterior_samples_trans "
+                              f"(distribution: {extra.get('distribution')}, {n_features} features) ← {mod_path}")
                 else:
-                    # Old format (backward compatibility)
                     self.model.modalities[mod_name].posterior_samples_trans = loaded_data
                     if verbose:
                         print(f"[LOAD] {mod_name}.posterior_samples_trans (legacy format) ← {mod_path}")
