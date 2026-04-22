@@ -1192,9 +1192,22 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
                 # The adjusted sum factor removes the x_true-dependent trend
                 # We want to keep the baseline level, so add back the global mean predicted value
                 global_baseline = np.mean(y_pred)
+                adjusted = residuals + global_baseline
+
+                # Clamp to a small positive floor rather than 0 to prevent mu_final=0 in
+                # trans fitting (log(0) = -inf logits → NaN gradients).
+                # Floor = 1% of the minimum positive sum factor in the data.
+                sf_min_positive = sum_factor_data[sum_factor_data > 0].min() if (sum_factor_data > 0).any() else 1e-6
+                sf_floor = 0.01 * sf_min_positive
+                n_clamped = int((adjusted < sf_floor).sum())
+                if n_clamped > 0:
+                    print(f"[WARNING] refit_sumfactor: {n_clamped} cell(s) had adjusted sum factor "
+                          f"below floor ({sf_floor:.4g}); clamped to floor. "
+                          f"This can happen when the spline overpredicts the cis-gene contribution. "
+                          f"These cells will have near-zero library size in trans fitting.")
                 if primary_mod.sum_factors is None:
                     primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
-                primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
+                primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(sf_floor, adjusted)
 
                 print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors using per-group spline alignment.")
                 return
@@ -1243,11 +1256,22 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
 
         # Predict and adjust
         y_pred = model_spline_ridge.predict(X_true.reshape(-1, 1))
+        adjusted = leftover_data - y_pred + baseline_ntc_of_group[group_id]
+
+        # Clamp to a small positive floor rather than 0 to prevent mu_final=0 in
+        # trans fitting (log(0) = -inf logits → NaN gradients).
+        # Floor = 1% of the minimum positive sum factor in the data.
+        sf_min_positive = sum_factor_data[sum_factor_data > 0].min() if (sum_factor_data > 0).any() else 1e-6
+        sf_floor = 0.01 * sf_min_positive
+        n_clamped = int((adjusted < sf_floor).sum())
+        if n_clamped > 0:
+            print(f"[WARNING] refit_sumfactor: {n_clamped} cell(s) had adjusted sum factor "
+                  f"below floor ({sf_floor:.4g}); clamped to floor. "
+                  f"This can happen when the spline overpredicts the cis-gene contribution. "
+                  f"These cells will have near-zero library size in trans fitting.")
         if primary_mod.sum_factors is None:
             primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
-        primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(
-            0, leftover_data - y_pred + baseline_ntc_of_group[group_id]
-        )
+        primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(sf_floor, adjusted)
         print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors with x_true-based adjustment.")
 
     def permute_genes(

@@ -825,7 +825,39 @@ class TechnicalFitter:
 
         zero_count_mask = feature_sums_ntc == 0
         zero_std_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
-    
+
+        # --- Per-group zero-count check for negbinom ---
+        # A feature with all-zero counts in ANY technical group will have an unconstrained
+        # (prior-dominated) alpha_y estimate for that group. This produces extreme
+        # multiplicative corrections (e.g. 2^22) that corrupt downstream trans fitting.
+        # Match the per-group checks already in place for binomial/normal/multinomial.
+        any_group_zero_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
+        if distribution == 'negbinom' and 'technical_group_code' in meta_ntc.columns:
+            groups_ntc_codes = meta_ntc['technical_group_code'].values
+            unique_groups_nb = np.unique(groups_ntc_codes)
+            if len(unique_groups_nb) > 1:  # only matters with multiple groups
+                if counts_ntc_array.ndim == 2:
+                    for g in unique_groups_nb:
+                        g_mask = (groups_ntc_codes == g)
+                        if g_mask.sum() == 0:
+                            continue
+                        if modality.cells_axis == 1:
+                            group_sums = counts_ntc_array[:, g_mask].sum(axis=1)
+                        else:
+                            group_sums = counts_ntc_array[g_mask, :].sum(axis=0)
+                        if sparse.issparse(group_sums):
+                            group_sums = np.asarray(group_sums).flatten()
+                        any_group_zero_mask |= (group_sums == 0)
+                # For 3D (multinomial handled separately below); negbinom is always 2D.
+                n_per_group_zero = int(any_group_zero_mask.sum())
+                n_already_excluded = int(zero_count_mask.sum())
+                n_new = int((any_group_zero_mask & ~zero_count_mask).sum())
+                if n_new > 0:
+                    print(f"[INFO] {modality_name}: excluding {n_new} additional feature(s) where "
+                          f"all NTC counts are zero in at least one technical group "
+                          f"(would produce extreme alpha_y estimates). "
+                          f"Total excluded: {n_already_excluded + n_new}/{len(feature_sums_ntc)}")
+
         if distribution == 'multinomial':
             for f_idx in range(counts_ntc_array.shape[0]):
                 feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
@@ -1017,19 +1049,21 @@ class TechnicalFitter:
 
     
         needs_filtering_mask = zero_std_mask | only_one_category_mask
-        needs_exclusion_mask = zero_count_mask | needs_filtering_mask
+        needs_exclusion_mask = zero_count_mask | needs_filtering_mask | any_group_zero_mask
 
         # Count features that are excluded ONLY for each reason (no overlap)
-        num_zero_count_only = (zero_count_mask & ~zero_std_mask & ~only_one_category_mask).sum()
-        num_zero_std_only = (zero_std_mask & ~only_one_category_mask).sum()
+        num_zero_count_only = (zero_count_mask & ~zero_std_mask & ~only_one_category_mask & ~any_group_zero_mask).sum()
+        num_zero_std_only = (zero_std_mask & ~only_one_category_mask & ~any_group_zero_mask).sum()
         num_single_category = only_one_category_mask.sum()
+        num_group_zero = (any_group_zero_mask & ~zero_count_mask).sum()
         num_excluded = needs_exclusion_mask.sum()
 
         if num_excluded > 0:
             warnings.warn(
                 f"[WARNING] {num_excluded} feature(s) excluded from fitting: "
                 f"{num_zero_count_only} zero-count-only, {num_zero_std_only} zero-std, "
-                f"{num_single_category} ≤1 category present in all technical groups. "
+                f"{num_single_category} ≤1 category present in all technical groups, "
+                f"{num_group_zero} zero-in-one-group (negbinom only). "
                 "Alpha set to baseline for excluded features.",
                 UserWarning,
             )

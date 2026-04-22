@@ -125,20 +125,20 @@ class TransFitter:
                 bad_grads.append(name)
 
         if changed and verbose_on_change:
-            print(f"\n[FATAL] Param(s) flipped finite→nonfinite at step {step} {where}: {changed}")
+            print(f"\n[ERROR] Param(s) flipped finite→nonfinite at step {step} {where}: {changed}")
             for n in changed:
                 self._print_tensor(n, store[n], prefix="  ")
                 if store[n].grad is not None:
                     self._print_tensor(n + ".grad", store[n].grad, prefix="  ")
 
         if bad_vals and verbose_on_change and not changed:
-            print(f"\n[FATAL] Non-finite param value(s) present at step {step} {where}: "
+            print(f"\n[ERROR] Non-finite param value(s) present at step {step} {where}: "
                   f"{bad_vals[:10]}{'...' if len(bad_vals)>10 else ''}")
             for n in bad_vals[:10]:
                 self._print_tensor(n, store[n], prefix="  ")
 
         if bad_grads and verbose_on_change:
-            print(f"\n[FATAL] Non-finite gradient(s) present at step {step} {where}: "
+            print(f"\n[ERROR] Non-finite gradient(s) present at step {step} {where}: "
                   f"{bad_grads[:10]}{'...' if len(bad_grads)>10 else ''}")
             for n in bad_grads[:10]:
                 if store[n].grad is not None:
@@ -161,7 +161,7 @@ class TransFitter:
                                 if torch.is_tensor(val) and (not torch.isfinite(val).all().item()):
                                     bad_state.append((pname, key))
                 if bad_state and verbose_on_change:
-                    print(f"\n[FATAL] Non-finite optimizer state at step {step} {where}: "
+                    print(f"\n[ERROR] Non-finite optimizer state at step {step} {where}: "
                           f"{bad_state[:10]}{'...' if len(bad_state)>10 else ''}")
 
         any_bad = bool(bad_vals or bad_grads)
@@ -263,11 +263,8 @@ class TransFitter:
                 bad_idx = torch.nonzero(torch.isnan(g), as_tuple=False).squeeze(-1)
                 if bad_idx.numel() > 0:
                     self._diagnose_log_Ka_nan_grad(svi, bad_idx, *args, **kwargs)
-        
             self.diagnose_nonfinite_sites(svi.model, svi.guide, *args, **kwargs)
-            raise FloatingPointError("Non-finite grads/params after loss_and_grads (before update).")
-        if any_bad:
-            self.diagnose_nonfinite_sites(svi.model, svi.guide, *args, **kwargs)
+            # Fitting will stop: FloatingPointError is caught in the main loop → [STOP] + break
             raise FloatingPointError("Non-finite grads/params after loss_and_grads (before update).")
 
         # Apply optimizer update
@@ -285,11 +282,8 @@ class TransFitter:
                 bad_idx = torch.nonzero(torch.isnan(g), as_tuple=False).squeeze(-1)
                 if bad_idx.numel() > 0:
                     self._diagnose_log_Ka_nan_grad(svi, bad_idx, *args, **kwargs)
-        
             self.diagnose_nonfinite_sites(svi.model, svi.guide, *args, **kwargs)
-            raise FloatingPointError("Non-finite grads/params after loss_and_grads (before update).")
-        if any_bad:
-            self.diagnose_nonfinite_sites(svi.model, svi.guide, *args, **kwargs)
+            # Fitting will stop: FloatingPointError is caught in the main loop → [STOP] + break
             raise FloatingPointError("Optimizer update produced non-finite params.")
 
         return loss, prev_finite
@@ -1556,8 +1550,24 @@ class TransFitter:
 
         # Handle sum factors for modality cells
         if sum_factor_col is not None:
+            sum_factor_vals = modality.sum_factors.loc[meta_subset['cell'].values, sum_factor_col].values
+            # Guard: zero, NaN, or inf sum factors will produce -inf/NaN logits in the likelihood
+            # (log(0) = -inf → NaN gradients for all features of that cell).
+            n_zero = int((sum_factor_vals == 0).sum())
+            n_nonfinite = int(~np.isfinite(sum_factor_vals).sum())
+            if n_nonfinite > 0:
+                raise ValueError(
+                    f"[fit_trans] Column '{sum_factor_col}' has {n_nonfinite} non-finite (NaN/inf) value(s). "
+                    f"Please fix before fitting."
+                )
+            if n_zero > 0:
+                raise ValueError(
+                    f"[fit_trans] Column '{sum_factor_col}' has {n_zero} zero value(s). "
+                    f"Zero sum factors produce log(0)=-inf logits and NaN gradients for all features. "
+                    f"If using sum_factor_refit, re-run refit_sumfactor() — it now floors values above zero."
+                )
             sum_factor_tensor = torch.tensor(
-                modality.sum_factors.loc[meta_subset['cell'].values, sum_factor_col].values,
+                sum_factor_vals,
                 dtype=torch.float32, device=self.model.device
             )
         else:

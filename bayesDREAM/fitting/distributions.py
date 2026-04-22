@@ -75,7 +75,12 @@ def sample_negbinom_trans(
     mu_final = mu_y * alpha_y[group] * sum_factor
     Handles both 2D ([C, T]) and 3D ([S, C, T]) alpha tensors for Predictive sampling.
     """
+    # use_epsilon controls whether eps is added inside log() for archive compatibility.
+    # We always clamp mu_final to >= 1e-8 as a safety floor: a zero sum factor (or
+    # zero mu_y) produces log(0)=-inf logits → NaN gradients for every feature of
+    # that cell. The clamp is applied after all multiplicative factors are combined.
     eps = 1e-8 if use_epsilon else 0.0
+    _mu_floor = 1e-8  # always applied regardless of use_epsilon
     # Apply technical group effects if present (multiplicative)
     if alpha_y_full is not None and groups_tensor is not None:
         if alpha_y_full.dim() == 2:
@@ -94,7 +99,7 @@ def sample_negbinom_trans(
                     "y_obs",
                     dist.NegativeBinomial(
                         total_count=phi_y_used,
-                        logits=torch.log(mu_final + eps) - torch.log(phi_y_used + eps)
+                        logits=torch.log(mu_final.clamp_min(_mu_floor) + eps) - torch.log(phi_y_used + eps)
                     ),
                     obs=y_obs_tensor
                 )
@@ -143,7 +148,7 @@ def sample_negbinom_trans(
                     "y_obs",
                     dist.NegativeBinomial(
                         total_count=phi_expanded,
-                        logits=torch.log(mu_final + eps) - torch.log(phi_expanded + eps)
+                        logits=torch.log(mu_final.clamp_min(_mu_floor) + eps) - torch.log(phi_expanded + eps)
                     ),
                     obs=y_obs_expanded.reshape(-1)
                 )
