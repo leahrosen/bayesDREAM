@@ -246,6 +246,7 @@ def plot_xtrue_density_by_guide(
     """
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -429,6 +430,7 @@ def plot_parameter_density_with_xtrue(
 
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
 
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
