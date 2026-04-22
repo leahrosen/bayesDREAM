@@ -26,7 +26,8 @@ def _guide_sort_key(g):
     return (root, idx)
 
 
-def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
+def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
+                     color_scheme=None,
                      single_guide_cells_only=False, facet_ntc=False,
                      ax=None, show=True):
     """
@@ -45,6 +46,10 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
         Cis gene name (title only; defaults to model.cis_gene).
     log2 : bool, default False
         Apply log2 transform before computing statistics.
+    log2fc : bool, default False
+        Express x-axis as log2 fold-change relative to the NTC mean.
+        Implies ``log2=True``; subtracts the mean log2 value across all NTC
+        cells so that NTC cells are centred at x = 0.
     color_scheme : ColorScheme, optional
         Custom color scheme.
     single_guide_cells_only : bool, default False
@@ -61,6 +66,9 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
     ax : matplotlib axes  (when ``facet_ntc=False``)
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
+    if log2fc:
+        log2 = True
+
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
     color_scheme = color_scheme.connect(model)
@@ -84,7 +92,16 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
         x_std  = np.zeros_like(x_vals)
 
     guide_labels = guide_labels[cell_mask]
-    suffix = ' (log2)' if log2 else ''
+
+    if log2fc:
+        ntc_mask = _guide_ntc_mask(guide_labels, model)
+        ntc_mean = float(np.nanmean(x_mean[ntc_mask])) if ntc_mask.any() else 0.0
+        x_mean = x_mean - ntc_mean
+        xlabel = 'log2FC x_true (vs NTC)'
+    else:
+        xlabel = f'mean x_true{" (log2)" if log2 else ""}'
+
+    suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
 
     def _draw(ax_, gl, xm, xs, title_):
         for guide in sorted(np.unique(gl), key=_guide_sort_key):
@@ -96,8 +113,10 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
             color = color_scheme.get_guide_color(guide, 'black')
             ax_.scatter(xm_g[valid], xs_g[valid], s=14, alpha=0.8,
                         color=color, label=guide)
-        ax_.set_xlabel(f'mean x_true{suffix}')
-        ax_.set_ylabel(f'std x_true{suffix}')
+        if log2fc:
+            ax_.axvline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
+        ax_.set_xlabel(xlabel)
+        ax_.set_ylabel(f'std x_true{" (log2)" if log2 else ""}')
         ax_.set_title(title_)
         ax_.grid(True, linewidth=0.5, alpha=0.4)
         n_guides_ax = len(np.unique(gl))
@@ -128,7 +147,8 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
     return ax
 
 
-def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
+def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
+                          full_width=False,
                           color_scheme=None, single_guide_cells_only=False,
                           facet_ntc=False, ax=None, show=True):
     """
@@ -145,6 +165,9 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
         Cis gene name (title only).
     log2 : bool, default False
         Apply log2 transform before computing statistics.
+    log2fc : bool, default False
+        Express x-axis as log2 fold-change relative to the NTC mean.
+        Implies ``log2=True``.
     full_width : bool, default False
         If ``True``, show full (p97.5 − p2.5) CI; otherwise half-width.
     color_scheme : ColorScheme, optional
@@ -163,6 +186,9 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     ax : matplotlib axes  (when ``facet_ntc=False``)
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
+    if log2fc:
+        log2 = True
+
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
     color_scheme = color_scheme.connect(model)
@@ -188,8 +214,17 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
 
     y_val = (q_hi - q_lo) if full_width else 0.5 * (q_hi - q_lo)
     guide_labels = guide_labels[cell_mask]
-    suffix = ' (log2)' if log2 else ''
-    ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{suffix}'
+
+    if log2fc:
+        ntc_mask = _guide_ntc_mask(guide_labels, model)
+        ntc_mean = float(np.nanmean(x_mean[ntc_mask])) if ntc_mask.any() else 0.0
+        x_mean = x_mean - ntc_mean
+        xlabel = 'log2FC x_true (vs NTC)'
+    else:
+        xlabel = f'mean x_true{" (log2)" if log2 else ""}'
+
+    suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
+    ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{" (log2)" if log2 else ""}'
 
     def _draw(ax_, gl, xm, yv, title_):
         for guide in sorted(np.unique(gl), key=_guide_sort_key):
@@ -201,7 +236,9 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
             color = color_scheme.get_guide_color(guide, 'black')
             ax_.scatter(xm_g[valid], yv_g[valid], s=14, alpha=0.85,
                         color=color, label=guide)
-        ax_.set_xlabel(f'mean x_true{suffix}')
+        if log2fc:
+            ax_.axvline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
+        ax_.set_xlabel(xlabel)
         ax_.set_ylabel(ylabel)
         ax_.set_title(title_)
         ax_.grid(True, linewidth=0.5, alpha=0.4)
@@ -415,7 +452,8 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     return ax
 
 
-def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=None,
+def filled_density_by_guide_log2(model, cis_gene=None, bw=None, log2fc=False,
+                                 color_scheme=None,
                                  single_guide_cells_only=False, facet_ntc=False,
                                  ax=None, show=True):
     """
@@ -429,6 +467,10 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
         Cis gene name (title only).
     bw : float, optional
         KDE bandwidth.  If ``None``, uses Scott's rule.
+    log2fc : bool, default False
+        Express x-axis as log2 fold-change relative to the NTC mean.
+        Subtracts the mean log2 value across all NTC cells so densities
+        are shown centred on 0 for NTC.
     color_scheme : ColorScheme, optional
         Custom color scheme.
     single_guide_cells_only : bool, default False
@@ -460,7 +502,17 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     x_log = _log2_safe(x_vals)
     valid = ~np.isnan(x_log)
 
-    xmin, xmax = np.nanpercentile(x_log, [0.5, 99.5])
+    if log2fc:
+        ntc_mask = _guide_ntc_mask(guide_labels, model)
+        ntc_mean = float(np.nanmean(x_log[ntc_mask & valid])) if (ntc_mask & valid).any() else 0.0
+        x_log = x_log - ntc_mean
+        xlabel = 'log2FC x_true (vs NTC)'
+        title_base = f'{cis_gene}: x_true density (log2FC)'
+    else:
+        xlabel = 'x_true (log₂)'
+        title_base = f'{cis_gene}: x_true density by guide'
+
+    xmin, xmax = np.nanpercentile(x_log[valid], [0.5, 99.5])
     x_grid = np.linspace(xmin, xmax, 500)
 
     def _draw(ax_, gl, xl, vl, title_):
@@ -474,10 +526,12 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
             color = color_scheme.get_guide_color(g, 'black')
             ax_.fill_between(x_grid, density, alpha=0.4, color=color, label=g)
             ax_.plot(x_grid, density, color=color, linewidth=1.5)
-        ax_.set_xlabel('x_true (log₂)', fontsize=11)
+        if log2fc:
+            ax_.axvline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
+        ax_.set_xlabel(xlabel, fontsize=11)
         ax_.set_ylabel('Density', fontsize=11)
         ax_.set_title(title_, fontsize=12)
-        n_guides_ax = len([g for g in np.unique(gl)])
+        n_guides_ax = len(np.unique(gl))
         n_cols = max(1, n_guides_ax // 15 + 1)
         ax_.legend(title='guide', fontsize=8, frameon=False,
                    loc='upper left', bbox_to_anchor=(1.01, 1.0),
@@ -496,7 +550,7 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 5))
-    _draw(ax, guide_labels, x_log, valid, f'{cis_gene}: x_true density by guide')
+    _draw(ax, guide_labels, x_log, valid, title_base)
     plt.tight_layout()
 
     if show:

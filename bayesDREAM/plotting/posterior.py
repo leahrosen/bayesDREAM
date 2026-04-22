@@ -183,6 +183,7 @@ def plot_xtrue_density_by_guide(
     model,
     cis_gene=None,
     log2=False,
+    log2fc=False,
     cmap="viridis",
     alpha_overall=0.5,
     density_gamma=0.7,
@@ -215,6 +216,11 @@ def plot_xtrue_density_by_guide(
         Cis gene name (title only).
     log2 : bool, default False
         Apply log2 transform.
+    log2fc : bool, default False
+        Express y-axis as log2 fold-change relative to the NTC mean.
+        Implies ``log2=True``; subtracts the mean log2 value across all NTC
+        cells (before any ``targeted_only`` filter) so NTC is centred at 0.
+        A grey dashed horizontal line is drawn at y = 0.
     cmap : str or Colormap
         Colormap for density intensity.
     alpha_overall : float
@@ -244,6 +250,9 @@ def plot_xtrue_density_by_guide(
     -------
     fig : matplotlib figure
     """
+    if log2fc:
+        log2 = True
+
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
     color_scheme = color_scheme.connect(model)
@@ -266,6 +275,12 @@ def plot_xtrue_density_by_guide(
         with np.errstate(divide='ignore', invalid='ignore'):
             samples = np.where(samples > 0,
                                np.log2(np.maximum(samples, 1e-300)), np.nan)
+
+    # ---- log2FC: subtract NTC mean (before targeted_only filter) ----
+    if log2fc:
+        ntc_mask = _guide_ntc_mask(guide_labels, model)
+        ntc_mean = float(np.nanmean(samples[:, ntc_mask])) if ntc_mask.any() else 0.0
+        samples = samples - ntc_mean
 
     # ---- optional NTC filter ----
     if targeted_only:
@@ -291,7 +306,10 @@ def plot_xtrue_density_by_guide(
     samples_sorted = samples[:, order]       # [S, N]
     guides_sorted  = guides[order]           # [N]
 
-    ylabel = "x_true" + (" (log₂)" if log2 else "")
+    if log2fc:
+        ylabel = "log2FC x_true (vs NTC)"
+    else:
+        ylabel = "x_true" + (" (log₂)" if log2 else "")
 
     fig = plt.figure(figsize=(max(10, N * 0.03 + 2), 6))
     ax  = plt.subplot2grid((20, 1), (2, 0), rowspan=18)
@@ -340,8 +358,12 @@ def plot_xtrue_density_by_guide(
     ax.legend(handles=legend_handles, title='guide', fontsize=9,
               loc='upper left', frameon=True, framealpha=0.9)
 
-    title_suffix = ' (targeted only)' if targeted_only else ''
-    fig.suptitle(f'{cis_gene}: x_true posterior density by cell{title_suffix}',
+    if log2fc:
+        ax.axhline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
+
+    mode_suffix = ' (log2FC)' if log2fc else (' (log₂)' if log2 else '')
+    title_suffix = (' (targeted only)' if targeted_only else '')
+    fig.suptitle(f'{cis_gene}: x_true posterior density by cell{mode_suffix}{title_suffix}',
                  fontsize=13, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
