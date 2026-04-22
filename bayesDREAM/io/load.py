@@ -158,38 +158,36 @@ def _check_nan_features(feat_mask, mod_name, mask_features):
             f"in the saved technical fit and would be filled with NaN.\n"
             f"Options:\n"
             f"  • load_technical_fit(..., mask_features=True)  — fill missing features with "
-            f"the per-group median alpha_y and mark them in modality.fitted_feature_mask; "
-            f"then use fit_trans(..., subset_features=True) to exclude them from fitting.\n"
+            f"the baseline alpha_y value (1.0 for negbinom, 0.0 for other distributions), "
+            f"exactly as fit_technical does for zero-count features; they are marked in "
+            f"modality.fitted_feature_mask.\n"
+            f"  • load_trans_fit(..., subset_features=True)  — after loading, subset the "
+            f"modality to only features present in the saved fit.\n"
             f"  • Rerun fit_technical() on the current feature set to produce a matching fit."
         )
 
 
-def _fill_nan_with_median(tensor, feat_mask):
+def _fill_nan_with_baseline(tensor, feat_mask, distribution):
     """
-    Replace NaN positions (where feat_mask is False) along the last matching dimension
-    with the nanmedian of the non-NaN positions (per leading dimension slice).
+    Replace NaN positions (where feat_mask is False) with the baseline alpha_y value,
+    matching what fit_technical's _reconstruct_full_2d does for excluded features:
+      - negbinom (multiplicative): baseline = 1.0
+      - all others (additive: normal, binomial, multinomial): baseline = 0.0
+
     Works for 2D [C, T] and 3D [C, T, K] tensors.
     """
     if tensor is None or not isinstance(tensor, torch.Tensor):
         return tensor
     if feat_mask.all():
         return tensor
+    baseline = 1.0 if distribution == 'negbinom' else 0.0
     t = tensor.clone()
-    # Identify the feature axis (last dim or second-to-last)
     feat_dim = _detect_feature_dim(t, len(feat_mask))
     if feat_dim is None:
         return t
-    # Move feature axis to last for uniform treatment
-    t = t.transpose(feat_dim, t.ndim - 1)  # [..., T]
-    # Flatten leading dims, fill row-wise
-    leading = t.shape[:-1]
-    t_flat = t.reshape(-1, t.shape[-1])         # [L, T]
-    for row in t_flat:
-        finite = row[feat_mask]
-        if finite.numel() > 0:
-            med = finite.nanmedian().item() if hasattr(finite, 'nanmedian') else float(torch.nanmedian(finite))
-            row[~feat_mask] = med
-    t = t_flat.reshape(*leading, -1)
+    # Move feature axis to last for uniform indexing
+    t = t.transpose(feat_dim, t.ndim - 1)      # [..., T]
+    t[..., ~feat_mask] = baseline
     return t.transpose(feat_dim, tensor.ndim - 1)
 
 
@@ -409,16 +407,16 @@ class ModelLoader:
                         if feat_mask is not None:
                             mod.fitted_feature_mask = feat_mask
                             if mask_features and not feat_mask.all():
-                                # Fill NaN positions with per-group median — same effective
-                                # treatment as zero-NTC-count genes in fit_technical
+                                # Fill NaN positions with baseline alpha_y — same treatment as
+                                # zero-NTC-count features in fit_technical's _reconstruct_full_2d:
+                                # 1.0 for negbinom (multiplicative), 0.0 for all other distributions.
                                 for k in list(posterior_raw.keys()):
                                     if isinstance(posterior_raw[k], torch.Tensor):
-                                        posterior_raw[k] = _fill_nan_with_median(
-                                            posterior_raw[k], feat_mask)
+                                        posterior_raw[k] = _fill_nan_with_baseline(
+                                            posterior_raw[k], feat_mask, mod.distribution)
                                 n_missing = int((~feat_mask).sum())
                                 print(f"[LOAD] {mod_name}: {n_missing} missing feature(s) filled "
-                                      f"with per-group median alpha_y (mask_features=True). "
-                                      f"Use fit_trans(..., subset_features=True) to exclude them.")
+                                      f"with baseline alpha_y (mask_features=True).")
                     mod.posterior_samples_technical = posterior_raw
 
                     # Reconstruct feature_meta DataFrame if present
@@ -498,7 +496,8 @@ class ModelLoader:
                             if not hasattr(mod, 'fitted_feature_mask'):
                                 mod.fitted_feature_mask = feat_mask
                             if mask_features and not feat_mask.all():
-                                alpha_y_to_set = _fill_nan_with_median(alpha_y_to_set, feat_mask)
+                                alpha_y_to_set = _fill_nan_with_baseline(
+                                    alpha_y_to_set, feat_mask, mod.distribution)
 
                 mod.alpha_y_prefit = alpha_y_to_set
                 if mod.distribution == 'negbinom':
@@ -711,7 +710,8 @@ class ModelLoader:
         return loaded
 
 
-    def load_trans_fit(self, input_dir: str = None, modalities: list = None, verbose: bool = False):
+    def load_trans_fit(self, input_dir: str = None, modalities: list = None, verbose: bool = False,
+                       subset_features: bool = False):
         """
         Load fitted trans parameters.
 
@@ -724,6 +724,11 @@ class ModelLoader:
             Example: ['gene', 'atac']
         verbose : bool
             If True, print detailed loading information. Default False (summary only).
+        subset_features : bool
+            If False (default), raise an error when the current modality contains features
+            that were not present in the saved trans fit (would introduce NaN posteriors).
+            If True, subset the modality in-place to only the features present in the saved
+            fit so that loading proceeds without NaNs.
 
         Returns
         -------
@@ -753,6 +758,11 @@ class ModelLoader:
             """
             Parse a trans posterior file and align features to current modality.
             Returns (posterior_dict, n_features, feat_mask, extra_meta).
+
+            When features in the current modality are missing from the saved fit
+            (would introduce NaN posteriors):
+              - subset_features=False: raises ValueError
+              - subset_features=True:  subsets the modality in-place to fitted features
             """
             if not (isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data):
                 # Old format — no alignment possible
@@ -776,7 +786,65 @@ class ModelLoader:
                     posterior_raw, feat_mask = _align_posterior_features(
                         posterior_raw, saved_names, cur_names, n_features)
                     _report_alignment(f"{label} features", saved_names, cur_names, feat_mask)
+
                     if feat_mask is not None:
+                        n_missing = int((~feat_mask).sum())
+                        if n_missing > 0:
+                            if not subset_features:
+                                raise ValueError(
+                                    f"[LOAD] {mod_name_saved}: {n_missing} feature(s) in the current "
+                                    f"modality were not present in the saved trans fit and would "
+                                    f"receive NaN posterior values.\n"
+                                    f"Options:\n"
+                                    f"  • load_trans_fit(..., subset_features=True)  — subset the "
+                                    f"modality to only features present in the saved fit.\n"
+                                    f"  • Rerun fit_trans() on the current feature set to produce "
+                                    f"a matching fit."
+                                )
+                            else:
+                                # Subset the modality in-place to fitted features only
+                                import numpy as _np
+                                mask_np = feat_mask.numpy()
+                                # Subset counts
+                                if mod.counts is not None:
+                                    if hasattr(mod.counts, 'toarray'):
+                                        arr = mod.counts.toarray()
+                                    else:
+                                        arr = mod.counts
+                                    if mod.cells_axis == 1:
+                                        mod.counts = arr[mask_np, :]
+                                    else:
+                                        mod.counts = arr[:, mask_np]
+                                # Subset denominator (binomial)
+                                if mod.denominator is not None:
+                                    denom = mod.denominator
+                                    if hasattr(denom, 'toarray'):
+                                        denom = denom.toarray()
+                                    if mod.cells_axis == 1:
+                                        mod.denominator = denom[mask_np, :]
+                                    else:
+                                        mod.denominator = denom[:, mask_np]
+                                # Subset feature_names
+                                if mod.feature_names is not None:
+                                    mod.feature_names = [mod.feature_names[i]
+                                                         for i, m in enumerate(mask_np) if m]
+                                # Subset feature_meta
+                                if mod.feature_meta is not None:
+                                    mod.feature_meta = mod.feature_meta.iloc[mask_np].reset_index(drop=True)
+                                # Also subset the (now-realigned) posterior NaN positions no longer exist
+                                # Re-extract without NaN fill: just index the posterior keys directly
+                                saved_idx = [i for i, n in enumerate(saved_names) if n in set(cur_names)]
+                                n_kept = int(mask_np.sum())
+                                print(f"[LOAD] {mod_name_saved}: subset_features=True — modality "
+                                      f"subsetted to {n_kept} features present in saved trans fit "
+                                      f"(dropped {n_missing}).")
+                                # Re-align posteriors with the subsetted modality (no NaNs now)
+                                new_cur_names = (mod.feature_names
+                                                 if mod.feature_names is not None
+                                                 else [cur_names[i] for i, m in enumerate(mask_np) if m])
+                                posterior_raw, feat_mask = _align_posterior_features(
+                                    loaded_data['posterior_samples'], saved_names, new_cur_names, n_features)
+                                # feat_mask should now be all True
                         mod.fitted_feature_mask = feat_mask
 
             extra = {
