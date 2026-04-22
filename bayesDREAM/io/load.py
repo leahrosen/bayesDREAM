@@ -118,9 +118,13 @@ class ModelLoader:
             mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
             if os.path.exists(mod_path):
                 alpha_y_to_set = _torch_load(mod_path)
-                # Backward compat: if saved as 3D posterior, collapse to mean
-                if isinstance(alpha_y_to_set, torch.Tensor) and alpha_y_to_set.ndim >= 3:
-                    alpha_y_to_set = alpha_y_to_set.mean(dim=0)
+                # Backward compat: collapse old multi-sample posteriors to point estimate.
+                # Valid point-estimate shapes: [C, T, K] (3D) for multinomial, [C, T] (2D) for others.
+                # Old saved format: [S, C, T, K] (4D) for multinomial, [S, C, T] (3D) for others.
+                if isinstance(alpha_y_to_set, torch.Tensor):
+                    collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
+                    if alpha_y_to_set.ndim >= collapse_threshold:
+                        alpha_y_to_set = alpha_y_to_set.mean(dim=0)
 
                 mod.alpha_y_prefit = alpha_y_to_set
 
@@ -178,9 +182,12 @@ class ModelLoader:
                 if 'alpha_y_add' in mod.posterior_samples_technical:
                     if not hasattr(mod, 'alpha_y_prefit_add') or mod.alpha_y_prefit_add is None:
                         alpha_y_add = mod.posterior_samples_technical['alpha_y_add']
-                        # Backward compat: collapse 3D posteriors to mean
-                        if isinstance(alpha_y_add, torch.Tensor) and alpha_y_add.ndim >= 3:
-                            alpha_y_add = alpha_y_add.mean(dim=0)
+                        # Backward compat: collapse old multi-sample posteriors to point estimate.
+                        # Valid shapes: [C, T, K] (3D) for multinomial, [C, T] (2D) for others.
+                        if isinstance(alpha_y_add, torch.Tensor):
+                            collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
+                            if alpha_y_add.ndim >= collapse_threshold:
+                                alpha_y_add = alpha_y_add.mean(dim=0)
                         mod.alpha_y_prefit_add = alpha_y_add
                         if not hasattr(mod, 'alpha_y_prefit') or mod.alpha_y_prefit is None:
                             if mod.distribution != 'negbinom':

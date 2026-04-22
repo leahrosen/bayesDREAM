@@ -158,7 +158,7 @@ class _BayesDREAMCore(PlottingMixin):
                 # counts is sparse array - will extract names from gene_meta and meta later
                 self._gene_names = None
                 self._cell_names = None
-            print(f"[SPARSE] Keeping counts as sparse matrix (shape: {counts.shape}, sparsity: {1 - counts.nnz / (counts.shape[0] * counts.shape[1]):.2%} zeros)")
+            pass  # sparse matrix stored as-is
         else:
             # DataFrame or dense array
             if isinstance(counts, pd.DataFrame):
@@ -190,7 +190,6 @@ class _BayesDREAMCore(PlottingMixin):
                     )
                 )
             self.is_high_moi = True
-            print("[INFO] High MOI mode detected")
 
             # Validate guide_assignment shape
             if guide_assignment.ndim != 2:
@@ -274,7 +273,6 @@ class _BayesDREAMCore(PlottingMixin):
 
                 # Store for later use
                 self.guide_targets_dict = guide_targets_dict
-                print(f"[INFO] Using guide_target DataFrame: {len(guide_target)} guide-target relationships")
 
             elif 'target' in guide_meta.columns:
                 # Use simple one-to-one mapping from guide_meta
@@ -283,15 +281,13 @@ class _BayesDREAMCore(PlottingMixin):
                     for _, row in guide_meta.iterrows()
                 }
                 self.guide_targets_dict = guide_targets_dict
-                print(f"[INFO] Using guide_meta['target'] for one-to-one guide-target mapping")
             else:
                 raise ValueError(
                     "Either guide_target DataFrame or guide_meta['target'] column must be provided "
                     "to specify guide-target relationships in high MOI mode."
                 )
 
-            print(f"[INFO] High MOI: {N_cells_assignment} cells (from guide_assignment), {G_guides} guides")
-            print(f"[INFO] Average guides per cell: {guide_assignment.sum(axis=1).mean():.2f}")
+            print(f"[INFO] High MOI: {G_guides} guides, avg {guide_assignment.sum(axis=1).mean():.2f} per cell")
 
         else:
             self.is_high_moi = False
@@ -299,7 +295,6 @@ class _BayesDREAMCore(PlottingMixin):
         # Handle gene metadata and extract gene names
         if gene_meta is None:
             # Create minimal gene metadata from counts
-            print("[INFO] No gene_meta provided - creating minimal metadata")
             if isinstance(counts, pd.DataFrame):
                 # DataFrame: use string index from DataFrame
                 gene_names = counts.index.tolist()
@@ -314,7 +309,6 @@ class _BayesDREAMCore(PlottingMixin):
                     'feature_id': range(n_features)
                 }, index=range(n_features))
                 self._gene_names = None  # No string names for matrices
-                print(f"[INFO] Using numeric feature indices [0..{n_features-1}] for matrix/array")
         else:
             # Validate and process provided gene_meta
             gene_meta = gene_meta.copy()
@@ -338,13 +332,10 @@ class _BayesDREAMCore(PlottingMixin):
                 if not has_gene_col:
                     if gene_meta.index.name is not None:
                         gene_meta['gene'] = gene_meta.index
-                        print(f"[INFO] Using gene_meta index ('{gene_meta.index.name}') as 'gene' column")
                     elif has_gene_name:
                         gene_meta['gene'] = gene_meta['gene_name']
-                        print("[INFO] Using 'gene_name' column as 'gene' identifier")
                     elif has_gene_id:
                         gene_meta['gene'] = gene_meta['gene_id']
-                        print("[INFO] Using 'gene_id' column as 'gene' identifier")
 
                 counts_gene_names = counts.index.tolist()
 
@@ -400,15 +391,10 @@ class _BayesDREAMCore(PlottingMixin):
                             f"For matrix/array counts, gene_meta must have exactly {n_features} rows."
                         )
                     gene_meta.index = range(n_features)
-                    print(f"[INFO] Reset gene_meta to numeric index [0..{n_features-1}] to match matrix/array")
 
                 self._gene_names = None  # No string names for matrices
 
             self.gene_meta = gene_meta
-
-            # Print summary
-            meta_cols = [c for c in ['gene', 'gene_name', 'gene_id', 'feature_id'] if c in self.gene_meta.columns]
-            print(f"[INFO] Feature metadata loaded with {len(self.gene_meta)} features and columns: {meta_cols}")
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -560,12 +546,9 @@ class _BayesDREAMCore(PlottingMixin):
 
         # Subset meta and counts to relevant cells
         valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
-        if len(valid_cells) < len(self.meta["cell"].unique()):
-            warnings.warn(
-                f"Subsetting reduced the number of cells in the metadata from {len(self.meta['cell'].unique())} to {len(valid_cells)}. "
-                "This may impact downstream analysis.",
-                UserWarning
-            )
+        n_cells_before = len(self.meta["cell"].unique())
+        if len(valid_cells) < n_cells_before:
+            print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
         self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
 
         # Subset counts by cells - works for both DataFrame and sparse
@@ -685,7 +668,6 @@ class _BayesDREAMCore(PlottingMixin):
             # CRITICAL: Reset index to [0, 1, 2, ..., n_remaining-1]
             # This ensures row i in counts corresponds to row i in gene_meta
             self.gene_meta.index = range(len(self.gene_meta))
-            print(f"[INFO] After filtering: reset gene_meta index to [0..{len(self.gene_meta)-1}]")
 
             # _gene_names remains None for matrices
             self._gene_names = None
@@ -713,11 +695,7 @@ class _BayesDREAMCore(PlottingMixin):
                 # No cis gene - all rows are trans
                 self.trans_genes = list(range(len(self.gene_meta)))
 
-        if num_removed > 0:
-            warnings.warn(
-                f"[WARNING] {num_removed} gene(s) had zero counts after subsetting and were removed from the counts matrix.",
-                UserWarning
-            )
+        # zero-count genes removed here from self.counts; Modality.__init__ reports its own filtering
         
         # Ensure same order of meta and counts
         # Use _cell_names for sparse/dense array compatibility
@@ -783,7 +761,7 @@ class _BayesDREAMCore(PlottingMixin):
         from .io.summary import ModelSummarizer
         self._summarizer = ModelSummarizer(self)
 
-        print(f"[INIT] bayesDREAM core: label={self.label}, device={self.device}")
+        pass  # init summary printed by bayesDREAM.__init__ after modality setup
 
     def cis_init_loc_fn(
         self,
@@ -943,17 +921,36 @@ class _BayesDREAMCore(PlottingMixin):
 
         Notes
         -----
-        For each guide within each covariate group:
+        **Single-guide mode** (low MOI): for each guide within each covariate group:
         - Compute mean NTC sum factor: mean_ntc
         - Compute mean guide sum factor: mean_guide
         - Adjustment factor = mean_ntc / mean_guide
         - Adjusted sum factor = sum_factor * adjustment_factor
+
+        **High MOI mode**: guide effects are assumed additive in log-space (same as fit_cis).
+        For each guide g within each covariate group:
+        - mean_log_sf_g = mean(log(sum_factor)) over cells containing guide g
+        - weighted_NTC = weighted mean of mean_log_sf_g for NTC guides (weights = cells_per_guide)
+        - delta_g = mean_log_sf_g - weighted_NTC
+        For each cell c: log(sf_adj_c) = log(sf_c) - sum(delta_g for guides in cell c)
         """
+        primary_mod = self.get_modality(self.primary_modality)
+
         meta_out = self.meta.copy()
         meta_out["original_index"] = np.arange(len(meta_out))
 
+        # Prefer sum_factors on the modality; fall back to meta for the initial
+        # 'sum_factor' column (present in meta from initialisation).
         if sum_factor_col_old not in meta_out.columns:
-            raise ValueError(f"No column '{sum_factor_col_old}' found in meta. Provide a precomputed sum_factor.")
+            if (primary_mod.sum_factors is not None
+                    and sum_factor_col_old in primary_mod.sum_factors.columns):
+                meta_out[sum_factor_col_old] = primary_mod.sum_factors.loc[
+                    meta_out['cell'].values, sum_factor_col_old
+                ].values
+            else:
+                raise ValueError(
+                    f"No column '{sum_factor_col_old}' found in meta or modality sum_factors."
+                )
 
         # Drop existing adjustment_factor column if it exists (prevents merge conflicts)
         if "adjustment_factor" in meta_out.columns:
@@ -968,22 +965,71 @@ class _BayesDREAMCore(PlottingMixin):
                     f"Available columns are: {list(meta_out.columns)}"
             )
         
-        if not covariates:
+        if self.is_high_moi:
+            # High MOI: guide effects are additive in log-space (same assumption as fit_cis).
+            # For a cell with guides g1, g2: log(sf_adj) = log(sf) - delta_g1 - delta_g2
+            # where delta_g = mean_log_sf_g - weighted_NTC_log_sf (per covariate group).
+            # Weights for NTC mean = cells_per_guide, matching fit_cis.
+
+            guide_assignment = self.guide_assignment  # (n_cells, n_guides)
+            is_ntc_guide = (self.guide_meta['target'] == 'ntc').values  # (n_guides,)
+
+            log_sf = np.log(meta_out[sum_factor_col_old].values.astype(float))
+            log_sf_adj = log_sf.copy()
+
+            def _apply_highmoi_correction(pos_indices):
+                ga = guide_assignment[pos_indices]   # (n_sub, n_guides)
+                lsf = log_sf[pos_indices]            # (n_sub,)
+
+                cells_per_guide = ga.sum(axis=0).astype(float)  # (n_guides,)
+
+                # (1) Mean log(sf) per guide via matrix multiply
+                mean_log_sf_g = np.where(
+                    cells_per_guide > 0,
+                    (ga.T @ lsf) / np.maximum(cells_per_guide, 1.0),
+                    np.nan
+                )  # (n_guides,)
+
+                # (2) Weighted NTC mean (weights = cells_per_guide, matching fit_cis)
+                ntc_means = mean_log_sf_g[is_ntc_guide]
+                ntc_counts = cells_per_guide[is_ntc_guide]
+                valid = ~np.isnan(ntc_means) & (ntc_counts > 0)
+                if valid.sum() == 0:
+                    return  # No NTC guides in group; skip correction
+                weighted_NTC_log_sf = np.average(ntc_means[valid], weights=ntc_counts[valid])
+
+                # (3) Per-guide delta; guides with no cells in this group get delta=0
+                delta_g = np.where(~np.isnan(mean_log_sf_g), mean_log_sf_g - weighted_NTC_log_sf, 0.0)
+
+                # (4) Additive correction per cell in log-space
+                log_sf_adj[pos_indices] -= ga @ delta_g
+
+            if not covariates:
+                _apply_highmoi_correction(np.arange(len(meta_out)))
+            else:
+                meta_out["_pos"] = np.arange(len(meta_out))
+                for _, group_df in meta_out.groupby(covariates):
+                    _apply_highmoi_correction(group_df["_pos"].values)
+                meta_out.drop(columns=["_pos"], inplace=True)
+
+            meta_out[sum_factor_col_adj] = np.exp(log_sf_adj)
+
+        elif not covariates:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
             mean_ntc_value = meta_out.loc[meta_out['target'] == 'ntc', sum_factor_col_old].mean()
-    
+
             # (2) Mean sum_factor among *all* guides, grouped by covariates + [guide_col]
             df_guide = (
                 meta_out.groupby(["guide_used"])[sum_factor_col_old]
                 .mean()
                 .reset_index(name="mean_SumFacs_guide")
             )
-    
+
             # (3) Merge them and compute ratio = mean_NTC / mean_guide
             df_guide["adjustment_factor"] = (
                 mean_ntc_value / (df_guide["mean_SumFacs_guide"])
             )
-    
+
             # (4) Merge that ratio back onto meta_out
             meta_out = pd.merge(
                 meta_out,
@@ -991,6 +1037,9 @@ class _BayesDREAMCore(PlottingMixin):
                 on="guide_used",
                 how="left"
             )
+
+            # (5) Multiply original sum_factor by ratio
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
 
         else:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
@@ -1000,29 +1049,34 @@ class _BayesDREAMCore(PlottingMixin):
                 .mean()
                 .reset_index(name="mean_SumFacs_ntc")
             )
-    
+
             # (2) Mean sum_factor among *all* guides, grouped by covariates + [guide_col]
             df_guide = (
                 meta_out.groupby(covariates + ["guide_used"])[sum_factor_col_old]
                 .mean()
                 .reset_index(name="mean_SumFacs_guide")
             )
-    
+
             # (3) Merge them and compute ratio = mean_NTC / mean_guide
             merged = pd.merge(df_guide, df_ntc, on=covariates, how="left")
             merged["adjustment_factor"] = merged["mean_SumFacs_ntc"] / merged["mean_SumFacs_guide"]
-    
+
             # (4) Merge that ratio back onto meta_out
             merge_cols = covariates + ["guide_used", "adjustment_factor"]
             meta_out = pd.merge(meta_out, merged[merge_cols], on=covariates + ["guide_used"], how="left")
-            
-        # (5) Multiply original sum_factor by ratio
-        meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
+
+            # (5) Multiply original sum_factor by ratio
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
 
         meta_out.sort_values("original_index", inplace=True)
         meta_out.drop(columns="original_index", inplace=True)
-        self.meta = meta_out
-        print(f"[INFO] Created '{sum_factor_col_adj}' in meta with NTC-based guide-level adjustment.")
+
+        # Write adjusted sum factor to modality, not back to meta
+        if primary_mod.sum_factors is None:
+            primary_mod.sum_factors = pd.DataFrame(index=meta_out['cell'].values)
+        primary_mod.sum_factors[sum_factor_col_adj] = meta_out.set_index('cell')[sum_factor_col_adj]
+
+        print(f"[INFO] Created '{sum_factor_col_adj}' in modality sum_factors with NTC-based guide-level adjustment.")
 
     def refit_sumfactor(
         self,
@@ -1100,7 +1154,21 @@ class _BayesDREAMCore(PlottingMixin):
         """
         from scipy.stats import gaussian_kde
 
-        sum_factor_data = self.meta[sum_factor_col_old].values  # shape (N,)
+        primary_mod = self.get_modality(self.primary_modality)
+
+        # Read sum factor from modality sum_factors, falling back to meta for the
+        # initial 'sum_factor' column that was present at model initialisation.
+        if (primary_mod.sum_factors is not None
+                and sum_factor_col_old in primary_mod.sum_factors.columns):
+            sum_factor_data = primary_mod.sum_factors.loc[
+                self.meta['cell'].values, sum_factor_col_old
+            ].values.astype(float)  # shape (N,)
+        elif sum_factor_col_old in self.meta.columns:
+            sum_factor_data = self.meta[sum_factor_col_old].values.astype(float)
+        else:
+            raise ValueError(
+                f"No column '{sum_factor_col_old}' found in modality sum_factors or meta."
+            )
 
         if covariates is None:
             covariates = []
@@ -1270,9 +1338,11 @@ class _BayesDREAMCore(PlottingMixin):
                 # The adjusted sum factor removes the x_true-dependent trend
                 # We want to keep the baseline level, so add back the global mean predicted value
                 global_baseline = np.mean(y_pred)
-                self.meta[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
+                if primary_mod.sum_factors is None:
+                    primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+                primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
 
-                print(f"[INFO] Created '{sum_factor_col_refit}' using per-group spline alignment.")
+                print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors using per-group spline alignment.")
                 return
 
         # =========================================================================
@@ -1319,8 +1389,12 @@ class _BayesDREAMCore(PlottingMixin):
 
         # Predict and adjust
         y_pred = model_spline_ridge.predict(X_true.reshape(-1, 1))
-        self.meta[sum_factor_col_refit] = np.maximum(0, leftover_data - y_pred + baseline_ntc_of_group[group_id])
-        print(f"[INFO] Created '{sum_factor_col_refit}' in meta with x_true-based adjustment.")
+        if primary_mod.sum_factors is None:
+            primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+        primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(
+            0, leftover_data - y_pred + baseline_ntc_of_group[group_id]
+        )
+        print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors with x_true-based adjustment.")
 
     def permute_genes(
         self,
@@ -1341,8 +1415,16 @@ class _BayesDREAMCore(PlottingMixin):
             Technical group covariates used to group cells for permutation (e.g., ['cell_line', 'lane']).
         """
 
-        if sum_factor_col not in self.meta.columns:
-            raise ValueError(f"No column '{sum_factor_col}' found in meta. Provide a precomputed sum_factor.")
+        primary_mod = self.get_modality(self.primary_modality)
+        _sf_available = (
+            primary_mod.sum_factors is not None
+            and sum_factor_col in primary_mod.sum_factors.columns
+        )
+        if not _sf_available:
+            raise ValueError(
+                f"No column '{sum_factor_col}' found in modality sum_factors. "
+                "Run adjust_ntc_sum_factor() first."
+            )
             
         print("Running gene permutation...")
 
@@ -1404,10 +1486,9 @@ class _BayesDREAMCore(PlottingMixin):
                         # Dense array
                         gene_counts_ntc = counts_sub[gene_idx, my_ntc_indices]
 
-                    # Get sum factors
-                    meta_indexed = meta_sub.set_index("cell")
-                    ntc_sum_factors = meta_indexed.loc[my_ntc_cells, sum_factor_col].values
-                    mycell_sum_factors = meta_indexed.loc[mycells, sum_factor_col].values
+                    # Get sum factors from modality
+                    ntc_sum_factors = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
+                    mycell_sum_factors = primary_mod.sum_factors.loc[mycells.values, sum_factor_col].values
 
                     # Sample values from NTC distribution
                     sampled_values = np.random.choice(
@@ -1452,9 +1533,8 @@ class _BayesDREAMCore(PlottingMixin):
                     # Get column indices for NTC cells
                     my_ntc_indices = [cell_to_col_idx[cell] for cell in my_ntc_cells]
 
-                    # Get sum factors
-                    meta_indexed = meta_sub.set_index("cell")
-                    ntc_sum_factor = meta_indexed.loc[my_ntc_cells, sum_factor_col].values
+                    # Get sum factors from modality
+                    ntc_sum_factor = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
 
                     # Get cis gene expression for NTC cells
                     if isinstance(self.counts, pd.DataFrame):
@@ -1511,14 +1591,14 @@ class _BayesDREAMCore(PlottingMixin):
         Create a new model instance with a subset of cells.
 
         Useful for testing without technical correction by subsetting to a single
-        cell_line (e.g., CRISPRi or CRISPRa only).
+        technical group (e.g., one cell line only).
 
         Parameters
         ----------
         cell_mask : np.ndarray, pd.Series, or list, optional
             Boolean mask or list of cell names to keep. If None, must provide query.
         query : str, optional
-            Pandas query string to filter cells (e.g., "cell_line == 'CRISPRa'").
+            Pandas query string to filter cells (e.g., "cell_line == 'K562'").
             Applied to self.meta. If None, must provide cell_mask.
         preserve_fits : bool
             If True (default), copy fitted parameters (alpha_x_prefit, alpha_y_prefit,
@@ -1532,15 +1612,15 @@ class _BayesDREAMCore(PlottingMixin):
         Examples
         --------
         # Subset by query
-        model_crispra = model.subset_cells(query="cell_line == 'CRISPRa'")
+        model_k562 = model.subset_cells(query="cell_line == 'K562'")
 
         # Subset by mask
-        mask = model.meta['cell_line'].str.contains('CRISPRa')
-        model_crispra = model.subset_cells(cell_mask=mask)
+        mask = model.meta['cell_line'].str.contains('K562')
+        model_k562 = model.subset_cells(cell_mask=mask)
 
         # Subset by cell list
-        cells = model.meta[model.meta['cell_line'] == 'CRISPRa']['cell'].tolist()
-        model_crispra = model.subset_cells(cell_mask=cells)
+        cells = model.meta[model.meta['cell_line'] == 'K562']['cell'].tolist()
+        model_k562 = model.subset_cells(cell_mask=cells)
         """
         if cell_mask is None and query is None:
             raise ValueError("Must provide either cell_mask or query")
@@ -1624,8 +1704,6 @@ class _BayesDREAMCore(PlottingMixin):
             require_ntc=False  # Allow subsetting without NTC cells
         )
 
-        print(f"[DEBUG] Original modalities: {list(self.modalities.keys())}")
-        print(f"[DEBUG] New model modalities: {list(model_new.modalities.keys())}")
 
         # Copy additional modalities (beyond the primary 'gene' modality)
         if hasattr(self, 'modalities'):

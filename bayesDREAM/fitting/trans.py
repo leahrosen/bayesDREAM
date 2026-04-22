@@ -524,41 +524,54 @@ class TransFitter:
 
                 # Sample A
                 if distribution == 'multinomial' and Amean_tensor.ndim > 1:
-                    # For multinomial: Use Dirichlet with weak concentration
-                    # concentration = mean_normalized * K (where K = number of categories)
-                    # This gives each category concentration ≈ 1 on average (weak prior)
+                    # For multinomial: LogisticNormal prior on A (Normal in logit space + softmax).
+                    #
+                    # We previously used dist.Dirichlet, but Pyro's autoguide represents the
+                    # K-simplex via a stick-breaking transform from R^(K-1).  With K=65 and
+                    # many phantom (all-zero) categories, float32 rounding in the stick-breaking
+                    # product chain makes the sample sum drift away from 1.0 beyond PyTorch's
+                    # 1e-6 Simplex tolerance, raising a ValueError in both compute_log_prob and
+                    # compute_score_parts — even with validate_args=False on the model, the
+                    # guide's TransformedDistribution re-validates the same sample.
+                    #
+                    # LogisticNormal sidesteps this entirely: the guide uses an unconstrained
+                    # Normal site (no simplex constraint, no stick-breaking), and softmax
+                    # guarantees a valid probability vector in the model.
                     K_dim = Amean_tensor.shape[-1]
 
-                    # For multinomial: use Dirichlet priors over K categories
-                    if use_data_driven_priors:
-                        # Data-driven Dirichlet: shift A mean to 0.5×Q05.
-                        # This gives P(A ≥ Q05) ≈ 13.5%, consistent with the negbinom A prior.
-                        # (The previous 0.1× gave P(A ≥ Q05) ≈ 0%, causing false positives
-                        # by forcing A near 0 and inflating effective Vmax.)
-                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
-                        A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
-
-                        # Weak concentration: mean_normalized * K gives ~1 per category
-                        concentration_A = A_mean_normalized * K_dim  # [T, K]
-                    else:
-                        # Uniform Dirichlet: all categories have equal concentration=1
-                        concentration_A = self._t(1.0).expand([T, K_dim])  # [T, K] with all 1s
-
-                    # Zero concentration for phantom categories (zero total observations
-                    # across all cells). Without this, the Dirichlet prior leaks mass to
-                    # padding positions, biasing real-category A values downward.
+                    # Build phantom mask (categories with zero observations across all cells)
+                    phantom_conc_mask = None
                     if y_obs_tensor.dim() == 3:  # multinomial: [N, T, K]
                         obs_total = y_obs_tensor.sum(dim=0)  # [T, K]
                         phantom_conc_mask = (obs_total == 0)  # [T, K]
-                        concentration_A = torch.where(
-                            phantom_conc_mask,
-                            torch.full_like(concentration_A, 1e-6),
-                            concentration_A,
-                        )
 
-                    # Sample K-dimensional probability vectors from Dirichlet
-                    # Each row sums to 1
-                    A = pyro.sample("A", dist.Dirichlet(concentration_A))  # [T, K]
+                    # Logit-space prior mean
+                    if use_data_driven_priors:
+                        # Shift A mean to 0.5×Q05 (→ P(A ≥ Q05) ≈ 13.5%, consistent with
+                        # the negbinom A prior), normalise, then take log as the logit mean.
+                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                        A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
+                        A_logit_mean = torch.log(A_mean_normalized.clamp(min=1e-10))  # [T, K]
+                    else:
+                        # Uniform prior: equal logits → uniform simplex after softmax
+                        A_logit_mean = torch.zeros(T, K_dim, device=self.model.device)
+
+                    # Push phantom categories to -inf in prior mean so the guide learns
+                    # to assign them zero probability.
+                    if phantom_conc_mask is not None:
+                        A_logit_mean = A_logit_mean.masked_fill(phantom_conc_mask, -1e4)
+
+                    # σ=1.0 in logit space ≈ weakly informative (comparable to Dirichlet α≈1)
+                    sigma_A_logit = self._t(1.0)
+
+                    # Sample in unconstrained logit space — the autoguide uses Normal here,
+                    # no simplex constraint, no stick-breaking transform.
+                    A_logit = pyro.sample("A", dist.Normal(A_logit_mean, sigma_A_logit).to_event(1))  # [T, K]
+
+                    # Softmax with phantom masking → valid probability vector [T, K]
+                    if phantom_conc_mask is not None:
+                        A_logit = A_logit.masked_fill(phantom_conc_mask, -1e9)
+                    A = torch.softmax(A_logit, dim=-1)  # [T, K]
 
                 else:
                     # For binomial: Beta priors
@@ -600,8 +613,7 @@ class TransFitter:
                 # respond while others remain flat. The Kth (residual) category is affected
                 # iff at least one K-1 category is on (conservation of probability).
                 if distribution == 'multinomial' and K is not None:
-                    with pyro.plate("category_plate_alpha", K - 1, dim=-1):
-                        alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T, K-1]
+                    alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor).expand([K - 1]).to_event(1))  # [T, K-1]
                 else:
                     alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
             else:
@@ -619,10 +631,10 @@ class TransFitter:
                 # Reduce over group dimension if necessary
                 K_sigma = (K_max_tensor / (self._t(2) * torch.sqrt(K_alpha_tensor))) + epsilon_tensor
 
-                # For multinomial, use reduced Vmax_for_A (without category dimension) for priors
+                # For multinomial, reduce [T, K] → [T] for the Hill function amplitude prior
                 # For other distributions, use Vmax_mean_tensor directly
                 if distribution == 'multinomial' and Vmax_mean_tensor.ndim > 1:
-                    Vmax_prior_mean = Vmax_for_A  # [T] - already reduced
+                    Vmax_prior_mean = Vmax_mean_tensor.mean(dim=-1)  # [T]
                 else:
                     Vmax_prior_mean = Vmax_mean_tensor  # [T]
 
@@ -647,12 +659,12 @@ class TransFitter:
                     K_minus_1 = K - 1
                     # Sample parameters for K-1 categories
                     # Each category gets its own Hill function parameters
-                    with pyro.plate("category_plate_n_a", K_minus_1, dim=-1):
-                        n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a))  # [T, K-1]
-                        n_a = pyro.deterministic(
-                            "n_a",
-                            _soft_clamp(n_a_raw, nmin, nmax)
-                        )  # [T, K-1]
+                    # Use .to_event(1) instead of a nested plate to avoid dim=-1 collision with trans_plate
+                    n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a.unsqueeze(-1).expand(T, K_minus_1)).to_event(1))  # [T, K-1]
+                    n_a = pyro.deterministic(
+                        "n_a",
+                        _soft_clamp(n_a_raw, nmin, nmax)
+                    )  # [T, K-1]
                 else:
                     # For non-multinomial: single set of parameters per feature
                     n_a_raw = pyro.sample("n_a_raw", dist.Normal(n_mu_raw_tensor, sigma_n_a))
@@ -683,7 +695,7 @@ class TransFitter:
 
                 if x_ntc_mean is not None:
                     # Centre K prior at NTC mean with ±5 log2FC (95% CI) coverage.
-                    # Note: for one-sided fits (CRISPRi-only or CRISPRa-only), K is not
+                    # Note: for one-sided fits (single technical group), K is not
                     # identifiable from the data when the true EC50 lies outside the observed
                     # x-range.  The NTC-centred prior then dominates and will under/over-shoot
                     # the true K.  This is a data limitation, not a code bug — the full dataset
@@ -721,14 +733,13 @@ class TransFitter:
 
                     if distribution == 'multinomial' and K is not None:
                         # For multinomial: Sample Vmax_a for K-1 categories (Kth is residual)
+                        # Use .to_event(1) instead of nested plates to avoid dim=-1 collision with trans_plate
                         K_minus_1 = K - 1
-                        with pyro.plate("category_plate_Vmax_a", K_minus_1, dim=-1):
-                            Vmax_a = pyro.sample("Vmax_a", dist.Beta(alpha_vmax, beta_vmax))  # [T, K-1]
+                        Vmax_a = pyro.sample("Vmax_a", dist.Beta(alpha_vmax[:, :K_minus_1], beta_vmax[:, :K_minus_1]).to_event(1))  # [T, K-1]
 
                         # K_a: Log-Normal for K-1 categories
-                        with pyro.plate("category_plate_K_a", K_minus_1, dim=-1):
-                            log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma))  # [T, K-1]
-                            K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T, K-1]
+                        log_K_a = pyro.sample("log_K_a", dist.Normal(K_log_mu, K_log_sigma).expand([K_minus_1]).to_event(1))  # [T, K-1]
+                        K_a = pyro.deterministic("K_a", torch.exp(log_K_a))  # [T, K-1]
                     else:
                         # For binomial: per-feature Vmax_a and K_a
                         Vmax_a = pyro.sample("Vmax_a", dist.Beta(alpha_vmax, beta_vmax))  # [T]
@@ -740,7 +751,7 @@ class TransFitter:
                     # Direction of effect is carried by n (negative n = repressor Hill),
                     # so Vmax must be strictly positive for all three distributions.
                     # Wide log_sigma (floor ≥ 1.5, ≈ 20× range) keeps the prior diffuse
-                    # enough for one-sided subsets (CRISPRa-only or CRISPRi-only).
+                    # enough for one-sided subsets (single technical group).
                     _Vmax_log_sigma_floor = (vmax_log_sigma_floor_tensor
                                              if vmax_log_sigma_floor_tensor is not None
                                              else self._t(1.5))
@@ -760,20 +771,20 @@ class TransFitter:
                 if function_type in ['additive_hill', 'nested_hill']:
                     sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
                     if distribution == 'multinomial' and K is not None:
-                        with pyro.plate("category_plate_beta", K - 1, dim=-1):
-                            beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T, K-1]
+                        # Use .to_event(1) instead of nested plate to avoid dim=-1 collision with trans_plate
+                        beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor).expand([K - 1]).to_event(1))  # [T, K-1]
                     else:
                         beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
 
                     # n_b: per-category for multinomial, single for others
                     if distribution == 'multinomial' and K is not None:
+                        # Use .to_event(1) instead of nested plate to avoid dim=-1 collision with trans_plate
                         K_minus_1 = K - 1
-                        with pyro.plate("category_plate_n_b", K_minus_1, dim=-1):
-                            n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b))  # [T, K-1]
-                            n_b = pyro.deterministic(
-                                "n_b",
-                                _soft_clamp(n_b_raw, nmin, nmax)
-                            )  # [T, K-1]
+                        n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b.unsqueeze(-1).expand(T, K_minus_1)).to_event(1))  # [T, K-1]
+                        n_b = pyro.deterministic(
+                            "n_b",
+                            _soft_clamp(n_b_raw, nmin, nmax)
+                        )  # [T, K-1]
                     else:
                         n_b_raw = pyro.sample("n_b_raw", dist.Normal(n_mu_raw_tensor, sigma_n_b))
                         n_b = pyro.deterministic(
@@ -785,14 +796,13 @@ class TransFitter:
                     if distribution in ['binomial', 'multinomial']:
                         if distribution == 'multinomial' and K is not None:
                             # For multinomial: Sample Vmax_b for K-1 categories (Kth is residual)
+                            # Use .to_event(1) instead of nested plates to avoid dim=-1 collision with trans_plate
                             K_minus_1 = K - 1
-                            with pyro.plate("category_plate_Vmax_b", K_minus_1, dim=-1):
-                                Vmax_b = pyro.sample("Vmax_b", dist.Beta(alpha_vmax, beta_vmax))  # [T, K-1]
+                            Vmax_b = pyro.sample("Vmax_b", dist.Beta(alpha_vmax[:, :K_minus_1], beta_vmax[:, :K_minus_1]).to_event(1))  # [T, K-1]
 
                             # K_b: Log-Normal for K-1 categories
-                            with pyro.plate("category_plate_K_b", K_minus_1, dim=-1):
-                                log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))  # [T, K-1]
-                                K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T, K-1]
+                            log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma).expand([K_minus_1]).to_event(1))  # [T, K-1]
+                            K_b = pyro.deterministic("K_b", torch.exp(log_K_b))  # [T, K-1]
                         else:
                             # For binomial: per-feature Vmax_b and K_b
                             Vmax_b = pyro.sample("Vmax_b", dist.Beta(alpha_vmax, beta_vmax))  # [T]
@@ -1542,7 +1552,10 @@ class TransFitter:
 
         # Handle sum factors for modality cells
         if sum_factor_col is not None:
-            sum_factor_tensor = torch.tensor(meta_subset[sum_factor_col].values, dtype=torch.float32, device=self.model.device)
+            sum_factor_tensor = torch.tensor(
+                modality.sum_factors.loc[meta_subset['cell'].values, sum_factor_col].values,
+                dtype=torch.float32, device=self.model.device
+            )
         else:
             sum_factor_tensor = torch.ones(N, dtype=torch.float32, device=self.model.device)
 
@@ -1665,6 +1678,30 @@ class TransFitter:
         else:
             y_obs_factored = y_obs_tensor
             y_obs_for_prior = y_obs_factored
+
+        # ---- Multinomial zero-category mask (analogous to fit_technical zero_cat_mask) ----
+        # Identifies categories structurally absent across ALL trans cells.
+        # These phantom positions are already masked inline inside _model_y; this block
+        # performs an early diagnostic check and warns when features have ≤1 active
+        # category (which should have been filtered at Modality initialisation).
+        if distribution == 'multinomial' and y_obs_tensor.ndim == 3:
+            _obs_total_per_cat = y_obs_tensor.sum(dim=0)  # [T, K]
+            zero_cat_mask_trans = (_obs_total_per_cat == 0)  # [T, K] bool
+            _active_k = (~zero_cat_mask_trans).sum(dim=-1)  # [T]
+            if (_active_k <= 1).any():
+                import warnings as _warnings
+                _bad_t = torch.nonzero(_active_k <= 1, as_tuple=False).squeeze(-1).tolist()
+                _warnings.warn(
+                    f"[fit_trans] {len(_bad_t)} multinomial feature(s) have ≤1 active "
+                    f"category in the trans data (feature indices: "
+                    f"{_bad_t[:10]}{'...' if len(_bad_t) > 10 else ''}). "
+                    f"These features should be filtered before fitting (at Modality "
+                    f"initialisation). Fitting will be unreliable for these features.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+        else:
+            zero_cat_mask_trans = None
 
         # ===================================================================
         # CORRECT FOR TECHNICAL EFFECTS BEFORE COMPUTING PRIORS
@@ -2112,7 +2149,7 @@ class TransFitter:
         # Diagnostic: Verify alpha_y_prefit is correctly structured
         if alpha_y_prefit is not None and groups_tensor is not None:
             print(f"[INFO] Technical correction setup: alpha_y_prefit.shape={alpha_y_prefit.shape}, C={C}")
-            if alpha_y_prefit.shape[0] == C if alpha_y_prefit.ndim == 2 else alpha_y_prefit.shape[1] == C:
+            if alpha_y_prefit.shape[0] == C:
                 print(f"[INFO] alpha_y_prefit already includes reference group (correct!)")
             else:
                 print(f"[WARNING] alpha_y_prefit shape mismatch - may need to add reference group")

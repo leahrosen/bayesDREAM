@@ -577,7 +577,7 @@ def get_technical_group_labels(model) -> List[str]:
     """
     Get informative labels for technical groups.
 
-    Returns human-readable labels like "CRISPRa", "CRISPRi:lane1" instead of
+    Returns human-readable labels like "K562", "TF1:lane1" instead of
     generic "technical_group_0", "technical_group_1".
 
     Parameters
@@ -656,30 +656,7 @@ def get_default_color_palette(labels: List[str]) -> Dict[str, str]:
     Dict[str, str]
         Mapping from label to color
     """
-    # Default colors for common cases
-    default_colors = {
-        'CRISPRa': 'crimson',
-        'CRISPRi': 'dodgerblue',
-        'a': 'crimson',
-        'i': 'dodgerblue'
-    }
-
-    # Check if labels match defaults
-    palette = {}
-    for label in labels:
-        if label in default_colors:
-            palette[label] = default_colors[label]
-        else:
-            # Check if label contains CRISPRa or CRISPRi
-            if 'CRISPRa' in label or 'a' in label:
-                palette[label] = 'crimson'
-            elif 'CRISPRi' in label or 'i' in label:
-                palette[label] = 'dodgerblue'
-            else:
-                # Fall back to matplotlib default colors
-                palette[label] = f'C{len(palette)}'
-
-    return palette
+    return {label: f'C{i}' for i, label in enumerate(labels)}
 
 
 def _labels_by_code_for_df(model, df) -> dict[int, str]:
@@ -708,16 +685,11 @@ def _labels_by_code_for_df(model, df) -> dict[int, str]:
 
 def _color_for_label(label: str, fallback_idx: int = 0, palette: dict | None = None) -> str:
     """
-    Use user's desired palette: CRISPRa=red, CRISPRi=blue; otherwise fall back.
+    Return colour for a technical group label, using user-supplied palette if provided.
     """
     palette = palette or {}
     if label in palette:
         return palette[label]
-    # hard defaults you wanted
-    if 'CRISPRa' in label:
-        return 'crimson'
-    if 'CRISPRi' in label:
-        return 'dodgerblue'
     return f'C{fallback_idx}'
 
 
@@ -3364,22 +3336,24 @@ def plot_negbinom_xy(
     else:
         y_obs = modality.counts[:, feature_idx]
 
-    # Check if sum_factor_col exists
-    if sum_factor_col not in model.meta.columns:
-        raise ValueError(f"Sum factor column '{sum_factor_col}' not found in model.meta. "
-                        f"Available columns: {list(model.meta.columns)}")
+    # Check if sum_factor_col exists on modality sum_factors
+    if modality.sum_factors is None or sum_factor_col not in modality.sum_factors.columns:
+        raise ValueError(
+            f"Sum factor column '{sum_factor_col}' not found in modality sum_factors. "
+            f"Available columns: {list(modality.sum_factors.columns) if modality.sum_factors is not None else '(none)'}"
+        )
 
     # Align cells between model.meta and modality
     x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(
         model, modality, x_true, y_obs, subset_mask
     )
 
-    # Build dataframe
+    # Build dataframe — read sum factors from modality, not from meta_aligned
     df_data = {
         'x_true': x_true_aligned,
         'y_obs': y_obs_aligned,
         'target': meta_aligned['target'].values,
-        'sum_factor': meta_aligned[sum_factor_col].values
+        'sum_factor': modality.sum_factors.loc[meta_aligned['cell'].values, sum_factor_col].values
     }
 
     # Conditionally add technical_group_code if it exists
@@ -4878,8 +4852,8 @@ def plot_xy_data(
         For binomial: minimum denominator
         For multinomial: minimum total counts
     color_palette : dict, optional
-        Custom colors for technical groups
-        Example: {'CRISPRa': 'crimson', 'CRISPRi': 'dodgerblue'}
+        Custom colors for technical groups, keyed by the group label string
+        Example: {'K562': 'crimson', 'TF1': 'dodgerblue'}
     show_hill_function : bool
         Overlay fitted trans function if trans model fitted (all distributions, default: True)
         Works with all function types: additive_hill, single_hill, polynomial
@@ -4903,8 +4877,8 @@ def plot_xy_data(
     subset_meta : dict, optional
         Subset cells by metadata columns. Dictionary of {column: value} pairs.
         Example: {'target': 'ntc'} - plot only NTC cells
-        Example: {'cell_line': 'CRISPRi'} - plot only CRISPRi cells
-        Example: {'lane': 'L1', 'cell_line': 'CRISPRa'} - plot L1 lane CRISPRa cells
+        Example: {'cell_line': 'K562'} - plot only K562 cells
+        Example: {'lane': 'L1', 'cell_line': 'K562'} - plot L1 lane K562 cells
         Multiple conditions are combined with AND logic.
     only_dependent : bool
         If True and plotting multiple features (gene name), filter to only "dependent" features
@@ -4994,7 +4968,7 @@ def plot_xy_data(
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj')
     >>>
     >>> # Plot with custom colors
-    >>> model.plot_xy_data('GFI1B', color_palette={'CRISPRa': 'red', 'CRISPRi': 'blue'})
+    >>> model.plot_xy_data('GFI1B', color_palette={'K562': 'red', 'TF1': 'blue'})
     >>>
     >>> # Show both corrected and uncorrected (default)
     >>> model.plot_xy_data('TET2', show_correction='both')
@@ -5005,8 +4979,8 @@ def plot_xy_data(
     >>> # Plot only NTC cells
     >>> model.plot_xy_data('TET2', subset_meta={'target': 'ntc'})
     >>>
-    >>> # Plot only CRISPRi cells
-    >>> model.plot_xy_data('GFI1B', subset_meta={'cell_line': 'CRISPRi'})
+    >>> # Plot only cells from one group
+    >>> model.plot_xy_data('GFI1B', subset_meta={'cell_line': 'K562'})
     >>>
     >>> # Plot all junctions for a gene, but only show dependent ones (n_a or n_b CI excludes 0)
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj', only_dependent=True, ci_level=95.0)

@@ -504,7 +504,11 @@ class CisFitter:
                     target_per_guide_tensor[g] = guide_targets[0]
         else:
             target_per_guide_tensor = None
-        sum_factor_tensor = torch.tensor(self.model.meta[sum_factor_col].values, dtype=torch.float32, device=self.model.device)
+        primary_mod = self.model.get_modality(self.model.primary_modality)
+        sum_factor_tensor = torch.tensor(
+            primary_mod.sum_factors.loc[self.model.meta['cell'].values, sum_factor_col].values,
+            dtype=torch.float32, device=self.model.device
+        )
 
         # Compute guide means (adjusting for alpha_x if provided)
         x_obs_factored = x_obs_tensor / sum_factor_tensor

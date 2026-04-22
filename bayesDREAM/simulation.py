@@ -81,7 +81,7 @@ def simulate_from_trans_summary(
         (typically the same column that was passed to ``fit_trans``, e.g.
         ``'sum_factor_new'`` from ``refit_sumfactor``)::
 
-            sim_sum_factor = model.meta['sum_factor_new'].values
+            sim_sum_factor = model.get_modality(model.primary_modality).sum_factors['sum_factor_new'].values
 
         Mathematically, ``plot_xy_data`` displays ``y / (sum_factor_plot * alpha_y)``
         and overlays ``A_mean + alpha * Hill(x)``.  For these to match in
@@ -254,7 +254,7 @@ def simulate_from_trans_summary(
             "(typically the same column passed to fit_trans, e.g. 'sum_factor_new'). "
             "If you see a systematic scale offset (e.g. A_true below A_lower), pass "
             "the per-cell sum factors that match your plotting correction:\n"
-            "    sim_sum_factor=model.meta['sum_factor_new'].values",
+            "    sim_sum_factor=model.get_modality(model.primary_modality).sum_factors['sum_factor_new'].values",
             UserWarning,
             stacklevel=2,
         )

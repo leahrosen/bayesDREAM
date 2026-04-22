@@ -1393,7 +1393,7 @@ class ModelSummarizer:
         x_ntc : float, optional
             Manually provided NTC mean for the cis gene (x-axis reference point).
             If None (default), computed from posterior_samples_technical of the cis modality.
-            Useful when fit_technical was not run (e.g., CRISPRa/CRISPRi-only subsets).
+            Useful when fit_technical was not run (e.g., single-group subsets).
         y_ntc : array-like, optional
             Manually provided NTC means for each trans feature (y-axis reference points).
             Shape: (n_features,). If None (default), computed from posterior_samples_technical

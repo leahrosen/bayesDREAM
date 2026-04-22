@@ -45,6 +45,7 @@ class Modality:
         denominator: Optional[np.ndarray] = None,
         cells_axis: int = 1,  # 0 if cells are rows, 1 if cells are columns
         cell_names: Optional[list] = None,  # Explicit cell names (when counts is ndarray)
+        min_count: int = 1,
         # Exon skipping specific parameters
         inc1: Optional[np.ndarray] = None,
         inc2: Optional[np.ndarray] = None,
@@ -108,7 +109,7 @@ class Modality:
             self.count_df = None
             self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
-            print(f"[SPARSE] Modality '{name}': Keeping counts as sparse matrix (shape: {counts.shape}, sparsity: {1 - counts.nnz / (counts.shape[0] * counts.shape[1]):.2%} zeros)")
+            pass  # sparse matrix stored as-is
         else:
             # Dense array: convert to numpy array
             self.counts = np.asarray(counts)
@@ -160,6 +161,57 @@ class Modality:
                             counts_arr[i, :, K_max - 1] = tmp     # residual slot now real
                     self.counts = counts_arr
 
+                # ---- Filter: drop multinomial features with ≤1 real category or
+                #              zero ratio-variance across cells ----
+                #
+                # Filter 1: Features with ≤1 real category cannot have multinomial
+                #           proportions (no structure to model).
+                # Filter 2: Features where all real-category ratios (count/cell_total)
+                #           have zero std across cells carry no fitting signal.
+                keep = n_cats > 1  # [T] bool, Filter 1
+
+                for i in range(len(n_cats)):
+                    if not keep[i]:
+                        continue
+                    feat = counts_arr[i]  # [n_cells, K_max]
+                    cell_totals = feat.sum(axis=1, keepdims=True)  # [n_cells, 1]
+                    real_cat_mask = feat.sum(axis=0) > 0  # [K_max]
+                    real_counts = feat[:, real_cat_mask]  # [n_cells, K_actual]
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        ratios = np.where(
+                            cell_totals > 0,
+                            real_counts / cell_totals,
+                            0.0,
+                        )  # [n_cells, K_actual]
+                    if np.all(ratios.std(axis=0) == 0):
+                        keep[i] = False  # Filter 2: zero ratio variance
+
+                n_dropped = int((~keep).sum())
+                if n_dropped > 0:
+                    import warnings
+                    n_le1_cat = int((n_cats <= 1).sum())
+                    n_zero_var = n_dropped - n_le1_cat
+                    warnings.warn(
+                        f"[Modality '{name}'] Dropped {n_dropped} multinomial feature(s): "
+                        f"{n_le1_cat} with ≤1 real category, "
+                        f"{n_zero_var} with zero category-ratio variance across cells.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    counts_arr = counts_arr[keep]
+                    if counts_arr.shape[0] == 0:
+                        raise ValueError(
+                            f"[Modality '{name}'] All multinomial features were filtered out "
+                            f"(≤1 real category or zero ratio variance). Check input data."
+                        )
+                    self.feature_meta = self.feature_meta[keep].reset_index(drop=True)
+                    self.feature_meta['n_categories'] = n_cats[keep]
+                    self.counts = counts_arr
+                    if self.feature_names is not None:
+                        self.feature_names = [
+                            fn for fn, k in zip(self.feature_names, keep) if k
+                        ]
+
         # Handle denominator (can also be sparse)
         if denominator is not None:
             if sparse.issparse(denominator):
@@ -190,10 +242,152 @@ class Modality:
         self.posterior_samples_technical = None  # Technical fit: full posterior samples
         self.posterior_samples_trans = None      # Trans fit: full posterior samples
 
+        # Sum factors DataFrame (negbinom modalities only).
+        # Index: cell barcode. Columns: named sum factor variants
+        # (e.g. 'sum_factor', 'sum_factor_adj', 'sum_factor_new').
+        # Populated by bayesDREAM._init_sum_factors() after model init.
+        # The 'cis' modality holds a reference to the same object as the primary modality.
+        self.sum_factors: Optional[pd.DataFrame] = None
+
+        self.min_count = min_count
+
         # Validate shapes
         self._validate()
 
         # Store dimensionality info
+        self.dims = self._compute_dims()
+
+        # Drop features with zero total counts or zero variance across cells.
+        # This runs at creation and automatically re-runs after cell subsetting
+        # (get_cell_subset returns a new Modality, triggering __init__).
+        self._filter_zero_features()
+
+    def _filter_zero_features(self) -> None:
+        """
+        Remove features with total counts below min_count or zero std across cells.
+
+        Called at the end of __init__, so it also fires automatically after any cell
+        subsetting (get_cell_subset returns a new Modality which calls __init__).
+        Modifies self in place; updates counts, feature_meta, feature_names, denominator,
+        inc1/inc2/skip, and dims.
+
+        Per-distribution logic
+        ----------------------
+        negbinom   : drop feature if total counts < min_count OR std across cells == 0
+        normal/
+        studentt   : drop feature if std across cells == 0
+                     (sum of values < min_count is also checked for consistency)
+        binomial   : drop feature if denominator sum < min_count (too few observations)
+                     OR ratio std (numer/denom) across cells == 0
+        multinomial: drop feature if total counts (summed over cells+categories) < min_count
+                     (zero-ratio-variance is already handled earlier in __init__)
+        """
+        min_count = self.min_count
+
+        # ------------------------------------------------------------------ #
+        # 1. Compute keep mask per distribution                               #
+        # ------------------------------------------------------------------ #
+        if self.distribution == 'multinomial':
+            counts_arr = np.asarray(self.counts)          # (T, C, K)
+            totals = counts_arr.sum(axis=(1, 2))          # (T,)
+            keep = totals >= min_count
+
+        elif self.distribution == 'binomial':
+            cell_ax = self.cells_axis
+
+            counts_num = (self.counts.toarray() if sparse.issparse(self.counts)
+                          else np.asarray(self.counts))
+            if self.denominator is not None:
+                denom = (self.denominator.toarray() if sparse.issparse(self.denominator)
+                         else np.asarray(self.denominator))
+            else:
+                denom = counts_num
+
+            denom_sums = denom.sum(axis=cell_ax)
+            has_data = denom_sums >= min_count
+
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratios = np.where(denom > 0, counts_num / denom, np.nan)
+            ratio_stds = np.nanstd(ratios, axis=cell_ax)
+            has_variance = ratio_stds > 0
+
+            keep = has_data & has_variance
+
+        else:  # negbinom, normal, studentt
+            cell_ax = self.cells_axis
+
+            if self.is_sparse:
+                _sp = self.counts.astype(float)
+                totals = np.array(_sp.sum(axis=cell_ax)).flatten()
+                _mean = np.array(_sp.mean(axis=cell_ax)).flatten()
+                _sp2 = _sp.copy()
+                _sp2.data **= 2
+                _sq_mean = np.array(_sp2.mean(axis=cell_ax)).flatten()
+                stds = np.sqrt(np.maximum(_sq_mean - _mean ** 2, 0))
+            else:
+                counts_arr = np.asarray(self.counts)
+                totals = counts_arr.sum(axis=cell_ax)
+                stds = counts_arr.std(axis=cell_ax)
+
+            keep = (totals >= min_count) & (stds > 0)
+
+        n_removed = int((~keep).sum())
+        if n_removed == 0:
+            return
+
+        keep_idx = np.where(keep)[0]
+        n_before = self.dims['n_features']
+
+        print(
+            f"[Modality '{self.name}'] Removed {n_removed}/{n_before} feature(s) "
+            f"with total counts < {min_count} or zero variance across cells."
+        )
+
+        # ------------------------------------------------------------------ #
+        # 2. Apply mask to counts and auxiliary arrays                        #
+        # ------------------------------------------------------------------ #
+        if self.distribution == 'multinomial':
+            self.counts = np.asarray(self.counts)[keep_idx, :, :]
+
+        elif self.cells_axis == 1:
+            if self.is_sparse:
+                self.counts = self.counts[keep_idx, :]
+            else:
+                self.counts = np.asarray(self.counts)[keep_idx, :]
+
+            if self.denominator is not None:
+                if sparse.issparse(self.denominator):
+                    self.denominator = self.denominator[keep_idx, :]
+                else:
+                    self.denominator = np.asarray(self.denominator)[keep_idx, :]
+
+            for _attr in ('inc1', 'inc2', 'skip'):
+                _val = getattr(self, _attr)
+                if _val is not None:
+                    setattr(self, _attr, _val[keep_idx, :])
+
+        else:  # cells_axis == 0
+            if self.is_sparse:
+                self.counts = self.counts[:, keep_idx]
+            else:
+                self.counts = np.asarray(self.counts)[:, keep_idx]
+
+            if self.denominator is not None:
+                if sparse.issparse(self.denominator):
+                    self.denominator = self.denominator[:, keep_idx]
+                else:
+                    self.denominator = np.asarray(self.denominator)[:, keep_idx]
+
+        # count_df is now stale — drop it to avoid inconsistency
+        self.count_df = None
+
+        # ------------------------------------------------------------------ #
+        # 3. Update metadata and dims                                         #
+        # ------------------------------------------------------------------ #
+        self.feature_meta = self.feature_meta.iloc[keep_idx].reset_index(drop=True)
+        if self.feature_names is not None:
+            self.feature_names = [self.feature_names[i] for i in keep_idx]
+
         self.dims = self._compute_dims()
 
     def _validate(self):
@@ -321,7 +515,8 @@ class Modality:
             distribution=self.distribution,
             denominator=new_denom,
             cells_axis=self.cells_axis,
-            feature_names=new_feature_names,   # <---
+            feature_names=new_feature_names,
+            min_count=self.min_count,
             inc1=new_inc1,
             inc2=new_inc2,
             skip=new_skip,
@@ -384,6 +579,7 @@ class Modality:
             cells_axis=self.cells_axis,
             feature_names=self.feature_names,  # Preserve feature names during cell subsetting
             cell_names=new_cell_names,
+            min_count=self.min_count,
             inc1=new_inc1,
             inc2=new_inc2,
             skip=new_skip,

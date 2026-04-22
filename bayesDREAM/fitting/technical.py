@@ -261,9 +261,16 @@ class TechnicalFitter:
         
             # Force α to 0 where category is structurally absent
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-        
-            # Center across categories; re-apply the mask to keep zeros exactly 0
-            alpha_logits_y = alpha_logits_y - alpha_logits_y.mean(dim=-1, keepdim=True)
+
+            # Center over ACTIVE categories only.
+            # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
+            # Dividing by n_active (not K) gives the correct softmax centering constraint
+            # (sum of active alphas = 0).  Dividing by K would leave a residual constant
+            # shift in the active alphas, breaking identifiability for features with
+            # many phantom categories.
+            n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
+            active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
+            alpha_logits_y = alpha_logits_y - active_mean
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
             alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
         
@@ -466,20 +473,16 @@ class TechnicalFitter:
                 torch.full_like(concentration, 1e-6),
                 concentration,
             )
-            #assert concentration.shape == (T, K), f"concentration {concentration.shape} != ({T},{K})"
             with f_plate:
                 probs0 = pyro.sample("probs_baseline_raw", dist.Dirichlet(concentration))  # [T, K]
-            #assert probs0.shape == (T, K), f"Dirichlet sample {probs0.shape} != ({T},{K})"
-            #assert zero_cat_mask.shape == (T, K), f"zero_cat_mask {zero_cat_mask.shape} != ({T},{K})"
-        
+
             # Hard-zero masked categories and renormalize across active ones
             probs_masked = probs0 * (~zero_cat_mask).to(probs0.dtype)                 # [T, K]
             row_sums = probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             probs_baseline = probs_masked / row_sums                                   # [T, K]
             probs_baseline = pyro.deterministic("probs_baseline", probs_baseline)
-        
+
             mu_y = probs_baseline  # [T, K]
-            #print(f'[DEBUG] mu_y.shape = {mu_y.shape}, expected: [{T}, {K}]')
 
     
         else:
@@ -635,7 +638,7 @@ class TechnicalFitter:
 
             **When NOT to use use_all_cells=True (use default NTC-only):**
             - Technical groups correlate with cis gene expression
-              Example: CRISPRi vs CRISPRa cell lines targeting the cis gene
+              Example: cell lines that differ in perturbation type
             - Low MOI experiments with clear NTC vs perturbed distinction
             - When technical correction should be based solely on unperturbed cells
 
@@ -763,7 +766,7 @@ class TechnicalFitter:
             warnings.warn(
                 "[WARNING] use_all_cells=True: Fitting technical effects on ALL cells. "
                 "Only use this mode if technical effects are independent of perturbation effects. "
-                "If technical groups (e.g., CRISPRi vs CRISPRa) correlate with cis gene expression, "
+                "If technical groups correlate with cis gene expression, "
                 "use the default NTC-only mode to avoid over-correction.",
                 UserWarning
             )
@@ -969,31 +972,31 @@ class TechnicalFitter:
             # per-feature categories must be present in *all* technical groups
             groups_ntc_codes = meta_ntc['technical_group_code'].values
             unique_groups = np.unique(groups_ntc_codes)
-        
+
             F, _, K = counts_ntc_array.shape  # [features, cells, categories]
-        
+
             for f_idx in range(F):
                 feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
-        
+
                 shared_present = None  # will become boolean [K]
                 for g in unique_groups:
                     g_mask = (groups_ntc_codes == g)
                     if not np.any(g_mask):
                         continue  # should not happen, but just in case
-        
+
                     counts_g = feature_counts[g_mask, :].sum(axis=0)  # [K]
                     present_g = counts_g > 0                          # category present in this group?
-        
+
                     if shared_present is None:
                         shared_present = present_g
                     else:
                         shared_present &= present_g  # intersection across groups
-        
+
                 if shared_present is None:
                     n_shared = 0
                 else:
                     n_shared = int(shared_present.sum())
-        
+
                 # If 0 or 1 categories survive the "present in all groups" criterion,
                 # the feature cannot support a multinomial cell-line effect.
                 if n_shared <= 1:
@@ -1098,7 +1101,8 @@ class TechnicalFitter:
 
         # Size-factor use only for NB; otherwise ignore
         if distribution == 'negbinom' and sum_factor_col is not None:
-            y_obs_ntc_factored = y_obs_ntc_for_priors / meta_ntc[sum_factor_col].values.reshape(-1, 1)
+            ntc_sf = modality.sum_factors.loc[meta_ntc['cell'].values, sum_factor_col].values
+            y_obs_ntc_factored = y_obs_ntc_for_priors / ntc_sf.reshape(-1, 1)
         else:
             y_obs_ntc_factored = y_obs_ntc_for_priors
 
@@ -1226,7 +1230,9 @@ class TechnicalFitter:
         del mu_x_mean, mu_x_sd  # Free numpy arrays
 
         if sum_factor_col is not None and distribution == 'negbinom':
-            sum_factor_np = meta_ntc[sum_factor_col].values.astype(np.float32)
+            sum_factor_np = modality.sum_factors.loc[
+                meta_ntc['cell'].values, sum_factor_col
+            ].values.astype(np.float32)
             sum_factor_ntc_tensor = torch.from_numpy(sum_factor_np).to(self.model.device)
             del sum_factor_np
         else:
@@ -1268,10 +1274,34 @@ class TechnicalFitter:
             gc.collect()
     
         # ---------------------------
+        # Multinomial precomputations (done once, before guide + SVI)
+        # ---------------------------
+        if distribution == 'multinomial':
+            # Replicate the zero-category mask from _model_technical so we can use it here.
+            _total_all = y_obs_ntc_tensor.sum(dim=0)                          # [T, K]
+            _zmask = (_total_all == 0)
+            for _g in range(C):
+                _gm = (groups_ntc_tensor == _g)
+                if _gm.sum() > 0:
+                    _zmask = _zmask | (y_obs_ntc_tensor[_gm].sum(dim=0) == 0)
+
+            # Reference group empirical proportions → log-space init for softmax guide
+            _ref_m = (groups_ntc_tensor == 0)
+            _ref_counts = (y_obs_ntc_tensor[_ref_m].sum(dim=0).float() + 1.0
+                           if _ref_m.sum() > 0 else y_obs_ntc_tensor.sum(dim=0).float() + 1.0)
+            _ref_counts = _ref_counts.masked_fill(_zmask, 0.0)
+            _ref_props = _ref_counts / _ref_counts.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            _log_p_init = torch.log(_ref_props.clamp(min=1e-8))              # [T, K]
+
+            # Store for the guide closure
+            self._multinomial_zero_cat_mask = _zmask                         # [T, K]
+            self._multinomial_log_p_init    = _log_p_init                    # [T, K]
+
+        # ---------------------------
         # Guide + init functions
         # ---------------------------
         import pyro.poutine as poutine
-        from pyro.infer.autoguide import AutoGuideList, AutoDelta, AutoNormal, AutoNormalMessenger, AutoIAFNormal
+        from pyro.infer.autoguide import AutoNormal, AutoNormalMessenger, AutoIAFNormal
         from pyro.infer.autoguide.initialization import init_to_median
         
         def _safe_simplex_from_counts(total_counts_TK: torch.Tensor, interior_floor=1e-3) -> torch.Tensor:
@@ -1302,37 +1332,8 @@ class TechnicalFitter:
             # Multinomial-only inits
             # -------------------------
             if distribution == 'multinomial':
-                # Robust init for Dirichlet (simplex) - use reference group empirical proportions
-                if name == "probs_baseline_raw":
-                    # Use the site's own shapes to be robust to any future plate changes
-                    T_local = int(site["fn"].batch_shape[0])
-                    K_local = int(site["fn"].event_shape[0])
-
-                    # Compute empirical proportions from reference group (group 0)
-                    baseline_mask = (groups_ntc_tensor == 0).cpu().numpy()
-                    if baseline_mask.sum() > 0:
-                        # Get reference group counts: [N_ref, T, K]
-                        y_ref = y_obs_ntc_tensor[baseline_mask, :, :].cpu().numpy()
-                        # Sum across cells: [T, K]
-                        total_counts_ref = y_ref.sum(axis=0) + 1.0  # Add pseudocount
-                        # Compute proportions
-                        p_empirical = total_counts_ref / total_counts_ref.sum(axis=1, keepdims=True)
-                        # Convert to torch
-                        p = torch.tensor(p_empirical, dtype=torch.float32, device=self.model.device)
-                    else:
-                        # Fallback to uniform if no reference group
-                        p = torch.full((T_local, K_local), 1.0 / K_local,
-                                       dtype=torch.float32, device=self.model.device)
-
-                    # Ensure strictly interior (move away from boundaries)
-                    eps = 5e-3
-                    p = (1.0 - K_local * eps) * p + eps
-                    p = p / p.sum(dim=-1, keepdim=True)
-
-                    assert torch.isfinite(p).all(), "Dirichlet init produced non-finite entries"
-                    assert (p > 0).all() and (p < 1).all(), "Dirichlet init not strictly interior"
-                    return p
-
+                # probs_baseline_raw is guided by the softmax pyro.param directly —
+                # init_loc_fn is never called for it. Only alpha_logits_y reaches here.
                 if name == "alpha_logits_y":
                     # Initialize with logit-scale differences between groups vs reference
                     shape = site["fn"].batch_shape  # [C-1, T_fit, K]
@@ -1446,22 +1447,30 @@ class TechnicalFitter:
         # Guide choice with memory check
         # ---------------------------
         if distribution == 'multinomial':
-            # Split guide: point-mass for Dirichlet baseline, Gaussian for the rest
-            guide_cellline = AutoGuideList(self._model_technical)
+            # Softmax guide for probs_baseline_raw: avoids the stick-breaking gradient
+            # compression that caused AutoDelta to overshoot near the simplex boundary.
+            # We parameterise log-proportions in ℝ^K and apply softmax — gradients are
+            # uniform everywhere, no vanishing near p→1.
+            _zmask_guide  = self._multinomial_zero_cat_mask   # [T, K]  captured in closure
+            _log_p_init_g = self._multinomial_log_p_init      # [T, K]
+            _T_guide      = T_fit
+            _plate_name   = "feature_plate_technical"
 
-            # Pin the Dirichlet site with a learnable point; init uses our interior simplex
-            guide_dirichlet = AutoDelta(
-                poutine.block(self._model_technical, expose=["probs_baseline_raw"]),
-                init_loc_fn=init_loc_fn,
-            )
-            guide_cellline.add(guide_dirichlet)
-
-            # Everything else stays as a stable Normal guide (uses your inits for alpha_logits_y, etc.)
-            guide_rest = AutoNormal(
+            # AutoNormal for alpha_logits_y (all sites except probs_baseline_raw)
+            _guide_alpha = AutoNormal(
                 poutine.block(self._model_technical, hide=["probs_baseline_raw"]),
                 init_loc_fn=init_loc_fn,
             )
-            guide_cellline.add(guide_rest)
+
+            def guide_cellline(*args, **kwargs):
+                # ---- probs_baseline_raw: softmax-parameterised point estimate ----
+                log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
+                log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
+                probs = torch.softmax(log_p_masked, dim=-1)                  # [T, K]
+                with pyro.plate(_plate_name, _T_guide, dim=-1):
+                    pyro.sample("probs_baseline_raw", dist.Delta(probs, event_dim=1))
+                # ---- everything else: AutoNormal ----
+                _guide_alpha(*args, **kwargs)
 
         elif distribution in ['binomial', 'normal', 'studentt']:
             # Calmer guide for these distributions
