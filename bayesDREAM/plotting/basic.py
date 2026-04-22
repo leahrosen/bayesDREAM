@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
-from .helpers import to_np, resolve_guide_labels
+from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior
 from .colors import ColorScheme
 
 
@@ -27,13 +27,15 @@ def _guide_sort_key(g):
 
 
 def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
-                     single_guide_cells_only=False, ax=None, show=True):
+                     single_guide_cells_only=False, facet_ntc=False,
+                     ax=None, show=True):
     """
-    Scatter plot of per-guide mean vs std of x_true, one point per guide.
+    Scatter of per-cell x_true posterior mean vs std, one point per cell.
 
-    x_true is a per-cell point estimate (posterior mean), so the scatter shows
-    variability *across cells* within each guide rather than posterior uncertainty
-    per cell.
+    Uses ``model.posterior_samples_cis['x_true']`` (shape ``[S, N_cells]``) when
+    available so that x and y reflect genuine posterior uncertainty per cell.
+    Falls back to the ``model.x_true`` point estimate (std = 0) if no posterior
+    is stored.
 
     Parameters
     ----------
@@ -46,65 +48,89 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
     color_scheme : ColorScheme, optional
         Custom color scheme.
     single_guide_cells_only : bool, default False
-        Required to be ``True`` for high-MOI models; subsets to cells with at
-        most one targeting guide (see :func:`resolve_guide_labels`).
+        Required to be ``True`` for high-MOI models.
+    facet_ntc : bool, default False
+        If ``True``, split into two side-by-side panels: NTC guides (left) and
+        targeting guides (right).  Returns ``(fig, [ax_ntc, ax_targeting])``.
     ax : matplotlib axes, optional
-        Axes to plot on.
+        Used only when ``facet_ntc=False``.
     show : bool, default True
-        Whether to display the plot.
 
     Returns
     -------
-    ax : matplotlib axes
+    ax : matplotlib axes  (when ``facet_ntc=False``)
+    (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
         color_scheme = ColorScheme()
-
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    x_vals = to_np(model.x_true)                          # [N_cells]
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
-    x_vals = x_vals[cell_mask]
-    guide_labels = guide_labels[cell_mask]
 
-    if log2:
-        x_vals = _log2_safe(x_vals)
+    post = _xtrue_posterior(model)
+    if post is not None:
+        post = post[:, cell_mask]                          # [S, N_kept]
+        if log2:
+            post = np.where(post > 0, np.log2(np.maximum(post, 1e-300)), np.nan)
+        x_mean = np.nanmean(post, axis=0)                  # [N_kept]
+        x_std  = np.nanstd(post,  axis=0)                  # [N_kept]
+    else:
+        x_vals = to_np(model.x_true)[cell_mask]
+        if log2:
+            x_vals = _log2_safe(x_vals)
+        x_mean = x_vals
+        x_std  = np.zeros_like(x_vals)
+
+    guide_labels = guide_labels[cell_mask]
+    suffix = ' (log2)' if log2 else ''
+
+    def _draw(ax_, gl, xm, xs, title_):
+        for guide in sorted(np.unique(gl), key=_guide_sort_key):
+            gmask = gl == guide
+            xm_g = xm[gmask];  xs_g = xs[gmask]
+            valid = ~(np.isnan(xm_g) | np.isnan(xs_g))
+            if not valid.any():
+                continue
+            color = color_scheme.get_guide_color(guide, 'black')
+            ax_.scatter(xm_g[valid], xs_g[valid], s=14, alpha=0.8,
+                        color=color, label=guide)
+        ax_.set_xlabel(f'mean x_true{suffix}')
+        ax_.set_ylabel(f'std x_true{suffix}')
+        ax_.set_title(title_)
+        ax_.grid(True, linewidth=0.5, alpha=0.4)
+        ax_.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
+
+    if facet_ntc:
+        ntc = _guide_ntc_mask(guide_labels, model)
+        fig, (ax_ntc, ax_tgt) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+        _draw(ax_ntc, guide_labels[ntc],  x_mean[ntc],  x_std[ntc],
+              f'{cis_gene}: NTC{suffix}')
+        _draw(ax_tgt, guide_labels[~ntc], x_mean[~ntc], x_std[~ntc],
+              f'{cis_gene}: targeting{suffix}')
+        plt.tight_layout()
+        if show:
+            plt.show()
+        return fig, [ax_ntc, ax_tgt]
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
-
-    for guide in np.unique(guide_labels):
-        vals = x_vals[guide_labels == guide]
-        vals = vals[~np.isnan(vals)]
-        if len(vals) == 0:
-            continue
-        color = color_scheme.get_guide_color(guide, 'black')
-        ax.scatter([np.mean(vals)], [np.std(vals)], s=40, alpha=0.85,
-                   color=color, label=guide)
-
-    suffix = ' (log2)' if log2 else ''
-    ax.set_xlabel(f'guide mean x_true{suffix}')
-    ax.set_ylabel(f'guide std x_true{suffix}')
-    ax.set_title(f'{cis_gene}: guide mean vs std of x_true{suffix}')
-    ax.grid(True, linewidth=0.5, alpha=0.4)
-    ax.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
+    _draw(ax, guide_labels, x_mean, x_std,
+          f'{cis_gene}: mean vs std of x_true{suffix}')
     plt.tight_layout()
-
     if show:
         plt.show()
-
     return ax
 
 
 def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
                           color_scheme=None, single_guide_cells_only=False,
-                          ax=None, show=True):
+                          facet_ntc=False, ax=None, show=True):
     """
-    Scatter of per-guide mean vs 95 % CI width of x_true, one point per guide.
+    Scatter of per-cell x_true posterior mean vs 95 % CI width, one point per cell.
 
-    The 95 % CI is computed across cells within each guide (not across posterior
-    samples), because x_true is now a per-cell point estimate.
+    Uses ``model.posterior_samples_cis['x_true']`` when available so that the CI
+    reflects genuine posterior uncertainty.  Falls back to ``model.x_true`` (CI = 0).
 
     Parameters
     ----------
@@ -115,58 +141,85 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     log2 : bool, default False
         Apply log2 transform before computing statistics.
     full_width : bool, default False
-        If ``True``, show full (p97.5 − p2.5) width; otherwise half-width.
+        If ``True``, show full (p97.5 − p2.5) CI; otherwise half-width.
     color_scheme : ColorScheme, optional
         Custom color scheme.
     single_guide_cells_only : bool, default False
         Required to be ``True`` for high-MOI models.
+    facet_ntc : bool, default False
+        If ``True``, split into NTC / targeting panels.
+        Returns ``(fig, [ax_ntc, ax_targeting])``.
     ax : matplotlib axes, optional
+        Used only when ``facet_ntc=False``.
     show : bool, default True
 
     Returns
     -------
-    ax : matplotlib axes
+    ax : matplotlib axes  (when ``facet_ntc=False``)
+    (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
         color_scheme = ColorScheme()
-
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    x_vals = to_np(model.x_true)                          # [N_cells]
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
-    x_vals = x_vals[cell_mask]
-    guide_labels = guide_labels[cell_mask]
 
-    if log2:
-        x_vals = _log2_safe(x_vals)
+    post = _xtrue_posterior(model)
+    if post is not None:
+        post = post[:, cell_mask]                          # [S, N_kept]
+        if log2:
+            post = np.where(post > 0, np.log2(np.maximum(post, 1e-300)), np.nan)
+        x_mean = np.nanmean(post, axis=0)
+        q_lo   = np.nanpercentile(post, 2.5,  axis=0)
+        q_hi   = np.nanpercentile(post, 97.5, axis=0)
+    else:
+        x_vals = to_np(model.x_true)[cell_mask]
+        if log2:
+            x_vals = _log2_safe(x_vals)
+        x_mean = x_vals
+        q_lo = q_hi = x_vals
+
+    y_val = (q_hi - q_lo) if full_width else 0.5 * (q_hi - q_lo)
+    guide_labels = guide_labels[cell_mask]
+    suffix = ' (log2)' if log2 else ''
+    ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{suffix}'
+
+    def _draw(ax_, gl, xm, yv, title_):
+        for guide in sorted(np.unique(gl), key=_guide_sort_key):
+            gmask = gl == guide
+            xm_g = xm[gmask];  yv_g = yv[gmask]
+            valid = ~(np.isnan(xm_g) | np.isnan(yv_g))
+            if not valid.any():
+                continue
+            color = color_scheme.get_guide_color(guide, 'black')
+            ax_.scatter(xm_g[valid], yv_g[valid], s=14, alpha=0.85,
+                        color=color, label=guide)
+        ax_.set_xlabel(f'mean x_true{suffix}')
+        ax_.set_ylabel(ylabel)
+        ax_.set_title(title_)
+        ax_.grid(True, linewidth=0.5, alpha=0.4)
+        ax_.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
+
+    if facet_ntc:
+        ntc = _guide_ntc_mask(guide_labels, model)
+        fig, (ax_ntc, ax_tgt) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+        _draw(ax_ntc, guide_labels[ntc],  x_mean[ntc],  y_val[ntc],
+              f'{cis_gene}: NTC{suffix}')
+        _draw(ax_tgt, guide_labels[~ntc], x_mean[~ntc], y_val[~ntc],
+              f'{cis_gene}: targeting{suffix}')
+        plt.tight_layout()
+        if show:
+            plt.show()
+        return fig, [ax_ntc, ax_tgt]
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
-
-    for guide in np.unique(guide_labels):
-        vals = x_vals[guide_labels == guide]
-        vals = vals[~np.isnan(vals)]
-        if len(vals) == 0:
-            continue
-        gm = np.mean(vals)
-        q_lo, q_hi = np.percentile(vals, [2.5, 97.5])
-        y_val = (q_hi - q_lo) if full_width else 0.5 * (q_hi - q_lo)
-        color = color_scheme.get_guide_color(guide, 'black')
-        ax.scatter([gm], [y_val], s=40, alpha=0.85, color=color, label=guide)
-
-    suffix = ' (log2)' if log2 else ''
-    ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{suffix}'
-    ax.set_xlabel(f'guide mean x_true{suffix}')
-    ax.set_ylabel(ylabel)
-    ax.set_title(f'{cis_gene}: mean vs 95% CI of x_true{suffix}')
-    ax.grid(True, linewidth=0.5, alpha=0.4)
-    ax.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
+    _draw(ax, guide_labels, x_mean, y_val,
+          f'{cis_gene}: mean vs 95% CI of x_true{suffix}')
     plt.tight_layout()
-
     if show:
         plt.show()
-
     return ax
 
 
@@ -245,7 +298,8 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
 
 
 def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=None,
-                                 single_guide_cells_only=False, ax=None, show=True):
+                                 single_guide_cells_only=False, facet_ntc=False,
+                                 ax=None, show=True):
     """
     Filled KDE density plot of x_true (log2), one curve per guide.
 
@@ -261,12 +315,17 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
         Custom color scheme.
     single_guide_cells_only : bool, default False
         Required to be ``True`` for high-MOI models.
+    facet_ntc : bool, default False
+        If ``True``, split into NTC / targeting panels.
+        Returns ``(fig, [ax_ntc, ax_targeting])``.
     ax : matplotlib axes, optional
+        Used only when ``facet_ntc=False``.
     show : bool, default True
 
     Returns
     -------
-    ax : matplotlib axes
+    ax : matplotlib axes  (when ``facet_ntc=False``)
+    (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
         color_scheme = ColorScheme()
@@ -285,28 +344,36 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     xmin, xmax = np.nanpercentile(x_log, [0.5, 99.5])
     x_grid = np.linspace(xmin, xmax, 500)
 
-    guide_order = sorted(np.unique(guide_labels), key=_guide_sort_key)
+    def _draw(ax_, gl, title_):
+        guide_order = sorted(np.unique(gl), key=_guide_sort_key)
+        for g in guide_order:
+            sub = x_log[(gl == g) & valid]
+            if len(sub) < 2:
+                continue
+            kde = gaussian_kde(sub, bw_method=bw)
+            density = kde(x_grid)
+            color = color_scheme.get_guide_color(g, 'black')
+            ax_.fill_between(x_grid, density, alpha=0.4, color=color, label=g)
+            ax_.plot(x_grid, density, color=color, linewidth=1.5)
+        ax_.set_xlabel('x_true (log₂)', fontsize=11)
+        ax_.set_ylabel('Density', fontsize=11)
+        ax_.set_title(title_, fontsize=12)
+        ax_.legend(title='guide', fontsize=8, frameon=False)
+        ax_.grid(True, linewidth=0.5, alpha=0.3)
+
+    if facet_ntc:
+        ntc = _guide_ntc_mask(guide_labels, model)
+        fig, (ax_ntc, ax_tgt) = plt.subplots(1, 2, figsize=(16, 5))
+        _draw(ax_ntc, guide_labels[ntc],  f'{cis_gene}: NTC')
+        _draw(ax_tgt, guide_labels[~ntc], f'{cis_gene}: targeting')
+        plt.tight_layout()
+        if show:
+            plt.show()
+        return fig, [ax_ntc, ax_tgt]
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 5))
-
-    for g in guide_order:
-        sub = x_log[(guide_labels == g) & valid]
-        if len(sub) < 2:
-            continue
-
-        kde = gaussian_kde(sub, bw_method=bw)
-        density = kde(x_grid)
-
-        color = color_scheme.get_guide_color(g, 'black')
-        ax.fill_between(x_grid, density, alpha=0.4, color=color, label=g)
-        ax.plot(x_grid, density, color=color, linewidth=1.5)
-
-    ax.set_xlabel('x_true (log₂)', fontsize=11)
-    ax.set_ylabel('Density', fontsize=11)
-    ax.set_title(f'{cis_gene}: x_true density by guide', fontsize=12)
-    ax.legend(title='guide', fontsize=8, frameon=False)
-    ax.grid(True, linewidth=0.5, alpha=0.3)
+    _draw(ax, guide_labels, f'{cis_gene}: x_true density by guide')
     plt.tight_layout()
 
     if show:

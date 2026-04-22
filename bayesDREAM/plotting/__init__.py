@@ -22,7 +22,8 @@ from .prior_posterior import (
 from .colors import ColorScheme, build_guide_colors, lighten, darken
 
 # Helper utilities
-from .helpers import to_np, per_cell_mean_std, resolve_guide_labels
+from .helpers import (to_np, per_cell_mean_std, resolve_guide_labels,
+                       _guide_ntc_mask, _xtrue_posterior)
 from .utils import (
     hill_xinf_samples,
     dependency_mask_from_n,
