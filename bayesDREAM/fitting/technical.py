@@ -696,25 +696,38 @@ class TechnicalFitter:
                     f"Cannot perform cis modeling with '{distribution}' distribution."
                 )
 
-        # For primary modality, use original counts (includes cis gene)
-        # For other modalities, use modality counts
-        if modality_name == self.model.primary_modality and hasattr(self.model, 'counts'):
-            # Use original counts which include the cis gene
-            if isinstance(self.model.counts, pd.DataFrame):
-                counts_to_fit = self.model.counts.values
-                # Cell names from the DataFrame columns
-                modality_cells = self.model.counts.columns.tolist()
-            else:
-                counts_to_fit = self.model.counts
-                # Fall back to meta cells
-                modality_cells = self.model.meta['cell'].values[:counts_to_fit.shape[modality.cells_axis]]
-            print(f"[INFO] Using original counts for primary modality '{modality_name}' (includes cis gene if present)")
+        # Always use the modality's filtered counts directly (densify if sparse)
+        counts_to_fit = modality.counts
+        if hasattr(counts_to_fit, 'toarray'):
+            counts_to_fit = counts_to_fit.toarray()
+        if modality.cell_names is not None:
+            modality_cells = modality.cell_names
         else:
-            counts_to_fit = modality.counts
-            if modality.cell_names is not None:
-                modality_cells = modality.cell_names
+            modality_cells = self.model.meta['cell'].values[:counts_to_fit.shape[modality.cells_axis]]
+
+        # Track number of trans features; we may append the cis gene row below
+        n_trans_features = modality.dims['n_features']
+        cis_idx_in_counts = None  # set if cis gene is appended as last row
+
+        # For primary modality with a cis gene: append the cis gene row so we can
+        # estimate alpha_x_prefit from the technical fit (NTC cells only).
+        if (modality_name == self.model.primary_modality
+                and self.model.cis_gene is not None
+                and 'cis' in self.model.modalities):
+            cis_mod = self.model.get_modality('cis')
+            # cis modality has cells_axis=1, so counts is [1, N]
+            cis_row = cis_mod.counts if cis_mod.cells_axis == 1 else cis_mod.counts.T
+
+            if sparse.issparse(counts_to_fit):
+                cis_row_sp = (cis_row.tocsr() if sparse.issparse(cis_row)
+                              else sparse.csr_matrix(np.asarray(cis_row).reshape(1, -1)))
+                counts_to_fit = sparse.vstack([counts_to_fit, cis_row_sp], format='csr')
             else:
-                modality_cells = self.model.meta['cell'].values[:counts_to_fit.shape[modality.cells_axis]]
+                cis_row_dense = np.asarray(cis_row).reshape(1, -1)
+                counts_to_fit = np.vstack([np.asarray(counts_to_fit), cis_row_dense])
+
+            cis_idx_in_counts = n_trans_features  # cis gene is the last row
+            print(f"[INFO] Appended cis gene '{self.model.cis_gene}' for alpha_x estimation")
 
         # CRITICAL: Convert numpy.matrix to numpy.ndarray if needed
         # numpy.matrix is deprecated and has problematic indexing behavior with boolean arrays
@@ -1979,59 +1992,24 @@ class TechnicalFitter:
         # ----------------------------------------
         # Feature metadata flags
         # ----------------------------------------
-        # Determine where masks were computed from (based on counts_to_fit source)
-        # If we used self.model.counts, masks correspond to those features
-        # If we used modality.counts, masks correspond to modality features
-        # Did we use self.model.counts as the source for counts_to_fit?
-        used_original_counts = (
-            modality_name == self.model.primary_modality
-            and hasattr(self.model, "counts")
-        )
-        
-        if used_original_counts:
-            # Masks are for original counts features - store in base class
-            if isinstance(self.model.counts, pd.DataFrame):
-                index = self.model.counts.index
-            else:
-                # No natural index => just use a RangeIndex of the right length
-                index = pd.RangeIndex(len(zero_count_mask))
-        
-            if not hasattr(self.model, "counts_meta"):
-                self.model.counts_meta = pd.DataFrame(index=index)
-            elif len(self.model.counts_meta) != len(zero_count_mask):
-                # Realign counts_meta if needed
-                self.model.counts_meta = self.model.counts_meta.reindex(index)
-        
-            self.model.counts_meta["ntc_zero_count"]            = zero_count_mask
-            self.model.counts_meta["ntc_zero_std"]              = zero_std_mask
-            self.model.counts_meta["ntc_single_category"]       = only_one_category_mask
-            self.model.counts_meta["ntc_excluded_from_fit"]     = needs_exclusion_mask
-            self.model.counts_meta["technical_correction_applied"] = ~needs_exclusion_mask
-        
-        else:
-            # Masks are for modality features - store in modality metadata
-            if len(zero_count_mask) != len(modality.feature_meta):
-                raise ValueError(
-                    f"Mask length mismatch: masks have {len(zero_count_mask)} elements "
-                    f"but modality.feature_meta has {len(modality.feature_meta)} rows. "
-                    f"This likely means counts_to_fit and modality.counts have different feature counts."
-                )
-            modality.feature_meta["ntc_zero_count"]            = zero_count_mask.tolist()
-            modality.feature_meta["ntc_zero_std"]              = zero_std_mask.tolist()
-            modality.feature_meta["ntc_single_category"]       = only_one_category_mask.tolist()
-            modality.feature_meta["ntc_excluded_from_fit"]     = needs_exclusion_mask.tolist()
-            modality.feature_meta["technical_correction_applied"] = (~needs_exclusion_mask).tolist()
+        # Masks cover rows 0..n_trans_features-1 (trans genes) and optionally
+        # row n_trans_features (cis gene, if appended).  Store only the trans
+        # portion in the modality's feature_meta.
+        if len(modality.feature_meta) == n_trans_features:
+            modality.feature_meta["ntc_zero_count"]               = zero_count_mask[:n_trans_features].tolist()
+            modality.feature_meta["ntc_zero_std"]                 = zero_std_mask[:n_trans_features].tolist()
+            modality.feature_meta["ntc_single_category"]          = only_one_category_mask[:n_trans_features].tolist()
+            modality.feature_meta["ntc_excluded_from_fit"]        = needs_exclusion_mask[:n_trans_features].tolist()
+            modality.feature_meta["technical_correction_applied"] = (~needs_exclusion_mask[:n_trans_features]).tolist()
 
     
         # ----------------------------------------
         # Persist results at modality level
         # ----------------------------------------
-        # For primary modality fitted with original counts (includes cis gene),
-        # we need to extract alpha_x for the cis gene and exclude it from modality alpha_y.
-        if modality_name == self.model.primary_modality and hasattr(self.model, 'counts') and \
-           self.model.cis_gene is not None and 'cis' in self.model.modalities:
+        if cis_idx_in_counts is not None:
+            # Cis gene was appended as the last row.  Extract its alpha for alpha_x_prefit,
+            # then trim it from all primary-modality posteriors so they align with the modality.
 
-            # Enforce: cis effect must NOT be multinomial
             if distribution == 'multinomial':
                 raise ValueError(
                     "Primary modality uses a multinomial distribution, "
@@ -2039,123 +2017,77 @@ class TechnicalFitter:
                     "Ensure the primary modality is not multinomial when cis is present."
                 )
 
-            # Check if cis gene is in the original counts
-            if isinstance(self.model.counts, pd.DataFrame) and self.model.cis_gene in self.model.counts.index:
-                all_genes_orig = self.model.counts.index.tolist()
-                cis_idx_orig = all_genes_orig.index(self.model.cis_gene)
+            full_alpha_y_mult = posterior_samples["alpha_y_mult"]
+            full_alpha_y_add  = posterior_samples["alpha_y_add"]
 
-                # Expect alpha_y_mult and alpha_y_add to be [S?, C, T_all] for non-multinomial primary
-                full_alpha_y_mult = posterior_samples["alpha_y_mult"]
-                full_alpha_y_add  = posterior_samples["alpha_y_add"]
+            if full_alpha_y_mult is None:
+                raise RuntimeError(
+                    "alpha_y_mult is None while attempting cis extraction. "
+                    "This can happen if the distribution is multinomial; "
+                    "check distribution handling earlier."
+                )
 
-                if full_alpha_y_mult is None:
-                    raise RuntimeError(
-                        "alpha_y_mult is None while attempting cis extraction. "
-                        "This can happen if the distribution is multinomial; "
-                        "check distribution handling earlier."
-                    )
+            cis_idx_orig = cis_idx_in_counts          # always == n_trans_features
+            trans_idx    = list(range(cis_idx_orig))  # 0 .. n_trans_features-1
+            T_all_with_cis = n_trans_features + 1
 
-                if cis_idx_orig < full_alpha_y_mult.shape[-1]:
-                    # Extract cis gene alpha (mean over samples → [C])
-                    self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
+            # alpha_x_prefit: mean over posterior samples → [C]
+            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
 
-                    # Exclude cis from modality alpha_y
-                    all_idx = list(range(full_alpha_y_mult.shape[-1]))
-                    trans_idx = [i for i in all_idx if i != cis_idx_orig]
-
-                    # Store mean over samples → [C, T]
-                    if modality.distribution == 'negbinom':
-                        modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
-                        # Don't set alpha_y_prefit_add for negbinom
-                    else:  # binomial, multinomial, normal, studentt use additive
-                        modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
-                        # Don't set alpha_y_prefit_mult for additive modalities
-
-                    # ========================================
-                    # Extract cis gene posterior samples and store in cis modality
-                    # ========================================
-                    cis_modality = self.model.get_modality('cis')
-                    cis_posterior = {}
-
-                    # Extract raw sampled parameters for cis gene
-                    if 'log2_alpha_y' in posterior_samples:
-                        cis_posterior['log2_alpha_x'] = posterior_samples['log2_alpha_y'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'alpha_y_mul' in posterior_samples:
-                        cis_posterior['alpha_x_mul'] = posterior_samples['alpha_y_mul'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'delta_y_add' in posterior_samples:
-                        cis_posterior['delta_x_add'] = posterior_samples['delta_y_add'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'o_y' in posterior_samples:
-                        cis_posterior['o_x'] = posterior_samples['o_y'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'mu_ntc' in posterior_samples:
-                        cis_posterior['mu_ntc'] = posterior_samples['mu_ntc'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    # Create reconstructed alpha with baseline (matching what we do for alpha_y)
-                    # These already have shape [S, C-1, 1] from the extraction above
-                    if 'alpha_x_mul' in cis_posterior:
-                        alpha_x_mul_raw = cis_posterior['alpha_x_mul']  # [S, C-1, 1]
-                        # Add baseline (C=1) dimension
-                        if alpha_x_mul_raw.dim() == 3:
-                            S, Cminus1, _ = alpha_x_mul_raw.shape
-                            cis_posterior['alpha_x_mult'] = torch.cat(
-                                [torch.ones(S, 1, 1, device=alpha_x_mul_raw.device), alpha_x_mul_raw],
-                                dim=1
-                            )  # [S, C, 1]
-                        cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']  # alias
-
-                    if 'delta_x_add' in cis_posterior:
-                        delta_x_add_raw = cis_posterior['delta_x_add']  # [S, C-1, 1]
-                        # Add baseline (C=0) dimension
-                        if delta_x_add_raw.dim() == 3:
-                            S, Cminus1, _ = delta_x_add_raw.shape
-                            cis_posterior['alpha_x_add'] = torch.cat(
-                                [torch.zeros(S, 1, 1, device=delta_x_add_raw.device), delta_x_add_raw],
-                                dim=1
-                            )  # [S, C, 1]
-
-                    # Store in cis modality
-                    cis_modality.posterior_samples_technical = cis_posterior
-                    print(f"[INFO] Stored cis gene posterior samples in 'cis' modality: {list(cis_posterior.keys())}")
-
-                    # ========================================
-                    # Exclude cis gene from ALL primary modality posterior samples
-                    # ========================================
-                    # Store full posteriors (not means) in posterior_samples dict
-                    if modality.distribution == 'negbinom':
-                        posterior_samples["alpha_y_mult"] = full_alpha_y_mult[..., trans_idx]
-                        posterior_samples["alpha_y"] = posterior_samples["alpha_y_mult"]
-                    else:
-                        posterior_samples["alpha_y_add"] = full_alpha_y_add[..., trans_idx]
-                        posterior_samples["alpha_y"] = posterior_samples["alpha_y_add"]
-
-                    # CRITICAL: Also exclude cis gene from ALL raw posterior samples
-                    # These raw samples are used for analysis/diagnostics, so they must match gene modality
-                    for key in ['log2_alpha_y', 'alpha_y_mul', 'delta_y_add', 'o_y', 'mu_ntc']:
-                        if key in posterior_samples:
-                            raw_sample = posterior_samples[key]
-                            # These are typically [S, C-1, T] or [S, 1, T] depending on the parameter
-                            if raw_sample is not None and raw_sample.shape[-1] == len(all_genes_orig):
-                                posterior_samples[key] = raw_sample[..., trans_idx]
-                                print(f"[INFO] Excluded cis gene from '{key}': {raw_sample.shape} -> {posterior_samples[key].shape}")
-
-                    print(f"[INFO] Extracted alpha_x for cis '{self.model.cis_gene}' and excluded it from ALL primary modality posterior samples")
-                else:
-                    # Cis gene not present after filtering; store mean
-                    if modality.distribution == 'negbinom':
-                        modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
-                    else:
-                        modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
+            # Modality alpha_y: trans genes only → mean → [C, T]
+            if modality.distribution == 'negbinom':
+                modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
             else:
-                # Cis gene not in counts; store mean
-                if modality.distribution == 'negbinom':
-                    modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
-                else:
-                    modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
+                modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
+
+            # ---- Store cis gene posteriors in cis modality ----
+            cis_modality = self.model.get_modality('cis')
+            cis_posterior = {}
+            for src_key, dst_key in [
+                ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
+                ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
+                ('mu_ntc',      'mu_ntc'),
+            ]:
+                if src_key in posterior_samples:
+                    cis_posterior[dst_key] = posterior_samples[src_key][..., cis_idx_orig:cis_idx_orig+1]
+
+            if 'alpha_x_mul' in cis_posterior:
+                raw = cis_posterior['alpha_x_mul']  # [S, C-1, 1]
+                if raw.dim() == 3:
+                    S, Cminus1, _ = raw.shape
+                    cis_posterior['alpha_x_mult'] = torch.cat(
+                        [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
+                    cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
+
+            if 'delta_x_add' in cis_posterior:
+                raw = cis_posterior['delta_x_add']  # [S, C-1, 1]
+                if raw.dim() == 3:
+                    S, Cminus1, _ = raw.shape
+                    cis_posterior['alpha_x_add'] = torch.cat(
+                        [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
+
+            cis_modality.posterior_samples_technical = cis_posterior
+            print(f"[INFO] Stored cis gene posteriors in 'cis' modality: {list(cis_posterior.keys())}")
+
+            # ---- Trim cis gene from ALL primary-modality posteriors ----
+            if modality.distribution == 'negbinom':
+                posterior_samples["alpha_y_mult"] = full_alpha_y_mult[..., trans_idx]
+                posterior_samples["alpha_y"]      = posterior_samples["alpha_y_mult"]
+            else:
+                posterior_samples["alpha_y_add"] = full_alpha_y_add[..., trans_idx]
+                posterior_samples["alpha_y"]     = posterior_samples["alpha_y_add"]
+
+            for key in ['log2_alpha_y', 'alpha_y_mul', 'delta_y_add', 'o_y', 'mu_ntc']:
+                if key in posterior_samples and isinstance(posterior_samples[key], torch.Tensor):
+                    v = posterior_samples[key]
+                    if v.shape[-1] == T_all_with_cis:
+                        posterior_samples[key] = v[..., trans_idx]
+
+            print(f"[INFO] Extracted alpha_x for '{self.model.cis_gene}' (index {cis_idx_orig}) "
+                  f"and trimmed it from primary modality posteriors")
+
         else:
-            # Not primary modality or no cis gene, store mean
+            # No cis gene appended (non-primary modality, or no cis_gene set)
             if modality.distribution == 'negbinom':
                 modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
             else:

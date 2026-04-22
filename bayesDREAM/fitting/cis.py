@@ -165,11 +165,8 @@ class CisFitter:
             # This is always finite since x_eff_g > 0 and NTC_mean > 0.
 
             # NTC reference: weighted mean of NTC guide effects
-            ntc_mask = torch.tensor(
-                [self.model.guide_meta.iloc[g]['target'] == 'ntc' for g in range(x_eff_g.shape[-1])],
-                dtype=torch.bool,
-                device=self.model.device
-            )
+            # Use pre-computed mask (set in fit_cis before SVI loop to avoid pandas access here)
+            ntc_mask = self.model._ntc_guide_mask
             cells_per_guide = self.model.guide_assignment_tensor.sum(dim=0)  # [G]
             weights = cells_per_guide / sigma_eff.clamp(min=1e-6)            # [G]
             ntc_weights = weights[ntc_mask]
@@ -328,12 +325,15 @@ class CisFitter:
         if isinstance(cis_modality.counts, pd.DataFrame):
             cis_counts = cis_modality.counts.loc[cis_feature].values
         else:
-            # numpy array - need to find index
+            # numpy/sparse array - need to find index
             feature_idx = cis_modality.feature_meta.index.get_loc(cis_feature)
             if cis_modality.cells_axis == 1:
                 cis_counts = cis_modality.counts[feature_idx, :]
             else:
                 cis_counts = cis_modality.counts[:, feature_idx]
+            # Densify if sparse (slicing sparse returns sparse row/col matrix)
+            if hasattr(cis_counts, 'toarray'):
+                cis_counts = cis_counts.toarray().ravel()
 
         # convert to gpu for fitting
         if self.model.alpha_x_prefit is not None and self.model.alpha_x_prefit.device != self.model.device:
@@ -480,15 +480,35 @@ class CisFitter:
 
             ### BUILD target_per_guide_tensor [G] based on guide → target
             if self.model.is_high_moi:
-                # High MOI: use guide_meta to get target for each guide
-                # guide_meta has 'target' column, and guides are in order by guide_code
-                if 'target' not in self.model.guide_meta.columns:
-                    raise ValueError("independent_mu_sigma is True, but guide_meta missing 'target' column.")
+                # High MOI: derive one target label per guide for grouping mu/sigma.
+                # Two sources: guide_meta['target'] (simple) or guide_targets_dict (many-to-many).
+                _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
 
-                # Factorize targets to get unique target codes
-                target_factorized, target_unique = pd.factorize(self.model.guide_meta['target'])
+                if 'target' in self.model.guide_meta.columns:
+                    guide_target_labels = self.model.guide_meta['target'].tolist()
+                elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
+                    # Derive a single representative target per guide.
+                    # Priority: cis_gene > any NTC variant > first target.
+                    def _primary_target(targets):
+                        if self.model.cis_gene and self.model.cis_gene in targets:
+                            return self.model.cis_gene
+                        for t in targets:
+                            if t in _ntc_variants:
+                                return 'ntc'
+                        return targets[0] if targets else 'ntc'
+
+                    guide_target_labels = [
+                        _primary_target(self.model.guide_targets_dict.get(row['guide'], ['ntc']))
+                        for _, row in self.model.guide_meta.iterrows()
+                    ]
+                else:
+                    raise ValueError(
+                        "independent_mu_sigma=True in high MOI mode requires either "
+                        "guide_meta['target'] or guide_targets_dict."
+                    )
+
+                target_factorized, target_unique = pd.factorize(guide_target_labels)
                 target_per_guide_tensor = torch.tensor(target_factorized, dtype=torch.long, device=self.model.device)
-
                 print(f"[INFO] independent_mu_sigma (high MOI): {len(target_unique)} unique targets")
             else:
                 # Single-guide mode: use existing logic
@@ -604,6 +624,25 @@ class CisFitter:
                 return sigma_eff_mean_tensor.clamp(min=1e-2).expand(G)
         
             return pyro.infer.autoguide.initialization.init_to_median(site)
+
+        # Pre-compute NTC guide mask for high MOI mode (avoids pandas access inside Pyro model)
+        if self.model.is_high_moi:
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            if 'target' in self.model.guide_meta.columns:
+                ntc_flags = [self.model.guide_meta.iloc[g]['target'] in _ntc_variants
+                             for g in range(G)]
+            elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
+                ntc_flags = [
+                    any(t in _ntc_variants for t in self.model.guide_targets_dict.get(row['guide'], []))
+                    for _, row in self.model.guide_meta.iterrows()
+                ]
+            else:
+                raise ValueError(
+                    "High MOI mode requires either guide_meta['target'] or guide_targets_dict "
+                    "to identify NTC guides."
+                )
+            self.model._ntc_guide_mask = torch.tensor(ntc_flags, dtype=torch.bool,
+                                                       device=self.model.device)
 
         guide_x = pyro.infer.autoguide.AutoNormalMessenger(self._model_x, init_loc_fn=init_loc_fn)
         guide_x.to(self.model.device)
