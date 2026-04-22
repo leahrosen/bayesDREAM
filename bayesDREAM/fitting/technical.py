@@ -827,36 +827,45 @@ class TechnicalFitter:
         zero_std_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
 
         # --- Per-group zero-count check for negbinom ---
-        # A feature with all-zero counts in ANY technical group will have an unconstrained
-        # (prior-dominated) alpha_y estimate for that group. This produces extreme
-        # multiplicative corrections (e.g. 2^22) that corrupt downstream trans fitting.
-        # Match the per-group checks already in place for binomial/normal/multinomial.
+        # Two cases need different treatment:
+        #  - Reference group (group 0) all-zero: baseline expression can't be estimated;
+        #    exclude the feature entirely (all groups get alpha_y = 1.0).
+        #  - Non-reference group all-zero: fit the feature on the other groups normally;
+        #    after fitting, patch alpha_y = 1.0 only for the zero-count group(s).
         any_group_zero_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
+        _negbinom_nonref_patch = {}   # {group_code (int): bool array [T_all]} — applied post-fit
         if distribution == 'negbinom' and 'technical_group_code' in meta_ntc.columns:
             groups_ntc_codes = meta_ntc['technical_group_code'].values
             unique_groups_nb = np.unique(groups_ntc_codes)
-            if len(unique_groups_nb) > 1:  # only matters with multiple groups
-                if counts_ntc_array.ndim == 2:
-                    for g in unique_groups_nb:
-                        g_mask = (groups_ntc_codes == g)
-                        if g_mask.sum() == 0:
-                            continue
-                        if modality.cells_axis == 1:
-                            group_sums = counts_ntc_array[:, g_mask].sum(axis=1)
-                        else:
-                            group_sums = counts_ntc_array[g_mask, :].sum(axis=0)
-                        if sparse.issparse(group_sums):
-                            group_sums = np.asarray(group_sums).flatten()
-                        any_group_zero_mask |= (group_sums == 0)
-                # For 3D (multinomial handled separately below); negbinom is always 2D.
-                n_per_group_zero = int(any_group_zero_mask.sum())
-                n_already_excluded = int(zero_count_mask.sum())
-                n_new = int((any_group_zero_mask & ~zero_count_mask).sum())
-                if n_new > 0:
-                    print(f"[INFO] {modality_name}: excluding {n_new} additional feature(s) where "
-                          f"all NTC counts are zero in at least one technical group "
-                          f"(would produce extreme alpha_y estimates). "
-                          f"Total excluded: {n_already_excluded + n_new}/{len(feature_sums_ntc)}")
+            if len(unique_groups_nb) > 1 and counts_ntc_array.ndim == 2:
+                for g in unique_groups_nb:
+                    g_mask = (groups_ntc_codes == g)
+                    if g_mask.sum() == 0:
+                        continue
+                    if modality.cells_axis == 1:
+                        group_sums = counts_ntc_array[:, g_mask].sum(axis=1)
+                    else:
+                        group_sums = counts_ntc_array[g_mask, :].sum(axis=0)
+                    if sparse.issparse(group_sums):
+                        group_sums = np.asarray(group_sums).flatten()
+                    feat_zero = (group_sums == 0)
+                    if g == 0:
+                        # Reference group zero → baseline corrupted → exclude entirely
+                        n_new = int((feat_zero & ~zero_count_mask).sum())
+                        if n_new > 0:
+                            print(f"[INFO] {modality_name}: {n_new} feature(s) excluded — "
+                                  f"all-zero NTC counts in reference group (baseline can't be estimated).")
+                        any_group_zero_mask |= feat_zero
+                    else:
+                        # Non-reference group zero → fit on other groups, patch this group after
+                        # Only track features that aren't already excluded for other reasons
+                        patchable = feat_zero & ~zero_count_mask
+                        n_patch = int(patchable.sum())
+                        if n_patch > 0:
+                            print(f"[INFO] {modality_name}: {n_patch} feature(s) have all-zero NTC counts "
+                                  f"in non-reference group {g}; will fit on other groups and "
+                                  f"set alpha_y=1.0 for group {g} after fitting.")
+                            _negbinom_nonref_patch[int(g)] = patchable
 
         if distribution == 'multinomial':
             for f_idx in range(counts_ntc_array.shape[0]):
@@ -1055,7 +1064,7 @@ class TechnicalFitter:
         num_zero_count_only = (zero_count_mask & ~zero_std_mask & ~only_one_category_mask & ~any_group_zero_mask).sum()
         num_zero_std_only = (zero_std_mask & ~only_one_category_mask & ~any_group_zero_mask).sum()
         num_single_category = only_one_category_mask.sum()
-        num_group_zero = (any_group_zero_mask & ~zero_count_mask).sum()
+        num_group_zero = (any_group_zero_mask & ~zero_count_mask).sum()  # ref-group-zero exclusions only
         num_excluded = needs_exclusion_mask.sum()
 
         if num_excluded > 0:
@@ -1920,6 +1929,18 @@ class TechnicalFitter:
             alpha_y_mult_full = _reconstruct_full_2d(alpha_y_mult_fit, baseline_value=1.0, fit_mask_bool=fit_mask)
             log2_alpha_fit = posterior_samples["log2_alpha_y"]
             alpha_y_add_full = _reconstruct_full_2d(log2_alpha_fit, baseline_value=0.0, fit_mask_bool=fit_mask)
+
+            # Patch non-reference zero-count (group, feature) pairs to baseline (negbinom only).
+            # These features were included in fitting but the zero-count group's alpha_y estimate
+            # is unreliable (prior-dominated). Overwrite with 1.0 (no technical correction).
+            # alpha_y_mult_full shape: [C, T_all]; group index matches technical_group_code.
+            if _negbinom_nonref_patch:
+                n_pairs = sum(int(m.sum()) for m in _negbinom_nonref_patch.values())
+                print(f"[INFO] Patching alpha_y=1.0 (mult) / 0.0 (add) for {n_pairs} "
+                      f"(group, feature) pair(s) with all-zero NTC counts in a non-reference group.")
+                for g, feat_mask_patch in _negbinom_nonref_patch.items():
+                    alpha_y_mult_full[g, feat_mask_patch] = 1.0
+                    alpha_y_add_full[g, feat_mask_patch] = 0.0
 
             # Choose correct type based on distribution
             # negbinom: multiplicative, others: additive
