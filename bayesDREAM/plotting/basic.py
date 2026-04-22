@@ -8,28 +8,50 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
-from .helpers import to_np
+from .helpers import to_np, resolve_guide_labels
 from .colors import ColorScheme
 
 
-def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None, ax=None, show=True):
+def _log2_safe(x):
+    """log2 of x, returning NaN for non-positive values."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(x > 0, np.log2(np.maximum(x, 1e-300)), np.nan)
+
+
+def _guide_sort_key(g):
+    """Sort guides: primary key = name before last underscore; secondary = trailing number."""
+    parts = g.rsplit('_', 1)
+    root = parts[0]
+    idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return (root, idx)
+
+
+def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
+                     single_guide_cells_only=False, ax=None, show=True):
     """
-    Scatter plot of per-cell mean vs std of x_true, colored by guide.
+    Scatter plot of per-guide mean vs std of x_true, one point per guide.
+
+    x_true is a per-cell point estimate (posterior mean), so the scatter shows
+    variability *across cells* within each guide rather than posterior uncertainty
+    per cell.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
     cis_gene : str, optional
-        Cis gene name (used for title, defaults to model.cis_gene)
+        Cis gene name (title only; defaults to model.cis_gene).
     log2 : bool, default False
-        Whether to use log2 scale
+        Apply log2 transform before computing statistics.
     color_scheme : ColorScheme, optional
-        Custom color scheme. If None, uses default.
+        Custom color scheme.
+    single_guide_cells_only : bool, default False
+        Required to be ``True`` for high-MOI models; subsets to cells with at
+        most one targeting guide (see :func:`resolve_guide_labels`).
     ax : matplotlib axes, optional
-        Axes to plot on. If None, creates new figure.
+        Axes to plot on.
     show : bool, default True
-        Whether to display the plot
+        Whether to display the plot.
 
     Returns
     -------
@@ -41,29 +63,30 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None, ax=Non
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    df = model.meta.copy()
-    X = to_np(model.x_true)
+    x_vals = to_np(model.x_true)                          # [N_cells]
+    guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
+    x_vals = x_vals[cell_mask]
+    guide_labels = guide_labels[cell_mask]
 
     if log2:
-        # filter strictly positive before log
-        mask_pos = (X > 0).all(axis=0)
-        X = X[:, mask_pos]
-        df = df.loc[mask_pos].reset_index(drop=True)
-        X = np.log2(X)
-
-    x_mean, x_std = X.mean(axis=0), X.std(axis=0)
+        x_vals = _log2_safe(x_vals)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
 
-    for guide, subidx in df.groupby('guide').groups.items():
+    for guide in np.unique(guide_labels):
+        vals = x_vals[guide_labels == guide]
+        vals = vals[~np.isnan(vals)]
+        if len(vals) == 0:
+            continue
         color = color_scheme.get_guide_color(guide, 'black')
-        ax.scatter(x_mean[subidx], x_std[subidx], s=14, alpha=0.8,
-                  color=color, label=guide)
+        ax.scatter([np.mean(vals)], [np.std(vals)], s=40, alpha=0.85,
+                   color=color, label=guide)
 
-    ax.set_xlabel('mean x_true' + (' (log2)' if log2 else ''))
-    ax.set_ylabel('std x_true' + (' (log2)' if log2 else ''))
-    ax.set_title(f'{cis_gene}: mean vs std of x_true' + (' (log2)' if log2 else ''))
+    suffix = ' (log2)' if log2 else ''
+    ax.set_xlabel(f'guide mean x_true{suffix}')
+    ax.set_ylabel(f'guide std x_true{suffix}')
+    ax.set_title(f'{cis_gene}: guide mean vs std of x_true{suffix}')
     ax.grid(True, linewidth=0.5, alpha=0.4)
     ax.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
     plt.tight_layout()
@@ -75,26 +98,30 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None, ax=Non
 
 
 def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
-                          color_scheme=None, ax=None, show=True):
+                          color_scheme=None, single_guide_cells_only=False,
+                          ax=None, show=True):
     """
-    Scatter of per-cell mean vs 95% CI width (or half-width) of x_true samples.
+    Scatter of per-guide mean vs 95 % CI width of x_true, one point per guide.
+
+    The 95 % CI is computed across cells within each guide (not across posterior
+    samples), because x_true is now a per-cell point estimate.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
     cis_gene : str, optional
-        Cis gene name (used for title, defaults to model.cis_gene)
+        Cis gene name (title only).
     log2 : bool, default False
-        Whether to use log2 scale
+        Apply log2 transform before computing statistics.
     full_width : bool, default False
-        If True, plot full width. If False, plot half-width.
+        If ``True``, show full (p97.5 − p2.5) width; otherwise half-width.
     color_scheme : ColorScheme, optional
-        Custom color scheme
+        Custom color scheme.
+    single_guide_cells_only : bool, default False
+        Required to be ``True`` for high-MOI models.
     ax : matplotlib axes, optional
-        Axes to plot on
     show : bool, default True
-        Whether to display the plot
 
     Returns
     -------
@@ -106,33 +133,33 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    df = model.meta.copy()
-    X = to_np(model.x_true)  # shape [S, N] (samples x cells)
+    x_vals = to_np(model.x_true)                          # [N_cells]
+    guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
+    x_vals = x_vals[cell_mask]
+    guide_labels = guide_labels[cell_mask]
 
     if log2:
-        mask_pos = (X > 0).all(axis=0)
-        X = X[:, mask_pos]
-        df = df.loc[mask_pos].reset_index(drop=True)
-        X = np.log2(X)
-
-    x_mean = X.mean(axis=0)
-    q_lo  = np.percentile(X, 2.5, axis=0)
-    q_hi  = np.percentile(X, 97.5, axis=0)
-    y_val = (q_hi - q_lo) if full_width else 0.5 * (q_hi - q_lo)
+        x_vals = _log2_safe(x_vals)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
 
-    for guide, idx in df.groupby('guide').groups.items():
+    for guide in np.unique(guide_labels):
+        vals = x_vals[guide_labels == guide]
+        vals = vals[~np.isnan(vals)]
+        if len(vals) == 0:
+            continue
+        gm = np.mean(vals)
+        q_lo, q_hi = np.percentile(vals, [2.5, 97.5])
+        y_val = (q_hi - q_lo) if full_width else 0.5 * (q_hi - q_lo)
         color = color_scheme.get_guide_color(guide, 'black')
-        ax.scatter(x_mean[idx], y_val[idx], s=14, alpha=0.85,
-                  color=color, label=guide)
+        ax.scatter([gm], [y_val], s=40, alpha=0.85, color=color, label=guide)
 
-    ax.set_xlabel('mean x_true' + (' (log2)' if log2 else ''))
-    ylabel = '95% CI ' + ('width' if full_width else 'half-width')
-    ylabel += ' of x_true' + (' (log2)' if log2 else '')
+    suffix = ' (log2)' if log2 else ''
+    ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{suffix}'
+    ax.set_xlabel(f'guide mean x_true{suffix}')
     ax.set_ylabel(ylabel)
-    ax.set_title(f'{cis_gene}: mean vs 95% CI of x_true' + (' (log2)' if log2 else ''))
+    ax.set_title(f'{cis_gene}: mean vs 95% CI of x_true{suffix}')
     ax.grid(True, linewidth=0.5, alpha=0.4)
     ax.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
     plt.tight_layout()
@@ -143,22 +170,23 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     return ax
 
 
-def violin_by_guide_log2(model, cis_gene=None, color_scheme=None, ax=None, show=True):
+def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
+                         single_guide_cells_only=False, ax=None, show=True):
     """
     Violin plot of x_true (log2) grouped by guide, colored by target.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
     cis_gene : str, optional
-        Cis gene name (used for title, defaults to model.cis_gene)
+        Cis gene name (title only).
     color_scheme : ColorScheme, optional
-        Custom color scheme
+        Custom color scheme.
+    single_guide_cells_only : bool, default False
+        Required to be ``True`` for high-MOI models.
     ax : matplotlib axes, optional
-        Axes to plot on
     show : bool, default True
-        Whether to display the plot
 
     Returns
     -------
@@ -170,25 +198,22 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None, ax=None, show=
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    df = model.meta.copy()
-    X = to_np(model.x_true)
+    x_vals = to_np(model.x_true)                          # [N_cells]
+    guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
+    x_vals = x_vals[cell_mask]
+    guide_labels = guide_labels[cell_mask]
 
-    pos_mask = (X > 0).all(axis=0)
-    X = X[:, pos_mask]
-    df = df.loc[pos_mask].reset_index(drop=True)
+    pos_mask = x_vals > 0
+    x_log = _log2_safe(x_vals)
 
-    Xlog = np.log2(X)
-    x_cell_mean = Xlog.mean(axis=0)
-    df = df.assign(x_true_mean_log2=x_cell_mean)
-
-    guide_order = sorted(df['guide'].astype(str).unique(),
-                        key=lambda g: (g.split('_')[0], int(g.split('_')[1])
-                                     if '_' in g and g.split('_')[1].isdigit() else 0))
-    data = [df.loc[df['guide'] == g, 'x_true_mean_log2'].values for g in guide_order]
+    guide_order = sorted(np.unique(guide_labels), key=_guide_sort_key)
+    data = [x_log[(guide_labels == g) & pos_mask] for g in guide_order]
 
     colors = []
     for g in guide_order:
-        target = g.split('_')[0] if '_' in g else g
+        # Target is everything before the last underscore-number suffix, if present
+        parts = g.rsplit('_', 1)
+        target = parts[0] if (len(parts) > 1 and parts[1].isdigit()) else g
         colors.append(color_scheme.get_target_color(target, 'gray'))
 
     if ax is None:
@@ -208,7 +233,7 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None, ax=None, show=
 
     ax.set_xticks(np.arange(1, len(guide_order)+1))
     ax.set_xticklabels(guide_order, rotation=45, ha='right', fontsize=9)
-    ax.set_ylabel('x_true mean (log₂)', fontsize=11)
+    ax.set_ylabel('x_true (log₂)', fontsize=11)
     ax.set_title(f'{cis_gene}: x_true distribution by guide', fontsize=12)
     ax.grid(axis='y', linewidth=0.5, alpha=0.3)
     plt.tight_layout()
@@ -220,24 +245,24 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None, ax=None, show=
 
 
 def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=None,
-                                 ax=None, show=True):
+                                 single_guide_cells_only=False, ax=None, show=True):
     """
-    Filled KDE density plot of x_true (log2), colored by guide.
+    Filled KDE density plot of x_true (log2), one curve per guide.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
     cis_gene : str, optional
-        Cis gene name (used for title, defaults to model.cis_gene)
+        Cis gene name (title only).
     bw : float, optional
-        KDE bandwidth. If None, uses scott's rule.
+        KDE bandwidth.  If ``None``, uses Scott's rule.
     color_scheme : ColorScheme, optional
-        Custom color scheme
+        Custom color scheme.
+    single_guide_cells_only : bool, default False
+        Required to be ``True`` for high-MOI models.
     ax : matplotlib axes, optional
-        Axes to plot on
     show : bool, default True
-        Whether to display the plot
 
     Returns
     -------
@@ -249,29 +274,24 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    df = model.meta.copy()
-    X = to_np(model.x_true)
+    x_vals = to_np(model.x_true)                          # [N_cells]
+    guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
+    x_vals = x_vals[cell_mask]
+    guide_labels = guide_labels[cell_mask]
 
-    pos_mask = (X > 0).all(axis=0)
-    X = X[:, pos_mask]
-    df = df.loc[pos_mask].reset_index(drop=True)
+    x_log = _log2_safe(x_vals)
+    valid = ~np.isnan(x_log)
 
-    Xlog = np.log2(X)
-    x_cell_mean = Xlog.mean(axis=0)
-    df = df.assign(x_true_mean_log2=x_cell_mean)
-
-    xmin, xmax = np.percentile(x_cell_mean, [0.5, 99.5])
+    xmin, xmax = np.nanpercentile(x_log, [0.5, 99.5])
     x_grid = np.linspace(xmin, xmax, 500)
 
-    guide_order = sorted(df['guide'].astype(str).unique(),
-                        key=lambda g: (g.split('_')[0], int(g.split('_')[1])
-                                     if '_' in g and g.split('_')[1].isdigit() else 0))
+    guide_order = sorted(np.unique(guide_labels), key=_guide_sort_key)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 5))
 
     for g in guide_order:
-        sub = df.loc[df['guide'] == g, 'x_true_mean_log2'].values
+        sub = x_log[(guide_labels == g) & valid]
         if len(sub) < 2:
             continue
 
@@ -282,7 +302,7 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
         ax.fill_between(x_grid, density, alpha=0.4, color=color, label=g)
         ax.plot(x_grid, density, color=color, linewidth=1.5)
 
-    ax.set_xlabel('x_true mean (log₂)', fontsize=11)
+    ax.set_xlabel('x_true (log₂)', fontsize=11)
     ax.set_ylabel('Density', fontsize=11)
     ax.set_title(f'{cis_gene}: x_true density by guide', fontsize=12)
     ax.legend(title='guide', fontsize=8, frameon=False)
