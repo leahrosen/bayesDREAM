@@ -63,6 +63,7 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
     """
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -164,6 +165,7 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     """
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -274,6 +276,7 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     """
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
 
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
@@ -354,14 +357,14 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     else:  # 'target'
         colors = []
         for g in guide_order:
-            parts = g.rsplit('_', 1)
-            target = parts[0] if (len(parts) > 1 and parts[1].isdigit()) else g
+            target = color_scheme.guide_target(g)
+            if target is None:
+                target = g  # last resort
             colors.append(color_scheme.get_target_color(target, 'gray'))
-        # Legend: unique target → color
+        # Legend: unique target → color (preserve guide_order ordering)
         seen_tgt = {}
         for g, c in zip(guide_order, colors):
-            parts = g.rsplit('_', 1)
-            tgt = parts[0] if (len(parts) > 1 and parts[1].isdigit()) else g
+            tgt = color_scheme.guide_target(g) or g
             if tgt not in seen_tgt:
                 seen_tgt[tgt] = c
         legend_handles = [
@@ -444,6 +447,7 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     """
     if color_scheme is None:
         color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
 
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')

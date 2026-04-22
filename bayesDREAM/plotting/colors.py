@@ -12,8 +12,20 @@ Defaults
 - Targeting guides:   shades of green (cm.Greens, 0.40–0.85) for first gene, etc.
 - CRISPRi:            steelblue
 - CRISPRa:            tomato
+
+Usage
+-----
+The recommended way to get correct guide colors is via the model's own scheme::
+
+    # Built automatically at model init:
+    model.color_scheme.get_guide_color(guide_name)
+
+When passing an explicit scheme to a plotting function, the function calls
+``color_scheme.connect(model)`` internally so that actual guide names are
+always resolved correctly — regardless of naming convention.
 """
 
+import copy
 import numpy as np
 import matplotlib.colors as mcolors
 from matplotlib import cm
@@ -64,9 +76,45 @@ def _detect_crispri_crispra(model):
     return result
 
 
+def _build_guide_to_target(model):
+    """
+    Build ``{guide_name: normalised_target}`` from model metadata.
+
+    Works for both low-MOI (reads ``model.meta``) and high-MOI (reads
+    ``model.guide_meta`` + ``model.guide_targets_dict``).  NTC variants
+    are all normalised to ``'NTC'``.
+
+    Returns
+    -------
+    dict[str, str]
+    """
+    guide_to_target = {}
+    is_high_moi = getattr(model, 'is_high_moi', False)
+
+    if is_high_moi and hasattr(model, 'guide_meta'):
+        guide_names = model.guide_meta['guide'].astype(str).tolist()
+        gtd = getattr(model, 'guide_targets_dict', {})
+        for gn in guide_names:
+            targets = [str(t) for t in gtd.get(gn, [])]
+            targeting = [t for t in targets if not _is_ntc(t)]
+            guide_to_target[gn] = targeting[0] if targeting else 'NTC'
+    elif hasattr(model, 'meta'):
+        if 'guide' in model.meta.columns and 'target' in model.meta.columns:
+            for _, row in model.meta.drop_duplicates('guide').iterrows():
+                t = str(row['target'])
+                guide_to_target[str(row['guide'])] = 'NTC' if _is_ntc(t) else t
+
+    guide_to_target['multiple_NTC'] = 'NTC'
+    # Normalise all NTC variants → 'NTC'
+    return {g: ('NTC' if _is_ntc(t) else t) for g, t in guide_to_target.items()}
+
+
 def build_guide_colors(palette_dict):
     """
     Build guide-level colors from target palette.
+
+    Generates ``TARGET_N`` style keys.  For actual model guide names use
+    ``ColorScheme.from_model()`` or ``ColorScheme.connect(model)`` instead.
 
     Parameters
     ----------
@@ -114,6 +162,15 @@ class ColorScheme:
     * ``ColorScheme.from_model(model)`` — recommended; auto-detects everything
     * ``ColorScheme(palette=..., technical_group_colors=...)`` — manual palette
 
+    Key method
+    ----------
+    ``connect(model)``
+        Augments any scheme with actual guide names from the model, using this
+        scheme's palette / colormaps for color generation.  Always call this
+        inside plotting functions before looking up guide colors::
+
+            color_scheme = color_scheme.connect(model)
+
     Attributes
     ----------
     guide_colors : dict
@@ -124,6 +181,8 @@ class ColorScheme:
         group name/value → color
     target_cmaps : dict
         target → colormap (for dynamic generation of unseen guides)
+    _guide_to_target : dict
+        guide name → target name (populated by ``from_model`` and ``connect``)
     """
 
     # Default colormap rotation for targets
@@ -136,20 +195,22 @@ class ColorScheme:
         Parameters
         ----------
         palette : dict, optional
-            Target -> list-of-colors mapping used to pre-populate ``guide_colors``.
-            Keys should be target root names (e.g. ``'GFI1B'``, ``'NTC'``).
-            If ``None`` a minimal default is used.
+            Target -> list-of-colors mapping.  Colors are indexed as
+            ``TARGET_1``, ``TARGET_2``, … For actual model guide names that
+            don't follow this convention, call ``connect(model)`` after
+            construction (plotting functions do this automatically).
         target_cmaps : dict, optional
-            Target -> colormap for dynamic color generation of unseen guides.
+            Target -> colormap.  If ``None``, inferred from palette keys:
+            NTC-variant keys → ``cm.Greys``; others rotate through
+            ``DEFAULT_CMAPS``.
         technical_group_colors : dict, optional
-            Explicit map from technical group string values to colors.
-            Defaults to ``{'CRISPRi': 'steelblue', 'CRISPRa': 'tomato', ...}``.
+            Explicit map from technical group values to colors.
         guide_colors : dict, optional
             Explicit guide-name → color overrides / additions.
         target_colors : dict, optional
             Explicit target-name → color overrides / additions.
         """
-        # ---- palette-based colours (backward compat) ----
+        # ---- palette-based colours ----
         if palette is None:
             self.palette = {
                 'GFI1B': [cm.Greens(i) for i in np.linspace(0.40, 0.85, 5)],
@@ -159,16 +220,21 @@ class ColorScheme:
         else:
             self.palette = palette
 
+        # Infer target_cmaps from palette when not supplied explicitly
         if target_cmaps is None:
-            self.target_cmaps = {
-                'GFI1B': cm.Greens,
-                'NTC':   cm.Greys,
-                'ntc':   cm.Greys,
-            }
+            self.target_cmaps = {}
+            non_ntc_idx = 0
+            for t in self.palette:
+                if _is_ntc(t):
+                    self.target_cmaps[t] = cm.Greys
+                else:
+                    self.target_cmaps[t] = self.DEFAULT_CMAPS[
+                        non_ntc_idx % len(self.DEFAULT_CMAPS)]
+                    non_ntc_idx += 1
         else:
             self.target_cmaps = dict(target_cmaps)
 
-        # Build from palette, then apply any explicit overrides
+        # Build from palette (TARGET_N style keys), then apply explicit overrides
         self.guide_colors = build_guide_colors(self.palette)
         if guide_colors:
             self.guide_colors.update(guide_colors)
@@ -187,6 +253,9 @@ class ColorScheme:
             self.technical_group_colors = dict(technical_group_colors)
 
         self._unknown_target_idx = 0
+
+        # Guide → target map; populated by from_model / connect
+        self._guide_to_target = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -224,8 +293,12 @@ class ColorScheme:
         Get color for a guide.
 
         Checks explicit ``guide_colors`` first (populated by ``from_model``
-        with real guide names), then falls back to dynamic generation from
-        the ``TARGET_NUMBER`` naming convention.
+        or ``connect``), then falls back to ``TARGET_NUMBER`` dynamic
+        generation, then to ``_guide_to_target`` lookup, then to ``default``.
+
+        For reliable coloring of non-``TARGET_N`` guide names, call
+        ``connect(model)`` on the scheme before plotting (plotting functions
+        do this automatically).
         """
         guide_str = str(guide)
 
@@ -247,6 +320,15 @@ class ColorScheme:
                 color = cmap(t)
                 self.guide_colors[guide_str] = color
                 return color
+
+        # _guide_to_target fallback (available after connect / from_model)
+        if guide_str in self._guide_to_target:
+            target = self._guide_to_target[guide_str]
+            cmap = self._get_target_cmap(target)
+            shade = 0.35 if _is_ntc(target) else 0.55
+            color = cmap(shade)
+            self.guide_colors[guide_str] = color
+            return color
 
         return default
 
@@ -276,6 +358,100 @@ class ColorScheme:
             return 'tomato'
         return default
 
+    def guide_target(self, guide):
+        """
+        Return the target for a guide name, or ``None`` if unknown.
+
+        Consults ``_guide_to_target`` (populated by ``from_model`` /
+        ``connect``), then falls back to the ``TARGET_NUMBER`` naming
+        convention.
+        """
+        g = str(guide)
+        if g in self._guide_to_target:
+            return self._guide_to_target[g]
+        # TARGET_NUMBER fallback
+        parts = g.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0]
+        return None
+
+    # ------------------------------------------------------------------
+    # Model connection
+    # ------------------------------------------------------------------
+
+    def connect(self, model):
+        """
+        Return a copy of this scheme with guide_colors populated for every
+        guide present in *model*.
+
+        This is the key method that makes palette-based schemes work with any
+        guide naming convention — not just ``TARGET_NUMBER`` format.
+
+        * If all guides are already in ``guide_colors`` **and**
+          ``_guide_to_target`` is already populated, returns ``self``
+          unchanged (no copy made).
+        * Colors for new guides are generated from this scheme's palette (if
+          the target is present) or from the target's colormap, distributing
+          shades evenly across guides within each target.
+        * The returned scheme's ``_guide_to_target`` is always fully
+          populated.
+
+        Parameters
+        ----------
+        model : bayesDREAM
+
+        Returns
+        -------
+        ColorScheme
+        """
+        g2t = _build_guide_to_target(model)
+        missing = {g: t for g, t in g2t.items() if g not in self.guide_colors}
+
+        # Fast path: nothing to do
+        if not missing and self._guide_to_target:
+            return self
+
+        new_cs = copy.copy(self)
+        new_cs._guide_to_target = {**self._guide_to_target, **g2t}
+        new_cs.guide_colors = dict(self.guide_colors)
+        new_cs.target_colors = dict(self.target_colors)
+        new_cs.target_cmaps = dict(self.target_cmaps)
+        new_cs._unknown_target_idx = self._unknown_target_idx
+
+        if not missing:
+            return new_cs
+
+        # Group missing guides by target
+        by_target = defaultdict(list)
+        for g, t in missing.items():
+            by_target[t].append(g)
+
+        for target, guides in by_target.items():
+            guides_sorted = sorted(guides, key=_guide_sort_key)
+            n = len(guides_sorted)
+
+            # If user supplied palette colors for this target, distribute them
+            palette_key = next(
+                (k for k in (target, target.lower(), target.upper())
+                 if k in self.palette), None)
+
+            if palette_key is not None:
+                palette_colors = self.palette[palette_key]
+                n_p = len(palette_colors)
+                for i, g in enumerate(guides_sorted):
+                    idx = int(round(i / max(n - 1, 1) * (n_p - 1))) if n > 1 else 0
+                    new_cs.guide_colors[g] = palette_colors[idx]
+            else:
+                cmap = new_cs._get_target_cmap(target)
+                if _is_ntc(target):
+                    shade_vals = np.linspace(0.35, 0.70, n)
+                else:
+                    shade_vals = np.linspace(0.40, 0.85, n)
+                for g, v in zip(guides_sorted, shade_vals):
+                    new_cs.guide_colors[g] = cmap(v)
+
+        return new_cs
+
     # ------------------------------------------------------------------
     # Class-method constructors
     # ------------------------------------------------------------------
@@ -286,8 +462,8 @@ class ColorScheme:
         Build a ColorScheme from a bayesDREAM model.
 
         Uses actual guide names from the model (works with any naming
-        convention, not just ``TARGET_NUMBER`` format).  Automatically
-        detects CRISPRi / CRISPRa in covariate columns.
+        convention).  Automatically detects CRISPRi / CRISPRa in covariate
+        columns.
 
         Parameters
         ----------
@@ -303,26 +479,7 @@ class ColorScheme:
         is_high_moi = getattr(model, 'is_high_moi', False)
 
         # ---- 1. guide → primary target ----
-        guide_to_target = {}  # guide_name (str) → target_name (str)
-
-        if is_high_moi and hasattr(model, 'guide_meta'):
-            guide_names = model.guide_meta['guide'].astype(str).tolist()
-            gtd = getattr(model, 'guide_targets_dict', {})
-            for gn in guide_names:
-                targets = [str(t) for t in gtd.get(gn, [])]
-                targeting = [t for t in targets if not _is_ntc(t)]
-                guide_to_target[gn] = targeting[0] if targeting else 'NTC'
-        else:
-            if 'guide' in model.meta.columns and 'target' in model.meta.columns:
-                for _, row in model.meta.drop_duplicates('guide').iterrows():
-                    t = str(row['target'])
-                    guide_to_target[str(row['guide'])] = 'NTC' if _is_ntc(t) else t
-
-        guide_to_target['multiple_NTC'] = 'NTC'
-
-        # Normalise: any NTC variant → 'NTC'
-        guide_to_target = {g: ('NTC' if _is_ntc(t) else t)
-                           for g, t in guide_to_target.items()}
+        guide_to_target = _build_guide_to_target(model)
 
         # ---- 2. Ordered target list: NTC, then cis_gene, then others ----
         cis_gene = getattr(model, 'cis_gene', None)
@@ -383,12 +540,14 @@ class ColorScheme:
         # ---- 5. Technical group colours ----
         tech_colors = _detect_crispri_crispra(model)
 
-        return cls(
+        instance = cls(
             technical_group_colors=tech_colors,
             guide_colors=guide_colors_out,
             target_colors=target_colors_out,
             target_cmaps=target_cmap,
         )
+        instance._guide_to_target = guide_to_target
+        return instance
 
     @classmethod
     def from_targets(cls, targets, colormaps=None, n_guides_per_target=None):
