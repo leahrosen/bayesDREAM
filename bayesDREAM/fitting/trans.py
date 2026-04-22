@@ -313,8 +313,10 @@ class TransFitter:
             return tr.nodes[name]["value"] if name in tr.nodes else None
     
         # --- pull site values (all should be finite, but may be extreme) ---
-        log_K_a = get_site(model_trace, "log_K_a") or get_site(guide_trace, "log_K_a")
-        log_Vmax_a = get_site(model_trace, "log_Vmax_a") or get_site(guide_trace, "log_Vmax_a")
+        def _first_nonnone(*vals):
+            return next((v for v in vals if v is not None), None)
+        log_K_a = _first_nonnone(get_site(model_trace, "log_K_a"), get_site(guide_trace, "log_K_a"))
+        log_Vmax_a = _first_nonnone(get_site(model_trace, "log_Vmax_a"), get_site(guide_trace, "log_Vmax_a"))
         Vmax_a = get_site(model_trace, "Vmax_a")
         K_a = get_site(model_trace, "K_a")
         n_a = get_site(model_trace, "n_a")
