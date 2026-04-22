@@ -62,7 +62,7 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
-        color_scheme = ColorScheme.from_model(model)
+        color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -99,7 +99,11 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
         ax_.set_ylabel(f'std x_true{suffix}')
         ax_.set_title(title_)
         ax_.grid(True, linewidth=0.5, alpha=0.4)
-        ax_.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
+        n_guides_ax = len(np.unique(gl))
+        n_cols = max(1, n_guides_ax // 15 + 1)
+        ax_.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False,
+                   loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                   ncol=n_cols, borderaxespad=0.)
 
     if facet_ntc:
         ntc = _guide_ntc_mask(guide_labels, model)
@@ -159,7 +163,7 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
-        color_scheme = ColorScheme.from_model(model)
+        color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -199,7 +203,11 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
         ax_.set_ylabel(ylabel)
         ax_.set_title(title_)
         ax_.grid(True, linewidth=0.5, alpha=0.4)
-        ax_.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False)
+        n_guides_ax = len(np.unique(gl))
+        n_cols = max(1, n_guides_ax // 15 + 1)
+        ax_.legend(title='guide', fontsize=8, markerscale=1.2, frameon=False,
+                   loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                   ncol=n_cols, borderaxespad=0.)
 
     if facet_ntc:
         ntc = _guide_ntc_mask(guide_labels, model)
@@ -224,9 +232,12 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
 
 
 def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
-                         single_guide_cells_only=False, ax=None, show=True):
+                         single_guide_cells_only=False,
+                         log2fc=False, sort_by_mean=False,
+                         color_by='target', width_per_guide=0.7,
+                         ax=None, show=True):
     """
-    Violin plot of x_true (log2) grouped by guide, colored by target.
+    Violin plot of x_true (log2) grouped by guide.
 
     Parameters
     ----------
@@ -235,9 +246,25 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     cis_gene : str, optional
         Cis gene name (title only).
     color_scheme : ColorScheme, optional
-        Custom color scheme.
+        Custom color scheme.  Defaults to ``model.color_scheme``.
     single_guide_cells_only : bool, default False
         Required to be ``True`` for high-MOI models.
+    log2fc : bool, default False
+        If ``True``, subtract the NTC guide mean so the y-axis shows log2 FC
+        relative to NTC.
+    sort_by_mean : bool, default False
+        If ``True``, sort guides by their per-guide mean x_true (ascending).
+        NTC guides are always placed first regardless.
+    color_by : str, default 'target'
+        How to color violins.  Options:
+
+        * ``'target'`` – one color per target (default)
+        * ``'guide'``  – one color per guide
+        * any column name in ``model.meta`` – color by that metadata column
+          (e.g. ``'cell_line'``, ``'batch'``)
+    width_per_guide : float, default 0.7
+        Figure width allocated per guide (inches).  Total width is
+        ``max(6, n_guides * width_per_guide)``.
     ax : matplotlib axes, optional
     show : bool, default True
 
@@ -246,7 +273,7 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     ax : matplotlib axes
     """
     if color_scheme is None:
-        color_scheme = ColorScheme()
+        color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
 
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
@@ -256,39 +283,127 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     x_vals = x_vals[cell_mask]
     guide_labels = guide_labels[cell_mask]
 
-    pos_mask = x_vals > 0
     x_log = _log2_safe(x_vals)
+    pos_mask = ~np.isnan(x_log)
 
-    guide_order = sorted(np.unique(guide_labels), key=_guide_sort_key)
+    # --- log2FC: subtract NTC mean ---
+    if log2fc:
+        ntc_mask = _guide_ntc_mask(guide_labels, model)
+        ntc_vals = x_log[ntc_mask & pos_mask]
+        ntc_mean = float(np.nanmean(ntc_vals)) if len(ntc_vals) > 0 else 0.0
+        x_log = x_log - ntc_mean
+        ylabel = 'log₂FC (relative to NTC)'
+    else:
+        ylabel = 'x_true (log₂)'
+
+    # --- guide ordering ---
+    unique_guides = np.unique(guide_labels)
+    ntc_guides = sorted([g for g in unique_guides if _guide_ntc_mask([g], model)[0]],
+                        key=_guide_sort_key)
+    tgt_guides = sorted([g for g in unique_guides if not _guide_ntc_mask([g], model)[0]],
+                        key=_guide_sort_key)
+
+    if sort_by_mean:
+        tgt_guides = sorted(
+            tgt_guides,
+            key=lambda g: float(np.nanmean(x_log[(guide_labels == g) & pos_mask]))
+                          if np.any((guide_labels == g) & pos_mask) else -np.inf
+        )
+
+    guide_order = ntc_guides + tgt_guides
     data = [x_log[(guide_labels == g) & pos_mask] for g in guide_order]
 
-    colors = []
-    for g in guide_order:
-        # Target is everything before the last underscore-number suffix, if present
-        parts = g.rsplit('_', 1)
-        target = parts[0] if (len(parts) > 1 and parts[1].isdigit()) else g
-        colors.append(color_scheme.get_target_color(target, 'gray'))
+    # --- build color list ---
+    # Determine color_by mode
+    meta_col = None
+    if color_by not in ('target', 'guide') and hasattr(model, 'meta'):
+        if color_by in model.meta.columns:
+            meta_col = color_by
+        else:
+            import warnings as _warn
+            _warn.warn(f"color_by='{color_by}' not found in model.meta columns; "
+                       f"falling back to 'target'")
+            color_by = 'target'
 
+    if meta_col is not None:
+        # Build guide → metadata value map
+        if 'guide' in model.meta.columns:
+            gmap = model.meta.drop_duplicates('guide').set_index('guide')[meta_col].to_dict()
+        else:
+            gmap = {}
+        # Build unique-value → color map (cycle through a tab20 palette)
+        from matplotlib import cm as _cm
+        unique_vals = sorted({str(gmap.get(g, '?')) for g in guide_order})
+        tab20 = _cm.get_cmap('tab20', max(len(unique_vals), 1))
+        val_color = {v: tab20(i / max(len(unique_vals), 1)) for i, v in enumerate(unique_vals)}
+        colors = [val_color.get(str(gmap.get(g, '?')), 'gray') for g in guide_order]
+        # Legend entries: one per unique value
+        legend_handles = [
+            plt.Rectangle((0, 0), 1, 1, fc=val_color[v], alpha=0.85, label=v)
+            for v in unique_vals
+        ]
+        legend_title = meta_col
+    elif color_by == 'guide':
+        colors = [color_scheme.get_guide_color(g, 'gray') for g in guide_order]
+        legend_handles = [
+            plt.Rectangle((0, 0), 1, 1, fc=color_scheme.get_guide_color(g, 'gray'),
+                          alpha=0.85, label=g)
+            for g in guide_order
+        ]
+        legend_title = 'guide'
+    else:  # 'target'
+        colors = []
+        for g in guide_order:
+            parts = g.rsplit('_', 1)
+            target = parts[0] if (len(parts) > 1 and parts[1].isdigit()) else g
+            colors.append(color_scheme.get_target_color(target, 'gray'))
+        # Legend: unique target → color
+        seen_tgt = {}
+        for g, c in zip(guide_order, colors):
+            parts = g.rsplit('_', 1)
+            tgt = parts[0] if (len(parts) > 1 and parts[1].isdigit()) else g
+            if tgt not in seen_tgt:
+                seen_tgt[tgt] = c
+        legend_handles = [
+            plt.Rectangle((0, 0), 1, 1, fc=c, alpha=0.85, label=t)
+            for t, c in seen_tgt.items()
+        ]
+        legend_title = 'target'
+
+    # --- figure size ---
+    n_guides = len(guide_order)
+    fig_w = max(6, n_guides * width_per_guide)
     if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(fig_w, 5))
 
-    parts = ax.violinplot(data, positions=np.arange(1, len(guide_order)+1),
-                         showmeans=True, showextrema=True, widths=0.7)
-    for body, c in zip(parts['bodies'], colors):
+    vp = ax.violinplot(data, positions=np.arange(1, n_guides + 1),
+                       showmeans=True, showextrema=True, widths=0.7)
+    for body, c in zip(vp['bodies'], colors):
         body.set_facecolor(c)
         body.set_edgecolor('black')
         body.set_alpha(0.85)
 
     for pc_key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
-        if pc_key in parts:
-            parts[pc_key].set_edgecolor('black')
-            parts[pc_key].set_linewidth(1.2)
+        if pc_key in vp:
+            vp[pc_key].set_edgecolor('black')
+            vp[pc_key].set_linewidth(1.2)
 
-    ax.set_xticks(np.arange(1, len(guide_order)+1))
-    ax.set_xticklabels(guide_order, rotation=45, ha='right', fontsize=9)
-    ax.set_ylabel('x_true (log₂)', fontsize=11)
-    ax.set_title(f'{cis_gene}: x_true distribution by guide', fontsize=12)
+    ax.set_xticks(np.arange(1, n_guides + 1))
+    ax.set_xticklabels(guide_order, rotation=90, ha='center', fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=11)
+    title_suffix = ' (log2FC)' if log2fc else ' (log₂)'
+    ax.set_title(f'{cis_gene}: x_true distribution by guide{title_suffix}', fontsize=12)
+
+    # Horizontal + vertical grid
     ax.grid(axis='y', linewidth=0.5, alpha=0.3)
+    ax.grid(axis='x', linewidth=0.5, alpha=0.2)
+
+    # Legend outside (multiple columns so it doesn't exceed plot height)
+    n_cols = max(1, len(legend_handles) // 15 + 1)
+    ax.legend(handles=legend_handles, title=legend_title, fontsize=8, frameon=False,
+              loc='upper left', bbox_to_anchor=(1.01, 1.0),
+              ncol=n_cols, borderaxespad=0.)
+
     plt.tight_layout()
 
     if show:
@@ -328,7 +443,7 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
-        color_scheme = ColorScheme()
+        color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
 
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
@@ -358,7 +473,11 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
         ax_.set_xlabel('x_true (log₂)', fontsize=11)
         ax_.set_ylabel('Density', fontsize=11)
         ax_.set_title(title_, fontsize=12)
-        ax_.legend(title='guide', fontsize=8, frameon=False)
+        n_guides_ax = len([g for g in np.unique(gl)])
+        n_cols = max(1, n_guides_ax // 15 + 1)
+        ax_.legend(title='guide', fontsize=8, frameon=False,
+                   loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                   ncol=n_cols, borderaxespad=0.)
         ax_.grid(True, linewidth=0.5, alpha=0.3)
 
     if facet_ntc:

@@ -7,6 +7,7 @@ molecular modalities using PyTorch and Pyro.
 
 from .model import bayesDREAM
 from .modality import Modality
+from .plotting.colors import ColorScheme
 from .fitting.distributions import (
     get_observation_sampler,
     requires_denominator,
@@ -28,6 +29,7 @@ __version__ = "1.0.0"
 __all__ = [
     "bayesDREAM",
     "Modality",
+    "ColorScheme",
     "get_observation_sampler",
     "requires_denominator",
     "requires_sum_factor",
