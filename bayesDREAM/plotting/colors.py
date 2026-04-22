@@ -164,13 +164,14 @@ class ColorScheme:
         """
         Create ColorScheme from a bayesDREAM model.
 
-        Automatically detects all guides and targets from the model's metadata
-        and assigns appropriate colors.
+        Automatically detects all guides and targets and assigns appropriate
+        colors.  Works for both low-MOI (reads ``model.meta``) and high-MOI
+        (reads ``model.guide_meta`` / ``model.guide_targets_dict``).
 
         Parameters
         ----------
         model : bayesDREAM
-            Fitted model with meta containing 'guide' and 'target' columns
+            Fitted model.
 
         Returns
         -------
@@ -179,21 +180,50 @@ class ColorScheme:
         if not hasattr(model, 'meta'):
             return cls()
 
-        # Get unique targets and guides
-        if 'target' in model.meta.columns:
-            targets = model.meta['target'].unique().tolist()
-        else:
+        is_high_moi = getattr(model, 'is_high_moi', False)
+
+        if is_high_moi and hasattr(model, 'guide_meta'):
+            # ---- High-MOI: build from guide_meta ----
+            gm = model.guide_meta
+            guides  = gm['guide'].astype(str).tolist()
             targets = []
 
-        if 'guide' in model.meta.columns:
-            guides = model.meta['guide'].unique().tolist()
-        else:
-            guides = []
+            # Get targets from guide_targets_dict if available
+            gtd = getattr(model, 'guide_targets_dict', {})
+            if gtd:
+                all_targets = set()
+                for tlist in gtd.values():
+                    all_targets.update(str(t) for t in tlist)
+                targets = sorted(all_targets)
+            elif 'target' in gm.columns:
+                targets = gm['target'].astype(str).unique().tolist()
 
-        # Count guides per target
-        n_guides_per_target = {}
-        for guide in guides:
-            if '_' in str(guide):
+            # Count guides per target
+            n_guides_per_target = {}
+            if gtd:
+                for guide, tlist in gtd.items():
+                    for t in tlist:
+                        t_str = str(t)
+                        n_guides_per_target[t_str] = (
+                            n_guides_per_target.get(t_str, 0) + 1
+                        )
+            elif 'target' in gm.columns:
+                for t in targets:
+                    n_guides_per_target[t] = int((gm['target'].astype(str) == t).sum())
+
+        else:
+            # ---- Low-MOI: build from meta ----
+            targets = []
+            if 'target' in model.meta.columns:
+                targets = model.meta['target'].astype(str).unique().tolist()
+
+            guides = []
+            if 'guide' in model.meta.columns:
+                guides = model.meta['guide'].astype(str).unique().tolist()
+
+            # Count guides per target
+            n_guides_per_target = {}
+            for guide in guides:
                 parts = str(guide).rsplit('_', 1)
                 if len(parts) == 2 and parts[1].isdigit():
                     target = parts[0]
@@ -201,16 +231,15 @@ class ColorScheme:
                     n_guides_per_target[target] = max(
                         n_guides_per_target.get(target, 0), idx
                     )
-
-        # Also count from target column
-        if 'target' in model.meta.columns and 'guide' in model.meta.columns:
-            for target in targets:
-                if target and str(target).lower() not in ('ntc', 'non-targeting'):
-                    mask = model.meta['target'] == target
-                    count = model.meta.loc[mask, 'guide'].nunique()
-                    n_guides_per_target[target] = max(
-                        n_guides_per_target.get(target, 0), count
-                    )
+            if 'target' in model.meta.columns and 'guide' in model.meta.columns:
+                for target in targets:
+                    if str(target).lower() not in ('ntc', 'non-targeting'):
+                        count = model.meta.loc[
+                            model.meta['target'].astype(str) == target, 'guide'
+                        ].nunique()
+                        n_guides_per_target[target] = max(
+                            n_guides_per_target.get(target, 0), count
+                        )
 
         return cls.from_targets(targets, n_guides_per_target=n_guides_per_target)
 

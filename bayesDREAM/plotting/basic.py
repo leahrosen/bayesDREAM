@@ -62,7 +62,7 @@ def scatter_by_guide(model, cis_gene=None, log2=False, color_scheme=None,
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
-        color_scheme = ColorScheme()
+        color_scheme = ColorScheme.from_model(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -159,7 +159,7 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, full_width=False,
     (fig, [ax_ntc, ax_targeting]) : tuple  (when ``facet_ntc=True``)
     """
     if color_scheme is None:
-        color_scheme = ColorScheme()
+        color_scheme = ColorScheme.from_model(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
@@ -344,10 +344,10 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     xmin, xmax = np.nanpercentile(x_log, [0.5, 99.5])
     x_grid = np.linspace(xmin, xmax, 500)
 
-    def _draw(ax_, gl, title_):
+    def _draw(ax_, gl, xl, vl, title_):
         guide_order = sorted(np.unique(gl), key=_guide_sort_key)
         for g in guide_order:
-            sub = x_log[(gl == g) & valid]
+            sub = xl[(gl == g) & vl]
             if len(sub) < 2:
                 continue
             kde = gaussian_kde(sub, bw_method=bw)
@@ -364,8 +364,8 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
     if facet_ntc:
         ntc = _guide_ntc_mask(guide_labels, model)
         fig, (ax_ntc, ax_tgt) = plt.subplots(1, 2, figsize=(16, 5))
-        _draw(ax_ntc, guide_labels[ntc],  f'{cis_gene}: NTC')
-        _draw(ax_tgt, guide_labels[~ntc], f'{cis_gene}: targeting')
+        _draw(ax_ntc, guide_labels[ntc],  x_log[ntc],  valid[ntc],  f'{cis_gene}: NTC')
+        _draw(ax_tgt, guide_labels[~ntc], x_log[~ntc], valid[~ntc], f'{cis_gene}: targeting')
         plt.tight_layout()
         if show:
             plt.show()
@@ -373,7 +373,7 @@ def filled_density_by_guide_log2(model, cis_gene=None, bw=None, color_scheme=Non
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 5))
-    _draw(ax, guide_labels, f'{cis_gene}: x_true density by guide')
+    _draw(ax, guide_labels, x_log, valid, f'{cis_gene}: x_true density by guide')
     plt.tight_layout()
 
     if show:

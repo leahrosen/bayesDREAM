@@ -245,7 +245,7 @@ def plot_xtrue_density_by_guide(
     fig : matplotlib figure
     """
     if color_scheme is None:
-        color_scheme = ColorScheme()
+        color_scheme = ColorScheme.from_model(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
