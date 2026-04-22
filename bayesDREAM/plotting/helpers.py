@@ -134,6 +134,52 @@ def resolve_guide_labels(model, single_guide_cells_only=False):
     return guide_labels.astype(str), cell_mask
 
 
+def _guide_ntc_mask(guide_labels, model):
+    """
+    Boolean array of length ``len(guide_labels)``, True where the label is NTC.
+
+    Works for both low-MOI (reads model.meta target column) and high-MOI
+    (reads guide_targets_dict / guide_meta).
+    """
+    if not getattr(model, 'is_high_moi', False):
+        if 'guide' in model.meta.columns and 'target' in model.meta.columns:
+            gtmap = (model.meta.drop_duplicates('guide')
+                     .set_index('guide')['target'].to_dict())
+            ntc_guides = frozenset(g for g, t in gtmap.items()
+                                   if str(t) in _NTC_VARIANTS)
+        else:
+            ntc_guides = _NTC_VARIANTS
+    else:
+        guide_names = model.guide_meta['guide'].values
+        guide_targets_dict = getattr(model, 'guide_targets_dict', {})
+        if 'target' in model.guide_meta.columns:
+            is_ntc_arr = model.guide_meta['target'].isin(_NTC_VARIANTS).values
+            ntc_guides = frozenset(guide_names[is_ntc_arr])
+        elif guide_targets_dict:
+            ntc_guides = frozenset(
+                gn for gn in guide_names
+                if any(t in _NTC_VARIANTS for t in guide_targets_dict.get(gn, []))
+            )
+        else:
+            ntc_guides = frozenset()
+
+    ntc_all = ntc_guides | frozenset({'multiple_NTC'})
+    return np.array([g in ntc_all for g in guide_labels])
+
+
+def _xtrue_posterior(model):
+    """
+    Return posterior samples of x_true as ``np.ndarray`` shape ``[S, N_cells]``,
+    or ``None`` if not available.
+
+    Reads ``model.posterior_samples_cis['x_true']``.
+    """
+    psc = getattr(model, 'posterior_samples_cis', None)
+    if psc is None or 'x_true' not in psc:
+        return None
+    return to_np(psc['x_true'])
+
+
 def per_cell_mean_std(x):
     """
     Compute per-cell mean and std along axis 0 (samples x cells).
