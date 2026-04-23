@@ -1939,11 +1939,20 @@ class TechnicalFitter:
                 print(f"[INFO] Patching alpha_y=1.0 (mult) / 0.0 (add) for {n_pairs} "
                       f"(group, feature) pair(s) with all-zero NTC counts in a non-reference group.")
                 for g, feat_mask_patch in _negbinom_nonref_patch.items():
-                    # Two-step indexing avoids PyTorch mis-routing numpy fancy
-                    # indices to the wrong dimension in 2D tensor[int, array].
-                    feat_indices = np.where(feat_mask_patch)[0]
-                    alpha_y_mult_full[int(g)][feat_indices] = 1.0
-                    alpha_y_add_full[int(g)][feat_indices] = 0.0
+                    # Use torch tensors for feature indices — numpy arrays cause
+                    # PyTorch to mis-route indices to the wrong dimension.
+                    # Branch on ndim: _reconstruct_full_2d returns [C, T] when
+                    # there are no posterior samples, or [S, C, T] when nsamps > 1.
+                    row = int(g)
+                    feat_idx_t = torch.as_tensor(
+                        np.where(feat_mask_patch)[0], dtype=torch.long
+                    )
+                    if alpha_y_mult_full.dim() == 2:    # [C, T]
+                        alpha_y_mult_full[row, feat_idx_t] = 1.0
+                        alpha_y_add_full[row, feat_idx_t] = 0.0
+                    else:                               # [S, C, T]
+                        alpha_y_mult_full[:, row, feat_idx_t] = 1.0
+                        alpha_y_add_full[:, row, feat_idx_t] = 0.0
 
             # Choose correct type based on distribution
             # negbinom: multiplicative, others: additive
