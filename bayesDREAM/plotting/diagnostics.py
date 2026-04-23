@@ -42,12 +42,38 @@ def plot_sum_factor_comparison(model, cis_gene=None, sf_col1='clustered.sum.fact
 
     fig, ax = plt.subplots(figsize=(5, 4))
 
-    df = model.meta.copy()
+    df = model.meta[['cell', 'guide']].copy() if 'guide' in model.meta.columns \
+        else model.meta[['cell']].copy()
+
+    # Resolve each sum factor column: check model.meta first, then primary modality
+    def _resolve_sf_col(col):
+        if col in model.meta.columns:
+            return model.meta.set_index('cell')[col]
+        primary_mod = model.get_modality(model.primary_modality)
+        if (primary_mod.sum_factors is not None
+                and col in primary_mod.sum_factors.columns):
+            return primary_mod.sum_factors[col]
+        return None
+
+    s1 = _resolve_sf_col(sf_col1)
+    s2 = _resolve_sf_col(sf_col2)
+
+    if s1 is None or s2 is None:
+        missing = [c for c, s in [(sf_col1, s1), (sf_col2, s2)] if s is None]
+        primary_mod = model.get_modality(model.primary_modality)
+        available_meta = list(model.meta.columns)
+        available_mod  = (list(primary_mod.sum_factors.columns)
+                          if primary_mod.sum_factors is not None else [])
+        print(f"Missing sum factor column(s): {missing}. "
+              f"Available in meta: {available_meta}. "
+              f"Available in modality sum_factors: {available_mod}")
+        return fig
+
+    df[sf_col1] = s1.loc[model.meta['cell'].values].values
+    df[sf_col2] = s2.loc[model.meta['cell'].values].values
 
     # Filter to positive values
-    if sf_col1 not in df.columns or sf_col2 not in df.columns:
-        print(f"Missing sum factor columns. Available: {list(df.columns)}")
-        return fig
+    df = df[(df[sf_col1] > 0) & (df[sf_col2] > 0)]
 
     df = df[(df[sf_col1] > 0) & (df[sf_col2] > 0)]
 
