@@ -90,6 +90,7 @@ def _build_guide_to_target(model):
     """
     guide_to_target = {}
     is_high_moi = getattr(model, 'is_high_moi', False)
+    cis_gene = getattr(model, 'cis_gene', None)
 
     if is_high_moi and hasattr(model, 'guide_meta'):
         guide_names = model.guide_meta['guide'].astype(str).tolist()
@@ -97,7 +98,13 @@ def _build_guide_to_target(model):
         for gn in guide_names:
             targets = [str(t) for t in gtd.get(gn, [])]
             targeting = [t for t in targets if not _is_ntc(t)]
-            guide_to_target[gn] = targeting[0] if targeting else 'NTC'
+            if not targeting:
+                guide_to_target[gn] = 'NTC'
+            elif cis_gene and cis_gene in targeting:
+                # Prefer cis gene over other targets for coloring
+                guide_to_target[gn] = cis_gene
+            else:
+                guide_to_target[gn] = targeting[0]
     elif hasattr(model, 'meta'):
         if 'guide' in model.meta.columns and 'target' in model.meta.columns:
             for _, row in model.meta.drop_duplicates('guide').iterrows():

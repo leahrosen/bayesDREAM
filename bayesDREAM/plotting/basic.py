@@ -271,6 +271,54 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
     return ax
 
 
+def _half_violin(ax, data, pos, side, color, max_width=0.35, alpha=0.85):
+    """
+    Draw one half of a split violin at x-position *pos*.
+
+    Parameters
+    ----------
+    side : {'left', 'right'}
+    max_width : float
+        Maximum half-width in data units (default 0.35, so split violin
+        spans ±0.35 around *pos*).
+    """
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+    if len(data) < 2:
+        if len(data) == 1:
+            ax.plot([pos, pos], [data[0] - 0.05, data[0] + 0.05],
+                    color=color, linewidth=2)
+        return
+    kde = gaussian_kde(data)
+    lo = min(data.min(), np.percentile(data, 1))
+    hi = max(data.max(), np.percentile(data, 99))
+    y_range = np.linspace(lo, hi, 300)
+    density_raw = kde(y_range)
+    scale = density_raw.max() if density_raw.max() > 0 else 1.0
+    density = density_raw / scale * max_width
+
+    if side == 'right':
+        ax.fill_betweenx(y_range, pos, pos + density,
+                         color=color, alpha=alpha, linewidth=0)
+        ax.plot(pos + density, y_range, color='black', linewidth=0.5)
+        ax.plot([pos, pos], [lo, hi], color='black', linewidth=0.5)
+    else:
+        ax.fill_betweenx(y_range, pos - density, pos,
+                         color=color, alpha=alpha, linewidth=0)
+        ax.plot(pos - density, y_range, color='black', linewidth=0.5)
+        ax.plot([pos, pos], [lo, hi], color='black', linewidth=0.5)
+
+    # Mean indicator
+    mean_val = float(np.nanmean(data))
+    mean_dens = float(kde([mean_val])[0]) / scale * max_width
+    if side == 'right':
+        ax.plot([pos, pos + mean_dens], [mean_val, mean_val],
+                color='black', linewidth=1.5)
+    else:
+        ax.plot([pos - mean_dens, pos], [mean_val, mean_val],
+                color='black', linewidth=1.5)
+
+
 def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
                          single_guide_cells_only=False,
                          log2fc=False, sort_by_mean=False,
@@ -319,10 +367,25 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
+    # --- detect color_by mode early so we can align meta_vals with cell_mask ---
+    import warnings as _warn
+    from matplotlib import cm as _cm
+    meta_col = None
+    if color_by not in ('target', 'guide') and hasattr(model, 'meta'):
+        if color_by in model.meta.columns:
+            meta_col = color_by
+        else:
+            _warn.warn(f"color_by='{color_by}' not found in model.meta columns; "
+                       f"falling back to 'target'")
+            color_by = 'target'
+
     x_vals = to_np(model.x_true)                          # [N_cells]
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
     x_vals = x_vals[cell_mask]
     guide_labels = guide_labels[cell_mask]
+
+    # Align meta values with cell_mask now, while we still have it
+    meta_vals = model.meta[meta_col].values[cell_mask] if meta_col is not None else None
 
     x_log = _log2_safe(x_vals)
     pos_mask = ~np.isnan(x_log)
@@ -352,64 +415,64 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
         )
 
     guide_order = ntc_guides + tgt_guides
-    data = [x_log[(guide_labels == g) & pos_mask] for g in guide_order]
 
-    # --- build color list ---
-    # Determine color_by mode
-    meta_col = None
-    if color_by not in ('target', 'guide') and hasattr(model, 'meta'):
-        if color_by in model.meta.columns:
-            meta_col = color_by
-        else:
-            import warnings as _warn
-            _warn.warn(f"color_by='{color_by}' not found in model.meta columns; "
-                       f"falling back to 'target'")
-            color_by = 'target'
-
+    # --- build color list and per-guide subgroups ---
     if meta_col is not None:
-        # Build guide → metadata value map
-        if 'guide' in model.meta.columns:
-            gmap = model.meta.drop_duplicates('guide').set_index('guide')[meta_col].to_dict()
-        else:
-            gmap = {}
-        # Build unique-value → color map (cycle through a tab20 palette)
-        from matplotlib import cm as _cm
-        unique_vals = sorted({str(gmap.get(g, '?')) for g in guide_order})
-        tab20 = _cm.get_cmap('tab20', max(len(unique_vals), 1))
-        val_color = {v: tab20(i / max(len(unique_vals), 1)) for i, v in enumerate(unique_vals)}
-        colors = [val_color.get(str(gmap.get(g, '?')), 'gray') for g in guide_order]
-        # Legend entries: one per unique value
+        # For each guide, group cells by the meta value they carry.
+        # This works cell-level (no drop_duplicates) so each cell contributes
+        # to exactly one (guide, meta_val) bucket.
+        guide_subgroups = {}   # guide -> {str(val): x_log_array}
+        for g in guide_order:
+            g_mask = (guide_labels == g) & pos_mask
+            vals_g = meta_vals[g_mask]
+            x_g = x_log[g_mask]
+            sg = {}
+            for v in np.unique(vals_g):
+                sg[str(v)] = x_g[vals_g == v]
+            guide_subgroups[g] = sg
+
+        all_unique_vals = sorted({v for sg in guide_subgroups.values() for v in sg},
+                                 key=str)
+        is_cell_level = any(len(sg) > 1 for sg in guide_subgroups.values())
+        n_unique_vals = max(len(all_unique_vals), 1)
+        tab20 = _cm.get_cmap('tab20', n_unique_vals)
+        val_color = {v: tab20(i / n_unique_vals) for i, v in enumerate(all_unique_vals)}
+
         legend_handles = [
             plt.Rectangle((0, 0), 1, 1, fc=val_color[v], alpha=0.85, label=v)
-            for v in unique_vals
+            for v in all_unique_vals
         ]
         legend_title = meta_col
-    elif color_by == 'guide':
-        colors = [color_scheme.get_guide_color(g, 'gray') for g in guide_order]
-        legend_handles = [
-            plt.Rectangle((0, 0), 1, 1, fc=color_scheme.get_guide_color(g, 'gray'),
-                          alpha=0.85, label=g)
-            for g in guide_order
-        ]
-        legend_title = 'guide'
-    else:  # 'target'
-        colors = []
-        for g in guide_order:
-            target = color_scheme.guide_target(g)
-            if target is None:
-                target = g  # last resort
-            colors.append(color_scheme.get_target_color(target, 'gray'))
-        # Legend: unique target → color (preserve guide_order ordering)
-        seen_tgt = {}
-        for g, c in zip(guide_order, colors):
-            tgt = color_scheme.guide_target(g) or g
-            if tgt not in seen_tgt:
-                seen_tgt[tgt] = c
-        legend_handles = [
-            plt.Rectangle((0, 0), 1, 1, fc=c, alpha=0.85, label=t)
-            for t, c in seen_tgt.items()
-        ]
-        legend_title = 'target'
+
+        # Single-value guides still need a flat color for the full-violin path
+        colors = [val_color.get(next(iter(guide_subgroups[g])), 'gray')
+                  for g in guide_order]
+    else:
+        guide_subgroups = None
+        is_cell_level = False
+        if color_by == 'guide':
+            colors = [color_scheme.get_guide_color(g, 'gray') for g in guide_order]
+            legend_handles = [
+                plt.Rectangle((0, 0), 1, 1, fc=color_scheme.get_guide_color(g, 'gray'),
+                              alpha=0.85, label=g)
+                for g in guide_order
+            ]
+            legend_title = 'guide'
+        else:  # 'target'
+            colors = []
+            for g in guide_order:
+                target = color_scheme.guide_target(g) or g
+                colors.append(color_scheme.get_target_color(target, 'gray'))
+            seen_tgt = {}
+            for g, c in zip(guide_order, colors):
+                tgt = color_scheme.guide_target(g) or g
+                if tgt not in seen_tgt:
+                    seen_tgt[tgt] = c
+            legend_handles = [
+                plt.Rectangle((0, 0), 1, 1, fc=c, alpha=0.85, label=t)
+                for t, c in seen_tgt.items()
+            ]
+            legend_title = 'target'
 
     # --- figure size ---
     n_guides = len(guide_order)
@@ -417,17 +480,73 @@ def violin_by_guide_log2(model, cis_gene=None, color_scheme=None,
     if ax is None:
         fig, ax = plt.subplots(figsize=(fig_w, 5))
 
-    vp = ax.violinplot(data, positions=np.arange(1, n_guides + 1),
-                       showmeans=True, showextrema=True, widths=0.7)
-    for body, c in zip(vp['bodies'], colors):
-        body.set_facecolor(c)
-        body.set_edgecolor('black')
-        body.set_alpha(0.85)
+    # --- plot violins ---
+    positions = np.arange(1, n_guides + 1)
 
-    for pc_key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
-        if pc_key in vp:
-            vp[pc_key].set_edgecolor('black')
-            vp[pc_key].set_linewidth(1.2)
+    if is_cell_level:
+        # Draw per-(guide, val) violins.
+        # 2 unique vals → half-violins (left/right).
+        # 1 or 3+ vals → full or offset violins.
+        for pos, g in zip(positions, guide_order):
+            sg = guide_subgroups[g]
+            n_sg = len(sg)
+            val_list = sorted(sg.keys(), key=str)
+
+            if n_sg == 1:
+                # Single value: full violin
+                d = sg[val_list[0]]
+                vp = ax.violinplot([d], positions=[pos],
+                                   showmeans=True, showextrema=True, widths=0.7)
+                for body in vp['bodies']:
+                    body.set_facecolor(val_color[val_list[0]])
+                    body.set_edgecolor('black')
+                    body.set_alpha(0.85)
+                for pc_key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+                    if pc_key in vp:
+                        vp[pc_key].set_edgecolor('black')
+                        vp[pc_key].set_linewidth(1.2)
+
+            elif n_sg == 2:
+                # Two values: half-violins
+                _half_violin(ax, sg[val_list[0]], pos, 'left',
+                             val_color[val_list[0]])
+                _half_violin(ax, sg[val_list[1]], pos, 'right',
+                             val_color[val_list[1]])
+
+            else:
+                # 3+ values: narrow offset violins
+                total_w = 0.7
+                sub_w = total_w / n_sg * 0.85
+                offsets = np.linspace(-total_w / 2 + sub_w / 2,
+                                       total_w / 2 - sub_w / 2, n_sg)
+                for v, off in zip(val_list, offsets):
+                    d = sg[v]
+                    if len(d) < 2:
+                        continue
+                    vp = ax.violinplot([d], positions=[pos + off],
+                                       showmeans=True, showextrema=True,
+                                       widths=sub_w)
+                    for body in vp['bodies']:
+                        body.set_facecolor(val_color[v])
+                        body.set_edgecolor('black')
+                        body.set_alpha(0.85)
+                    for pc_key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+                        if pc_key in vp:
+                            vp[pc_key].set_edgecolor('black')
+                            vp[pc_key].set_linewidth(1.2)
+    else:
+        # Standard path: one full violin per guide
+        data = [x_log[(guide_labels == g) & pos_mask] for g in guide_order]
+        vp = ax.violinplot(data, positions=positions,
+                           showmeans=True, showextrema=True, widths=0.7)
+        for body, c in zip(vp['bodies'], colors):
+            body.set_facecolor(c)
+            body.set_edgecolor('black')
+            body.set_alpha(0.85)
+        for pc_key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+            if pc_key in vp:
+                vp[pc_key].set_edgecolor('black')
+                vp[pc_key].set_linewidth(1.2)
 
     ax.set_xticks(np.arange(1, n_guides + 1))
     ax.set_xticklabels(guide_order, rotation=90, ha='center', fontsize=9)
@@ -1918,3 +2037,244 @@ def plot_additivity_violin(model, response='x_obs',
     if show:
         plt.show()
     return ax
+
+
+def _pvalue_stars(p):
+    """Convert p-value to significance stars."""
+    if p < 0.001:
+        return '***'
+    if p < 0.01:
+        return '**'
+    if p < 0.05:
+        return '*'
+    return 'ns'
+
+
+def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_color,
+                          test, pvalue_fmt, zero_line=True):
+    """
+    Draw a single residual violin panel onto *ax*.
+
+    Parameters
+    ----------
+    groups : list of (label, residuals_array, violin_color)
+    Returns the y-range used (for shared-axis decisions).
+    """
+    from scipy import stats as _stats
+
+    if not groups:
+        ax.set_visible(False)
+        return
+
+    labels, data, colors = zip(*groups)
+    n = len(groups)
+    positions = np.arange(1, n + 1)
+
+    vp = ax.violinplot(list(data), positions=positions,
+                       showmeans=True, showextrema=True, widths=0.7)
+    for body, col in zip(vp['bodies'], colors):
+        body.set_facecolor(col)
+        body.set_edgecolor('black')
+        body.set_alpha(0.8)
+    for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+        if key in vp:
+            vp[key].set_edgecolor('black')
+            vp[key].set_linewidth(1.1)
+
+    if jitter:
+        rng = np.random.default_rng(0)
+        for pos, resids in zip(positions, data):
+            jx = pos + rng.uniform(-0.15, 0.15, size=len(resids))
+            ax.scatter(jx, resids, s=jitter_size, alpha=jitter_alpha,
+                       color=jitter_color, linewidths=0, zorder=3)
+
+    if zero_line:
+        ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
+                   label='Zero (perfect additivity)')
+
+    # n= and optional test annotations
+    y_top = ax.get_ylim()[1]
+    for pos, resids in zip(positions, data):
+        finite = resids[np.isfinite(resids)]
+        n_cells = len(finite)
+        pval_str = ''
+        if test is not None and n_cells >= 10:
+            if test == 'wilcoxon':
+                _, pval = _stats.wilcoxon(finite, alternative='two-sided')
+            elif test == 't':
+                _, pval = _stats.ttest_1samp(finite, popmean=0)
+            else:
+                raise ValueError(f"test must be 'wilcoxon', 't', or None; got {test!r}")
+            pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
+                        else f'\np={pval:.2g}')
+        ax.text(pos, y_top, f'n={n_cells}{pval_str}',
+                ha='center', va='bottom', fontsize=7)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+    ax.grid(axis='y', linewidth=0.5, alpha=0.3)
+
+
+def plot_additivity_residuals(model, response='x_obs',
+                               sum_factor_col='sum_factor', epsilon=0.5,
+                               min_single_cells=3, top_n_combos=8,
+                               jitter=False, jitter_alpha=0.3, jitter_size=4,
+                               jitter_color='black',
+                               test=None, pvalue_fmt='stars',
+                               axes=None, show=True):
+    """
+    Additivity residual violin plot for high-MOI models, split into three panels.
+
+    **Row 1 — single guide**: NTC cells and cells carrying exactly one targeting
+    guide (no NTC guide co-assigned).  Single-guide residuals are near zero by
+    construction; they establish the noise floor.
+
+    **Row 2 — NTC + target**: cells carrying one NTC guide *and* one targeting
+    guide.  Acts as a null: if the NTC guide is truly inert, residuals should
+    match row 1.
+
+    **Row 3 — 2× target**: cells carrying two targeting guides.  Systematic
+    shifts vs rows 1–2 reveal non-additivity (buffering if negative, synergy if
+    positive); wider violins reveal excess variability.
+
+    Residual definition per cell::
+
+        NTC:        log2_val − NTC_mean
+        single g:   log2_val − (NTC_mean + log2FC[g])
+        NTC+g:      log2_val − (NTC_mean + log2FC[g])
+        g1+g2:      log2_val − (NTC_mean + log2FC[g1] + log2FC[g2])
+
+    Parameters
+    ----------
+    model : bayesDREAM
+        Must be a high-MOI model.
+    response : {'x_obs', 'x_true'}, default 'x_obs'
+    sum_factor_col : str, default 'sum_factor'
+    epsilon : float, default 0.5
+    min_single_cells : int, default 3
+    top_n_combos : int, default 8
+        Maximum multi-guide combinations shown in row 3.
+    jitter : bool, default False
+        Overlay individual cell residuals as jittered points.
+    jitter_alpha : float, default 0.3
+    jitter_size : float, default 4
+    jitter_color : str, default 'black'
+        Color for jittered points (applied to all panels).
+    test : {None, 'wilcoxon', 't'}, default None
+        One-sample test of H₀: residuals = 0.
+        ``'wilcoxon'``: Wilcoxon signed-rank (tests median = 0, non-parametric).
+        ``'t'``: one-sample t-test (tests mean = 0).
+    pvalue_fmt : {'stars', 'numeric'}, default 'stars'
+    axes : list of 3 matplotlib Axes, optional
+        Pre-created axes.  If None a new figure is created.
+    show : bool, default True
+
+    Returns
+    -------
+    axes : list of 3 matplotlib Axes
+        [ax_single, ax_ntc_target, ax_dual]
+    """
+    _require_high_moi(model, 'plot_additivity_residuals')
+
+    log2_vals = _cell_log2_response(model, response, sum_factor_col, epsilon)
+    ntc_mean, guide_log2fc, single_mask, multi_mask, ntc_mask, is_ntc_guide = \
+        _guide_effects_from_single_cells(model, log2_vals, min_single_cells)
+
+    ga = model.guide_assignment
+    guide_names = model.guide_meta['guide'].values
+    assigned = ga > 0
+
+    # Split single_mask into pure-single vs NTC+target
+    has_ntc_guide = assigned[:, is_ntc_guide].any(axis=1)
+    pure_single_mask = single_mask & ~has_ntc_guide
+    ntc_target_mask  = single_mask & has_ntc_guide
+
+    # ── Panel 1: NTC baseline + pure single-guide ────────────────────────────
+    panel1 = []
+    ntc_resids = log2_vals[ntc_mask] - ntc_mean
+    if len(ntc_resids) >= min_single_cells:
+        panel1.append(('NTC', ntc_resids, '#888888'))
+
+    single_entries = []
+    for j, gname in enumerate(guide_names):
+        if is_ntc_guide[j] or gname not in guide_log2fc:
+            continue
+        cell_mask = pure_single_mask & assigned[:, j]
+        vals = log2_vals[cell_mask]
+        if len(vals) >= min_single_cells:
+            pred = ntc_mean + guide_log2fc[gname]
+            single_entries.append((gname, vals - pred, '#4C72B0'))
+    single_entries.sort(key=lambda t: float(np.nanmean(t[1])))
+    panel1.extend(single_entries)
+
+    # ── Panel 2: NTC + target ────────────────────────────────────────────────
+    panel2 = []
+    ntc_target_entries = []
+    for j, gname in enumerate(guide_names):
+        if is_ntc_guide[j] or gname not in guide_log2fc:
+            continue
+        cell_mask = ntc_target_mask & assigned[:, j]
+        vals = log2_vals[cell_mask]
+        if len(vals) >= min_single_cells:
+            pred = ntc_mean + guide_log2fc[gname]
+            ntc_target_entries.append((f'NTC+{gname}', vals - pred, '#55A868'))
+    ntc_target_entries.sort(key=lambda t: float(np.nanmean(t[1])))
+    panel2.extend(ntc_target_entries)
+
+    # ── Panel 3: 2× target ───────────────────────────────────────────────────
+    panel3 = []
+    combo_cells = {}
+    for i in np.where(multi_mask)[0]:
+        combo = tuple(sorted(guide_names[j]
+                             for j in np.where(assigned[i] & ~is_ntc_guide)[0]))
+        combo_cells.setdefault(combo, []).append(i)
+
+    valid_combos = {
+        c: idxs for c, idxs in combo_cells.items()
+        if all(g in guide_log2fc for g in c) and len(idxs) >= min_single_cells
+    }
+    top_combos = sorted(valid_combos.items(), key=lambda kv: -len(kv[1]))[:top_n_combos]
+    top_combos = sorted(top_combos,
+                        key=lambda kv: sum(guide_log2fc[g] for g in kv[0]))
+    for combo, idxs in top_combos:
+        label = '+'.join(combo)
+        vals = log2_vals[np.array(idxs)]
+        pred = ntc_mean + sum(guide_log2fc[g] for g in combo)
+        panel3.append((label, vals - pred, '#DD8452'))
+
+    # ── Figure layout ────────────────────────────────────────────────────────
+    n1 = max(len(panel1), 1)
+    n2 = max(len(panel2), 1)
+    n3 = max(len(panel3), 1)
+
+    if axes is None:
+        fig, axes = plt.subplots(
+            3, 1,
+            figsize=(max(6, max(n1, n2, n3) * 0.9), 12),
+            gridspec_kw={'hspace': 0.55},
+        )
+    else:
+        fig = axes[0].get_figure()
+
+    panel_kwargs = dict(jitter=jitter, jitter_alpha=jitter_alpha,
+                        jitter_size=jitter_size, jitter_color=jitter_color,
+                        test=test, pvalue_fmt=pvalue_fmt)
+
+    row_labels = ['single guide', 'NTC + target (null)', '2× target']
+    for ax_i, panel, row_label in zip(axes, [panel1, panel2, panel3], row_labels):
+        _draw_residual_panel(ax_i, panel, **panel_kwargs)
+        ax_i.set_title(row_label, fontsize=10, loc='left', style='italic')
+
+    response_label = (f'log₂[(x_obs+ε) / (α_x·{sum_factor_col})]'
+                      if response == 'x_obs' else 'log₂(x_true)')
+    ylabel = f'Residual  (observed − additive prediction)\n{response_label}'
+    for ax_i in axes:
+        ax_i.set_ylabel(ylabel, fontsize=9)
+
+    cis_gene = getattr(model, 'cis_gene', 'cis')
+    fig.suptitle(f'{cis_gene}: additivity residuals', fontsize=12, y=1.01)
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+    return axes

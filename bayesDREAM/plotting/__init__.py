@@ -43,6 +43,7 @@ from .basic import (
     extract_posterior_dataframe,
     plot_additivity_scatter,
     plot_additivity_violin,
+    plot_additivity_residuals,
 )
 
 # Posterior density plots
@@ -94,6 +95,7 @@ __all__ = [
     'extract_posterior_dataframe',
     'plot_additivity_scatter',
     'plot_additivity_violin',
+    'plot_additivity_residuals',
     # Posterior plots
     'plot_posterior_density_lines',
     'plot_xtrue_density_by_guide',
