@@ -711,6 +711,7 @@ class TechnicalFitter:
 
         # For primary modality with a cis gene: append the cis gene row so we can
         # estimate alpha_x_prefit from the technical fit (NTC cells only).
+        from scipy import sparse
         if (modality_name == self.model.primary_modality
                 and self.model.cis_gene is not None
                 and 'cis' in self.model.modalities):
@@ -741,7 +742,6 @@ class TechnicalFitter:
         # CRITICAL: Convert COO sparse matrices to CSR for efficient row indexing
         # COO matrices don't support indexing operations needed throughout this function
         # CSR is optimal for row-based operations (subsetting, slicing, means)
-        from scipy import sparse
         if sparse.issparse(counts_to_fit):
             if sparse.isspmatrix_coo(counts_to_fit):
                 print(f"[INFO] Converting COO sparse matrix to CSR for efficient row indexing")
