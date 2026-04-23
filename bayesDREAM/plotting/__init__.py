@@ -40,7 +40,9 @@ from .basic import (
     filled_density_by_guide_log2,
     scatter_param_mean_vs_ci,
     plot_parameter_ci_panel,
-    extract_posterior_dataframe
+    extract_posterior_dataframe,
+    plot_additivity_scatter,
+    plot_additivity_violin,
 )
 
 # Posterior density plots
@@ -90,6 +92,8 @@ __all__ = [
     'scatter_param_mean_vs_ci',
     'plot_parameter_ci_panel',
     'extract_posterior_dataframe',
+    'plot_additivity_scatter',
+    'plot_additivity_violin',
     # Posterior plots
     'plot_posterior_density_lines',
     'plot_xtrue_density_by_guide',

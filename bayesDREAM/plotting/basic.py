@@ -8,7 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
-from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior
+import pandas as pd
+from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior, _NTC_VARIANTS
 from .colors import ColorScheme
 
 
@@ -1547,3 +1548,373 @@ def extract_posterior_dataframe(
                 })
 
     return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# High-MOI additivity check helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _require_high_moi(model, fn_name):
+    """Raise a clear error if the model is not in high-MOI mode."""
+    if not getattr(model, 'is_high_moi', False):
+        raise ValueError(
+            f"{fn_name}() is only meaningful for high-MOI models (where cells can "
+            "carry multiple guides). Your model is in low-MOI mode — every cell has "
+            "at most one guide, so there are no multi-guide cells to compare."
+        )
+
+
+def _ntc_guide_boolean(model):
+    """Boolean array [G_guides] — True if guide is NTC."""
+    gm = model.guide_meta
+    if 'target' in gm.columns:
+        return gm['target'].isin(_NTC_VARIANTS).values
+    gd = getattr(model, 'guide_targets_dict', {})
+    return np.array([
+        any(t in _NTC_VARIANTS for t in gd.get(g, []))
+        for g in gm['guide'].values
+    ])
+
+
+def _cell_log2_response(model, response='x_true',
+                         sum_factor_col='sum_factor', epsilon=0.5):
+    """
+    Return log2 expression per cell, shape ``(N_cells,)``.
+
+    Parameters
+    ----------
+    model : bayesDREAM
+    response : {'x_true', 'x_obs'}
+        ``'x_true'`` uses the posterior mean ``model.log2_x_true``.
+        ``'x_obs'`` computes ``log2((x_obs + epsilon) / (alpha_x * sum_factor))``,
+        mirroring the normalisation applied inside ``fit_cis``.
+    sum_factor_col : str
+        Column to use when ``response='x_obs'``.  Ignored for ``'x_true'``.
+    epsilon : float
+        Pseudocount added to raw counts before log2 (only for ``'x_obs'``).
+
+    Returns
+    -------
+    np.ndarray, shape (N_cells,)
+    """
+    if response == 'x_true':
+        if not hasattr(model, 'log2_x_true') or model.log2_x_true is None:
+            raise ValueError(
+                "model.log2_x_true is not set. Run fit_cis() first, "
+                "or use response='x_obs'."
+            )
+        return to_np(model.log2_x_true).copy()
+
+    if response == 'x_obs':
+        # Raw counts from the 'cis' modality
+        cis_mod = model.get_modality('cis')
+        cis_idx = cis_mod.feature_meta.index[0]
+        if isinstance(cis_mod.counts, pd.DataFrame):
+            x_obs = cis_mod.counts.loc[cis_idx].values.astype(float)
+        else:
+            feat_pos = cis_mod.feature_meta.index.get_loc(cis_idx)
+            raw = (cis_mod.counts[feat_pos, :] if cis_mod.cells_axis == 1
+                   else cis_mod.counts[:, feat_pos])
+            x_obs = np.asarray(raw).ravel().astype(float)
+
+        # Sum factor from the primary modality
+        primary_mod = model.get_modality(model.primary_modality)
+        sf = primary_mod.sum_factors.loc[
+            model.meta['cell'].values, sum_factor_col
+        ].values.astype(float)
+
+        # Per-cell alpha_x correction
+        if (model.alpha_x_prefit is not None
+                and 'technical_group_code' in model.meta.columns):
+            alpha_x = to_np(model.alpha_x_prefit)          # [C]
+            tg = model.meta['technical_group_code'].values  # [N]
+            alpha_x_per_cell = alpha_x[tg]
+        else:
+            alpha_x_per_cell = np.ones(len(x_obs))
+
+        return np.log2((x_obs + epsilon) / (alpha_x_per_cell * sf))
+
+    raise ValueError(f"response must be 'x_true' or 'x_obs', got {response!r}.")
+
+
+def _guide_effects_from_single_cells(model, log2_vals, min_single_cells=3):
+    """
+    Estimate per-guide log2FC from single-targeting-guide cells.
+
+    Returns
+    -------
+    ntc_mean : float
+    guide_log2fc : dict {guide_name -> float}
+        Only includes guides that have ≥ min_single_cells single-guide cells.
+    single_mask : np.ndarray[bool]  (N_cells,)
+    multi_mask  : np.ndarray[bool]  (N_cells,)
+    ntc_cell_mask : np.ndarray[bool]  (N_cells,)
+    is_ntc_guide  : np.ndarray[bool]  (G_guides,)
+    """
+    ga = model.guide_assignment                  # [N, G]
+    guide_names = model.guide_meta['guide'].values
+    is_ntc_guide = _ntc_guide_boolean(model)
+
+    assigned = ga > 0
+    n_targeting = assigned[:, ~is_ntc_guide].sum(axis=1)
+
+    ntc_cell_mask = n_targeting == 0
+    single_mask   = n_targeting == 1
+    multi_mask    = n_targeting >= 2
+
+    ntc_mean = float(np.nanmean(log2_vals[ntc_cell_mask]))
+
+    guide_log2fc = {}
+    for j, gname in enumerate(guide_names):
+        if is_ntc_guide[j]:
+            continue
+        cells = single_mask & assigned[:, j]
+        if cells.sum() >= min_single_cells:
+            guide_log2fc[gname] = float(np.nanmean(log2_vals[cells])) - ntc_mean
+
+    return ntc_mean, guide_log2fc, single_mask, multi_mask, ntc_cell_mask, is_ntc_guide
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public plots
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_additivity_scatter(model, response='x_obs',
+                             sum_factor_col='sum_factor', epsilon=0.5,
+                             min_single_cells=3, ax=None, show=True):
+    """
+    Additivity check — scatter plot for high-MOI models.
+
+    For each cell carrying two or more targeting guides the *additive
+    prediction* is computed by summing the per-guide log2FC values estimated
+    from single-guide cells.  The prediction is plotted against the observed
+    log2FC for that cell.  If the additive assumption holds, points should
+    cluster near the y = x line.
+
+    Parameters
+    ----------
+    model : bayesDREAM
+        Must be a high-MOI model (raises ``ValueError`` otherwise).
+    response : {'x_obs', 'x_true'}, default 'x_obs'
+        Response variable per cell.
+
+        * ``'x_obs'`` – normalised raw counts:
+          ``log2((x_obs + epsilon) / (alpha_x * sum_factor))``
+        * ``'x_true'`` – posterior mean ``model.log2_x_true``
+    sum_factor_col : str, default 'sum_factor'
+        Sum-factor column to use when ``response='x_obs'``.
+    epsilon : float, default 0.5
+        Pseudocount added before log2 (only used when ``response='x_obs'``).
+    min_single_cells : int, default 3
+        Minimum number of single-guide cells required to estimate a guide
+        effect.  Multi-guide cells whose guides don't meet this threshold are
+        excluded from the plot.
+    ax : matplotlib Axes, optional
+    show : bool, default True
+
+    Returns
+    -------
+    ax : matplotlib Axes
+    """
+    _require_high_moi(model, 'plot_additivity_scatter')
+
+    log2_vals = _cell_log2_response(model, response, sum_factor_col, epsilon)
+    ntc_mean, guide_log2fc, single_mask, multi_mask, ntc_mask, is_ntc_guide = \
+        _guide_effects_from_single_cells(model, log2_vals, min_single_cells)
+
+    ga = model.guide_assignment
+    guide_names = model.guide_meta['guide'].values
+    assigned = ga > 0
+
+    pred_fc, obs_fc, n_tgt_list = [], [], []
+    for i in np.where(multi_mask)[0]:
+        tgt_guides = [guide_names[j]
+                      for j in np.where(assigned[i] & ~is_ntc_guide)[0]]
+        if not all(g in guide_log2fc for g in tgt_guides):
+            continue
+        pred_fc.append(sum(guide_log2fc[g] for g in tgt_guides))
+        obs_fc.append(log2_vals[i] - ntc_mean)
+        n_tgt_list.append(len(tgt_guides))
+
+    if not pred_fc:
+        raise ValueError(
+            "No multi-guide cells could be plotted. Check that single-guide cells "
+            f"exist (min_single_cells={min_single_cells}) and that guides match."
+        )
+
+    pred_fc   = np.array(pred_fc)
+    obs_fc    = np.array(obs_fc)
+    n_tgt_arr = np.array(n_tgt_list)
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5, 5))
+
+    sc = ax.scatter(pred_fc, obs_fc, c=n_tgt_arr, cmap='plasma',
+                    alpha=0.4, s=18, linewidths=0)
+    plt.colorbar(sc, ax=ax, label='# targeting guides per cell')
+
+    finite = np.isfinite(pred_fc) & np.isfinite(obs_fc)
+    lim = np.nanpercentile(np.abs(np.concatenate([pred_fc[finite],
+                                                   obs_fc[finite]])), 99) * 1.15
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+
+    ax.axline((0, 0), slope=1, color='crimson', linestyle='--',
+              linewidth=1.5, label='y = x (perfect additivity)')
+    ax.axhline(0, color='gray', linewidth=0.5, alpha=0.5)
+    ax.axvline(0, color='gray', linewidth=0.5, alpha=0.5)
+
+    r = float(np.corrcoef(pred_fc[finite], obs_fc[finite])[0, 1]) \
+        if finite.sum() > 1 else np.nan
+    ax.text(0.05, 0.95, f'r = {r:.3f}\nn = {finite.sum():,} cells',
+            transform=ax.transAxes, va='top', fontsize=9)
+
+    response_label = (f'log₂[(x_obs+ε) / (α_x·{sum_factor_col})]'
+                      if response == 'x_obs' else 'log₂(x_true)')
+    ax.set_xlabel('Predicted log₂FC  (additive sum of single-guide effects)',
+                  fontsize=10)
+    ax.set_ylabel(f'Observed log₂FC\n{response_label} − NTC mean', fontsize=10)
+    ax.set_title(f'{getattr(model, "cis_gene", "cis")}: additivity check',
+                 fontsize=11)
+    ax.legend(fontsize=8)
+    ax.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+    return ax
+
+
+def plot_additivity_violin(model, response='x_obs',
+                            sum_factor_col='sum_factor', epsilon=0.5,
+                            min_single_cells=3, top_n_combos=8,
+                            ax=None, show=True):
+    """
+    Additivity check — violin plot for high-MOI models.
+
+    Displays the per-cell expression distribution for NTC cells, each
+    single-targeting-guide group, and the most common multi-guide
+    combinations.  For multi-guide combos a red X marks the additive
+    prediction (NTC mean + sum of individual guide log2FC values).
+
+    Parameters
+    ----------
+    model : bayesDREAM
+        Must be a high-MOI model (raises ``ValueError`` otherwise).
+    response : {'x_obs', 'x_true'}, default 'x_obs'
+        Response variable per cell.
+
+        * ``'x_obs'`` – normalised raw counts:
+          ``log2((x_obs + epsilon) / (alpha_x * sum_factor))``
+        * ``'x_true'`` – posterior mean ``model.log2_x_true``
+    sum_factor_col : str, default 'sum_factor'
+        Sum-factor column to use when ``response='x_obs'``.
+    epsilon : float, default 0.5
+        Pseudocount added before log2 (only used when ``response='x_obs'``).
+    min_single_cells : int, default 3
+        Minimum cells to include a group in the plot.
+    top_n_combos : int, default 8
+        Show only the N most common multi-guide combinations.
+    ax : matplotlib Axes, optional
+    show : bool, default True
+
+    Returns
+    -------
+    ax : matplotlib Axes
+    """
+    _require_high_moi(model, 'plot_additivity_violin')
+
+    log2_vals = _cell_log2_response(model, response, sum_factor_col, epsilon)
+    ntc_mean, guide_log2fc, single_mask, multi_mask, ntc_mask, is_ntc_guide = \
+        _guide_effects_from_single_cells(model, log2_vals, min_single_cells)
+
+    ga = model.guide_assignment
+    guide_names = model.guide_meta['guide'].values
+    assigned = ga > 0
+
+    # (label, values, color, additive_pred_or_None)
+    groups = []
+
+    ntc_vals = log2_vals[ntc_mask]
+    if len(ntc_vals) >= min_single_cells:
+        groups.append(('NTC', ntc_vals, '#888888', None))
+
+    single_entries = []
+    for j, gname in enumerate(guide_names):
+        if is_ntc_guide[j] or gname not in guide_log2fc:
+            continue
+        vals = log2_vals[single_mask & assigned[:, j]]
+        if len(vals) >= min_single_cells:
+            single_entries.append((gname, vals, '#4C72B0', None))
+    single_entries.sort(key=lambda t: float(np.nanmean(t[1])))
+    groups.extend(single_entries)
+
+    # Multi-guide combos
+    combo_cells = {}
+    for i in np.where(multi_mask)[0]:
+        combo = tuple(sorted(guide_names[j]
+                             for j in np.where(assigned[i] & ~is_ntc_guide)[0]))
+        combo_cells.setdefault(combo, []).append(i)
+
+    valid_combos = {
+        c: idxs for c, idxs in combo_cells.items()
+        if all(g in guide_log2fc for g in c) and len(idxs) >= min_single_cells
+    }
+    top_combos = sorted(valid_combos.items(),
+                        key=lambda kv: -len(kv[1]))[:top_n_combos]
+    # sort displayed combos by additive prediction (ascending)
+    top_combos = sorted(top_combos,
+                        key=lambda kv: sum(guide_log2fc[g] for g in kv[0]))
+
+    for combo, idxs in top_combos:
+        label = '+'.join(combo)
+        vals  = log2_vals[np.array(idxs)]
+        pred  = ntc_mean + sum(guide_log2fc[g] for g in combo)
+        groups.append((label, vals, '#DD8452', pred))
+
+    if not groups:
+        raise ValueError("No groups to plot. Check min_single_cells.")
+
+    labels, data, colors, preds = zip(*groups)
+    n = len(groups)
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(max(6, n * 0.9), 5))
+
+    positions = np.arange(1, n + 1)
+    vp = ax.violinplot(list(data), positions=positions,
+                       showmeans=True, showextrema=True, widths=0.7)
+    for body, col in zip(vp['bodies'], colors):
+        body.set_facecolor(col)
+        body.set_edgecolor('black')
+        body.set_alpha(0.8)
+    for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+        if key in vp:
+            vp[key].set_edgecolor('black')
+            vp[key].set_linewidth(1.1)
+
+    pred_xs = [pos for pos, p in zip(positions, preds) if p is not None]
+    pred_ys = [p   for p       in preds                if p is not None]
+    if pred_xs:
+        ax.scatter(pred_xs, pred_ys, marker='x', color='crimson', s=80,
+                   linewidths=2, zorder=10, label='Additive prediction')
+
+    ax.axhline(ntc_mean, color='gray', linestyle=':', linewidth=1, alpha=0.7,
+               label='NTC mean')
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+    response_label = (f'log₂[(x_obs+ε) / (α_x·{sum_factor_col})]'
+                      if response == 'x_obs' else 'log₂(x_true)')
+    ax.set_ylabel(response_label, fontsize=10)
+    ax.set_title(
+        f'{getattr(model, "cis_gene", "cis")}: additivity check by guide group',
+        fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(axis='y', linewidth=0.5, alpha=0.3)
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+    return ax
