@@ -1939,11 +1939,11 @@ class TechnicalFitter:
                 print(f"[INFO] Patching alpha_y=1.0 (mult) / 0.0 (add) for {n_pairs} "
                       f"(group, feature) pair(s) with all-zero NTC counts in a non-reference group.")
                 for g, feat_mask_patch in _negbinom_nonref_patch.items():
-                    # Convert boolean mask to integer indices — PyTorch misinterprets
-                    # tensor[int, numpy_bool_array] by applying the mask to dim 0.
+                    # Two-step indexing avoids PyTorch mis-routing numpy fancy
+                    # indices to the wrong dimension in 2D tensor[int, array].
                     feat_indices = np.where(feat_mask_patch)[0]
-                    alpha_y_mult_full[g, feat_indices] = 1.0
-                    alpha_y_add_full[g, feat_indices] = 0.0
+                    alpha_y_mult_full[int(g)][feat_indices] = 1.0
+                    alpha_y_add_full[int(g)][feat_indices] = 0.0
 
             # Choose correct type based on distribution
             # negbinom: multiplicative, others: additive
