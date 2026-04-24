@@ -65,7 +65,11 @@ from .de_comparison import (
 )
 
 # Diagnostic plots
-from .diagnostics import plot_sum_factor_comparison
+from .diagnostics import (
+    scatter_with_smooth_by_group,
+    plot_x_true_residuals_vs_sumfactor,
+    plot_sum_factor_comparison,
+)
 
 __all__ = [
     # Prior/posterior
@@ -109,5 +113,7 @@ __all__ = [
     'plot_edger_vs_bayes_observed_range',
     'dependency_mask_from_n',
     # Diagnostics
+    'scatter_with_smooth_by_group',
+    'plot_x_true_residuals_vs_sumfactor',
     'plot_sum_factor_comparison',
 ]
