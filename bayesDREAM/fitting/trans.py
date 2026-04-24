@@ -409,6 +409,7 @@ class TransFitter:
         vmax_log_sigma_floor_tensor=None,
         k_log_sigma_min_tensor=None,
         k_center_tensor=None,
+        latents_only=False,
     ):
 
         if use_alpha:
@@ -813,6 +814,15 @@ class TransFitter:
                         log_K_b = pyro.sample("log_K_b", dist.Normal(K_log_mu, K_log_sigma))
                         K_b = pyro.deterministic("K_b", torch.exp(log_K_b))
                 
+                # Early exit for memory-efficient posterior sampling.
+                # All gene-level latent variables (A, alpha, beta, Vmax_a/b, K_a/b, n_a/b,
+                # o_y, sigma_n_a/b) have been sampled above as [T]-shaped tensors.
+                # Skipping the cell-level Hill computation avoids creating [N, T] tensors
+                # (each ~2.68 GB for N=29318, T=22834), which is the source of OOM during
+                # pyro.infer.Predictive with num_samples > 1.
+                if latents_only:
+                    return
+
                 # Compute Hill function(s)
                 # Hill_based_positive returns values in [0, Vmax]
                 # We compute: y = A + alpha * Hill + beta * Hill (for additive)
@@ -964,6 +974,9 @@ class TransFitter:
                             coeffs_per_category.append(coeff)
                     coeffs = torch.stack(coeffs_per_category, dim=-3)  # [degree, K, T]
 
+                    if latents_only:
+                        return
+
                     # Compute polynomial for each category
                     # coeffs: [degree, K, T]
                     # Need to permute to [degree, T, K] for Polynomial_function to work correctly
@@ -993,6 +1006,9 @@ class TransFitter:
                     coeffs = torch.stack(coeffs, dim=-2)  # [degree, T]
                     if (coeffs.shape[1] == 1) & (coeffs.ndim == 4):
                         coeffs = coeffs.squeeze(1)        # [S, D, T]
+
+                    if latents_only:
+                        return
 
                     # Distribution-specific polynomial computation:
                     if distribution in ['normal', 'studentt']:
@@ -2511,7 +2527,14 @@ class TransFitter:
         gc.collect()
 
         max_samples = nsamples
-        keep_sites = kwargs.get("keep_sites", lambda name, site: site["value"].ndim <= 2 or name != "y_obs")
+        keep_sites = kwargs.get("keep_sites", lambda name, site: name != "y_obs")
+
+        # Add latents_only=True so _model_y exits before [N, T] Hill/polynomial computation.
+        # All downstream-used sites (A, o_y, alpha, beta, Vmax_a/b, K_a/b, n_a/b, etc.) are
+        # [T]-shaped and sampled BEFORE the cell-level computation, so nothing is lost.
+        # This avoids allocating multiple [N=cells, T=genes] tensors (~2.68 GB each) per
+        # Predictive sample, which is the primary source of OOM on large datasets.
+        predictive_model_inputs = {**model_inputs, "latents_only": True}
 
         if minibatch_size is not None:
             from collections import defaultdict
@@ -2526,7 +2549,7 @@ class TransFitter:
             all_samples = defaultdict(list)
             with torch.no_grad():
                 for i in range(0, max_samples, minibatch_size):
-                    samples = predictive_y(**model_inputs)
+                    samples = predictive_y(**predictive_model_inputs)
                     for k, v in samples.items():
                         if keep_sites(k, {"value": v}):
                             all_samples[k].append(self._to_cpu(v))
@@ -2541,13 +2564,12 @@ class TransFitter:
             predictive_y = pyro.infer.Predictive(
                 self._model_y,
                 guide=guide_y,
-                num_samples=nsamples#,
-                #parallel=True
+                num_samples=nsamples
             )
             with torch.no_grad():
-                _raw_samples = predictive_y(**model_inputs)
-                # Apply keep_sites filter immediately to avoid retaining large observation
-                # tensors (e.g. y_obs of shape [nsamps, N, T]) in CPU RAM.
+                _raw_samples = predictive_y(**predictive_model_inputs)
+                # keep_sites filters out y_obs (never used downstream, and not computed
+                # when latents_only=True anyway — this is a safety net for other callers).
                 posterior_samples_y = {
                     k: v for k, v in _raw_samples.items()
                     if keep_sites(k, {"value": v})
