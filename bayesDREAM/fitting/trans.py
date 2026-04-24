@@ -2545,7 +2545,14 @@ class TransFitter:
                 #parallel=True
             )
             with torch.no_grad():
-                posterior_samples_y = predictive_y(**model_inputs)
+                _raw_samples = predictive_y(**model_inputs)
+                # Apply keep_sites filter immediately to avoid retaining large observation
+                # tensors (e.g. y_obs of shape [nsamps, N, T]) in CPU RAM.
+                posterior_samples_y = {
+                    k: v for k, v in _raw_samples.items()
+                    if keep_sites(k, {"value": v})
+                }
+                del _raw_samples
                 if self.model.device.type == "cuda":
                     torch.cuda.empty_cache()
                 import gc
