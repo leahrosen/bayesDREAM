@@ -6,10 +6,11 @@ Covers:
 - Pandas DataFrames
 """
 
-import unittest
 import numpy as np
 import pandas as pd
 from scipy import sparse
+
+import pytest
 
 
 def _make_test_data(n_genes=50, n_cells=100, matrix_type='dataframe', seed=42):
@@ -37,7 +38,7 @@ def _make_test_data(n_genes=50, n_cells=100, matrix_type='dataframe', seed=42):
             {'gene_name': gene_names_for_meta, 'gene_id': [f'ENSG{i:08d}' for i in range(n_genes)]},
             index=range(n_genes),
         )
-    elif matrix_type == 'sparse':
+    elif matrix_type == 'sparse': 
         counts = sparse.csr_matrix(counts_array.astype(float))
         gene_names_for_meta = ['GFI1B'] + [f'Gene_{i}' for i in range(1, n_genes)]
         gene_meta = pd.DataFrame(
@@ -50,40 +51,52 @@ def _make_test_data(n_genes=50, n_cells=100, matrix_type='dataframe', seed=42):
     return meta, counts, gene_meta
 
 
-class TestMatrixTypes(unittest.TestCase):
-    """Verify bayesDREAM initialises correctly for all supported matrix formats."""
-
-    def _init_model(self, matrix_type):
-        from bayesDREAM import bayesDREAM
-        meta, counts, gene_meta = _make_test_data(matrix_type=matrix_type)
-        return bayesDREAM(
-            meta=meta,
-            counts=counts,
-            feature_meta=gene_meta,
-            cis_gene='GFI1B',
-            output_dir=f'./test_output_{matrix_type}',
-            label=f'test_{matrix_type}',
-            device='cpu',
-        )
-
-    def test_dataframe_input(self):
-        model = self._init_model('dataframe')
-        self.assertIsInstance(model.counts, pd.DataFrame)
-        gene_mod = model.get_modality('gene')
-        self.assertEqual(len(gene_mod.feature_meta), gene_mod.counts.shape[0])
-
-    def test_dense_numpy_input(self):
-        model = self._init_model('dense')
-        self.assertIsInstance(model.counts, np.ndarray)
-        gene_mod = model.get_modality('gene')
-        self.assertEqual(len(gene_mod.feature_meta), gene_mod.counts.shape[0])
-
-    def test_sparse_scipy_input(self):
-        model = self._init_model('sparse')
-        self.assertTrue(sparse.issparse(model.counts))
-        gene_mod = model.get_modality('gene')
-        self.assertEqual(len(gene_mod.feature_meta), gene_mod.counts.shape[0])
+def test_dataframe_input():
+    from bayesDREAM import bayesDREAM
+    meta, counts, gene_meta = _make_test_data(matrix_type='dataframe')
+    model = bayesDREAM(
+        meta=meta,
+        counts=counts,
+        feature_meta=gene_meta,
+        cis_gene='GFI1B',
+        output_dir='./test_output_dataframe',
+        label='test_dataframe',
+        device='cpu',
+    )
+    assert isinstance(model.counts, pd.DataFrame)
+    gene_mod = model.get_modality('gene')
+    assert len(gene_mod.feature_meta) == gene_mod.counts.shape[0]
 
 
-if __name__ == '__main__':
-    unittest.main()
+def test_dense_numpy_input():
+    from bayesDREAM import bayesDREAM
+    meta, counts, gene_meta = _make_test_data(matrix_type='dense')
+    model = bayesDREAM(
+        meta=meta,
+        counts=counts,
+        feature_meta=gene_meta,
+        cis_gene='GFI1B',
+        output_dir='./test_output_dense',
+        label='test_dense',
+        device='cpu',
+    )
+    assert isinstance(model.counts, np.ndarray)
+    gene_mod = model.get_modality('gene')
+    assert len(gene_mod.feature_meta) == gene_mod.counts.shape[0]
+
+
+def test_sparse_scipy_input():
+    from bayesDREAM import bayesDREAM
+    meta, counts, gene_meta = _make_test_data(matrix_type='sparse')
+    model = bayesDREAM(
+        meta=meta,
+        counts=counts,
+        feature_meta=gene_meta,
+        cis_gene='GFI1B',
+        output_dir='./test_output_sparse',
+        label='test_sparse',
+        device='cpu',
+    )
+    assert sparse.issparse(model.counts)
+    gene_mod = model.get_modality('gene')
+    assert len(gene_mod.feature_meta) == gene_mod.counts.shape[0]

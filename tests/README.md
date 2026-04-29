@@ -17,7 +17,7 @@ This directory contains test scripts for bayesDREAM functionality.
 
 ### Feature-Specific Tests
 
-- **`test_atac_modality.py`** - Tests ATAC-seq modality integration
+- **`test_modality_atac.py`** - Tests ATAC-seq modality integration
 - **`test_cell_names_numpy.py`** - Tests cell_names parameter for numpy arrays
 - **`test_exon_skip_aggregation.py`** - Tests exon skipping aggregation methods (min vs mean)
 - **`test_filtering_simple.py`** - Distribution-specific filtering at modality creation
