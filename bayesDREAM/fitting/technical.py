@@ -261,9 +261,16 @@ class TechnicalFitter:
         
             # Force α to 0 where category is structurally absent
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-        
-            # Center across categories; re-apply the mask to keep zeros exactly 0
-            alpha_logits_y = alpha_logits_y - alpha_logits_y.mean(dim=-1, keepdim=True)
+
+            # Center over ACTIVE categories only.
+            # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
+            # Dividing by n_active (not K) gives the correct softmax centering constraint
+            # (sum of active alphas = 0).  Dividing by K would leave a residual constant
+            # shift in the active alphas, breaking identifiability for features with
+            # many phantom categories.
+            n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
+            active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
+            alpha_logits_y = alpha_logits_y - active_mean
             alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
             alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
         
@@ -466,20 +473,16 @@ class TechnicalFitter:
                 torch.full_like(concentration, 1e-6),
                 concentration,
             )
-            #assert concentration.shape == (T, K), f"concentration {concentration.shape} != ({T},{K})"
             with f_plate:
                 probs0 = pyro.sample("probs_baseline_raw", dist.Dirichlet(concentration))  # [T, K]
-            #assert probs0.shape == (T, K), f"Dirichlet sample {probs0.shape} != ({T},{K})"
-            #assert zero_cat_mask.shape == (T, K), f"zero_cat_mask {zero_cat_mask.shape} != ({T},{K})"
-        
+
             # Hard-zero masked categories and renormalize across active ones
             probs_masked = probs0 * (~zero_cat_mask).to(probs0.dtype)                 # [T, K]
             row_sums = probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             probs_baseline = probs_masked / row_sums                                   # [T, K]
             probs_baseline = pyro.deterministic("probs_baseline", probs_baseline)
-        
+
             mu_y = probs_baseline  # [T, K]
-            #print(f'[DEBUG] mu_y.shape = {mu_y.shape}, expected: [{T}, {K}]')
 
     
         else:
@@ -635,7 +638,7 @@ class TechnicalFitter:
 
             **When NOT to use use_all_cells=True (use default NTC-only):**
             - Technical groups correlate with cis gene expression
-              Example: CRISPRi vs CRISPRa cell lines targeting the cis gene
+              Example: cell lines that differ in perturbation type
             - Low MOI experiments with clear NTC vs perturbed distinction
             - When technical correction should be based solely on unperturbed cells
 
@@ -693,25 +696,39 @@ class TechnicalFitter:
                     f"Cannot perform cis modeling with '{distribution}' distribution."
                 )
 
-        # For primary modality, use original counts (includes cis gene)
-        # For other modalities, use modality counts
-        if modality_name == self.model.primary_modality and hasattr(self.model, 'counts'):
-            # Use original counts which include the cis gene
-            if isinstance(self.model.counts, pd.DataFrame):
-                counts_to_fit = self.model.counts.values
-                # Cell names from the DataFrame columns
-                modality_cells = self.model.counts.columns.tolist()
-            else:
-                counts_to_fit = self.model.counts
-                # Fall back to meta cells
-                modality_cells = self.model.meta['cell'].values[:counts_to_fit.shape[modality.cells_axis]]
-            print(f"[INFO] Using original counts for primary modality '{modality_name}' (includes cis gene if present)")
+        # Always use the modality's filtered counts directly (densify if sparse)
+        counts_to_fit = modality.counts
+        if hasattr(counts_to_fit, 'toarray'):
+            counts_to_fit = counts_to_fit.toarray()
+        if modality.cell_names is not None:
+            modality_cells = modality.cell_names
         else:
-            counts_to_fit = modality.counts
-            if modality.cell_names is not None:
-                modality_cells = modality.cell_names
+            modality_cells = self.model.meta['cell'].values[:counts_to_fit.shape[modality.cells_axis]]
+
+        # Track number of trans features; we may append the cis gene row below
+        n_trans_features = modality.dims['n_features']
+        cis_idx_in_counts = None  # set if cis gene is appended as last row
+
+        # For primary modality with a cis gene: append the cis gene row so we can
+        # estimate alpha_x_prefit from the technical fit (NTC cells only).
+        from scipy import sparse
+        if (modality_name == self.model.primary_modality
+                and self.model.cis_gene is not None
+                and 'cis' in self.model.modalities):
+            cis_mod = self.model.get_modality('cis')
+            # cis modality has cells_axis=1, so counts is [1, N]
+            cis_row = cis_mod.counts if cis_mod.cells_axis == 1 else cis_mod.counts.T
+
+            if sparse.issparse(counts_to_fit):
+                cis_row_sp = (cis_row.tocsr() if sparse.issparse(cis_row)
+                              else sparse.csr_matrix(np.asarray(cis_row).reshape(1, -1)))
+                counts_to_fit = sparse.vstack([counts_to_fit, cis_row_sp], format='csr')
             else:
-                modality_cells = self.model.meta['cell'].values[:counts_to_fit.shape[modality.cells_axis]]
+                cis_row_dense = np.asarray(cis_row).reshape(1, -1)
+                counts_to_fit = np.vstack([np.asarray(counts_to_fit), cis_row_dense])
+
+            cis_idx_in_counts = n_trans_features  # cis gene is the last row
+            print(f"[INFO] Appended cis gene '{self.model.cis_gene}' for alpha_x estimation")
 
         # CRITICAL: Convert numpy.matrix to numpy.ndarray if needed
         # numpy.matrix is deprecated and has problematic indexing behavior with boolean arrays
@@ -725,7 +742,6 @@ class TechnicalFitter:
         # CRITICAL: Convert COO sparse matrices to CSR for efficient row indexing
         # COO matrices don't support indexing operations needed throughout this function
         # CSR is optimal for row-based operations (subsetting, slicing, means)
-        from scipy import sparse
         if sparse.issparse(counts_to_fit):
             if sparse.isspmatrix_coo(counts_to_fit):
                 print(f"[INFO] Converting COO sparse matrix to CSR for efficient row indexing")
@@ -763,7 +779,7 @@ class TechnicalFitter:
             warnings.warn(
                 "[WARNING] use_all_cells=True: Fitting technical effects on ALL cells. "
                 "Only use this mode if technical effects are independent of perturbation effects. "
-                "If technical groups (e.g., CRISPRi vs CRISPRa) correlate with cis gene expression, "
+                "If technical groups correlate with cis gene expression, "
                 "use the default NTC-only mode to avoid over-correction.",
                 UserWarning
             )
@@ -969,31 +985,31 @@ class TechnicalFitter:
             # per-feature categories must be present in *all* technical groups
             groups_ntc_codes = meta_ntc['technical_group_code'].values
             unique_groups = np.unique(groups_ntc_codes)
-        
+
             F, _, K = counts_ntc_array.shape  # [features, cells, categories]
-        
+
             for f_idx in range(F):
                 feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
-        
+
                 shared_present = None  # will become boolean [K]
                 for g in unique_groups:
                     g_mask = (groups_ntc_codes == g)
                     if not np.any(g_mask):
                         continue  # should not happen, but just in case
-        
+
                     counts_g = feature_counts[g_mask, :].sum(axis=0)  # [K]
                     present_g = counts_g > 0                          # category present in this group?
-        
+
                     if shared_present is None:
                         shared_present = present_g
                     else:
                         shared_present &= present_g  # intersection across groups
-        
+
                 if shared_present is None:
                     n_shared = 0
                 else:
                     n_shared = int(shared_present.sum())
-        
+
                 # If 0 or 1 categories survive the "present in all groups" criterion,
                 # the feature cannot support a multinomial cell-line effect.
                 if n_shared <= 1:
@@ -1098,7 +1114,8 @@ class TechnicalFitter:
 
         # Size-factor use only for NB; otherwise ignore
         if distribution == 'negbinom' and sum_factor_col is not None:
-            y_obs_ntc_factored = y_obs_ntc_for_priors / meta_ntc[sum_factor_col].values.reshape(-1, 1)
+            ntc_sf = modality.sum_factors.loc[meta_ntc['cell'].values, sum_factor_col].values
+            y_obs_ntc_factored = y_obs_ntc_for_priors / ntc_sf.reshape(-1, 1)
         else:
             y_obs_ntc_factored = y_obs_ntc_for_priors
 
@@ -1226,7 +1243,9 @@ class TechnicalFitter:
         del mu_x_mean, mu_x_sd  # Free numpy arrays
 
         if sum_factor_col is not None and distribution == 'negbinom':
-            sum_factor_np = meta_ntc[sum_factor_col].values.astype(np.float32)
+            sum_factor_np = modality.sum_factors.loc[
+                meta_ntc['cell'].values, sum_factor_col
+            ].values.astype(np.float32)
             sum_factor_ntc_tensor = torch.from_numpy(sum_factor_np).to(self.model.device)
             del sum_factor_np
         else:
@@ -1268,10 +1287,34 @@ class TechnicalFitter:
             gc.collect()
     
         # ---------------------------
+        # Multinomial precomputations (done once, before guide + SVI)
+        # ---------------------------
+        if distribution == 'multinomial':
+            # Replicate the zero-category mask from _model_technical so we can use it here.
+            _total_all = y_obs_ntc_tensor.sum(dim=0)                          # [T, K]
+            _zmask = (_total_all == 0)
+            for _g in range(C):
+                _gm = (groups_ntc_tensor == _g)
+                if _gm.sum() > 0:
+                    _zmask = _zmask | (y_obs_ntc_tensor[_gm].sum(dim=0) == 0)
+
+            # Reference group empirical proportions → log-space init for softmax guide
+            _ref_m = (groups_ntc_tensor == 0)
+            _ref_counts = (y_obs_ntc_tensor[_ref_m].sum(dim=0).float() + 1.0
+                           if _ref_m.sum() > 0 else y_obs_ntc_tensor.sum(dim=0).float() + 1.0)
+            _ref_counts = _ref_counts.masked_fill(_zmask, 0.0)
+            _ref_props = _ref_counts / _ref_counts.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            _log_p_init = torch.log(_ref_props.clamp(min=1e-8))              # [T, K]
+
+            # Store for the guide closure
+            self._multinomial_zero_cat_mask = _zmask                         # [T, K]
+            self._multinomial_log_p_init    = _log_p_init                    # [T, K]
+
+        # ---------------------------
         # Guide + init functions
         # ---------------------------
         import pyro.poutine as poutine
-        from pyro.infer.autoguide import AutoGuideList, AutoDelta, AutoNormal, AutoNormalMessenger, AutoIAFNormal
+        from pyro.infer.autoguide import AutoNormal, AutoNormalMessenger, AutoIAFNormal
         from pyro.infer.autoguide.initialization import init_to_median
         
         def _safe_simplex_from_counts(total_counts_TK: torch.Tensor, interior_floor=1e-3) -> torch.Tensor:
@@ -1302,37 +1345,8 @@ class TechnicalFitter:
             # Multinomial-only inits
             # -------------------------
             if distribution == 'multinomial':
-                # Robust init for Dirichlet (simplex) - use reference group empirical proportions
-                if name == "probs_baseline_raw":
-                    # Use the site's own shapes to be robust to any future plate changes
-                    T_local = int(site["fn"].batch_shape[0])
-                    K_local = int(site["fn"].event_shape[0])
-
-                    # Compute empirical proportions from reference group (group 0)
-                    baseline_mask = (groups_ntc_tensor == 0).cpu().numpy()
-                    if baseline_mask.sum() > 0:
-                        # Get reference group counts: [N_ref, T, K]
-                        y_ref = y_obs_ntc_tensor[baseline_mask, :, :].cpu().numpy()
-                        # Sum across cells: [T, K]
-                        total_counts_ref = y_ref.sum(axis=0) + 1.0  # Add pseudocount
-                        # Compute proportions
-                        p_empirical = total_counts_ref / total_counts_ref.sum(axis=1, keepdims=True)
-                        # Convert to torch
-                        p = torch.tensor(p_empirical, dtype=torch.float32, device=self.model.device)
-                    else:
-                        # Fallback to uniform if no reference group
-                        p = torch.full((T_local, K_local), 1.0 / K_local,
-                                       dtype=torch.float32, device=self.model.device)
-
-                    # Ensure strictly interior (move away from boundaries)
-                    eps = 5e-3
-                    p = (1.0 - K_local * eps) * p + eps
-                    p = p / p.sum(dim=-1, keepdim=True)
-
-                    assert torch.isfinite(p).all(), "Dirichlet init produced non-finite entries"
-                    assert (p > 0).all() and (p < 1).all(), "Dirichlet init not strictly interior"
-                    return p
-
+                # probs_baseline_raw is guided by the softmax pyro.param directly —
+                # init_loc_fn is never called for it. Only alpha_logits_y reaches here.
                 if name == "alpha_logits_y":
                     # Initialize with logit-scale differences between groups vs reference
                     shape = site["fn"].batch_shape  # [C-1, T_fit, K]
@@ -1446,22 +1460,30 @@ class TechnicalFitter:
         # Guide choice with memory check
         # ---------------------------
         if distribution == 'multinomial':
-            # Split guide: point-mass for Dirichlet baseline, Gaussian for the rest
-            guide_cellline = AutoGuideList(self._model_technical)
+            # Softmax guide for probs_baseline_raw: avoids the stick-breaking gradient
+            # compression that caused AutoDelta to overshoot near the simplex boundary.
+            # We parameterise log-proportions in ℝ^K and apply softmax — gradients are
+            # uniform everywhere, no vanishing near p→1.
+            _zmask_guide  = self._multinomial_zero_cat_mask   # [T, K]  captured in closure
+            _log_p_init_g = self._multinomial_log_p_init      # [T, K]
+            _T_guide      = T_fit
+            _plate_name   = "feature_plate_technical"
 
-            # Pin the Dirichlet site with a learnable point; init uses our interior simplex
-            guide_dirichlet = AutoDelta(
-                poutine.block(self._model_technical, expose=["probs_baseline_raw"]),
-                init_loc_fn=init_loc_fn,
-            )
-            guide_cellline.add(guide_dirichlet)
-
-            # Everything else stays as a stable Normal guide (uses your inits for alpha_logits_y, etc.)
-            guide_rest = AutoNormal(
+            # AutoNormal for alpha_logits_y (all sites except probs_baseline_raw)
+            _guide_alpha = AutoNormal(
                 poutine.block(self._model_technical, hide=["probs_baseline_raw"]),
                 init_loc_fn=init_loc_fn,
             )
-            guide_cellline.add(guide_rest)
+
+            def guide_cellline(*args, **kwargs):
+                # ---- probs_baseline_raw: softmax-parameterised point estimate ----
+                log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
+                log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
+                probs = torch.softmax(log_p_masked, dim=-1)                  # [T, K]
+                with pyro.plate(_plate_name, _T_guide, dim=-1):
+                    pyro.sample("probs_baseline_raw", dist.Delta(probs, event_dim=1))
+                # ---- everything else: AutoNormal ----
+                _guide_alpha(*args, **kwargs)
 
         elif distribution in ['binomial', 'normal', 'studentt']:
             # Calmer guide for these distributions
@@ -1970,59 +1992,24 @@ class TechnicalFitter:
         # ----------------------------------------
         # Feature metadata flags
         # ----------------------------------------
-        # Determine where masks were computed from (based on counts_to_fit source)
-        # If we used self.model.counts, masks correspond to those features
-        # If we used modality.counts, masks correspond to modality features
-        # Did we use self.model.counts as the source for counts_to_fit?
-        used_original_counts = (
-            modality_name == self.model.primary_modality
-            and hasattr(self.model, "counts")
-        )
-        
-        if used_original_counts:
-            # Masks are for original counts features - store in base class
-            if isinstance(self.model.counts, pd.DataFrame):
-                index = self.model.counts.index
-            else:
-                # No natural index => just use a RangeIndex of the right length
-                index = pd.RangeIndex(len(zero_count_mask))
-        
-            if not hasattr(self.model, "counts_meta"):
-                self.model.counts_meta = pd.DataFrame(index=index)
-            elif len(self.model.counts_meta) != len(zero_count_mask):
-                # Realign counts_meta if needed
-                self.model.counts_meta = self.model.counts_meta.reindex(index)
-        
-            self.model.counts_meta["ntc_zero_count"]            = zero_count_mask
-            self.model.counts_meta["ntc_zero_std"]              = zero_std_mask
-            self.model.counts_meta["ntc_single_category"]       = only_one_category_mask
-            self.model.counts_meta["ntc_excluded_from_fit"]     = needs_exclusion_mask
-            self.model.counts_meta["technical_correction_applied"] = ~needs_exclusion_mask
-        
-        else:
-            # Masks are for modality features - store in modality metadata
-            if len(zero_count_mask) != len(modality.feature_meta):
-                raise ValueError(
-                    f"Mask length mismatch: masks have {len(zero_count_mask)} elements "
-                    f"but modality.feature_meta has {len(modality.feature_meta)} rows. "
-                    f"This likely means counts_to_fit and modality.counts have different feature counts."
-                )
-            modality.feature_meta["ntc_zero_count"]            = zero_count_mask.tolist()
-            modality.feature_meta["ntc_zero_std"]              = zero_std_mask.tolist()
-            modality.feature_meta["ntc_single_category"]       = only_one_category_mask.tolist()
-            modality.feature_meta["ntc_excluded_from_fit"]     = needs_exclusion_mask.tolist()
-            modality.feature_meta["technical_correction_applied"] = (~needs_exclusion_mask).tolist()
+        # Masks cover rows 0..n_trans_features-1 (trans genes) and optionally
+        # row n_trans_features (cis gene, if appended).  Store only the trans
+        # portion in the modality's feature_meta.
+        if len(modality.feature_meta) == n_trans_features:
+            modality.feature_meta["ntc_zero_count"]               = zero_count_mask[:n_trans_features].tolist()
+            modality.feature_meta["ntc_zero_std"]                 = zero_std_mask[:n_trans_features].tolist()
+            modality.feature_meta["ntc_single_category"]          = only_one_category_mask[:n_trans_features].tolist()
+            modality.feature_meta["ntc_excluded_from_fit"]        = needs_exclusion_mask[:n_trans_features].tolist()
+            modality.feature_meta["technical_correction_applied"] = (~needs_exclusion_mask[:n_trans_features]).tolist()
 
     
         # ----------------------------------------
         # Persist results at modality level
         # ----------------------------------------
-        # For primary modality fitted with original counts (includes cis gene),
-        # we need to extract alpha_x for the cis gene and exclude it from modality alpha_y.
-        if modality_name == self.model.primary_modality and hasattr(self.model, 'counts') and \
-           self.model.cis_gene is not None and 'cis' in self.model.modalities:
+        if cis_idx_in_counts is not None:
+            # Cis gene was appended as the last row.  Extract its alpha for alpha_x_prefit,
+            # then trim it from all primary-modality posteriors so they align with the modality.
 
-            # Enforce: cis effect must NOT be multinomial
             if distribution == 'multinomial':
                 raise ValueError(
                     "Primary modality uses a multinomial distribution, "
@@ -2030,123 +2017,77 @@ class TechnicalFitter:
                     "Ensure the primary modality is not multinomial when cis is present."
                 )
 
-            # Check if cis gene is in the original counts
-            if isinstance(self.model.counts, pd.DataFrame) and self.model.cis_gene in self.model.counts.index:
-                all_genes_orig = self.model.counts.index.tolist()
-                cis_idx_orig = all_genes_orig.index(self.model.cis_gene)
+            full_alpha_y_mult = posterior_samples["alpha_y_mult"]
+            full_alpha_y_add  = posterior_samples["alpha_y_add"]
 
-                # Expect alpha_y_mult and alpha_y_add to be [S?, C, T_all] for non-multinomial primary
-                full_alpha_y_mult = posterior_samples["alpha_y_mult"]
-                full_alpha_y_add  = posterior_samples["alpha_y_add"]
+            if full_alpha_y_mult is None:
+                raise RuntimeError(
+                    "alpha_y_mult is None while attempting cis extraction. "
+                    "This can happen if the distribution is multinomial; "
+                    "check distribution handling earlier."
+                )
 
-                if full_alpha_y_mult is None:
-                    raise RuntimeError(
-                        "alpha_y_mult is None while attempting cis extraction. "
-                        "This can happen if the distribution is multinomial; "
-                        "check distribution handling earlier."
-                    )
+            cis_idx_orig = cis_idx_in_counts          # always == n_trans_features
+            trans_idx    = list(range(cis_idx_orig))  # 0 .. n_trans_features-1
+            T_all_with_cis = n_trans_features + 1
 
-                if cis_idx_orig < full_alpha_y_mult.shape[-1]:
-                    # Extract cis gene alpha (mean over samples → [C])
-                    self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
+            # alpha_x_prefit: mean over posterior samples → [C]
+            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
 
-                    # Exclude cis from modality alpha_y
-                    all_idx = list(range(full_alpha_y_mult.shape[-1]))
-                    trans_idx = [i for i in all_idx if i != cis_idx_orig]
-
-                    # Store mean over samples → [C, T]
-                    if modality.distribution == 'negbinom':
-                        modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
-                        # Don't set alpha_y_prefit_add for negbinom
-                    else:  # binomial, multinomial, normal, studentt use additive
-                        modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
-                        # Don't set alpha_y_prefit_mult for additive modalities
-
-                    # ========================================
-                    # Extract cis gene posterior samples and store in cis modality
-                    # ========================================
-                    cis_modality = self.model.get_modality('cis')
-                    cis_posterior = {}
-
-                    # Extract raw sampled parameters for cis gene
-                    if 'log2_alpha_y' in posterior_samples:
-                        cis_posterior['log2_alpha_x'] = posterior_samples['log2_alpha_y'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'alpha_y_mul' in posterior_samples:
-                        cis_posterior['alpha_x_mul'] = posterior_samples['alpha_y_mul'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'delta_y_add' in posterior_samples:
-                        cis_posterior['delta_x_add'] = posterior_samples['delta_y_add'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'o_y' in posterior_samples:
-                        cis_posterior['o_x'] = posterior_samples['o_y'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    if 'mu_ntc' in posterior_samples:
-                        cis_posterior['mu_ntc'] = posterior_samples['mu_ntc'][..., cis_idx_orig:cis_idx_orig+1]
-
-                    # Create reconstructed alpha with baseline (matching what we do for alpha_y)
-                    # These already have shape [S, C-1, 1] from the extraction above
-                    if 'alpha_x_mul' in cis_posterior:
-                        alpha_x_mul_raw = cis_posterior['alpha_x_mul']  # [S, C-1, 1]
-                        # Add baseline (C=1) dimension
-                        if alpha_x_mul_raw.dim() == 3:
-                            S, Cminus1, _ = alpha_x_mul_raw.shape
-                            cis_posterior['alpha_x_mult'] = torch.cat(
-                                [torch.ones(S, 1, 1, device=alpha_x_mul_raw.device), alpha_x_mul_raw],
-                                dim=1
-                            )  # [S, C, 1]
-                        cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']  # alias
-
-                    if 'delta_x_add' in cis_posterior:
-                        delta_x_add_raw = cis_posterior['delta_x_add']  # [S, C-1, 1]
-                        # Add baseline (C=0) dimension
-                        if delta_x_add_raw.dim() == 3:
-                            S, Cminus1, _ = delta_x_add_raw.shape
-                            cis_posterior['alpha_x_add'] = torch.cat(
-                                [torch.zeros(S, 1, 1, device=delta_x_add_raw.device), delta_x_add_raw],
-                                dim=1
-                            )  # [S, C, 1]
-
-                    # Store in cis modality
-                    cis_modality.posterior_samples_technical = cis_posterior
-                    print(f"[INFO] Stored cis gene posterior samples in 'cis' modality: {list(cis_posterior.keys())}")
-
-                    # ========================================
-                    # Exclude cis gene from ALL primary modality posterior samples
-                    # ========================================
-                    # Store full posteriors (not means) in posterior_samples dict
-                    if modality.distribution == 'negbinom':
-                        posterior_samples["alpha_y_mult"] = full_alpha_y_mult[..., trans_idx]
-                        posterior_samples["alpha_y"] = posterior_samples["alpha_y_mult"]
-                    else:
-                        posterior_samples["alpha_y_add"] = full_alpha_y_add[..., trans_idx]
-                        posterior_samples["alpha_y"] = posterior_samples["alpha_y_add"]
-
-                    # CRITICAL: Also exclude cis gene from ALL raw posterior samples
-                    # These raw samples are used for analysis/diagnostics, so they must match gene modality
-                    for key in ['log2_alpha_y', 'alpha_y_mul', 'delta_y_add', 'o_y', 'mu_ntc']:
-                        if key in posterior_samples:
-                            raw_sample = posterior_samples[key]
-                            # These are typically [S, C-1, T] or [S, 1, T] depending on the parameter
-                            if raw_sample is not None and raw_sample.shape[-1] == len(all_genes_orig):
-                                posterior_samples[key] = raw_sample[..., trans_idx]
-                                print(f"[INFO] Excluded cis gene from '{key}': {raw_sample.shape} -> {posterior_samples[key].shape}")
-
-                    print(f"[INFO] Extracted alpha_x for cis '{self.model.cis_gene}' and excluded it from ALL primary modality posterior samples")
-                else:
-                    # Cis gene not present after filtering; store mean
-                    if modality.distribution == 'negbinom':
-                        modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
-                    else:
-                        modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
+            # Modality alpha_y: trans genes only → mean → [C, T]
+            if modality.distribution == 'negbinom':
+                modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
             else:
-                # Cis gene not in counts; store mean
-                if modality.distribution == 'negbinom':
-                    modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
-                else:
-                    modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
+                modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
+
+            # ---- Store cis gene posteriors in cis modality ----
+            cis_modality = self.model.get_modality('cis')
+            cis_posterior = {}
+            for src_key, dst_key in [
+                ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
+                ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
+                ('mu_ntc',      'mu_ntc'),
+            ]:
+                if src_key in posterior_samples:
+                    cis_posterior[dst_key] = posterior_samples[src_key][..., cis_idx_orig:cis_idx_orig+1]
+
+            if 'alpha_x_mul' in cis_posterior:
+                raw = cis_posterior['alpha_x_mul']  # [S, C-1, 1]
+                if raw.dim() == 3:
+                    S, Cminus1, _ = raw.shape
+                    cis_posterior['alpha_x_mult'] = torch.cat(
+                        [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
+                    cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
+
+            if 'delta_x_add' in cis_posterior:
+                raw = cis_posterior['delta_x_add']  # [S, C-1, 1]
+                if raw.dim() == 3:
+                    S, Cminus1, _ = raw.shape
+                    cis_posterior['alpha_x_add'] = torch.cat(
+                        [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
+
+            cis_modality.posterior_samples_technical = cis_posterior
+            print(f"[INFO] Stored cis gene posteriors in 'cis' modality: {list(cis_posterior.keys())}")
+
+            # ---- Trim cis gene from ALL primary-modality posteriors ----
+            if modality.distribution == 'negbinom':
+                posterior_samples["alpha_y_mult"] = full_alpha_y_mult[..., trans_idx]
+                posterior_samples["alpha_y"]      = posterior_samples["alpha_y_mult"]
+            else:
+                posterior_samples["alpha_y_add"] = full_alpha_y_add[..., trans_idx]
+                posterior_samples["alpha_y"]     = posterior_samples["alpha_y_add"]
+
+            for key in ['log2_alpha_y', 'alpha_y_mul', 'delta_y_add', 'o_y', 'mu_ntc']:
+                if key in posterior_samples and isinstance(posterior_samples[key], torch.Tensor):
+                    v = posterior_samples[key]
+                    if v.shape[-1] == T_all_with_cis:
+                        posterior_samples[key] = v[..., trans_idx]
+
+            print(f"[INFO] Extracted alpha_x for '{self.model.cis_gene}' (index {cis_idx_orig}) "
+                  f"and trimmed it from primary modality posteriors")
+
         else:
-            # Not primary modality or no cis gene, store mean
+            # No cis gene appended (non-primary modality, or no cis_gene set)
             if modality.distribution == 'negbinom':
                 modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
             else:

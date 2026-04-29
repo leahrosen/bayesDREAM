@@ -46,11 +46,12 @@ from .fitting.distributions import get_observation_sampler, requires_denominator
 from .fitting import TechnicalFitter, CisFitter, TransFitter
 from .io import ModelSaver, ModelLoader
 from .plotting.model_plots import PlottingMixin
+from .diagnostics import DiagnosticsMixin
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-class _BayesDREAMCore(PlottingMixin):
+class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
     """
     Internal core class for the three-step Bayesian Dosage Response Effects Across Modalities framework:
 
@@ -148,27 +149,14 @@ class _BayesDREAMCore(PlottingMixin):
         # Handle counts - can be DataFrame or sparse matrix
         self.is_sparse_counts = sparse.issparse(counts)
         if self.is_sparse_counts:
-            # Keep sparse matrix as-is
             self.counts = counts.copy() if hasattr(counts, 'copy') else counts.tocsr()
-            # Extract gene and cell names from DataFrame metadata
-            if isinstance(counts, pd.DataFrame):
-                self._gene_names = counts.index.tolist()
-                self._cell_names = counts.columns.tolist()
-            else:
-                # counts is sparse array - will extract names from gene_meta and meta later
-                self._gene_names = None
-                self._cell_names = None
-            print(f"[SPARSE] Keeping counts as sparse matrix (shape: {counts.shape}, sparsity: {1 - counts.nnz / (counts.shape[0] * counts.shape[1]):.2%} zeros)")
+            self._cell_names = counts.columns.tolist() if isinstance(counts, pd.DataFrame) else None
         else:
-            # DataFrame or dense array
             if isinstance(counts, pd.DataFrame):
                 self.counts = counts.copy()
-                self._gene_names = counts.index.tolist()
                 self._cell_names = counts.columns.tolist()
             else:
-                # Dense numpy array - store as-is, extract names later
                 self.counts = counts.copy() if hasattr(counts, 'copy') else counts
-                self._gene_names = None
                 self._cell_names = None
 
         self.cis_gene = cis_gene
@@ -190,7 +178,6 @@ class _BayesDREAMCore(PlottingMixin):
                     )
                 )
             self.is_high_moi = True
-            print("[INFO] High MOI mode detected")
 
             # Validate guide_assignment shape
             if guide_assignment.ndim != 2:
@@ -274,7 +261,6 @@ class _BayesDREAMCore(PlottingMixin):
 
                 # Store for later use
                 self.guide_targets_dict = guide_targets_dict
-                print(f"[INFO] Using guide_target DataFrame: {len(guide_target)} guide-target relationships")
 
             elif 'target' in guide_meta.columns:
                 # Use simple one-to-one mapping from guide_meta
@@ -283,132 +269,16 @@ class _BayesDREAMCore(PlottingMixin):
                     for _, row in guide_meta.iterrows()
                 }
                 self.guide_targets_dict = guide_targets_dict
-                print(f"[INFO] Using guide_meta['target'] for one-to-one guide-target mapping")
             else:
                 raise ValueError(
                     "Either guide_target DataFrame or guide_meta['target'] column must be provided "
                     "to specify guide-target relationships in high MOI mode."
                 )
 
-            print(f"[INFO] High MOI: {N_cells_assignment} cells (from guide_assignment), {G_guides} guides")
-            print(f"[INFO] Average guides per cell: {guide_assignment.sum(axis=1).mean():.2f}")
+            print(f"[INFO] High MOI: {G_guides} guides, avg {guide_assignment.sum(axis=1).mean():.2f} per cell")
 
         else:
             self.is_high_moi = False
-
-        # Handle gene metadata and extract gene names
-        if gene_meta is None:
-            # Create minimal gene metadata from counts
-            print("[INFO] No gene_meta provided - creating minimal metadata")
-            if isinstance(counts, pd.DataFrame):
-                # DataFrame: use string index from DataFrame
-                gene_names = counts.index.tolist()
-                self.gene_meta = pd.DataFrame({
-                    'gene': gene_names
-                }, index=gene_names)
-                self._gene_names = gene_names
-            else:
-                # Matrix/array: use NUMERIC index [0, 1, 2, ...]
-                n_features = counts.shape[0]
-                self.gene_meta = pd.DataFrame({
-                    'feature_id': range(n_features)
-                }, index=range(n_features))
-                self._gene_names = None  # No string names for matrices
-                print(f"[INFO] Using numeric feature indices [0..{n_features-1}] for matrix/array")
-        else:
-            # Validate and process provided gene_meta
-            gene_meta = gene_meta.copy()
-
-            # Check that gene_meta has at least one identifier column
-            has_gene_col = 'gene' in gene_meta.columns
-            has_gene_name = 'gene_name' in gene_meta.columns
-            has_gene_id = 'gene_id' in gene_meta.columns
-            has_feature_id = 'feature_id' in gene_meta.columns
-
-            if not has_gene_col and not has_gene_name and not has_gene_id and not has_feature_id:
-                raise ValueError(
-                    "gene_meta must have at least one identifier column: "
-                    "'gene', 'gene_name', 'gene_id', or 'feature_id'"
-                )
-
-            # Handle based on counts type
-            if isinstance(counts, pd.DataFrame):
-                # DataFrame: gene_meta should use same string index as counts
-                # Ensure we have a 'gene' column for internal use
-                if not has_gene_col:
-                    if gene_meta.index.name is not None:
-                        gene_meta['gene'] = gene_meta.index
-                        print(f"[INFO] Using gene_meta index ('{gene_meta.index.name}') as 'gene' column")
-                    elif has_gene_name:
-                        gene_meta['gene'] = gene_meta['gene_name']
-                        print("[INFO] Using 'gene_name' column as 'gene' identifier")
-                    elif has_gene_id:
-                        gene_meta['gene'] = gene_meta['gene_id']
-                        print("[INFO] Using 'gene_id' column as 'gene' identifier")
-
-                counts_gene_names = counts.index.tolist()
-
-                # Ensure gene_meta index matches counts index
-                if not gene_meta.index.equals(pd.Index(counts_gene_names)):
-                    # Try to reindex by matching identifiers
-                    if set(counts_gene_names).issubset(set(gene_meta.index)):
-                        gene_meta = gene_meta.loc[counts_gene_names]
-                    else:
-                        warnings.warn(
-                            f"[WARNING] gene_meta index does not match counts index. "
-                            f"Attempting to match by identifier columns.",
-                            UserWarning
-                        )
-                        # Try matching by columns
-                        matched_indices = []
-                        for gene in counts_gene_names:
-                            found = False
-                            for col in ['gene', 'gene_name', 'gene_id']:
-                                if col in gene_meta.columns and gene in gene_meta[col].values:
-                                    matched_indices.append(gene_meta[gene_meta[col] == gene].index[0])
-                                    found = True
-                                    break
-                            if not found:
-                                # Add minimal metadata for missing gene
-                                matched_indices.append(gene)
-
-                        # Add any missing genes
-                        missing = set(counts_gene_names) - set(gene_meta.index)
-                        if missing:
-                            missing_df = pd.DataFrame({'gene': list(missing)}, index=list(missing))
-                            gene_meta = pd.concat([gene_meta, missing_df])
-
-                        gene_meta = gene_meta.loc[counts_gene_names]
-
-                self._gene_names = counts_gene_names
-            else:
-                # Matrix/array: ensure gene_meta has NUMERIC index [0, 1, 2, ...]
-                n_features = counts.shape[0]
-
-                # Check if gene_meta already has numeric index of correct length
-                if isinstance(gene_meta.index, pd.RangeIndex) and len(gene_meta) == n_features:
-                    # Already has correct numeric index
-                    pass
-                elif all(isinstance(idx, (int, np.integer)) for idx in gene_meta.index) and len(gene_meta) == n_features:
-                    # Has integer index - ensure it's a proper range
-                    gene_meta.index = range(n_features)
-                else:
-                    # Reset to numeric index
-                    if len(gene_meta) != n_features:
-                        raise ValueError(
-                            f"gene_meta has {len(gene_meta)} rows but counts has {n_features} features. "
-                            f"For matrix/array counts, gene_meta must have exactly {n_features} rows."
-                        )
-                    gene_meta.index = range(n_features)
-                    print(f"[INFO] Reset gene_meta to numeric index [0..{n_features-1}] to match matrix/array")
-
-                self._gene_names = None  # No string names for matrices
-
-            self.gene_meta = gene_meta
-
-            # Print summary
-            meta_cols = [c for c in ['gene', 'gene_name', 'gene_id', 'feature_id'] if c in self.gene_meta.columns]
-            print(f"[INFO] Feature metadata loaded with {len(self.gene_meta)} features and columns: {meta_cols}")
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -560,12 +430,9 @@ class _BayesDREAMCore(PlottingMixin):
 
         # Subset meta and counts to relevant cells
         valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
-        if len(valid_cells) < len(self.meta["cell"].unique()):
-            warnings.warn(
-                f"Subsetting reduced the number of cells in the metadata from {len(self.meta['cell'].unique())} to {len(valid_cells)}. "
-                "This may impact downstream analysis.",
-                UserWarning
-            )
+        n_cells_before = len(self.meta["cell"].unique())
+        if len(valid_cells) < n_cells_before:
+            print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
         self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
 
         # Subset counts by cells - works for both DataFrame and sparse
@@ -637,87 +504,33 @@ class _BayesDREAMCore(PlottingMixin):
         detected_mask = gene_sums > 0
         num_removed = (~detected_mask).sum()
 
-        # Raise error if cis gene is undetected
-        if self.cis_gene is not None:
-            if isinstance(self.counts, pd.DataFrame):
-                # DataFrame: check if cis_gene is in index
-                if self.cis_gene not in self.counts.index:
-                    raise ValueError(f"[ERROR] The cis gene '{self.cis_gene}' not found in counts index!")
-                cis_idx = self.counts.index.get_loc(self.cis_gene)
-            else:
-                # Matrix/array: search gene_meta columns for cis_gene
-                # Try columns in order: gene_name, gene, gene_id, feature_id
-                cis_idx = None
-                for col in ['gene_name', 'gene', 'gene_id', 'feature_id']:
-                    if col in self.gene_meta.columns:
-                        matches = self.gene_meta[self.gene_meta[col] == self.cis_gene]
-                        if len(matches) > 0:
-                            # Found cis gene - use its numeric index for validation
-                            cis_idx = matches.index[0]
-                            break
-
-                if cis_idx is None:
-                    available_cols = [c for c in ['gene_name', 'gene', 'gene_id', 'feature_id'] if c in self.gene_meta.columns]
-                    raise ValueError(
-                        f"[ERROR] The cis gene '{self.cis_gene}' not found in gene_meta columns {available_cols}!"
-                    )
-
-            # Check if cis gene has zero counts
+        # Cis gene existence and zero-variance are already validated by _extract_cis_from_gene
+        # (called in bayesDREAM.__init__ before super().__init__).
+        # For DataFrame counts only: double-check the gene is still in the index after cell subsetting.
+        if self.cis_gene is not None and isinstance(self.counts, pd.DataFrame):
+            if self.cis_gene not in self.counts.index:
+                raise ValueError(f"[ERROR] The cis gene '{self.cis_gene}' not found in counts index!")
+            cis_idx = self.counts.index.get_loc(self.cis_gene)
             if not detected_mask[cis_idx]:
                 raise ValueError(f"[ERROR] The cis gene '{self.cis_gene}' has zero counts after subsetting!")
 
-        # Subset counts to detected genes only - works for DataFrame, dense, and sparse
+        # Subset counts to detected genes only (counts freed at end of init; used for cell alignment below)
         if isinstance(self.counts, pd.DataFrame):
             self.counts = self.counts.loc[detected_mask]
-            self._gene_names = self.counts.index.tolist()
-            self.gene_meta = self.gene_meta.loc[self._gene_names]
         else:
-            # Sparse or dense array - subset by row indices
             gene_indices = np.where(detected_mask)[0]
-            if self.is_sparse_counts:
-                self.counts = self.counts[gene_indices, :]
-            else:
-                self.counts = self.counts[gene_indices, :]
+            self.counts = self.counts[gene_indices, :]
 
-            # Subset gene_meta by numeric indices
-            self.gene_meta = self.gene_meta.iloc[gene_indices].copy()
-
-            # CRITICAL: Reset index to [0, 1, 2, ..., n_remaining-1]
-            # This ensures row i in counts corresponds to row i in gene_meta
-            self.gene_meta.index = range(len(self.gene_meta))
-            print(f"[INFO] After filtering: reset gene_meta index to [0..{len(self.gene_meta)-1}]")
-
-            # _gene_names remains None for matrices
-            self._gene_names = None
-
-        # Set trans genes
-        if isinstance(self.counts, pd.DataFrame):
-            # DataFrame: use string names
-            self.trans_genes = [g for g in self._gene_names if g != self.cis_gene]
+        # Set trans_genes from the primary modality (created in bayesDREAM.__init__ before super())
+        if hasattr(self, 'primary_modality') and self.primary_modality in getattr(self, 'modalities', {}):
+            gene_mod = self.modalities[self.primary_modality]
+            self.trans_genes = (gene_mod.feature_names
+                                if gene_mod.feature_names
+                                else list(range(gene_mod.dims['n_features'])))
         else:
-            # Matrix/array: trans_genes is list of numeric indices excluding cis
-            # Find which row has the cis gene after filtering
-            cis_row_after_filter = None
-            if self.cis_gene is not None:
-                for col in ['gene_name', 'gene', 'gene_id', 'feature_id']:
-                    if col in self.gene_meta.columns:
-                        matches = self.gene_meta[self.gene_meta[col] == self.cis_gene]
-                        if len(matches) > 0:
-                            cis_row_after_filter = matches.index[0]
-                            break
+            self.trans_genes = []
 
-            if cis_row_after_filter is not None:
-                # trans_genes = all indices except cis row
-                self.trans_genes = [i for i in range(len(self.gene_meta)) if i != cis_row_after_filter]
-            else:
-                # No cis gene - all rows are trans
-                self.trans_genes = list(range(len(self.gene_meta)))
-
-        if num_removed > 0:
-            warnings.warn(
-                f"[WARNING] {num_removed} gene(s) had zero counts after subsetting and were removed from the counts matrix.",
-                UserWarning
-            )
+        # zero-count genes removed here from self.counts; Modality.__init__ reports its own filtering
         
         # Ensure same order of meta and counts
         # Use _cell_names for sparse/dense array compatibility
@@ -783,7 +596,12 @@ class _BayesDREAMCore(PlottingMixin):
         from .io.summary import ModelSummarizer
         self._summarizer = ModelSummarizer(self)
 
-        print(f"[INIT] bayesDREAM core: label={self.label}, device={self.device}")
+        # Free the raw counts matrix – data now lives in modalities.
+        # After all init logic above has consumed self.counts, drop it to save RAM.
+        self.counts = None
+        self.is_sparse_counts = None  # no longer meaningful without the matrix
+
+        pass  # init summary printed by bayesDREAM.__init__ after modality setup
 
     def cis_init_loc_fn(
         self,
@@ -898,7 +716,7 @@ class _BayesDREAMCore(PlottingMixin):
         """
         Sets x_true as a point estimate with shape [N] (one value per cell).
         """
-        N = self.counts.shape[1]
+        N = len(self.meta)
         x_true = sample_or_use_point("x_true_posterior", x_true, self.device)
         if not (x_true.ndim == 1 and x_true.shape[0] == N):
             raise ValueError(
@@ -943,17 +761,36 @@ class _BayesDREAMCore(PlottingMixin):
 
         Notes
         -----
-        For each guide within each covariate group:
+        **Single-guide mode** (low MOI): for each guide within each covariate group:
         - Compute mean NTC sum factor: mean_ntc
         - Compute mean guide sum factor: mean_guide
         - Adjustment factor = mean_ntc / mean_guide
         - Adjusted sum factor = sum_factor * adjustment_factor
+
+        **High MOI mode**: guide effects are assumed additive in log-space (same as fit_cis).
+        For each guide g within each covariate group:
+        - mean_log_sf_g = mean(log(sum_factor)) over cells containing guide g
+        - weighted_NTC = weighted mean of mean_log_sf_g for NTC guides (weights = cells_per_guide)
+        - delta_g = mean_log_sf_g - weighted_NTC
+        For each cell c: log(sf_adj_c) = log(sf_c) - sum(delta_g for guides in cell c)
         """
+        primary_mod = self.get_modality(self.primary_modality)
+
         meta_out = self.meta.copy()
         meta_out["original_index"] = np.arange(len(meta_out))
 
+        # Prefer sum_factors on the modality; fall back to meta for the initial
+        # 'sum_factor' column (present in meta from initialisation).
         if sum_factor_col_old not in meta_out.columns:
-            raise ValueError(f"No column '{sum_factor_col_old}' found in meta. Provide a precomputed sum_factor.")
+            if (primary_mod.sum_factors is not None
+                    and sum_factor_col_old in primary_mod.sum_factors.columns):
+                meta_out[sum_factor_col_old] = primary_mod.sum_factors.loc[
+                    meta_out['cell'].values, sum_factor_col_old
+                ].values
+            else:
+                raise ValueError(
+                    f"No column '{sum_factor_col_old}' found in meta or modality sum_factors."
+                )
 
         # Drop existing adjustment_factor column if it exists (prevents merge conflicts)
         if "adjustment_factor" in meta_out.columns:
@@ -968,22 +805,85 @@ class _BayesDREAMCore(PlottingMixin):
                     f"Available columns are: {list(meta_out.columns)}"
             )
         
-        if not covariates:
+        if self.is_high_moi:
+            # High MOI: guide effects are additive in log-space (same assumption as fit_cis).
+            # For a cell with guides g1, g2: log(sf_adj) = log(sf) - delta_g1 - delta_g2
+            # where delta_g = mean_log_sf_g - weighted_NTC_log_sf (per covariate group).
+            # Weights for NTC mean = cells_per_guide, matching fit_cis.
+
+            guide_assignment = self.guide_assignment  # (n_cells, n_guides)
+
+            # Determine which guides are NTC — works for both guide_meta['target'] and guide_targets_dict
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            if 'target' in self.guide_meta.columns:
+                is_ntc_guide = self.guide_meta['target'].isin(_ntc_variants).values
+            elif hasattr(self, 'guide_targets_dict') and self.guide_targets_dict:
+                is_ntc_guide = np.array([
+                    any(t in _ntc_variants for t in self.guide_targets_dict.get(row['guide'], []))
+                    for _, row in self.guide_meta.iterrows()
+                ])
+            else:
+                raise ValueError(
+                    "adjust_ntc_sum_factor (high MOI): cannot identify NTC guides — "
+                    "guide_meta has no 'target' column and guide_targets_dict is unavailable."
+                )
+
+            log_sf = np.log(meta_out[sum_factor_col_old].values.astype(float))
+            log_sf_adj = log_sf.copy()
+
+            def _apply_highmoi_correction(pos_indices):
+                ga = guide_assignment[pos_indices]   # (n_sub, n_guides)
+                lsf = log_sf[pos_indices]            # (n_sub,)
+
+                cells_per_guide = ga.sum(axis=0).astype(float)  # (n_guides,)
+
+                # (1) Mean log(sf) per guide via matrix multiply
+                mean_log_sf_g = np.where(
+                    cells_per_guide > 0,
+                    (ga.T @ lsf) / np.maximum(cells_per_guide, 1.0),
+                    np.nan
+                )  # (n_guides,)
+
+                # (2) Weighted NTC mean (weights = cells_per_guide, matching fit_cis)
+                ntc_means = mean_log_sf_g[is_ntc_guide]
+                ntc_counts = cells_per_guide[is_ntc_guide]
+                valid = ~np.isnan(ntc_means) & (ntc_counts > 0)
+                if valid.sum() == 0:
+                    return  # No NTC guides in group; skip correction
+                weighted_NTC_log_sf = np.average(ntc_means[valid], weights=ntc_counts[valid])
+
+                # (3) Per-guide delta; guides with no cells in this group get delta=0
+                delta_g = np.where(~np.isnan(mean_log_sf_g), mean_log_sf_g - weighted_NTC_log_sf, 0.0)
+
+                # (4) Additive correction per cell in log-space
+                log_sf_adj[pos_indices] -= ga @ delta_g
+
+            if not covariates:
+                _apply_highmoi_correction(np.arange(len(meta_out)))
+            else:
+                meta_out["_pos"] = np.arange(len(meta_out))
+                for _, group_df in meta_out.groupby(covariates):
+                    _apply_highmoi_correction(group_df["_pos"].values)
+                meta_out.drop(columns=["_pos"], inplace=True)
+
+            meta_out[sum_factor_col_adj] = np.exp(log_sf_adj)
+
+        elif not covariates:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
             mean_ntc_value = meta_out.loc[meta_out['target'] == 'ntc', sum_factor_col_old].mean()
-    
+
             # (2) Mean sum_factor among *all* guides, grouped by covariates + [guide_col]
             df_guide = (
                 meta_out.groupby(["guide_used"])[sum_factor_col_old]
                 .mean()
                 .reset_index(name="mean_SumFacs_guide")
             )
-    
+
             # (3) Merge them and compute ratio = mean_NTC / mean_guide
             df_guide["adjustment_factor"] = (
                 mean_ntc_value / (df_guide["mean_SumFacs_guide"])
             )
-    
+
             # (4) Merge that ratio back onto meta_out
             meta_out = pd.merge(
                 meta_out,
@@ -991,6 +891,9 @@ class _BayesDREAMCore(PlottingMixin):
                 on="guide_used",
                 how="left"
             )
+
+            # (5) Multiply original sum_factor by ratio
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
 
         else:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
@@ -1000,29 +903,34 @@ class _BayesDREAMCore(PlottingMixin):
                 .mean()
                 .reset_index(name="mean_SumFacs_ntc")
             )
-    
+
             # (2) Mean sum_factor among *all* guides, grouped by covariates + [guide_col]
             df_guide = (
                 meta_out.groupby(covariates + ["guide_used"])[sum_factor_col_old]
                 .mean()
                 .reset_index(name="mean_SumFacs_guide")
             )
-    
+
             # (3) Merge them and compute ratio = mean_NTC / mean_guide
             merged = pd.merge(df_guide, df_ntc, on=covariates, how="left")
             merged["adjustment_factor"] = merged["mean_SumFacs_ntc"] / merged["mean_SumFacs_guide"]
-    
+
             # (4) Merge that ratio back onto meta_out
             merge_cols = covariates + ["guide_used", "adjustment_factor"]
             meta_out = pd.merge(meta_out, merged[merge_cols], on=covariates + ["guide_used"], how="left")
-            
-        # (5) Multiply original sum_factor by ratio
-        meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
+
+            # (5) Multiply original sum_factor by ratio
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
 
         meta_out.sort_values("original_index", inplace=True)
         meta_out.drop(columns="original_index", inplace=True)
-        self.meta = meta_out
-        print(f"[INFO] Created '{sum_factor_col_adj}' in meta with NTC-based guide-level adjustment.")
+
+        # Write adjusted sum factor to modality, not back to meta
+        if primary_mod.sum_factors is None:
+            primary_mod.sum_factors = pd.DataFrame(index=meta_out['cell'].values)
+        primary_mod.sum_factors[sum_factor_col_adj] = meta_out.set_index('cell')[sum_factor_col_adj]
+
+        print(f"[INFO] Created '{sum_factor_col_adj}' in modality sum_factors with NTC-based guide-level adjustment.")
 
     def refit_sumfactor(
         self,
@@ -1100,7 +1008,21 @@ class _BayesDREAMCore(PlottingMixin):
         """
         from scipy.stats import gaussian_kde
 
-        sum_factor_data = self.meta[sum_factor_col_old].values  # shape (N,)
+        primary_mod = self.get_modality(self.primary_modality)
+
+        # Read sum factor from modality sum_factors, falling back to meta for the
+        # initial 'sum_factor' column that was present at model initialisation.
+        if (primary_mod.sum_factors is not None
+                and sum_factor_col_old in primary_mod.sum_factors.columns):
+            sum_factor_data = primary_mod.sum_factors.loc[
+                self.meta['cell'].values, sum_factor_col_old
+            ].values.astype(float)  # shape (N,)
+        elif sum_factor_col_old in self.meta.columns:
+            sum_factor_data = self.meta[sum_factor_col_old].values.astype(float)
+        else:
+            raise ValueError(
+                f"No column '{sum_factor_col_old}' found in modality sum_factors or meta."
+            )
 
         if covariates is None:
             covariates = []
@@ -1270,9 +1192,11 @@ class _BayesDREAMCore(PlottingMixin):
                 # The adjusted sum factor removes the x_true-dependent trend
                 # We want to keep the baseline level, so add back the global mean predicted value
                 global_baseline = np.mean(y_pred)
-                self.meta[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
+                if primary_mod.sum_factors is None:
+                    primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+                primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(0, residuals + global_baseline)
 
-                print(f"[INFO] Created '{sum_factor_col_refit}' using per-group spline alignment.")
+                print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors using per-group spline alignment.")
                 return
 
         # =========================================================================
@@ -1319,8 +1243,12 @@ class _BayesDREAMCore(PlottingMixin):
 
         # Predict and adjust
         y_pred = model_spline_ridge.predict(X_true.reshape(-1, 1))
-        self.meta[sum_factor_col_refit] = np.maximum(0, leftover_data - y_pred + baseline_ntc_of_group[group_id])
-        print(f"[INFO] Created '{sum_factor_col_refit}' in meta with x_true-based adjustment.")
+        if primary_mod.sum_factors is None:
+            primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+        primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(
+            0, leftover_data - y_pred + baseline_ntc_of_group[group_id]
+        )
+        print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors with x_true-based adjustment.")
 
     def permute_genes(
         self,
@@ -1341,165 +1269,141 @@ class _BayesDREAMCore(PlottingMixin):
             Technical group covariates used to group cells for permutation (e.g., ['cell_line', 'lane']).
         """
 
-        if sum_factor_col not in self.meta.columns:
-            raise ValueError(f"No column '{sum_factor_col}' found in meta. Provide a precomputed sum_factor.")
+        primary_mod = self.get_modality(self.primary_modality)
+        _sf_available = (
+            primary_mod.sum_factors is not None
+            and sum_factor_col in primary_mod.sum_factors.columns
+        )
+        if not _sf_available:
+            raise ValueError(
+                f"No column '{sum_factor_col}' found in modality sum_factors. "
+                "Run adjust_ntc_sum_factor() first."
+            )
             
         print("Running gene permutation...")
 
-        # If genes2permute is 'All', include all genes except the cis_gene
+        # --- Use modality counts directly ---
+        gene_mod = self.get_modality(self.primary_modality)
+        cis_mod  = self.get_modality('cis') if 'cis' in self.modalities else None
+
+        # Build feature-name → row-index lookup for the gene modality
+        feature_names = gene_mod.feature_names  # list[str] or None
+        if feature_names:
+            feat_name_to_idx = {name: idx for idx, name in enumerate(feature_names)}
+        else:
+            feat_name_to_idx = None
+
+        # If genes2permute is 'All', permute every trans gene
         if genes2permute == 'All' or genes2permute == ['All']:
-            if isinstance(self.counts, pd.DataFrame):
-                genes2permute = list(self.counts.index.values[self.counts.index.values != self.cis_gene])
-            else:
-                # For matrices/arrays: use self.trans_genes (already computed as numeric indices)
-                genes2permute = self.trans_genes.copy()
+            genes2permute = feature_names if feature_names else list(range(gene_mod.dims['n_features']))
 
         if isinstance(genes2permute, str):
             genes2permute = [genes2permute]
 
         meta_sub = self.meta.copy()
 
-        # Handle counts copying based on type
-        if isinstance(self.counts, pd.DataFrame):
-            counts_sub = self.counts.copy()
-        elif self.is_sparse_counts:
-            counts_sub = self.counts.copy()
-        else:
-            counts_sub = self.counts.copy()
+        # Copy gene modality counts for in-place modification
+        counts_sub = gene_mod.counts.copy()
 
-        # Create cell name to column index mapping for matrices/arrays
-        if isinstance(self.counts, pd.DataFrame):
-            cell_to_col_idx = {cell: idx for idx, cell in enumerate(counts_sub.columns)}
-        else:
-            cell_to_col_idx = {cell: idx for idx, cell in enumerate(self._cell_names)}
+        # Cell-name → column-index mapping (uses modality cell ordering)
+        cell_to_col_idx = {cell: idx for idx, cell in enumerate(gene_mod.cell_names)}
+
+        _is_sparse = sparse.issparse(counts_sub)
 
         for gene in genes2permute:
-            # Check if gene exists - works for both DataFrame and arrays
-            if isinstance(self.counts, pd.DataFrame):
-                if gene not in counts_sub.index:
+            # Resolve gene → row index in counts_sub
+            if feat_name_to_idx is not None and isinstance(gene, str):
+                if gene not in feat_name_to_idx:
                     continue
-                gene_idx = gene  # Use gene name directly for DataFrame
+                gene_row = feat_name_to_idx[gene]
+            elif isinstance(gene, int):
+                if gene >= gene_mod.dims['n_features']:
+                    continue
+                gene_row = gene
             else:
-                # For matrices/arrays: gene is a numeric index
-                if gene >= counts_sub.shape[0]:
-                    continue
-                gene_idx = gene  # Use numeric index directly
+                continue
 
-            for cov_values, group in meta_sub.groupby(covariates):
-                mycells = group.loc[group["target"] != "ntc", "cell"]
+            for _cov_values, group in meta_sub.groupby(covariates):
+                mycells     = group.loc[group["target"] != "ntc", "cell"]
                 my_ntc_cells = group.loc[group["target"] == "ntc", "cell"]
 
                 if len(mycells) > 0 and len(my_ntc_cells) > 0:
-                    # Get column indices for cells
-                    mycell_indices = [cell_to_col_idx[cell] for cell in mycells]
-                    my_ntc_indices = [cell_to_col_idx[cell] for cell in my_ntc_cells]
+                    mycell_indices   = [cell_to_col_idx[c] for c in mycells   if c in cell_to_col_idx]
+                    my_ntc_indices   = [cell_to_col_idx[c] for c in my_ntc_cells if c in cell_to_col_idx]
 
-                    # Get count data - works for DataFrame, dense, and sparse
-                    if isinstance(self.counts, pd.DataFrame):
-                        gene_counts_ntc = counts_sub.loc[gene_idx, my_ntc_cells].values
-                    elif self.is_sparse_counts:
-                        # Sparse: extract row, convert to dense array
-                        gene_counts_ntc = np.array(counts_sub[gene_idx, my_ntc_indices].todense()).flatten()
+                    if _is_sparse:
+                        gene_counts_ntc = np.asarray(counts_sub[gene_row, my_ntc_indices].todense()).flatten()
                     else:
-                        # Dense array
-                        gene_counts_ntc = counts_sub[gene_idx, my_ntc_indices]
+                        gene_counts_ntc = counts_sub[gene_row, my_ntc_indices]
 
-                    # Get sum factors
-                    meta_indexed = meta_sub.set_index("cell")
-                    ntc_sum_factors = meta_indexed.loc[my_ntc_cells, sum_factor_col].values
-                    mycell_sum_factors = meta_indexed.loc[mycells, sum_factor_col].values
+                    ntc_sum_factors    = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
+                    mycell_sum_factors = primary_mod.sum_factors.loc[mycells.values,      sum_factor_col].values
 
-                    # Sample values from NTC distribution
                     sampled_values = np.random.choice(
                         gene_counts_ntc / ntc_sum_factors,
                         size=len(mycells),
                         replace=True
                     ) * mycell_sum_factors
 
-                    # Assign back to counts - works for DataFrame, dense, and sparse
-                    if isinstance(self.counts, pd.DataFrame):
-                        counts_sub.loc[gene_idx, mycells] = np.round(sampled_values)
-                    elif self.is_sparse_counts:
-                        # For sparse: convert to LIL format for efficient assignment
+                    if _is_sparse:
                         counts_sub = counts_sub.tolil()
-                        for i, cell_idx in enumerate(mycell_indices):
-                            counts_sub[gene_idx, cell_idx] = np.round(sampled_values[i])
+                        for i, col_idx in enumerate(mycell_indices):
+                            counts_sub[gene_row, col_idx] = np.round(sampled_values[i])
                         counts_sub = counts_sub.tocsr()
+                        _is_sparse = True  # still sparse
                     else:
-                        # Dense array
-                        counts_sub[gene_idx, mycell_indices] = np.round(sampled_values)
+                        counts_sub[gene_row, mycell_indices] = np.round(sampled_values)
 
-        if permute_ntc_x:
-            # Find cis gene index
-            if isinstance(self.counts, pd.DataFrame):
-                cis_gene_idx = self.cis_gene
-            else:
-                # For matrices/arrays: find cis gene row
-                cis_gene_idx = None
-                for col in ['gene_name', 'gene', 'gene_id', 'feature_id']:
-                    if col in self.gene_meta.columns:
-                        matches = self.gene_meta[self.gene_meta[col] == self.cis_gene]
-                        if len(matches) > 0:
-                            cis_gene_idx = matches.index[0]
-                            break
-                if cis_gene_idx is None:
-                    raise ValueError(f"Cannot find cis gene '{self.cis_gene}' for permutation")
+        if permute_ntc_x and cis_mod is not None:
+            cis_counts_sub = cis_mod.counts.copy()
+            cis_is_sparse  = sparse.issparse(cis_counts_sub)
+            cis_row = 0  # cis modality has exactly 1 feature row
 
-            for cov_values, group in meta_sub.groupby(covariates):
+            cis_cell_to_col = {cell: idx for idx, cell in enumerate(cis_mod.cell_names)}
+
+            for _cov_values, group in meta_sub.groupby(covariates):
                 my_ntc_cells = group.loc[group["target"] == "ntc", "cell"]
 
                 if len(my_ntc_cells) > 0:
-                    # Get column indices for NTC cells
-                    my_ntc_indices = [cell_to_col_idx[cell] for cell in my_ntc_cells]
+                    my_ntc_indices = [cis_cell_to_col[c] for c in my_ntc_cells if c in cis_cell_to_col]
 
-                    # Get sum factors
-                    meta_indexed = meta_sub.set_index("cell")
-                    ntc_sum_factor = meta_indexed.loc[my_ntc_cells, sum_factor_col].values
+                    ntc_sum_factor = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
 
-                    # Get cis gene expression for NTC cells
-                    if isinstance(self.counts, pd.DataFrame):
-                        ntc_expr = counts_sub.loc[cis_gene_idx, my_ntc_cells].values
-                    elif self.is_sparse_counts:
-                        ntc_expr = np.array(counts_sub[cis_gene_idx, my_ntc_indices].todense()).flatten()
+                    if cis_is_sparse:
+                        ntc_expr = np.asarray(cis_counts_sub[cis_row, my_ntc_indices].todense()).flatten()
                     else:
-                        ntc_expr = counts_sub[cis_gene_idx, my_ntc_indices]
+                        ntc_expr = np.asarray(cis_counts_sub)[cis_row, my_ntc_indices]
 
-                    ntc_expr_norm = ntc_expr / ntc_sum_factor
-
-                    # Sample indices with replacement
+                    ntc_expr_norm    = ntc_expr / ntc_sum_factor
                     permuted_indices = np.random.choice(len(my_ntc_cells), size=len(my_ntc_cells), replace=True)
+                    new_counts       = ntc_expr_norm[permuted_indices] * ntc_sum_factor
 
-                    # Permute counts
-                    new_counts = ntc_expr_norm[permuted_indices] * ntc_sum_factor
-
-                    # Assign back
-                    if isinstance(self.counts, pd.DataFrame):
-                        counts_sub.loc[cis_gene_idx, my_ntc_cells] = np.round(new_counts)
-                    elif self.is_sparse_counts:
-                        counts_sub = counts_sub.tolil()
-                        for i, cell_idx in enumerate(my_ntc_indices):
-                            counts_sub[cis_gene_idx, cell_idx] = np.round(new_counts[i])
-                        counts_sub = counts_sub.tocsr()
+                    if cis_is_sparse:
+                        cis_counts_sub = cis_counts_sub.tolil()
+                        for i, col_idx in enumerate(my_ntc_indices):
+                            cis_counts_sub[cis_row, col_idx] = np.round(new_counts[i])
+                        cis_counts_sub = cis_counts_sub.tocsr()
                     else:
-                        counts_sub[cis_gene_idx, my_ntc_indices] = np.round(new_counts)
-        
-                    # Permute x_true in the same order
+                        cis_counts_sub = np.asarray(cis_counts_sub)
+                        cis_counts_sub[cis_row, my_ntc_indices] = np.round(new_counts)
+
+                    # Permute x_true for NTC cells in the same order
                     ntc_idx = meta_sub.index[meta_sub["cell"].isin(my_ntc_cells)].tolist()
-                    assert len(ntc_idx) == len(my_ntc_cells)  # Sanity check
-        
-                    # Apply permutation to x_true
+                    assert len(ntc_idx) == len(my_ntc_cells)
+
                     if isinstance(self.x_true, torch.Tensor):
                         x_true_np = self.x_true.detach().cpu().numpy()
                     else:
                         x_true_np = np.array(self.x_true)
-        
+
                     x_true_ntc = x_true_np[ntc_idx]
                     x_true_np[ntc_idx] = x_true_ntc[permuted_indices]
-        
-                    # Assign back
                     self.x_true = torch.tensor(x_true_np, dtype=self.x_true.dtype, device=self.x_true.device)
 
-        self.counts = counts_sub
+            cis_mod.counts = cis_counts_sub
+
+        # Write permuted counts back into the modality
+        gene_mod.counts = counts_sub
 
     def subset_cells(
         self,
@@ -1511,14 +1415,14 @@ class _BayesDREAMCore(PlottingMixin):
         Create a new model instance with a subset of cells.
 
         Useful for testing without technical correction by subsetting to a single
-        cell_line (e.g., CRISPRi or CRISPRa only).
+        technical group (e.g., one cell line only).
 
         Parameters
         ----------
         cell_mask : np.ndarray, pd.Series, or list, optional
             Boolean mask or list of cell names to keep. If None, must provide query.
         query : str, optional
-            Pandas query string to filter cells (e.g., "cell_line == 'CRISPRa'").
+            Pandas query string to filter cells (e.g., "cell_line == 'K562'").
             Applied to self.meta. If None, must provide cell_mask.
         preserve_fits : bool
             If True (default), copy fitted parameters (alpha_x_prefit, alpha_y_prefit,
@@ -1532,15 +1436,15 @@ class _BayesDREAMCore(PlottingMixin):
         Examples
         --------
         # Subset by query
-        model_crispra = model.subset_cells(query="cell_line == 'CRISPRa'")
+        model_k562 = model.subset_cells(query="cell_line == 'K562'")
 
         # Subset by mask
-        mask = model.meta['cell_line'].str.contains('CRISPRa')
-        model_crispra = model.subset_cells(cell_mask=mask)
+        mask = model.meta['cell_line'].str.contains('K562')
+        model_k562 = model.subset_cells(cell_mask=mask)
 
         # Subset by cell list
-        cells = model.meta[model.meta['cell_line'] == 'CRISPRa']['cell'].tolist()
-        model_crispra = model.subset_cells(cell_mask=cells)
+        cells = model.meta[model.meta['cell_line'] == 'K562']['cell'].tolist()
+        model_k562 = model.subset_cells(cell_mask=cells)
         """
         if cell_mask is None and query is None:
             raise ValueError("Must provide either cell_mask or query")
@@ -1573,16 +1477,49 @@ class _BayesDREAMCore(PlottingMixin):
 
         print(f"[INFO] Subsetting from {len(self.meta)} to {len(meta_subset)} cells")
 
-        # Subset counts
-        if isinstance(self.counts, pd.DataFrame):
-            counts_subset = self.counts[cells_to_keep].copy()
+        # Subset counts — reconstruct from modalities (self.counts is None after init)
+        cells_to_keep_set = set(cells_to_keep)
+        gene_mod = self.get_modality(self.primary_modality)
+        cis_mod  = self.get_modality('cis') if 'cis' in self.modalities else None
+
+        # Get column indices in the gene modality matching cells_to_keep
+        if gene_mod.cell_names:
+            gene_cell_indices = [i for i, c in enumerate(gene_mod.cell_names) if c in cells_to_keep_set]
         else:
-            # Sparse or dense array - subset by column indices
-            cell_indices = [i for i, cell in enumerate(self._cell_names) if cell in cells_to_keep]
-            if self.is_sparse_counts:
-                counts_subset = self.counts[:, cell_indices]
+            gene_cell_indices = [i for i, cell in enumerate(self.meta['cell']) if cell in cells_to_keep_set]
+
+        gene_counts_sub  = gene_mod.counts[:, gene_cell_indices]
+        gene_feat_meta   = gene_mod.feature_meta.copy() if gene_mod.feature_meta is not None else None
+
+        if cis_mod is not None:
+            if cis_mod.cell_names:
+                cis_cell_indices = [i for i, c in enumerate(cis_mod.cell_names) if c in cells_to_keep_set]
             else:
-                counts_subset = self.counts[:, cell_indices]
+                cis_cell_indices = gene_cell_indices
+
+            cis_counts_row = cis_mod.counts[:, cis_cell_indices]   # shape [1, N_sub]
+            cis_feat_meta  = cis_mod.feature_meta.copy()
+
+            # Stack: cis row first (row 0), then gene rows
+            if sparse.issparse(gene_counts_sub):
+                cis_sp       = (cis_counts_row.tocsr() if sparse.issparse(cis_counts_row)
+                                else sparse.csr_matrix(np.asarray(cis_counts_row).reshape(1, -1)))
+                counts_subset = sparse.vstack([cis_sp, gene_counts_sub], format='csr')
+            else:
+                cis_dense     = np.asarray(cis_counts_row).reshape(1, -1)
+                counts_subset = np.vstack([cis_dense, np.asarray(gene_counts_sub)])
+
+            # Build combined feature_meta with sequential 0-based index
+            # (constructor's _extract_cis_from_gene searches this by value, not position)
+            cis_fm  = cis_feat_meta.copy();  cis_fm.index  = [0]
+            if gene_feat_meta is not None:
+                gene_fm = gene_feat_meta.copy(); gene_fm.index = range(1, 1 + len(gene_feat_meta))
+                feature_meta_subset = pd.concat([cis_fm, gene_fm], ignore_index=True)
+            else:
+                feature_meta_subset = cis_fm
+        else:
+            counts_subset       = gene_counts_sub
+            feature_meta_subset = gene_feat_meta
 
         # Subset high MOI guide_assignment if applicable
         guide_assignment_subset = None
@@ -1609,7 +1546,7 @@ class _BayesDREAMCore(PlottingMixin):
             meta=meta_subset,
             counts=counts_subset,
             modality_name=self.primary_modality,  # Use same primary modality name
-            feature_meta=self.gene_meta.copy() if hasattr(self, 'gene_meta') else None,
+            feature_meta=feature_meta_subset,
             cis_gene=self.cis_gene,
             guide_covariates=self.guide_covariates,  # Preserve guide covariates
             guide_covariates_ntc=self.guide_covariates_ntc,  # Preserve NTC guide covariates
@@ -1624,8 +1561,6 @@ class _BayesDREAMCore(PlottingMixin):
             require_ntc=False  # Allow subsetting without NTC cells
         )
 
-        print(f"[DEBUG] Original modalities: {list(self.modalities.keys())}")
-        print(f"[DEBUG] New model modalities: {list(model_new.modalities.keys())}")
 
         # Copy additional modalities (beyond the primary 'gene' modality)
         if hasattr(self, 'modalities'):
@@ -1801,3 +1736,7 @@ class _BayesDREAMCore(PlottingMixin):
     def save_trans_summary(self, *args, **kwargs):
         """Delegate to ModelSummarizer."""
         return self._summarizer.save_trans_summary(*args, **kwargs)
+
+    def classify_second_deriv_roots(self, *args, **kwargs):
+        """Delegate to ModelSummarizer.classify_second_deriv_roots."""
+        return self._summarizer.classify_second_deriv_roots(*args, **kwargs)

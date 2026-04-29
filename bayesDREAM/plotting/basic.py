@@ -626,10 +626,10 @@ def _get_technical_param_samples(param, tech_posterior, technical_group):
 
     elif param == 'o_y_tech':
         # o_y from the technical fit (NTC-only). Use 'o_y' for the trans fit version.
-        # Shape [S, T] — no C dimension.
+        # Shape [S, T] — not group-specific. If stored as [S, 1, T], use index 0.
         raw = to_np(tech_posterior['o_y'])
         if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
+            raw = raw[:, 0, :]
         return raw
 
     else:

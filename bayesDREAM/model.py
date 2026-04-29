@@ -82,7 +82,8 @@ class bayesDREAM(
         random_seed: int = 2402,
         cores: int = 1,
         exclude_targets: list = None,
-        require_ntc: bool = True
+        require_ntc: bool = True,
+        min_count: int = 1,
     ):
         """
         Initialize bayesDREAM.
@@ -232,6 +233,9 @@ class bayesDREAM(
                 )
             cis_feature = cis_gene
 
+        # Store min_count for use in modality creation
+        self.min_count = min_count
+
         # Store original counts for base class initialization
         counts_for_base = counts
 
@@ -254,10 +258,10 @@ class bayesDREAM(
             if modality_name == 'gene':
                 # Use gene-specific creation (with gene_meta handling)
                 # Pass both the name and numeric index for exclusion
-                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta)
+                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta, min_count=min_count)
             else:
                 # Generic negbinom modality creation
-                self._create_negbinom_modality(counts, modality_name, cis_feature, cis_numeric_idx, feature_meta, meta)
+                self._create_negbinom_modality(counts, modality_name, cis_feature, cis_numeric_idx, feature_meta, meta, min_count=min_count)
 
         # Store primary modality name
         self.primary_modality = modality_name
@@ -274,7 +278,7 @@ class bayesDREAM(
                     f"The primary modality must represent count data that follows a negative binomial distribution."
                 )
             if cis_feature is not None:
-                print(f"[VALIDATION] Primary modality '{modality_name}' is 'negbinom' - cis modeling is valid")
+                pass
         elif counts is None:
             # No counts provided - user will add modalities later
             warnings.warn(
@@ -293,7 +297,7 @@ class bayesDREAM(
                 primary_counts = mod.counts  # This is the matrix/array, not densified
             else:
                 # No counts and no primary modality - create placeholder
-                print("[INFO] Creating placeholder counts - will be replaced when modality is added")
+                pass
                 # Create minimal placeholder (will be replaced)
                 primary_counts = np.ones((1, len(meta)))
         else:
@@ -328,8 +332,6 @@ class bayesDREAM(
         # Subset all modalities to match filtered cells from base class
         # Base class (super().__init__) has filtered self.meta to valid cells
         valid_cells = self.meta['cell'].tolist()
-        print(f"[INFO] Subsetting modalities to {len(valid_cells)} cells from filtered meta")
-
         for mod_name in list(self.modalities.keys()):
             mod = self.modalities[mod_name]
             if mod.cell_names is not None:
@@ -337,17 +339,56 @@ class bayesDREAM(
                 cell_indices = [i for i, c in enumerate(mod.cell_names)
                               if c in valid_cells]
                 if len(cell_indices) < len(mod.cell_names):
-                    print(f"[INFO] Subsetting modality '{mod_name}' from {len(mod.cell_names)} to {len(cell_indices)} cells")
                     self.modalities[mod_name] = mod.get_cell_subset(cell_indices)
-                elif len(cell_indices) == len(mod.cell_names):
-                    print(f"[INFO] Modality '{mod_name}' already has {len(cell_indices)} cells - no subsetting needed")
                 else:
                     # This shouldn't happen - means we have fewer cells in modality than in meta
                     print(f"[WARNING] Modality '{mod_name}' has {len(mod.cell_names)} cells but filtered meta has {len(valid_cells)}")
 
-        print(f"[INIT] bayesDREAM: {len(self.modalities)} modalities loaded")
+        print(f"bayesDREAM: label={self.label}, device={self.device}, {len(self.modalities)} modalities")
         for name, mod in self.modalities.items():
             print(f"  - {name}: {mod}")
+
+        # Initialise sum_factors on all negbinom modalities from meta.
+        # Must run AFTER super().__init__() and cell subsetting so self.meta is final.
+        self._init_sum_factors(sum_factor_col)
+
+    def _init_sum_factors(self, sum_factor_col: str = 'sum_factor'):
+        """
+        Initialise sum_factors DataFrame on negbinom modalities from self.meta.
+
+        Copies every column whose name contains 'sum_factor' into a cell-indexed
+        DataFrame stored on each negbinom modality.  The 'cis' modality (when
+        present) receives a reference to the *same* DataFrame as the primary
+        modality — not a copy — so that writes made via adjust_ntc_sum_factor()
+        or refit_sumfactor() are immediately visible to both.
+
+        Called once at the end of __init__, after super().__init__() and cell
+        subsetting so self.meta is in its final, filtered state.
+        """
+        if self.primary_modality not in self.modalities:
+            return
+
+        primary_mod = self.modalities[self.primary_modality]
+        if primary_mod.distribution != 'negbinom':
+            return
+
+        # Collect all sum-factor columns present in meta
+        sf_cols = [c for c in self.meta.columns if 'sum_factor' in c.lower()]
+        if sum_factor_col not in sf_cols and sum_factor_col in self.meta.columns:
+            sf_cols.append(sum_factor_col)
+
+        if not sf_cols:
+            primary_mod.sum_factors = pd.DataFrame(index=self.meta['cell'].values)
+        else:
+            sf_df = self.meta.set_index('cell')[sf_cols].copy()
+            primary_mod.sum_factors = sf_df
+
+        # The 'cis' modality is a view of the primary — share the same DataFrame.
+        if 'cis' in self.modalities:
+            self.modalities['cis'].sum_factors = primary_mod.sum_factors
+
+        print(f"[INIT] sum_factors initialised on '{self.primary_modality}' "
+              f"with columns: {list(primary_mod.sum_factors.columns)}")
 
     def _filter_features(self, counts, feature_meta, features_to_keep):
         """
@@ -564,7 +605,7 @@ class bayesDREAM(
                 f"Cannot model cis effects for a gene with constant expression."
             )
 
-        print(f"[INFO] Extracting 'cis' modality from gene '{cis_gene}' (row {numeric_idx})")
+        print(f"[INFO] Extracting 'cis' modality: {cis_gene}")
 
         # Use numeric index and keep original gene name
         cis_feature_meta = pd.DataFrame({
@@ -602,7 +643,8 @@ class bayesDREAM(
             feature_meta=cis_feature_meta,
             cell_names=cell_names,
             distribution='negbinom',
-            cells_axis=1
+            cells_axis=1,
+            min_count=self.min_count,
         )
 
         return cis_gene, numeric_idx
@@ -707,7 +749,7 @@ class bayesDREAM(
                 f"Cannot model cis effects for a feature with constant values."
             )
 
-        print(f"[INFO] Extracting 'cis' modality from feature '{cis_feature}' (row {numeric_idx}, {modality_name})")
+        print(f"[INFO] Extracting 'cis' modality: {cis_feature} (from '{modality_name}')")
 
         # Use numeric index and keep original feature name
         cis_feature_meta = pd.DataFrame({
@@ -738,7 +780,8 @@ class bayesDREAM(
             feature_meta=cis_feature_meta,
             cell_names=cell_names,
             distribution='negbinom',
-            cells_axis=1
+            cells_axis=1,
+            min_count=self.min_count,
         )
 
         return cis_feature, numeric_idx
@@ -750,7 +793,8 @@ class bayesDREAM(
         cis_feature: Optional[str] = None,
         cis_feature_idx: Optional[int] = None,
         feature_meta: Optional[pd.DataFrame] = None,
-        meta: Optional[pd.DataFrame] = None
+        meta: Optional[pd.DataFrame] = None,
+        min_count: int = 1,
     ):
         """
         Create a generic negbinom modality (excluding cis feature if specified).
@@ -859,11 +903,7 @@ class bayesDREAM(
         n_cis = 1 if cis_feature_idx is not None else 0
         n_zero_std = n_total - len(features_to_keep) - n_cis
 
-        if cis_feature_idx is not None:
-            print(f"[INFO] Creating '{modality_name}' modality: excluding cis feature '{cis_feature}' (row {cis_feature_idx})")
-        if n_zero_std > 0:
-            print(f"[INFO] Filtered {n_zero_std} feature(s) with zero standard deviation")
-        print(f"[INFO] {modality_name} modality: {len(features_to_keep)} features (from {n_total} total)")
+        pass  # Modality.__init__ reports feature counts and filtering
 
         # Filter counts and metadata
         counts_trans, mod_feature_meta = self._filter_features(counts, feature_meta, features_to_keep)
@@ -898,7 +938,8 @@ class bayesDREAM(
             cell_names=cell_names,
             distribution='negbinom',
             cells_axis=1,
-            feature_names=feature_names_for_modality
+            feature_names=feature_names_for_modality,
+            min_count=min_count,
         )
 
     def _create_gene_modality(
@@ -907,7 +948,8 @@ class bayesDREAM(
         cis_gene: Optional[str] = None,
         cis_gene_idx: Optional[int] = None,
         gene_meta: Optional[pd.DataFrame] = None,
-        meta: Optional[pd.DataFrame] = None
+        meta: Optional[pd.DataFrame] = None,
+        min_count: int = 1,
     ):
         """
         Create 'gene' modality from gene counts (excluding cis gene if specified).
@@ -1031,11 +1073,7 @@ class bayesDREAM(
         n_cis = 1 if cis_gene_idx is not None else 0
         n_zero_std = n_total - len(features_to_keep) - n_cis
 
-        if cis_gene_idx is not None:
-            print(f"[INFO] Creating 'gene' modality: excluding cis gene '{cis_gene}' (row {cis_gene_idx})")
-        if n_zero_std > 0:
-            print(f"[INFO] Filtered {n_zero_std} gene(s) with zero standard deviation")
-        print(f"[INFO] Gene modality: {len(features_to_keep)} features (from {n_total} total)")
+        pass  # Modality.__init__ reports feature counts and filtering
 
         # Filter counts and metadata
         counts_trans, gene_feature_meta = self._filter_features(counts, gene_meta, features_to_keep)
@@ -1070,7 +1108,8 @@ class bayesDREAM(
             cell_names=cell_names,
             distribution='negbinom',
             cells_axis=1,
-            feature_names=gene_names_for_modality
+            feature_names=gene_names_for_modality,
+            min_count=min_count,
         )
 
     def add_modality(

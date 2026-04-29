@@ -577,7 +577,7 @@ def get_technical_group_labels(model) -> List[str]:
     """
     Get informative labels for technical groups.
 
-    Returns human-readable labels like "CRISPRa", "CRISPRi:lane1" instead of
+    Returns human-readable labels like "K562", "TF1:lane1" instead of
     generic "technical_group_0", "technical_group_1".
 
     Parameters
@@ -656,30 +656,7 @@ def get_default_color_palette(labels: List[str]) -> Dict[str, str]:
     Dict[str, str]
         Mapping from label to color
     """
-    # Default colors for common cases
-    default_colors = {
-        'CRISPRa': 'crimson',
-        'CRISPRi': 'dodgerblue',
-        'a': 'crimson',
-        'i': 'dodgerblue'
-    }
-
-    # Check if labels match defaults
-    palette = {}
-    for label in labels:
-        if label in default_colors:
-            palette[label] = default_colors[label]
-        else:
-            # Check if label contains CRISPRa or CRISPRi
-            if 'CRISPRa' in label or 'a' in label:
-                palette[label] = 'crimson'
-            elif 'CRISPRi' in label or 'i' in label:
-                palette[label] = 'dodgerblue'
-            else:
-                # Fall back to matplotlib default colors
-                palette[label] = f'C{len(palette)}'
-
-    return palette
+    return {label: f'C{i}' for i, label in enumerate(labels)}
 
 
 def _labels_by_code_for_df(model, df) -> dict[int, str]:
@@ -708,16 +685,11 @@ def _labels_by_code_for_df(model, df) -> dict[int, str]:
 
 def _color_for_label(label: str, fallback_idx: int = 0, palette: dict | None = None) -> str:
     """
-    Use user's desired palette: CRISPRa=red, CRISPRi=blue; otherwise fall back.
+    Return colour for a technical group label, using user-supplied palette if provided.
     """
     palette = palette or {}
     if label in palette:
         return palette[label]
-    # hard defaults you wanted
-    if 'CRISPRa' in label:
-        return 'crimson'
-    if 'CRISPRi' in label:
-        return 'dodgerblue'
     return f'C{fallback_idx}'
 
 
@@ -1754,6 +1726,10 @@ def plot_trans_functions(
     title: Optional[str] = None,
     legend: bool = True,
     ax: Optional[plt.Axes] = None,
+    overlay_roots=None,
+    overlay_roots_lw: float = 1.0,
+    overlay_roots_alpha: float = 0.8,
+    overlay_roots_also_on_function: bool = True,
 ) -> plt.Figure:
     """
     Plot fitted trans functions and/or their derivatives.
@@ -1833,6 +1809,26 @@ def plot_trans_functions(
         Show legend (default: True)
     ax : plt.Axes, optional
         Existing axes to plot on. If None, creates new figure.
+    overlay_roots : pd.DataFrame, pd.Series, dict, or None
+        If provided, draws dashed vertical lines at derivative roots on each
+        subplot.  Accepted forms:
+
+        - **pd.DataFrame** (full summary from ``save_trans_summary``): for each
+          feature being plotted, the matching row is looked up by the ``feature``
+          column.
+        - **pd.Series / dict** (a single row): used as-is for every feature.
+        - **None** (default): no overlay.
+
+        Root columns are selected automatically to match the plot's x-axis space:
+        ``*_log2fc_mean`` when ``use_log2fc=True``, ``*_delta_p_mean`` when
+        ``use_delta_p=True``, and ``*_mean`` (x-space, converted to log2 if
+        ``use_log2_x=True``) otherwise.
+    overlay_roots_lw : float
+        Line width for root vlines (default 1.0).
+    overlay_roots_alpha : float
+        Transparency for root vlines (default 0.8).
+    overlay_roots_also_on_function : bool
+        If True (default), draw all root sets also on the function subplot.
 
     Returns
     -------
@@ -1853,6 +1849,15 @@ def plot_trans_functions(
     >>> # Plot function and derivatives for one gene
     >>> model.plot_trans_functions('TET2', show_first_derivative=True,
     ...                            show_second_derivative=True)
+
+    >>> # Plot with derivative roots overlaid from summary df
+    >>> df = model.save_trans_summary(compute_derivative_roots=True)
+    >>> model.plot_trans_functions('TET2', use_log2fc=True,
+    ...                            show_function=True,
+    ...                            show_first_derivative=True,
+    ...                            show_second_derivative=True,
+    ...                            show_third_derivative=True,
+    ...                            overlay_roots=df)
 
     >>> # Plot first derivative of multiple genes
     >>> model.plot_trans_functions(['TET2', 'MYB', 'GFI1B'],
@@ -2198,6 +2203,69 @@ def plot_trans_functions(
 
                 ax_curr.plot(x_plot_feat, third_deriv, color=color, alpha=alpha,
                            linewidth=linewidth, label=feature if feat_idx < 20 else None)
+
+        # ---- Root overlay ------------------------------------------------
+        if overlay_roots is not None:
+            import pandas as _pd
+            from bayesDREAM.io.summary import ModelSummarizer as _MS
+
+            # Resolve the row for this feature
+            if isinstance(overlay_roots, _pd.DataFrame):
+                if 'feature' in overlay_roots.columns:
+                    _matches = overlay_roots[overlay_roots['feature'] == feature]
+                    _row = _matches.iloc[0] if len(_matches) > 0 else None
+                else:
+                    _row = None
+            else:
+                # Series or dict — use directly for every feature
+                _row = overlay_roots
+
+            if _row is not None:
+                _parse = _MS._parse_semicolon_roots
+
+                if use_log2fc:
+                    _r1 = _parse(_row.get('first_deriv_roots_log2fc_mean',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_log2fc_mean', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_log2fc_mean',  None))
+                    _to_plot_x = lambda v: v  # already u-space
+                elif use_delta_p:
+                    _r1 = _parse(_row.get('first_deriv_roots_delta_p_mean',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_delta_p_mean', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_delta_p_mean',  None))
+                    _to_plot_x = lambda v: v  # already u-space
+                else:
+                    _r1 = _parse(_row.get('first_deriv_roots_mean',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_mean', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_mean',  None))
+                    _to_plot_x = (lambda v: np.log2(max(v, 1e-300))) if use_log2_x else (lambda v: v)
+
+                # Build a map: plot_type → (ax, roots, label)
+                _ax_for = {pt: axes[i] for i, (pt, _) in enumerate(plot_types)}
+                _root_sets = [
+                    ('first_deriv',  _r1, 'roots: 1st deriv'),
+                    ('second_deriv', _r2, 'roots: 2nd deriv'),
+                    ('third_deriv',  _r3, 'roots: 3rd deriv'),
+                ]
+
+                def _draw_vlines(ax, roots, label):
+                    first = True
+                    for v in roots:
+                        xv = _to_plot_x(v)
+                        if np.isfinite(xv):
+                            ax.axvline(xv, linestyle='--',
+                                       linewidth=overlay_roots_lw,
+                                       alpha=overlay_roots_alpha,
+                                       label=(label if first else None))
+                            first = False
+
+                for _pt, _roots, _lbl in _root_sets:
+                    if _pt in _ax_for:
+                        _draw_vlines(_ax_for[_pt], _roots, _lbl)
+
+                if overlay_roots_also_on_function and 'function' in _ax_for:
+                    for _pt, _roots, _lbl in _root_sets:
+                        _draw_vlines(_ax_for['function'], _roots, _lbl)
+        # ------------------------------------------------------------------
 
     if not successful_features:
         raise ValueError(f"Could not plot any of the requested features: {features}")
@@ -3364,22 +3432,24 @@ def plot_negbinom_xy(
     else:
         y_obs = modality.counts[:, feature_idx]
 
-    # Check if sum_factor_col exists
-    if sum_factor_col not in model.meta.columns:
-        raise ValueError(f"Sum factor column '{sum_factor_col}' not found in model.meta. "
-                        f"Available columns: {list(model.meta.columns)}")
+    # Check if sum_factor_col exists on modality sum_factors
+    if modality.sum_factors is None or sum_factor_col not in modality.sum_factors.columns:
+        raise ValueError(
+            f"Sum factor column '{sum_factor_col}' not found in modality sum_factors. "
+            f"Available columns: {list(modality.sum_factors.columns) if modality.sum_factors is not None else '(none)'}"
+        )
 
     # Align cells between model.meta and modality
     x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(
         model, modality, x_true, y_obs, subset_mask
     )
 
-    # Build dataframe
+    # Build dataframe — read sum factors from modality, not from meta_aligned
     df_data = {
         'x_true': x_true_aligned,
         'y_obs': y_obs_aligned,
         'target': meta_aligned['target'].values,
-        'sum_factor': meta_aligned[sum_factor_col].values
+        'sum_factor': modality.sum_factors.loc[meta_aligned['cell'].values, sum_factor_col].values
     }
 
     # Conditionally add technical_group_code if it exists
@@ -4878,8 +4948,8 @@ def plot_xy_data(
         For binomial: minimum denominator
         For multinomial: minimum total counts
     color_palette : dict, optional
-        Custom colors for technical groups
-        Example: {'CRISPRa': 'crimson', 'CRISPRi': 'dodgerblue'}
+        Custom colors for technical groups, keyed by the group label string
+        Example: {'K562': 'crimson', 'TF1': 'dodgerblue'}
     show_hill_function : bool
         Overlay fitted trans function if trans model fitted (all distributions, default: True)
         Works with all function types: additive_hill, single_hill, polynomial
@@ -4903,8 +4973,8 @@ def plot_xy_data(
     subset_meta : dict, optional
         Subset cells by metadata columns. Dictionary of {column: value} pairs.
         Example: {'target': 'ntc'} - plot only NTC cells
-        Example: {'cell_line': 'CRISPRi'} - plot only CRISPRi cells
-        Example: {'lane': 'L1', 'cell_line': 'CRISPRa'} - plot L1 lane CRISPRa cells
+        Example: {'cell_line': 'K562'} - plot only K562 cells
+        Example: {'lane': 'L1', 'cell_line': 'K562'} - plot L1 lane K562 cells
         Multiple conditions are combined with AND logic.
     only_dependent : bool
         If True and plotting multiple features (gene name), filter to only "dependent" features
@@ -4994,7 +5064,7 @@ def plot_xy_data(
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj')
     >>>
     >>> # Plot with custom colors
-    >>> model.plot_xy_data('GFI1B', color_palette={'CRISPRa': 'red', 'CRISPRi': 'blue'})
+    >>> model.plot_xy_data('GFI1B', color_palette={'K562': 'red', 'TF1': 'blue'})
     >>>
     >>> # Show both corrected and uncorrected (default)
     >>> model.plot_xy_data('TET2', show_correction='both')
@@ -5005,8 +5075,8 @@ def plot_xy_data(
     >>> # Plot only NTC cells
     >>> model.plot_xy_data('TET2', subset_meta={'target': 'ntc'})
     >>>
-    >>> # Plot only CRISPRi cells
-    >>> model.plot_xy_data('GFI1B', subset_meta={'cell_line': 'CRISPRi'})
+    >>> # Plot only cells from one group
+    >>> model.plot_xy_data('GFI1B', subset_meta={'cell_line': 'K562'})
     >>>
     >>> # Plot all junctions for a gene, but only show dependent ones (n_a or n_b CI excludes 0)
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj', only_dependent=True, ci_level=95.0)

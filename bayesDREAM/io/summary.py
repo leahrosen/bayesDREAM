@@ -1203,9 +1203,27 @@ class ModelSummarizer:
                 raw_counts_mean.append(np.nan)
 
         # Build guide-level DataFrame
+        # 'target' column may be absent in high MOI mode when guide_targets_dict is used;
+        # fall back to deriving the primary target from guide_targets_dict.
+        if 'target' in guide_meta.columns:
+            guide_targets_col = guide_meta['target'].values
+        elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            def _primary(g):
+                ts = self.model.guide_targets_dict.get(g, [])
+                if self.model.cis_gene and self.model.cis_gene in ts:
+                    return self.model.cis_gene
+                for t in ts:
+                    if t in _ntc_variants:
+                        return 'ntc'
+                return ts[0] if ts else 'unknown'
+            guide_targets_col = [_primary(g) for g in guides]
+        else:
+            guide_targets_col = ['unknown'] * len(guides)
+
         guide_df = pd.DataFrame({
             'guide': guides,
-            'target': guide_meta['target'].values,
+            'target': guide_targets_col,
             'n_cells': guide_meta['n_cells'].values,
             'x_true_mean': x_true_mean,
             'x_true_lower': x_true_lower,
@@ -1393,7 +1411,7 @@ class ModelSummarizer:
         x_ntc : float, optional
             Manually provided NTC mean for the cis gene (x-axis reference point).
             If None (default), computed from posterior_samples_technical of the cis modality.
-            Useful when fit_technical was not run (e.g., CRISPRa/CRISPRi-only subsets).
+            Useful when fit_technical was not run (e.g., single-group subsets).
         y_ntc : array-like, optional
             Manually provided NTC means for each trans feature (y-axis reference points).
             Shape: (n_features,). If None (default), computed from posterior_samples_technical
@@ -4436,3 +4454,165 @@ class ModelSummarizer:
         if return_argextrema:
             return out, (float(x_eval[imin]), float(x_eval[imax]))
         return out
+
+    # ------------------------------------------------------------------
+    # Post-processing helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_semicolon_roots(val):
+        """Parse a semicolon-separated root string (e.g. '0.8;2.1') into a sorted list of floats."""
+        if val is None:
+            return []
+        if isinstance(val, float) and np.isnan(val):
+            return []
+        s = str(val).strip()
+        if s == "" or s.lower() == "nan":
+            return []
+        out = []
+        for tok in s.split(";"):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                x = float(tok)
+            except ValueError:
+                continue
+            if np.isfinite(x):
+                out.append(x)
+        return sorted(set(out))
+
+    def classify_second_deriv_roots(
+        self,
+        df: "pd.DataFrame",
+        root_col: str = "second_deriv_roots_log2fc_mean",
+        tol_f: float = 1e-10,
+        tol_f3: float = 1e-12,
+    ) -> "pd.DataFrame":
+        """
+        Classify second-derivative roots as local maxima or minima of |g'(u)|.
+
+        At each root u* where g''(u*) = 0, the first derivative g'(u) is either at a
+        local maximum or minimum of its absolute value:
+          - sign(g') * g'''  > 0  →  local_min_abs  (|g'| decreasing through u*)
+          - sign(g') * g'''  < 0  →  local_max_abs  (|g'| increasing through u*)
+          - g' ≈ 0                →  local_min_abs  (|g'| can't go below 0)
+
+        Only supported for additive_hill function type.  Rows with missing parameters
+        or no roots are skipped.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Summary DataFrame returned by ``save_trans_summary`` (with
+            ``compute_derivative_roots=True``).  Required columns:
+            ``feature``, ``x_ntc``, ``A_mean``, ``alpha_mean``, ``beta_mean``,
+            ``Vmax_a_mean``, ``K_a_mean``, ``n_a_mean``, ``Vmax_b_mean``,
+            ``K_b_mean``, ``n_b_mean``, and the root column specified by
+            ``root_col``.
+        root_col : str
+            Column in *df* containing the semicolon-separated root strings to
+            evaluate (default: ``"second_deriv_roots_log2fc_mean"``).
+        tol_f : float
+            Absolute tolerance below which g'(u) is treated as zero (default 1e-10).
+        tol_f3 : float
+            Absolute tolerance below which g'''(u) is treated as zero (default 1e-12).
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per (feature, root) with columns:
+            - ``feature``: feature name
+            - ``u_root``: the root value in log2FC space
+            - ``dg_du``: first derivative g'(u) at the root
+            - ``d3g_du3``: third derivative g'''(u) at the root
+            - ``abs_dg_du``: absolute value of g'(u)
+            - ``extremum_type_abs``: ``"local_min_abs"``, ``"local_max_abs"``,
+              or ``"ambiguous"``
+            - ``classification``: the feature's classification column from *df*
+              (passed through unchanged, NaN if absent)
+
+        Examples
+        --------
+        >>> df = model.save_trans_summary(compute_derivative_roots=True)
+        >>> df_roots = model.classify_second_deriv_roots(df)
+        >>> # Keep only clear local maxima of rate of change
+        >>> peaks = df_roots[df_roots["extremum_type_abs"] == "local_max_abs"]
+        """
+        required_params = ["x_ntc", "A_mean", "alpha_mean", "beta_mean",
+                           "Vmax_a_mean", "K_a_mean", "n_a_mean",
+                           "Vmax_b_mean", "K_b_mean", "n_b_mean"]
+        missing = [c for c in ["feature", root_col] + required_params if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"classify_second_deriv_roots: DataFrame is missing required columns: {missing}. "
+                "Ensure save_trans_summary was called with compute_derivative_roots=True and "
+                "function_type='additive_hill'."
+            )
+
+        rows = []
+        for _, r in df.iterrows():
+            roots_u = self._parse_semicolon_roots(r.get(root_col, ""))
+            if not roots_u:
+                continue
+
+            try:
+                x_ntc  = float(r["x_ntc"])
+                A      = float(r["A_mean"])
+                alpha  = float(r["alpha_mean"])
+                beta   = float(r["beta_mean"])
+                Vmax_a = float(r["Vmax_a_mean"])
+                K_a    = float(r["K_a_mean"])
+                n_a    = float(r["n_a_mean"])
+                Vmax_b = float(r["Vmax_b_mean"])
+                K_b    = float(r["K_b_mean"])
+                n_b    = float(r["n_b_mean"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            u_arr = np.array(roots_u, dtype=float)
+            g1, _g2, g3 = self._g_derivs_at_u(
+                u_arr, A, alpha, Vmax_a, K_a, n_a, beta, Vmax_b, K_b, n_b, x_ntc
+            )
+
+            feat = r["feature"]
+            classif = r.get("classification", None)
+            for u, dg_du, d3g_du3 in zip(roots_u, g1, g3):
+                rows.append({
+                    "feature":        feat,
+                    "u_root":         u,
+                    "dg_du":          dg_du,
+                    "d3g_du3":        d3g_du3,
+                    "classification": classif,
+                })
+
+        if not rows:
+            return pd.DataFrame(columns=["feature", "u_root", "dg_du", "d3g_du3",
+                                         "abs_dg_du", "extremum_type_abs", "classification"])
+
+        df_roots = pd.DataFrame(rows)
+        df_roots = (df_roots
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna(subset=["u_root", "dg_du", "d3g_du3"])
+                    .reset_index(drop=True))
+
+        f  = df_roots["dg_du"].to_numpy(dtype=float)
+        f3 = df_roots["d3g_du3"].to_numpy(dtype=float)
+
+        sgn_f = np.zeros_like(f)
+        sgn_f[f >  tol_f] =  1.0
+        sgn_f[f < -tol_f] = -1.0
+
+        curv_abs = sgn_f * f3
+
+        ext_type = np.full(len(df_roots), "ambiguous", dtype=object)
+        # |g'| ~ 0 → can only be a minimum of |g'|
+        ext_type[np.abs(f) <= tol_f] = "local_min_abs"
+        mask = np.abs(f) > tol_f
+        ext_type[mask & (curv_abs >  tol_f3)] = "local_min_abs"
+        ext_type[mask & (curv_abs < -tol_f3)] = "local_max_abs"
+
+        df_roots["extremum_type_abs"] = ext_type
+        df_roots["abs_dg_du"]         = np.abs(f)
+
+        return df_roots
