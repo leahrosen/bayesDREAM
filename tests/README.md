@@ -17,7 +17,7 @@ This directory contains test scripts for bayesDREAM functionality.
 
 ### Feature-Specific Tests
 
-- **`test_modality_atac.py`** - Tests ATAC-seq modality integration
+- **`test_modality_atac.py`** - Tests ATAC-seq modality integration  
 - **`test_cell_names_numpy.py`** - Tests cell_names parameter for numpy arrays
 - **`test_exon_skip_aggregation.py`** - Tests exon skipping aggregation methods (min vs mean)
 - **`test_filtering_simple.py`** - Distribution-specific filtering at modality creation
@@ -35,45 +35,13 @@ This directory contains test scripts for bayesDREAM functionality.
 
 - **`test_imports.py`** - Quick smoke test for package imports
 
+### CLI and full pipeline tests
+
+- **`test_cli_system.py`** - test the CLI
+- **`test_system_quick_pipeline.py`** - run a full pipeline
+
 ## Running Tests
 
-Tests require the `pyroenv` conda environment:
-
 ```bash
-# Set PYTHONPATH to repository root
-cd "/Users/lrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/bayesDREAM code/bayesDREAM_forClaude"
-export PYTHONPATH="."
-
-# Run a specific test
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_multimodal_fitting.py
-
-# Run multiple tests
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_filtering_simple.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_per_modality_fitting.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_trans_all_distributions.py
+pytest .
 ```
-
-## Archived Tests
-
-The `archive/` subdirectory contains older test scripts organized by category:
-
-- **`archive/debug_scripts/`** - One-off debugging scripts (debug_alpha_*.py, quick_test_*.py, verify_extraction.py)
-- **`archive/bug_fix_tests/`** - Tests for specific bug fixes (sparse sum flatten, cis extraction)
-- **`archive/plotting_tests/`** - Old plotting validation tests
-- **`archive/redundant_tests/`** - Tests superseded by more comprehensive versions
-
-These archived tests are kept for historical reference but are no longer actively maintained.
-
-## Test Organization Principles
-
-**Essential tests** (kept in main tests/ directory):
-- Core integration tests for main functionality
-- Backward compatibility tests
-- Feature-specific tests for actively maintained features
-- Export and summary functionality tests
-
-**Archived tests** (moved to tests/archive/):
-- One-off debugging scripts
-- Tests for specific historical bugs
-- Redundant tests superseded by more comprehensive versions
-- Development-phase validation scripts
