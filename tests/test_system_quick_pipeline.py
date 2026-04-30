@@ -1,14 +1,3 @@
-"""Lightweight system test for the full bayesDREAM pipeline.
-
-This test runs:
-1) fit_technical
-2) fit_cis
-3) fit_trans
-4) save/load roundtrip
-
-It is intentionally small but end-to-end.
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -62,7 +51,6 @@ def _make_quick_test_data(n_cells: int = 50, seed: int = 42) -> tuple[pd.DataFra
 
 
 def test_quick_system_pipeline_and_roundtrip(tmp_path):
-    """Run full fit pipeline and verify save/load roundtrip."""
     pytest.importorskip("torch")
     pytest.importorskip("pyro")
 
