@@ -88,6 +88,23 @@ def calculate_mu_x_guide(guide, x_obs_ntc_factored, guides_ntc):
     return torch.mean(x_obs_ntc_factored[mask])
 
 
+def update_convergence_state(loss, smoothed_loss, alpha_ewma, tolerance):
+    """
+    Update EWMA-smoothed loss and decide whether SVI should stop early.
+
+    Returns
+    -------
+    tuple[bool, float]
+        A tuple of (has_converged, updated_smoothed_loss).
+    """
+    if smoothed_loss is None:
+        return False, loss
+
+    has_converged = abs(alpha_ewma * (loss - smoothed_loss)) < tolerance
+    updated_smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+    return has_converged, updated_smoothed_loss
+
+
 ########################################
 # Dose-Response Functions
 ########################################

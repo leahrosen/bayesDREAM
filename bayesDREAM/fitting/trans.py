@@ -24,6 +24,7 @@ import pyro.poutine as poutine
 import pyro.distributions as dist
 
 from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
+from ..utils import update_convergence_state
 
 
 def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
@@ -2394,13 +2395,15 @@ class TransFitter:
             self.losses_trans.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {Vmax_mean_tensor.device}")
-            if smoothed_loss is None:
-                smoothed_loss = loss
-            else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
-                smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+            has_converged, smoothed_loss = update_convergence_state(
+                loss=loss,
+                smoothed_loss=smoothed_loss,
+                alpha_ewma=alpha_ewma,
+                tolerance=tolerance,
+            )
+            if has_converged:
+                print(f"Converged at step {step}! Loss = {loss:.5e}")
+                break
 
         # Move to CPU if using too much GPU memory for Predictive
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch

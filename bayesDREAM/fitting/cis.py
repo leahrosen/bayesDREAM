@@ -15,6 +15,8 @@ from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
 
+from ..utils import update_convergence_state
+
 
 
 class CisFitter:
@@ -683,13 +685,15 @@ class CisFitter:
             losses.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {mu_x_mean_tensor.device}")
-            if smoothed_loss is None:
-                smoothed_loss = loss
-            else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
-                smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+            has_converged, smoothed_loss = update_convergence_state(
+                loss=loss,
+                smoothed_loss=smoothed_loss,
+                alpha_ewma=alpha_ewma,
+                tolerance=tolerance,
+            )
+            if has_converged:
+                print(f"Converged at step {step}! Loss = {loss:.5e}")
+                break
             
 
         # Move to CPU if using too much GPU memory for Predictive

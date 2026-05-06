@@ -17,6 +17,8 @@ import pyro.optim as optim
 import pyro.infer as infer
 import multiprocessing
 
+from ..utils import update_convergence_state
+
 # Optional dependency for memory detection
 try:
     import psutil
@@ -1647,13 +1649,15 @@ class TechnicalFitter:
                     "(2) check for extreme values in sum_factor, "
                     "(3) reduce OneCycleLR peak (pass lr=3e-4 to use a smaller cycle)."
                 )
-            if smoothed_loss is None:
-                smoothed_loss = loss
-            else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
-                smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+            has_converged, smoothed_loss = update_convergence_state(
+                loss=loss,
+                smoothed_loss=smoothed_loss,
+                alpha_ewma=alpha_ewma,
+                tolerance=tolerance,
+            )
+            if has_converged:
+                print(f"Converged at step {step}! Loss = {loss:.5e}")
+                break
     
         # ---------------------------
         # Predictive (optionally on CPU)
