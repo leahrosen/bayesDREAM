@@ -238,6 +238,7 @@ class ModelSaver:
                 'cis_gene': self.model.cis_gene,
                 'modality_name': 'cis',  # Cis always uses 'cis' modality
                 'feature_meta': cis_mod.feature_meta.to_dict('records') if hasattr(cis_mod, 'feature_meta') and cis_mod.feature_meta is not None else None,
+                'cell_names': self.model.meta['cell'].tolist() if 'cell' in self.model.meta.columns else None,
                 'loss_x': self.model.loss_x if hasattr(self.model, 'loss_x') else None
             }
 
