@@ -699,6 +699,10 @@ class CisFitter:
             print(f"[INFO] SVI completed on {original_device}. Running Predictive on CPU to reduce GPU memory pressure...")
             guide_x.to("cpu")
             self.model.device = torch.device("cpu")
+            # Move high-MOI tensors that are accessed directly in _model_x
+            if self.model.is_high_moi:
+                self.model.guide_assignment_tensor = self.model.guide_assignment_tensor.cpu()
+                self.model._ntc_guide_mask = self.model._ntc_guide_mask.cpu()
 
             model_inputs = {
                 "N": N,
@@ -792,6 +796,9 @@ class CisFitter:
         if run_on_cpu:
             self.model.device = original_device
             print("[INFO] Reset self.model.device to:", self.model.device)
+            if self.model.is_high_moi:
+                self.model.guide_assignment_tensor = self.model.guide_assignment_tensor.to(original_device)
+                self.model._ntc_guide_mask = self.model._ntc_guide_mask.to(original_device)
 
         for k, v in posterior_samples_x.items():
             posterior_samples_x[k] = self._to_cpu(v)
