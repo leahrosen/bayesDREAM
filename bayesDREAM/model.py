@@ -27,6 +27,7 @@ from .modalities import (
     CustomModalityMixin,
     PlottingMixin
 )
+from .plotting.colors import ColorScheme
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -84,6 +85,7 @@ class bayesDREAM(
         exclude_targets: list = None,
         require_ntc: bool = True,
         min_count: int = 1,
+        color_scheme: 'ColorScheme' = None,
     ):
         """
         Initialize bayesDREAM.
@@ -163,6 +165,10 @@ class bayesDREAM(
             Random seed for reproducibility
         cores : int, default=1
             Number of CPU cores for parallel operations
+        color_scheme : ColorScheme, optional
+            Color scheme for visualizations. If None, auto-built from model
+            metadata via ``ColorScheme.from_model(self)`` after initialization.
+            Can also be set later via ``set_color_scheme()``.
 
         Raises
         ------
@@ -351,6 +357,24 @@ class bayesDREAM(
         # Initialise sum_factors on all negbinom modalities from meta.
         # Must run AFTER super().__init__() and cell subsetting so self.meta is final.
         self._init_sum_factors(sum_factor_col)
+
+        # Colour scheme — user-supplied or auto-built from model metadata.
+        # Must run AFTER super().__init__() so self.meta / guide_meta are final.
+        if color_scheme is not None:
+            self.color_scheme = color_scheme
+        else:
+            self.color_scheme = ColorScheme.from_model(self)
+
+    def set_color_scheme(self, color_scheme: 'ColorScheme'):
+        """
+        Replace the model's color scheme.
+
+        Parameters
+        ----------
+        color_scheme : ColorScheme
+            New color scheme to use for all visualizations.
+        """
+        self.color_scheme = color_scheme
 
     def _init_sum_factors(self, sum_factor_col: str = 'sum_factor'):
         """

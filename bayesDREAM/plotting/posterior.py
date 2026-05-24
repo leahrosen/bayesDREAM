@@ -11,8 +11,16 @@ from matplotlib import cm
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 
-from .helpers import to_np
+from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior
 from .colors import ColorScheme
+
+
+def _guide_sort_key(g):
+    """Sort guides by root name then trailing number."""
+    parts = g.rsplit('_', 1)
+    root = parts[0]
+    idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return (root, idx)
 
 
 def plot_posterior_density_lines(
@@ -175,6 +183,7 @@ def plot_xtrue_density_by_guide(
     model,
     cis_gene=None,
     log2=False,
+    log2fc=False,
     cmap="viridis",
     alpha_overall=0.5,
     density_gamma=0.7,
@@ -183,99 +192,132 @@ def plot_xtrue_density_by_guide(
     grid_points=350,
     linewidth=0.8,
     group_by_guide=True,
+    single_guide_cells_only=False,
+    targeted_only=False,
     color_scheme=None,
     show=True,
 ):
     """
-    One vertical density line per cell for x_true, with guide annotations.
+    Per-cell posterior density plot for x_true, one density strip per cell.
+
+    Each cell's strip is a KDE computed from its ``S`` posterior samples of
+    ``x_true`` (loaded from ``model.posterior_samples_cis['x_true']``, shape
+    ``[S, N_cells]``).  Cells are grouped and sorted by guide, with a colour
+    bar above the plot annotating guide membership.
+
+    Falls back to ``model.x_true`` point estimates (one value per cell, no KDE
+    width) when no posterior is stored.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
     cis_gene : str, optional
-        Cis gene name (used for title, defaults to model.cis_gene)
-    log2 : bool
-        Whether to use log2 scale
+        Cis gene name (title only).
+    log2 : bool, default False
+        Apply log2 transform.
+    log2fc : bool, default False
+        Express y-axis as log2 fold-change relative to the NTC mean.
+        Implies ``log2=True``; subtracts the mean log2 value across all NTC
+        cells (before any ``targeted_only`` filter) so NTC is centred at 0.
+        A grey dashed horizontal line is drawn at y = 0.
     cmap : str or Colormap
-        Colormap for density visualization
+        Colormap for density intensity.
     alpha_overall : float
-        Overall alpha for density colors
+        Overall alpha for density colours.
     density_gamma : float
-        Gamma correction for density intensity
+        Gamma correction for density intensity.
     norm_global : bool
-        If True, normalize density across all cells
+        Normalise density globally across all cells.
     y_quantiles : tuple
-        Quantiles for y-axis range
+        Quantiles (lo, hi) for y-axis range.
     grid_points : int
-        Number of grid points for KDE
+        KDE grid resolution.
     linewidth : float
-        Width of lines
+        Line width for median ticks.
     group_by_guide : bool
-        If True, group cells by guide. If False, order by median only.
+        Sort cells by guide then by within-guide median.  If ``False``,
+        sort globally by median.
+    single_guide_cells_only : bool, default False
+        Required to be ``True`` for high-MOI models.
+    targeted_only : bool, default False
+        If ``True``, exclude NTC cells (show only cells from targeting guides).
     color_scheme : ColorScheme, optional
-        Custom color scheme for guide annotations
-    show : bool
-        Whether to display the plot
+        Custom colour scheme for guide annotations.
+    show : bool, default True
 
     Returns
     -------
     fig : matplotlib figure
     """
-    if color_scheme is None:
-        color_scheme = ColorScheme()
+    if log2fc:
+        log2 = True
 
+    if color_scheme is None:
+        color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
 
-    df = model.meta.copy()
-    X = to_np(model.x_true)  # [S, N_cells]
+    guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
-    # log2 transform without dropping guides
+    # ---- load posterior or fall back to point estimates ----
+    post = _xtrue_posterior(model)          # [S, N_cells] or None
+    if post is not None:
+        samples = post[:, cell_mask]        # [S, N_kept]
+    else:
+        x_vals = to_np(model.x_true)[cell_mask]
+        samples = x_vals[np.newaxis, :]     # [1, N_kept]
+
+    guide_labels = guide_labels[cell_mask]
+
     if log2:
-        eps = 1e-6
-        X = np.log2(np.maximum(X, eps))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            samples = np.where(samples > 0,
+                               np.log2(np.maximum(samples, 1e-300)), np.nan)
 
-    samples = np.asarray(X)       # [S, N]
+    # ---- log2FC: subtract NTC mean (before targeted_only filter) ----
+    if log2fc:
+        ntc_mask = _guide_ntc_mask(guide_labels, model)
+        ntc_mean = float(np.nanmean(samples[:, ntc_mask])) if ntc_mask.any() else 0.0
+        samples = samples - ntc_mean
+
+    # ---- optional NTC filter ----
+    if targeted_only:
+        ntc = _guide_ntc_mask(guide_labels, model)
+        guide_labels = guide_labels[~ntc]
+        samples = samples[:, ~ntc]
+
     S, N = samples.shape
-    guides = df['guide'].astype(str).to_numpy()   # length N
+    guides = guide_labels            # [N]
 
-    # ---------- choose ordering ----------
-    med_per_cell = np.nanmedian(samples, axis=0)
+    # ---- cell ordering ----
+    med_per_cell = np.nanmedian(samples, axis=0)   # [N]
 
     if group_by_guide:
-        # order cells: by guide, then median within guide
-        def guide_sort_key(g):
-            parts = g.split('_')
-            root = parts[0]
-            idx  = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            return (root, idx)
-
-        unique_guides = sorted(np.unique(guides), key=guide_sort_key)
-        guide_block_rank = {g: i for i, g in enumerate(unique_guides)}
-        guide_ranks = np.array([guide_block_rank[g] for g in guides])
-
-        order = np.lexsort((med_per_cell, guide_ranks))  # (N,)
+        unique_guides = sorted(np.unique(guides), key=_guide_sort_key)
+        block_rank    = {g: i for i, g in enumerate(unique_guides)}
+        guide_ranks   = np.array([block_rank[g] for g in guides])
+        order         = np.lexsort((med_per_cell, guide_ranks))
     else:
-        unique_guides = sorted(np.unique(guides))
-        order = np.argsort(med_per_cell)
+        unique_guides = sorted(np.unique(guides), key=_guide_sort_key)
+        order         = np.argsort(med_per_cell)
 
-    samples_sorted = samples[:, order]
-    guides_sorted  = guides[order]
+    samples_sorted = samples[:, order]       # [S, N]
+    guides_sorted  = guides[order]           # [N]
 
-    # ---------- draw density background using generic function ----------
-    ylabel = "x_true" + (" (log₂)" if log2 else "")
+    if log2fc:
+        ylabel = "log2FC x_true (vs NTC)"
+    else:
+        ylabel = "x_true" + (" (log₂)" if log2 else "")
 
-    # Create figure with space for guide color bar
-    fig = plt.figure(figsize=(12, 6))
-    ax = plt.subplot2grid((20, 1), (2, 0), rowspan=18)
+    fig = plt.figure(figsize=(max(10, N * 0.03 + 2), 6))
+    ax  = plt.subplot2grid((20, 1), (2, 0), rowspan=18)
 
-    # Draw density lines (no title, we'll add it to figure)
     plot_posterior_density_lines(
-        samples_sorted,
+        samples_sorted,          # [S, N] — each column is one cell
         title="",
         sort_by=None,
-        subset_mask=None,
         cmap=cmap,
         alpha_overall=alpha_overall,
         density_gamma=density_gamma,
@@ -289,38 +331,40 @@ def plot_xtrue_density_by_guide(
         show=False,
     )
 
-    # ---------- add colored median ticks per cell ----------
+    # ---- coloured median tick per cell ----
     medians_sorted = np.nanmedian(samples_sorted, axis=0)
     for i, g in enumerate(guides_sorted):
         color = color_scheme.get_guide_color(g, 'black')
-        ax.plot([i+0.7, i+1.3], [medians_sorted[i], medians_sorted[i]],
-               color=color, linewidth=1.5, alpha=0.9)
+        ax.plot([i + 0.7, i + 1.3], [medians_sorted[i], medians_sorted[i]],
+                color=color, linewidth=1.5, alpha=0.9)
 
-    # ---------- add guide color bar between title and axes ----------
+    # ---- guide colour bar above axes ----
     ax_bar = plt.subplot2grid((20, 1), (0, 0), rowspan=1)
     ax_bar.set_xlim(0.5, N + 0.5)
     ax_bar.set_ylim(0, 1)
     ax_bar.axis('off')
-
     for i, g in enumerate(guides_sorted):
         color = color_scheme.get_guide_color(g, 'black')
-        rect = Rectangle((i+0.5, 0), 1, 1, facecolor=color, edgecolor='none')
+        rect = Rectangle((i + 0.5, 0), 1, 1, facecolor=color, edgecolor='none')
         ax_bar.add_patch(rect)
 
-    # ---------- add legend ----------
-    legend_handles = []
-    for g in unique_guides:
-        color = color_scheme.get_guide_color(g, 'black')
-        legend_handles.append(Line2D([0], [0], marker='o', color='w',
-                                    markerfacecolor=color, markersize=8, label=g))
-
+    # ---- legend ----
+    legend_handles = [
+        Line2D([0], [0], marker='o', color='w',
+               markerfacecolor=color_scheme.get_guide_color(g, 'black'),
+               markersize=8, label=g)
+        for g in unique_guides
+    ]
     ax.legend(handles=legend_handles, title='guide', fontsize=9,
-             loc='upper left', frameon=True, framealpha=0.9)
+              loc='upper left', frameon=True, framealpha=0.9)
 
-    # Figure title
-    fig.suptitle(f'{cis_gene}: x_true posterior density by cell (colored by guide)',
-                fontsize=13, y=0.98)
+    if log2fc:
+        ax.axhline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
 
+    mode_suffix = ' (log2FC)' if log2fc else (' (log₂)' if log2 else '')
+    title_suffix = (' (targeted only)' if targeted_only else '')
+    fig.suptitle(f'{cis_gene}: x_true posterior density by cell{mode_suffix}{title_suffix}',
+                 fontsize=13, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
     if show:
@@ -407,7 +451,8 @@ def plot_parameter_density_with_xtrue(
     from scipy.stats import gaussian_kde
 
     if color_scheme is None:
-        color_scheme = ColorScheme()
+        color_scheme = getattr(model, 'color_scheme', None) or ColorScheme.from_model(model)
+    color_scheme = color_scheme.connect(model)
 
     if cis_gene is None:
         cis_gene = getattr(model, 'cis_gene', 'cis')
@@ -418,10 +463,9 @@ def plot_parameter_density_with_xtrue(
         from .utils import log2_pos
         param_samps = log2_pos(param_samps)
 
-    # Get x_true samples and metadata
+    # Get x_true (point estimate per cell)
     df_meta = model.meta.copy()
-    x_true_samps = to_np(model.x_true)  # [S, N_cells]
-    xtrue_mean_per_cell = x_true_samps.mean(axis=0)  # [N_cells]
+    xtrue_mean_per_cell = to_np(model.x_true)  # [N_cells]
 
     if log2:
         from .utils import log2_pos

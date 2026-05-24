@@ -825,7 +825,48 @@ class TechnicalFitter:
 
         zero_count_mask = feature_sums_ntc == 0
         zero_std_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
-    
+
+        # --- Per-group zero-count check for negbinom ---
+        # Two cases need different treatment:
+        #  - Reference group (group 0) all-zero: baseline expression can't be estimated;
+        #    exclude the feature entirely (all groups get alpha_y = 1.0).
+        #  - Non-reference group all-zero: fit the feature on the other groups normally;
+        #    after fitting, patch alpha_y = 1.0 only for the zero-count group(s).
+        any_group_zero_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
+        _negbinom_nonref_patch = {}   # {group_code (int): bool array [T_all]} — applied post-fit
+        if distribution == 'negbinom' and 'technical_group_code' in meta_ntc.columns:
+            groups_ntc_codes = meta_ntc['technical_group_code'].values
+            unique_groups_nb = np.unique(groups_ntc_codes)
+            if len(unique_groups_nb) > 1 and counts_ntc_array.ndim == 2:
+                for g in unique_groups_nb:
+                    g_mask = (groups_ntc_codes == g)
+                    if g_mask.sum() == 0:
+                        continue
+                    if modality.cells_axis == 1:
+                        group_sums = counts_ntc_array[:, g_mask].sum(axis=1)
+                    else:
+                        group_sums = counts_ntc_array[g_mask, :].sum(axis=0)
+                    if sparse.issparse(group_sums):
+                        group_sums = np.asarray(group_sums).flatten()
+                    feat_zero = (group_sums == 0)
+                    if g == 0:
+                        # Reference group zero → baseline corrupted → exclude entirely
+                        n_new = int((feat_zero & ~zero_count_mask).sum())
+                        if n_new > 0:
+                            print(f"[INFO] {modality_name}: {n_new} feature(s) excluded — "
+                                  f"all-zero NTC counts in reference group (baseline can't be estimated).")
+                        any_group_zero_mask |= feat_zero
+                    else:
+                        # Non-reference group zero → fit on other groups, patch this group after
+                        # Only track features that aren't already excluded for other reasons
+                        patchable = feat_zero & ~zero_count_mask
+                        n_patch = int(patchable.sum())
+                        if n_patch > 0:
+                            print(f"[INFO] {modality_name}: {n_patch} feature(s) have all-zero NTC counts "
+                                  f"in non-reference group {g}; will fit on other groups and "
+                                  f"set alpha_y=1.0 for group {g} after fitting.")
+                            _negbinom_nonref_patch[int(g)] = patchable
+
         if distribution == 'multinomial':
             for f_idx in range(counts_ntc_array.shape[0]):
                 feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
@@ -1017,19 +1058,21 @@ class TechnicalFitter:
 
     
         needs_filtering_mask = zero_std_mask | only_one_category_mask
-        needs_exclusion_mask = zero_count_mask | needs_filtering_mask
+        needs_exclusion_mask = zero_count_mask | needs_filtering_mask | any_group_zero_mask
 
         # Count features that are excluded ONLY for each reason (no overlap)
-        num_zero_count_only = (zero_count_mask & ~zero_std_mask & ~only_one_category_mask).sum()
-        num_zero_std_only = (zero_std_mask & ~only_one_category_mask).sum()
+        num_zero_count_only = (zero_count_mask & ~zero_std_mask & ~only_one_category_mask & ~any_group_zero_mask).sum()
+        num_zero_std_only = (zero_std_mask & ~only_one_category_mask & ~any_group_zero_mask).sum()
         num_single_category = only_one_category_mask.sum()
+        num_group_zero = (any_group_zero_mask & ~zero_count_mask).sum()  # ref-group-zero exclusions only
         num_excluded = needs_exclusion_mask.sum()
 
         if num_excluded > 0:
             warnings.warn(
                 f"[WARNING] {num_excluded} feature(s) excluded from fitting: "
                 f"{num_zero_count_only} zero-count-only, {num_zero_std_only} zero-std, "
-                f"{num_single_category} ≤1 category present in all technical groups. "
+                f"{num_single_category} ≤1 category present in all technical groups, "
+                f"{num_group_zero} zero-in-one-group (negbinom only). "
                 "Alpha set to baseline for excluded features.",
                 UserWarning,
             )
@@ -1886,6 +1929,33 @@ class TechnicalFitter:
             alpha_y_mult_full = _reconstruct_full_2d(alpha_y_mult_fit, baseline_value=1.0, fit_mask_bool=fit_mask)
             log2_alpha_fit = posterior_samples["log2_alpha_y"]
             alpha_y_add_full = _reconstruct_full_2d(log2_alpha_fit, baseline_value=0.0, fit_mask_bool=fit_mask)
+
+            # Patch non-reference zero-count (group, feature) pairs to baseline (negbinom only).
+            # These features were included in fitting but the zero-count group's alpha_y estimate
+            # is unreliable (prior-dominated). Overwrite with 1.0 (no technical correction).
+            # alpha_y_mult_full shape: [C, T_all]; group index matches technical_group_code.
+            if _negbinom_nonref_patch:
+                n_pairs = sum(int(m.sum()) for m in _negbinom_nonref_patch.values())
+                print(f"[INFO] Patching alpha_y=1.0 (mult) / 0.0 (add) for {n_pairs} "
+                      f"(group, feature) pair(s) with all-zero NTC counts in a non-reference group.")
+                for g, feat_mask_patch in _negbinom_nonref_patch.items():
+                    # Use torch LongTensor for feature indices — numpy arrays
+                    # cause PyTorch to mis-route indices to the wrong dimension.
+                    # Pyro Predictive always produces a leading S dimension, so
+                    # _reconstruct_full_2d always returns [S, C, T_all] (3D).
+                    # The 2D branch [C, T_all] is kept for robustness only.
+                    # `row` is the non-reference group code (int ≥ 1, < C).
+                    # `feat_idx_t` indexes T_all, matching the last dimension.
+                    row = int(g)
+                    feat_idx_t = torch.as_tensor(
+                        np.where(feat_mask_patch)[0], dtype=torch.long
+                    )
+                    if alpha_y_mult_full.dim() == 2:    # [C, T_all]  — fallback
+                        alpha_y_mult_full[row, feat_idx_t] = 1.0
+                        alpha_y_add_full[row, feat_idx_t] = 0.0
+                    else:                               # [S, C, T_all] — normal
+                        alpha_y_mult_full[:, row, feat_idx_t] = 1.0
+                        alpha_y_add_full[:, row, feat_idx_t] = 0.0
 
             # Choose correct type based on distribution
             # negbinom: multiplicative, others: additive

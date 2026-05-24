@@ -22,7 +22,8 @@ from .prior_posterior import (
 from .colors import ColorScheme, build_guide_colors, lighten, darken
 
 # Helper utilities
-from .helpers import to_np, per_cell_mean_std
+from .helpers import (to_np, per_cell_mean_std, resolve_guide_labels,
+                       _guide_ntc_mask, _xtrue_posterior)
 from .utils import (
     hill_xinf_samples,
     dependency_mask_from_n,
@@ -39,7 +40,10 @@ from .basic import (
     filled_density_by_guide_log2,
     scatter_param_mean_vs_ci,
     plot_parameter_ci_panel,
-    extract_posterior_dataframe
+    extract_posterior_dataframe,
+    plot_additivity_scatter,
+    plot_additivity_violin,
+    plot_additivity_residuals,
 )
 
 # Posterior density plots
@@ -61,7 +65,11 @@ from .de_comparison import (
 )
 
 # Diagnostic plots
-from .diagnostics import plot_sum_factor_comparison
+from .diagnostics import (
+    scatter_with_smooth_by_group,
+    plot_x_true_residuals_vs_sumfactor,
+    plot_sum_factor_comparison,
+)
 
 __all__ = [
     # Prior/posterior
@@ -76,6 +84,7 @@ __all__ = [
     # Helpers
     'to_np',
     'per_cell_mean_std',
+    'resolve_guide_labels',
     'hill_xinf_samples',
     'abs_n_gt_tol_mask',
     'log2_pos',
@@ -88,6 +97,9 @@ __all__ = [
     'scatter_param_mean_vs_ci',
     'plot_parameter_ci_panel',
     'extract_posterior_dataframe',
+    'plot_additivity_scatter',
+    'plot_additivity_violin',
+    'plot_additivity_residuals',
     # Posterior plots
     'plot_posterior_density_lines',
     'plot_xtrue_density_by_guide',
@@ -101,5 +113,7 @@ __all__ = [
     'plot_edger_vs_bayes_observed_range',
     'dependency_mask_from_n',
     # Diagnostics
+    'scatter_with_smooth_by_group',
+    'plot_x_true_residuals_vs_sumfactor',
     'plot_sum_factor_comparison',
 ]
