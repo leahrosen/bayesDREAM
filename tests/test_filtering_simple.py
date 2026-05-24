@@ -1,8 +1,8 @@
 """Test distribution-specific filtering at modality creation."""
-
-import unittest
 import numpy as np
 import pandas as pd
+
+import pytest
 
 
 def _make_model():
@@ -30,67 +30,63 @@ def _make_model():
     )
 
 
-class TestFilteringSimple(unittest.TestCase):
-    """Verify constant-feature filtering for each distribution type."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = _make_model()
-
-    def test_binomial_filters_constant_ratio(self):
-        custom_counts = np.array([
-            [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],   # variable ratio
-            [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],   # constant ratio
-        ])
-        custom_denom = np.array([
-            [100] * 10,                                   # constant denom → variable ratio
-            [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],  # proportional → constant ratio
-        ])
-        custom_meta = pd.DataFrame({'feature': ['feat1_variable', 'feat2_constant']})
-        self.model.add_custom_modality(
-            name='custom_binomial',
-            counts=custom_counts,
-            feature_meta=custom_meta,
-            distribution='binomial',
-            denominator=custom_denom,
-        )
-        mod = self.model.get_modality('custom_binomial')
-        self.assertEqual(mod.dims['n_features'], 1,
-                         "Constant-ratio binomial feature should be filtered out")
-
-    def test_multinomial_filters_constant_ratios(self):
-        multinomial_counts = np.array([
-            [[10, 10], [20, 10], [30, 10], [40, 10], [50, 10],
-             [60, 10], [70, 10], [80, 10], [90, 10], [100, 10]],   # variable
-            [[5, 5]] * 10,                                            # constant [0.5, 0.5]
-        ])
-        multinomial_meta = pd.DataFrame({'feature': ['feat1_variable', 'feat2_constant']})
-        self.model.add_custom_modality(
-            name='custom_multinomial',
-            counts=multinomial_counts,
-            feature_meta=multinomial_meta,
-            distribution='multinomial',
-        )
-        mod = self.model.get_modality('custom_multinomial')
-        self.assertEqual(mod.dims['n_features'], 1,
-                         "Constant-ratio multinomial feature should be filtered out")
-
-    def test_normal_filters_zero_variance(self):
-        normal_counts = np.array([
-            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],  # variable
-            [5.0] * 10,                                                # constant → filter
-        ])
-        normal_meta = pd.DataFrame({'feature': ['feat1_variable', 'feat2_constant']})
-        self.model.add_custom_modality(
-            name='custom_normal',
-            counts=normal_counts,
-            feature_meta=normal_meta,
-            distribution='normal',
-        )
-        mod = self.model.get_modality('custom_normal')
-        self.assertEqual(mod.dims['n_features'], 1,
-                         "Zero-variance normal feature should be filtered out")
+@pytest.fixture(scope='module')
+def filter_test_model():
+    return _make_model()
 
 
-if __name__ == '__main__':
-    unittest.main()
+def test_binomial_filters_constant_ratio(filter_test_model):
+    model = filter_test_model
+    custom_counts = np.array([
+        [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],   # variable ratio
+        [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],   # constant ratio
+    ])
+    custom_denom = np.array([
+        [100] * 10,                                   # constant denom → variable ratio
+        [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],  # proportional → constant ratio
+    ])
+    custom_meta = pd.DataFrame({'feature': ['feat1_variable', 'feat2_constant']})
+    model.add_custom_modality(
+        name='custom_binomial',
+        counts=custom_counts,
+        feature_meta=custom_meta,
+        distribution='binomial',
+        denominator=custom_denom,
+    )
+    mod = model.get_modality('custom_binomial')
+    assert mod.dims['n_features'] == 1, "Constant-ratio binomial feature should be filtered out"
+
+
+def test_multinomial_filters_constant_ratios(filter_test_model):
+    model = filter_test_model
+    multinomial_counts = np.array([
+        [[10, 10], [20, 10], [30, 10], [40, 10], [50, 10],
+         [60, 10], [70, 10], [80, 10], [90, 10], [100, 10]],   # variable
+        [[5, 5]] * 10,                                            # constant [0.5, 0.5]
+    ])
+    multinomial_meta = pd.DataFrame({'feature': ['feat1_variable', 'feat2_constant']})
+    model.add_custom_modality(
+        name='custom_multinomial',
+        counts=multinomial_counts,
+        feature_meta=multinomial_meta,
+        distribution='multinomial',
+    )
+    mod = model.get_modality('custom_multinomial')
+    assert mod.dims['n_features'] == 1, "Constant-ratio multinomial feature should be filtered out"
+
+
+def test_normal_filters_zero_variance(filter_test_model):
+    model = filter_test_model
+    normal_counts = np.array([
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],  # variable
+        [5.0] * 10,                                                # constant → filter
+    ])
+    normal_meta = pd.DataFrame({'feature': ['feat1_variable', 'feat2_constant']})
+    model.add_custom_modality(
+        name='custom_normal',
+        counts=normal_counts,
+        feature_meta=normal_meta,
+        distribution='normal',
+    )
+    mod = model.get_modality('custom_normal')
+    assert mod.dims['n_features'] == 1, "Zero-variance normal feature should be filtered out"

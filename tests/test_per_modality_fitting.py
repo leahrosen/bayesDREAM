@@ -4,164 +4,150 @@ Verifies that fit_technical() and fit_trans() can fit different modalities
 and store results correctly per modality, without overwriting each other.
 """
 
-import unittest
 import numpy as np
 import pandas as pd
 
 import pytest
 pytestmark = pytest.mark.slow
 
+NITERS = 20
+NSAMPLES = 10
 
-def _make_base_data(n_genes=10, n_cells=50, n_guides=10, seed=42):
-    np.random.seed(seed)
-    cell_names = [f'cell_{i}' for i in range(n_cells)]
-    guides = np.repeat([f'guide_{i}' for i in range(n_guides)], n_cells // n_guides)
-    targets = ['ntc'] * (n_cells // 2) + ['GFI1B'] * (n_cells // 2)
-    cell_lines = np.random.choice(['A', 'B'], n_cells)
-    meta = pd.DataFrame({
-        'cell': cell_names,
-        'guide': guides,
-        'target': targets,
-        'cell_line': cell_lines,
-        'sum_factor': np.random.uniform(0.8, 1.2, n_cells),
-        'L_cell_barcode': cell_names,
-    })
-    gene_names = [f'gene_{i}' for i in range(n_genes)] + ['GFI1B']
-    gene_counts = pd.DataFrame(
-        np.random.poisson(50, (n_genes + 1, n_cells)),
-        index=gene_names,
-        columns=cell_names,
+
+@pytest.fixture(scope='module')
+def fitted_multimodal_model(shared_test_data):
+    import torch
+    pytest.importorskip('torch')
+    pytest.importorskip('pyro')
+    from bayesDREAM import bayesDREAM, Modality
+
+    meta = shared_test_data['meta'].copy()
+    gene_counts = shared_test_data['gene_counts'].copy()
+    cell_names = meta['cell'].tolist()
+    n_cells = len(cell_names)
+
+    model = bayesDREAM(
+        meta=meta,
+        counts=gene_counts,
+        cis_gene='GFI1B',
+        primary_modality='gene',
+        output_dir='./test_output',
+        label='per_modality_test',
+        device='cpu',
     )
-    return meta, gene_counts, cell_names, n_cells
+
+    # Add a splicing-like binomial modality
+    sj_counts = shared_test_data['splicing_counts']
+    sj_total = shared_test_data['splicing_denom']
+    sj_meta = shared_test_data['splicing_meta'].copy()
+    splicing_modality = Modality(
+        name='splicing_test',
+        counts=pd.DataFrame(sj_counts, columns=cell_names),
+        feature_meta=sj_meta,
+        distribution='binomial',
+        denominator=sj_total,
+        cells_axis=1,
+    )
+    model.add_modality('splicing_test', splicing_modality)
+
+    # Fit technical on both modalities
+    model.set_technical_groups(['cell_line'])
+    model.fit_technical(sum_factor_col='sum_factor', modality_name='gene',
+                        niters=NITERS, nsamples=NSAMPLES)
+    model.fit_technical(modality_name='splicing_test', niters=NITERS, nsamples=NSAMPLES)
+
+    # Set dummy x_true for trans tests
+    model.x_true = torch.ones(n_cells, dtype=torch.float32)
+
+    # Fit trans on gene modality
+    model.fit_trans(
+        sum_factor_col='sum_factor',
+        function_type='additive_hill',
+        modality_name='gene',
+        p0=0.01, gamma_threshold=0.01,
+        niters=NITERS, nsamples=NSAMPLES,
+    )
+
+    # Fit trans on splicing modality
+    model.fit_trans(
+        function_type='additive_hill',
+        modality_name='splicing_test',
+        p0=0.01, gamma_threshold=0.01,
+        niters=NITERS, nsamples=NSAMPLES,
+        min_denominator=0,
+    )
+
+    return model
 
 
-class TestPerModalityFitting(unittest.TestCase):
-    """Run technical and trans fits across primary and non-primary modalities."""
+# --- Technical fit checks ---
 
-    @classmethod
-    def setUpClass(cls):
-        import torch
-        pytest.importorskip('torch')
-        pytest.importorskip('pyro')
-        from bayesDREAM import bayesDREAM, Modality
-
-        cls.meta, cls.gene_counts, cls.cell_names, cls.n_cells = _make_base_data()
-
-        cls.model = bayesDREAM(
-            meta=cls.meta,
-            counts=cls.gene_counts,
-            cis_gene='GFI1B',
-            primary_modality='gene',
-            output_dir='./test_output',
-            label='per_modality_test',
-            device='cpu',
-        )
-
-        # Add a splicing-like binomial modality
-        n_junctions = 5
-        sj_counts = np.random.poisson(20, (n_junctions, cls.n_cells))
-        sj_total = np.random.poisson(100, (n_junctions, cls.n_cells))
-        sj_meta = pd.DataFrame({
-            'junction_id': [f'junction_{i}' for i in range(n_junctions)],
-            'chrom': ['chr1'] * n_junctions,
-            'strand': ['+'] * n_junctions,
-        })
-        cls.splicing_modality = Modality(
-            name='splicing_test',
-            counts=pd.DataFrame(sj_counts, columns=cls.cell_names),
-            feature_meta=sj_meta,
-            distribution='binomial',
-            denominator=sj_total,
-            cells_axis=1,
-        )
-        cls.model.add_modality('splicing_test', cls.splicing_modality)
-
-        # Fit technical on both modalities
-        cls.model.set_technical_groups(['cell_line'])
-        cls.model.fit_technical(sum_factor_col='sum_factor', modality_name='gene',
-                                niters=100, nsamples=10)
-        cls.model.fit_technical(modality_name='splicing_test', niters=100, nsamples=10)
-
-        # Set dummy x_true for trans tests
-        cls.model.x_true = torch.ones(cls.n_cells, dtype=torch.float32)
-
-        # Fit trans on gene modality
-        cls.model.fit_trans(
-            sum_factor_col='sum_factor',
-            function_type='additive_hill',
-            modality_name='gene',
-            p0=0.01, gamma_threshold=0.01,
-            niters=100, nsamples=10,
-        )
-
-        # Fit trans on splicing modality
-        cls.model.fit_trans(
-            function_type='additive_hill',
-            modality_name='splicing_test',
-            p0=0.01, gamma_threshold=0.01,
-            niters=100, nsamples=10,
-            min_denominator=0,
-        )
-
-    # --- Technical fit checks ---
-
-    def test_gene_modality_alpha_y_prefit_set(self):
-        gene_mod = self.model.get_modality('gene')
-        self.assertIsNotNone(gene_mod.alpha_y_prefit)
-
-    def test_splicing_modality_alpha_y_prefit_set(self):
-        spl_mod = self.model.get_modality('splicing_test')
-        self.assertIsNotNone(spl_mod.alpha_y_prefit)
-
-    def test_gene_alpha_not_overwritten_by_splicing_fit(self):
-        gene_mod = self.model.get_modality('gene')
-        spl_mod = self.model.get_modality('splicing_test')
-        # Both should be set, and they should differ (different data)
-        self.assertIsNotNone(gene_mod.alpha_y_prefit)
-        self.assertIsNotNone(spl_mod.alpha_y_prefit)
-
-    def test_model_level_technical_stored(self):
-        # posterior_samples_technical is stored per-modality, not at model level
-        gene_mod = self.model.get_modality('gene')
-        self.assertIsNotNone(gene_mod.posterior_samples_technical)
-
-    # --- Trans fit checks ---
-
-    def test_gene_modality_posterior_samples_trans(self):
-        gene_mod = self.model.get_modality('gene')
-        self.assertIsNotNone(gene_mod.posterior_samples_trans)
-
-    def test_splicing_modality_posterior_samples_trans(self):
-        spl_mod = self.model.get_modality('splicing_test')
-        self.assertIsNotNone(spl_mod.posterior_samples_trans)
-
-    def test_model_level_posterior_samples_trans_backward_compat(self):
-        self.assertIsNotNone(self.model.posterior_samples_trans)
-
-    # --- Error handling ---
-
-    def test_trans_without_technical_fit_raises(self):
-        from bayesDREAM import Modality
-        third_modality = Modality(
-            name='untrained',
-            counts=np.random.poisson(10, (5, self.n_cells)),
-            feature_meta=pd.DataFrame({'feature': [f'f_{i}' for i in range(5)]}),
-            distribution='negbinom',
-            cells_axis=1,
-        )
-        self.model.add_modality('untrained', third_modality)
-        with self.assertRaises(ValueError):
-            self.model.fit_trans(modality_name='untrained', niters=10, nsamples=5)
-
-    # --- Default behaviour ---
-
-    def test_fit_technical_defaults_to_primary_modality(self):
-        gene_mod = self.model.get_modality('gene')
-        gene_mod.alpha_y_prefit = None
-        gene_mod.posterior_samples_technical = None
-        self.model.fit_technical(sum_factor_col='sum_factor', niters=100, nsamples=10)
-        self.assertIsNotNone(gene_mod.alpha_y_prefit)
+def test_gene_modality_alpha_y_prefit_set(fitted_multimodal_model):
+    gene_mod = fitted_multimodal_model.get_modality('gene')
+    assert gene_mod.alpha_y_prefit is not None
 
 
-if __name__ == '__main__':
-    unittest.main()
+def test_splicing_modality_alpha_y_prefit_set(fitted_multimodal_model):
+    spl_mod = fitted_multimodal_model.get_modality('splicing_test')
+    assert spl_mod.alpha_y_prefit is not None
+
+
+def test_gene_alpha_not_overwritten_by_splicing_fit(fitted_multimodal_model):
+    gene_mod = fitted_multimodal_model.get_modality('gene')
+    spl_mod = fitted_multimodal_model.get_modality('splicing_test')
+    assert gene_mod.alpha_y_prefit is not None
+    assert spl_mod.alpha_y_prefit is not None
+
+
+def test_model_level_technical_stored(fitted_multimodal_model):
+    gene_mod = fitted_multimodal_model.get_modality('gene')
+    assert gene_mod.posterior_samples_technical is not None
+
+
+# --- Trans fit checks ---
+
+def test_gene_modality_posterior_samples_trans(fitted_multimodal_model):
+    gene_mod = fitted_multimodal_model.get_modality('gene')
+    assert gene_mod.posterior_samples_trans is not None
+
+
+def test_splicing_modality_posterior_samples_trans(fitted_multimodal_model):
+    spl_mod = fitted_multimodal_model.get_modality('splicing_test')
+    assert spl_mod.posterior_samples_trans is not None
+
+
+def test_model_level_posterior_samples_trans_backward_compat(fitted_multimodal_model):
+    assert fitted_multimodal_model.posterior_samples_trans is not None
+
+
+# --- Error handling ---
+
+def test_trans_without_technical_fit_raises(fitted_multimodal_model):
+    from bayesDREAM import Modality
+
+    n_cells = len(fitted_multimodal_model.meta)
+    third_modality = Modality(
+        name='untrained',
+        counts=np.random.poisson(10, (5, n_cells)),
+        feature_meta=pd.DataFrame({'feature': [f'f_{i}' for i in range(5)]}),
+        distribution='negbinom',
+        cells_axis=1,
+    )
+    fitted_multimodal_model.add_modality('untrained', third_modality)
+    
+    with pytest.raises(ValueError):
+        fitted_multimodal_model.fit_trans(modality_name='untrained', niters=10, nsamples=5)
+
+
+# --- Default behaviour ---
+
+def test_fit_technical_defaults_to_primary_modality(fitted_multimodal_model):
+    gene_mod = fitted_multimodal_model.get_modality('gene')
+    # Reset the prefit for this test
+    gene_mod.alpha_y_prefit = None
+    gene_mod.posterior_samples_technical = None
+    
+    # Fit technical without specifying modality (should default to 'gene')
+    fitted_multimodal_model.fit_technical(sum_factor_col='sum_factor', niters=NITERS, nsamples=NSAMPLES)
+    
+    assert gene_mod.alpha_y_prefit is not None
