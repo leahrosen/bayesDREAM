@@ -1269,6 +1269,7 @@ class TransFitter:
         vmax_log_sigma_floor: float = 1.5,
         k_log_sigma_min: float = None,
         k_prior_center: str = 'middle',
+        checkpoint_interval: int = 10_000,
         **kwargs
     ):
         """
@@ -2291,7 +2292,29 @@ class TransFitter:
         self.losses_trans = []
         smoothed_loss = None
         _phase2_announced = False
-        for step in range(total_steps):
+        start_step = 0
+
+        # ── Checkpoint setup ──────────────────────────────────────────────────
+        checkpoint_path = None
+        if checkpoint_interval is not None:
+            _ckpt_dir = os.path.join(self.model.output_dir, self.model.label)
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            checkpoint_path = os.path.join(_ckpt_dir, f'trans_checkpoint_{modality_name}.pt')
+            if os.path.exists(checkpoint_path):
+                print(f"[INFO] Resuming trans fit from checkpoint: {checkpoint_path}")
+                ckpt = torch.load(checkpoint_path, map_location=self.model.device, weights_only=False)
+                start_step = ckpt['step'] + 1
+                self.losses_trans = ckpt['losses']
+                smoothed_loss = ckpt['smoothed_loss']
+                _phase2_announced = ckpt.get('phase2_announced', False)
+                pyro.get_param_store().set_state(ckpt['param_store'])
+                try:
+                    optimizer.set_state(ckpt['optimizer_state'])
+                except Exception as e:
+                    print(f"[WARNING] Could not restore optimizer state: {e}. Continuing with fresh optimizer.")
+                print(f"[INFO] Resumed from step {start_step} / {total_steps}")
+
+        for step in range(start_step, total_steps):
             # ── Curriculum: choose effective function type and temperature ──
             if _do_warmup and step < warmup_steps:
                 effective_function_type = 'single_hill'
@@ -2422,6 +2445,16 @@ class TransFitter:
             self.losses_trans.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {Vmax_mean_tensor.device}")
+            if checkpoint_path is not None and step > 0 and step % checkpoint_interval == 0:
+                torch.save({
+                    'step': step,
+                    'losses': self.losses_trans,
+                    'smoothed_loss': smoothed_loss,
+                    'phase2_announced': _phase2_announced,
+                    'param_store': pyro.get_param_store().get_state(),
+                    'optimizer_state': optimizer.get_state(),
+                }, checkpoint_path)
+                print(f"[CKPT] Checkpoint saved at step {step}")
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
@@ -2429,6 +2462,11 @@ class TransFitter:
                     print(f"Converged at step {step}! Loss = {loss:.5e}")
                     break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+
+        # Remove checkpoint after successful (or converged) completion
+        if checkpoint_path is not None and os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+            print(f"[INFO] Checkpoint removed after successful completion.")
 
         # Move to CPU if using too much GPU memory for Predictive
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
