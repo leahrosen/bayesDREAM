@@ -51,6 +51,15 @@ def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Te
 class TransFitter:
     """Handles trans effects fitting."""
 
+    def _save_checkpoint_atomic(self, checkpoint_path: str, data: dict) -> None:
+        """Write checkpoint atomically (tmp → rename) and keep previous as .bak."""
+        backup_path = checkpoint_path + '.bak'
+        tmp_path = checkpoint_path + '.tmp'
+        torch.save(data, tmp_path)
+        if os.path.exists(checkpoint_path):
+            os.replace(checkpoint_path, backup_path)
+        os.replace(tmp_path, checkpoint_path)
+
     def __init__(self, model):
         """
         Initialize trans fitter.
@@ -1270,6 +1279,7 @@ class TransFitter:
         k_log_sigma_min: float = None,
         k_prior_center: str = 'middle',
         checkpoint_interval: int = 10_000,
+        checkpoint_dir: str = None,
         **kwargs
     ):
         """
@@ -2297,22 +2307,39 @@ class TransFitter:
         # ── Checkpoint setup ──────────────────────────────────────────────────
         checkpoint_path = None
         if checkpoint_interval is not None:
-            _ckpt_dir = os.path.join(self.model.output_dir, self.model.label)
+            _ckpt_dir = (checkpoint_dir if checkpoint_dir is not None
+                         else os.path.join(self.model.output_dir, self.model.label))
             os.makedirs(_ckpt_dir, exist_ok=True)
             checkpoint_path = os.path.join(_ckpt_dir, f'trans_checkpoint_{modality_name}.pt')
+            _backup_path = checkpoint_path + '.bak'
+            # Try to load checkpoint; fall back to .bak if primary is corrupt
+            _ckpt_to_load = None
             if os.path.exists(checkpoint_path):
-                print(f"[INFO] Resuming trans fit from checkpoint: {checkpoint_path}")
-                ckpt = torch.load(checkpoint_path, map_location=self.model.device, weights_only=False)
-                start_step = ckpt['step'] + 1
-                self.losses_trans = ckpt['losses']
-                smoothed_loss = ckpt['smoothed_loss']
-                _phase2_announced = ckpt.get('phase2_announced', False)
-                pyro.get_param_store().set_state(ckpt['param_store'])
+                _ckpt_to_load = checkpoint_path
+            elif os.path.exists(_backup_path):
+                print(f"[WARNING] Primary checkpoint missing; loading backup: {_backup_path}")
+                _ckpt_to_load = _backup_path
+            if _ckpt_to_load is not None:
+                print(f"[INFO] Resuming trans fit from checkpoint: {_ckpt_to_load}")
                 try:
-                    optimizer.set_state(ckpt['optimizer_state'])
+                    ckpt = torch.load(_ckpt_to_load, map_location=self.model.device, weights_only=False)
                 except Exception as e:
-                    print(f"[WARNING] Could not restore optimizer state: {e}. Continuing with fresh optimizer.")
-                print(f"[INFO] Resumed from step {start_step} / {total_steps}")
+                    print(f"[WARNING] Could not load checkpoint ({e}); starting from scratch.")
+                    ckpt = None
+                if ckpt is not None:
+                    if ckpt.get('complete', False):
+                        print(f"[INFO] Checkpoint is marked complete — training already finished. "
+                              f"Skipping to Predictive sampling.")
+                    start_step = ckpt['step'] + 1
+                    self.losses_trans = ckpt['losses']
+                    smoothed_loss = ckpt['smoothed_loss']
+                    _phase2_announced = ckpt.get('phase2_announced', False)
+                    pyro.get_param_store().set_state(ckpt['param_store'])
+                    try:
+                        optimizer.set_state(ckpt['optimizer_state'])
+                    except Exception as e:
+                        print(f"[WARNING] Could not restore optimizer state: {e}. Continuing with fresh optimizer.")
+                    print(f"[INFO] Resumed from step {start_step} / {total_steps}")
 
         for step in range(start_step, total_steps):
             # ── Curriculum: choose effective function type and temperature ──
@@ -2446,14 +2473,15 @@ class TransFitter:
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {Vmax_mean_tensor.device}")
             if checkpoint_path is not None and step > 0 and step % checkpoint_interval == 0:
-                torch.save({
+                self._save_checkpoint_atomic(checkpoint_path, {
                     'step': step,
                     'losses': self.losses_trans,
                     'smoothed_loss': smoothed_loss,
                     'phase2_announced': _phase2_announced,
                     'param_store': pyro.get_param_store().get_state(),
                     'optimizer_state': optimizer.get_state(),
-                }, checkpoint_path)
+                    'complete': False,
+                })
                 print(f"[CKPT] Checkpoint saved at step {step}")
             if smoothed_loss is None:
                 smoothed_loss = loss
@@ -2463,10 +2491,18 @@ class TransFitter:
                     break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
 
-        # Remove checkpoint after successful (or converged) completion
-        if checkpoint_path is not None and os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
-            print(f"[INFO] Checkpoint removed after successful completion.")
+        # Save complete=True checkpoint so Predictive can be retried if it OOMs
+        if checkpoint_path is not None:
+            self._save_checkpoint_atomic(checkpoint_path, {
+                'step': total_steps - 1,
+                'losses': self.losses_trans,
+                'smoothed_loss': smoothed_loss,
+                'phase2_announced': _phase2_announced,
+                'param_store': pyro.get_param_store().get_state(),
+                'optimizer_state': optimizer.get_state(),
+                'complete': True,
+            })
+            print(f"[CKPT] Final checkpoint saved (complete=True).")
 
         # Move to CPU if using too much GPU memory for Predictive
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
@@ -2752,6 +2788,13 @@ class TransFitter:
         import gc
         gc.collect()
         pyro.clear_param_store()
+
+        # Clean up checkpoint and backup now that results are stored on the model
+        if checkpoint_path is not None:
+            for _p in [checkpoint_path, checkpoint_path + '.bak', checkpoint_path + '.tmp']:
+                if os.path.exists(_p):
+                    os.remove(_p)
+            print(f"[INFO] Checkpoint files removed.")
 
         print("Finished fit_trans.")
 
