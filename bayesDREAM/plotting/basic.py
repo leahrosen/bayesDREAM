@@ -2050,8 +2050,27 @@ def _pvalue_stars(p):
     return 'ns'
 
 
+def _apply_mht(raw_pvals, method):
+    """Apply MHT correction to a list of raw p-values.
+
+    None entries (untested groups) are passed through unchanged.
+    """
+    if method is None:
+        return list(raw_pvals)
+    from statsmodels.stats.multitest import multipletests
+    testable_idx = [i for i, p in enumerate(raw_pvals) if p is not None]
+    if not testable_idx:
+        return list(raw_pvals)
+    _, adj, _, _ = multipletests([raw_pvals[i] for i in testable_idx],
+                                  method=method)
+    result = list(raw_pvals)
+    for i, adj_p in zip(testable_idx, adj):
+        result[i] = float(adj_p)
+    return result
+
+
 def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_color,
-                          test, pvalue_fmt, zero_line=True, fill_palette=None):
+                          test, pvalue_fmt, zero_line=True, fill_palette=None, mht=None):
     """
     Draw a single residual violin panel onto *ax*.
 
@@ -2064,8 +2083,19 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
     fill_palette : dict {category_value -> colour}, optional
         When set, one violin per (group × category) is drawn instead of one
         plain violin per group.
+    mht : str or None
+        MHT correction method passed to ``_apply_mht``.
     """
     from scipy import stats as _stats
+
+    def _raw_pval(finite):
+        if test == 'wilcoxon':
+            _, p = _stats.wilcoxon(finite, alternative='two-sided')
+        elif test == 't':
+            _, p = _stats.ttest_1samp(finite, popmean=0)
+        else:
+            raise ValueError(f"test must be 'wilcoxon', 't', or None; got {test!r}")
+        return p
 
     if not groups:
         ax.set_visible(False)
@@ -2098,22 +2128,17 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
             ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
                        label='Zero (perfect additivity)')
 
+        items = [(pos, resids[np.isfinite(resids)])
+                 for pos, resids in zip(group_positions, data)]
+        raw_pvals = [_raw_pval(f) if test is not None and len(f) >= 10 else None
+                     for _, f in items]
+        adj_pvals = _apply_mht(raw_pvals, mht)
+
         y_top = ax.get_ylim()[1]
-        for pos, resids in zip(group_positions, data):
-            finite = resids[np.isfinite(resids)]
-            n_cells = len(finite)
-            pval_str = ''
-            if test is not None and n_cells >= 10:
-                if test == 'wilcoxon':
-                    _, pval = _stats.wilcoxon(finite, alternative='two-sided')
-                elif test == 't':
-                    _, pval = _stats.ttest_1samp(finite, popmean=0)
-                else:
-                    raise ValueError(
-                        f"test must be 'wilcoxon', 't', or None; got {test!r}")
-                pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
-                            else f'\np={pval:.2g}')
-            ax.text(pos, y_top, f'n={n_cells}{pval_str}',
+        for (pos, finite), adj_p in zip(items, adj_pvals):
+            pval_str = (f'\n{_pvalue_stars(adj_p)}' if pvalue_fmt == 'stars'
+                        else f'\np={adj_p:.2g}') if adj_p is not None else ''
+            ax.text(pos, y_top, f'n={len(finite)}{pval_str}',
                     ha='center', va='bottom', fontsize=7)
 
         ax.set_xticks(group_positions)
@@ -2129,14 +2154,12 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
         offsets = (np.linspace(-half_span, half_span, E) if E > 1
                    else np.array([0.0]))
 
-        # Build sub-violin entries
         sub_pos_list, sub_data_list, sub_col_list = [], [], []
         for g_pos, (label, resids, _, fvals) in zip(group_positions, groups):
             for e_idx, exp_val in enumerate(ordered_exps):
                 if fvals is None:
                     continue
-                mask = fvals == exp_val
-                sub_resids = resids[mask]
+                sub_resids = resids[fvals == exp_val]
                 if len(sub_resids) < 2:
                     continue
                 sub_pos_list.append(float(g_pos) + offsets[e_idx])
@@ -2170,23 +2193,17 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
             ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
                        label='Zero (perfect additivity)')
 
+        items = [(sp, sr[np.isfinite(sr)], sc)
+                 for sp, sr, sc in zip(sub_pos_list, sub_data_list, sub_col_list)]
+        raw_pvals = [_raw_pval(f) if test is not None and len(f) >= 10 else None
+                     for _, f, _ in items]
+        adj_pvals = _apply_mht(raw_pvals, mht)
+
         y_top = ax.get_ylim()[1]
-        for sub_pos, sub_resids, sub_col in zip(sub_pos_list, sub_data_list,
-                                                 sub_col_list):
-            finite = sub_resids[np.isfinite(sub_resids)]
-            n_cells = len(finite)
-            pval_str = ''
-            if test is not None and n_cells >= 10:
-                if test == 'wilcoxon':
-                    _, pval = _stats.wilcoxon(finite, alternative='two-sided')
-                elif test == 't':
-                    _, pval = _stats.ttest_1samp(finite, popmean=0)
-                else:
-                    raise ValueError(
-                        f"test must be 'wilcoxon', 't', or None; got {test!r}")
-                pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
-                            else f'\np={pval:.2g}')
-            ax.text(sub_pos, y_top, f'n={n_cells}{pval_str}',
+        for (sub_pos, finite, sub_col), adj_p in zip(items, adj_pvals):
+            pval_str = (f'\n{_pvalue_stars(adj_p)}' if pvalue_fmt == 'stars'
+                        else f'\np={adj_p:.2g}') if adj_p is not None else ''
+            ax.text(sub_pos, y_top, f'n={len(finite)}{pval_str}',
                     ha='center', va='bottom', fontsize=6,
                     color=sub_col, fontweight='bold')
 
@@ -2202,6 +2219,7 @@ def plot_additivity_residuals(model, response='x_obs',
                                jitter=False, jitter_alpha=0.3, jitter_size=4,
                                jitter_color='black',
                                test=None, pvalue_fmt='stars',
+                               mht=None,
                                fill_by=None, fill_palette=None,
                                axes=None, show=True):
     """
@@ -2247,6 +2265,11 @@ def plot_additivity_residuals(model, response='x_obs',
         ``'wilcoxon'``: Wilcoxon signed-rank (tests median = 0, non-parametric).
         ``'t'``: one-sample t-test (tests mean = 0).
     pvalue_fmt : {'stars', 'numeric'}, default 'stars'
+    mht : str or None, default None
+        Multiple hypothesis testing correction applied within each panel
+        (across all violins in that panel).  Any method accepted by
+        ``statsmodels.stats.multitest.multipletests``, e.g. ``'fdr_bh'``,
+        ``'bonferroni'``, ``'holm'``.  ``None`` means no correction.
     fill_by : str, optional
         Column name in ``model.meta`` used to colour jitter points.  Each unique
         value gets a distinct colour from *fill_palette* (or auto-generated from
@@ -2374,7 +2397,8 @@ def plot_additivity_residuals(model, response='x_obs',
 
     panel_kwargs = dict(jitter=jitter, jitter_alpha=jitter_alpha,
                         jitter_size=jitter_size, jitter_color=jitter_color,
-                        test=test, pvalue_fmt=pvalue_fmt, fill_palette=palette)
+                        test=test, pvalue_fmt=pvalue_fmt, mht=mht,
+                        fill_palette=palette)
 
     row_labels = ['single guide', 'NTC + target (null)', '2× target']
     for ax_i, panel, row_label in zip(axes, [panel1, panel2, panel3], row_labels):
