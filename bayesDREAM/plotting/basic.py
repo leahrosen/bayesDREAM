@@ -2305,7 +2305,6 @@ def plot_additivity_residuals(model, response='x_obs',
             import matplotlib.cm as _cm
             cmap = _cm.get_cmap('tab10')
             palette = {v: cmap(i % 10) for i, v in enumerate(unique_vals)}
-        jitter = True  # auto-enable jitter so fill_by is visible
 
     def _fill(mask_or_idxs, is_idx=False):
         if cell_fill_vals is None:
