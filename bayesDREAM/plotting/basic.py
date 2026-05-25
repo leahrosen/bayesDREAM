@@ -2161,11 +2161,10 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
         if jitter:
             rng = np.random.default_rng(0)
             half_w = sub_w * 0.4
-            for sub_pos, sub_resids, sub_col in zip(sub_pos_list, sub_data_list,
-                                                     sub_col_list):
+            for sub_pos, sub_resids in zip(sub_pos_list, sub_data_list):
                 jx = sub_pos + rng.uniform(-half_w, half_w, size=len(sub_resids))
                 ax.scatter(jx, sub_resids, s=jitter_size, alpha=jitter_alpha,
-                           color=sub_col, linewidths=0, zorder=3)
+                           color=jitter_color, linewidths=0, zorder=3)
 
         if zero_line:
             ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
