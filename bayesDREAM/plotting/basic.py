@@ -2058,10 +2058,12 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
     Parameters
     ----------
     groups : list of (label, residuals_array, violin_color, fill_vals_or_None)
-        ``fill_vals_or_None`` is an array of per-cell category values used to
-        colour jitter points when *fill_palette* is provided.
+        ``fill_vals_or_None`` is an array of per-cell category values.  When
+        *fill_palette* is provided each group is split into one sub-violin per
+        category, coloured accordingly.
     fill_palette : dict {category_value -> colour}, optional
-    Returns the y-range used (for shared-axis decisions).
+        When set, one violin per (group × category) is drawn instead of one
+        plain violin per group.
     """
     from scipy import stats as _stats
 
@@ -2070,55 +2072,128 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
         return
 
     labels, data, colors, fill_vals_list = zip(*groups)
-    n = len(groups)
-    positions = np.arange(1, n + 1)
+    group_positions = np.arange(1, len(groups) + 1)
 
-    vp = ax.violinplot(list(data), positions=positions,
-                       showmeans=True, showextrema=True, widths=0.7)
-    for body, col in zip(vp['bodies'], colors):
-        body.set_facecolor(col)
-        body.set_edgecolor('black')
-        body.set_alpha(0.8)
-    for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
-        if key in vp:
-            vp[key].set_edgecolor('black')
-            vp[key].set_linewidth(1.1)
+    if fill_palette is None:
+        # ── Original path: one violin per group ──────────────────────────────
+        vp = ax.violinplot(list(data), positions=group_positions,
+                           showmeans=True, showextrema=True, widths=0.7)
+        for body, col in zip(vp['bodies'], colors):
+            body.set_facecolor(col)
+            body.set_edgecolor('black')
+            body.set_alpha(0.8)
+        for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+            if key in vp:
+                vp[key].set_edgecolor('black')
+                vp[key].set_linewidth(1.1)
 
-    if jitter:
-        rng = np.random.default_rng(0)
-        for pos, resids, fvals in zip(positions, data, fill_vals_list):
-            jx = pos + rng.uniform(-0.15, 0.15, size=len(resids))
-            if fvals is not None and fill_palette is not None:
-                point_colors = [fill_palette.get(v, jitter_color) for v in fvals]
-            else:
-                point_colors = jitter_color
-            ax.scatter(jx, resids, s=jitter_size, alpha=jitter_alpha,
-                       color=point_colors, linewidths=0, zorder=3)
+        if jitter:
+            rng = np.random.default_rng(0)
+            for pos, resids in zip(group_positions, data):
+                jx = pos + rng.uniform(-0.15, 0.15, size=len(resids))
+                ax.scatter(jx, resids, s=jitter_size, alpha=jitter_alpha,
+                           color=jitter_color, linewidths=0, zorder=3)
 
-    if zero_line:
-        ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
-                   label='Zero (perfect additivity)')
+        if zero_line:
+            ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
+                       label='Zero (perfect additivity)')
 
-    # n= and optional test annotations
-    y_top = ax.get_ylim()[1]
-    for pos, resids in zip(positions, data):
-        finite = resids[np.isfinite(resids)]
-        n_cells = len(finite)
-        pval_str = ''
-        if test is not None and n_cells >= 10:
-            if test == 'wilcoxon':
-                _, pval = _stats.wilcoxon(finite, alternative='two-sided')
-            elif test == 't':
-                _, pval = _stats.ttest_1samp(finite, popmean=0)
-            else:
-                raise ValueError(f"test must be 'wilcoxon', 't', or None; got {test!r}")
-            pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
-                        else f'\np={pval:.2g}')
-        ax.text(pos, y_top, f'n={n_cells}{pval_str}',
-                ha='center', va='bottom', fontsize=7)
+        y_top = ax.get_ylim()[1]
+        for pos, resids in zip(group_positions, data):
+            finite = resids[np.isfinite(resids)]
+            n_cells = len(finite)
+            pval_str = ''
+            if test is not None and n_cells >= 10:
+                if test == 'wilcoxon':
+                    _, pval = _stats.wilcoxon(finite, alternative='two-sided')
+                elif test == 't':
+                    _, pval = _stats.ttest_1samp(finite, popmean=0)
+                else:
+                    raise ValueError(
+                        f"test must be 'wilcoxon', 't', or None; got {test!r}")
+                pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
+                            else f'\np={pval:.2g}')
+            ax.text(pos, y_top, f'n={n_cells}{pval_str}',
+                    ha='center', va='bottom', fontsize=7)
 
-    ax.set_xticks(positions)
-    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+    else:
+        # ── Split path: one violin per (group × experiment) ──────────────────
+        ordered_exps = list(fill_palette.keys())
+        E = len(ordered_exps)
+        gap = 0.06
+        sub_w = max((0.8 - gap * (E - 1)) / max(E, 1), 0.08)
+        half_span = (E - 1) * (sub_w + gap) / 2
+        offsets = (np.linspace(-half_span, half_span, E) if E > 1
+                   else np.array([0.0]))
+
+        # Build sub-violin entries
+        sub_pos_list, sub_data_list, sub_col_list = [], [], []
+        for g_pos, (label, resids, _, fvals) in zip(group_positions, groups):
+            for e_idx, exp_val in enumerate(ordered_exps):
+                if fvals is None:
+                    continue
+                mask = fvals == exp_val
+                sub_resids = resids[mask]
+                if len(sub_resids) < 2:
+                    continue
+                sub_pos_list.append(float(g_pos) + offsets[e_idx])
+                sub_data_list.append(sub_resids)
+                sub_col_list.append(fill_palette[exp_val])
+
+        if not sub_pos_list:
+            ax.set_visible(False)
+            return
+
+        vp = ax.violinplot(sub_data_list, positions=sub_pos_list,
+                           showmeans=True, showextrema=True, widths=sub_w)
+        for body, col in zip(vp['bodies'], sub_col_list):
+            body.set_facecolor(col)
+            body.set_edgecolor('black')
+            body.set_alpha(0.85)
+        for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+            if key in vp:
+                vp[key].set_edgecolor('black')
+                vp[key].set_linewidth(1.1)
+
+        if jitter:
+            rng = np.random.default_rng(0)
+            half_w = sub_w * 0.4
+            for sub_pos, sub_resids, sub_col in zip(sub_pos_list, sub_data_list,
+                                                     sub_col_list):
+                jx = sub_pos + rng.uniform(-half_w, half_w, size=len(sub_resids))
+                ax.scatter(jx, sub_resids, s=jitter_size, alpha=jitter_alpha,
+                           color=sub_col, linewidths=0, zorder=3)
+
+        if zero_line:
+            ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
+                       label='Zero (perfect additivity)')
+
+        y_top = ax.get_ylim()[1]
+        for sub_pos, sub_resids, sub_col in zip(sub_pos_list, sub_data_list,
+                                                 sub_col_list):
+            finite = sub_resids[np.isfinite(sub_resids)]
+            n_cells = len(finite)
+            pval_str = ''
+            if test is not None and n_cells >= 10:
+                if test == 'wilcoxon':
+                    _, pval = _stats.wilcoxon(finite, alternative='two-sided')
+                elif test == 't':
+                    _, pval = _stats.ttest_1samp(finite, popmean=0)
+                else:
+                    raise ValueError(
+                        f"test must be 'wilcoxon', 't', or None; got {test!r}")
+                pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
+                            else f'\np={pval:.2g}')
+            ax.text(sub_pos, y_top, f'n={n_cells}{pval_str}',
+                    ha='center', va='bottom', fontsize=6,
+                    color=sub_col, fontweight='bold')
+
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
     ax.grid(axis='y', linewidth=0.5, alpha=0.3)
 
 
