@@ -2051,13 +2051,16 @@ def _pvalue_stars(p):
 
 
 def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_color,
-                          test, pvalue_fmt, zero_line=True):
+                          test, pvalue_fmt, zero_line=True, fill_palette=None):
     """
     Draw a single residual violin panel onto *ax*.
 
     Parameters
     ----------
-    groups : list of (label, residuals_array, violin_color)
+    groups : list of (label, residuals_array, violin_color, fill_vals_or_None)
+        ``fill_vals_or_None`` is an array of per-cell category values used to
+        colour jitter points when *fill_palette* is provided.
+    fill_palette : dict {category_value -> colour}, optional
     Returns the y-range used (for shared-axis decisions).
     """
     from scipy import stats as _stats
@@ -2066,7 +2069,7 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
         ax.set_visible(False)
         return
 
-    labels, data, colors = zip(*groups)
+    labels, data, colors, fill_vals_list = zip(*groups)
     n = len(groups)
     positions = np.arange(1, n + 1)
 
@@ -2083,10 +2086,14 @@ def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_c
 
     if jitter:
         rng = np.random.default_rng(0)
-        for pos, resids in zip(positions, data):
+        for pos, resids, fvals in zip(positions, data, fill_vals_list):
             jx = pos + rng.uniform(-0.15, 0.15, size=len(resids))
+            if fvals is not None and fill_palette is not None:
+                point_colors = [fill_palette.get(v, jitter_color) for v in fvals]
+            else:
+                point_colors = jitter_color
             ax.scatter(jx, resids, s=jitter_size, alpha=jitter_alpha,
-                       color=jitter_color, linewidths=0, zorder=3)
+                       color=point_colors, linewidths=0, zorder=3)
 
     if zero_line:
         ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
@@ -2121,6 +2128,7 @@ def plot_additivity_residuals(model, response='x_obs',
                                jitter=False, jitter_alpha=0.3, jitter_size=4,
                                jitter_color='black',
                                test=None, pvalue_fmt='stars',
+                               fill_by=None, fill_palette=None,
                                axes=None, show=True):
     """
     Additivity residual violin plot for high-MOI models, split into three panels.
@@ -2159,12 +2167,19 @@ def plot_additivity_residuals(model, response='x_obs',
     jitter_alpha : float, default 0.3
     jitter_size : float, default 4
     jitter_color : str, default 'black'
-        Color for jittered points (applied to all panels).
+        Fallback color for jittered points when *fill_by* is not used.
     test : {None, 'wilcoxon', 't'}, default None
         One-sample test of H₀: residuals = 0.
         ``'wilcoxon'``: Wilcoxon signed-rank (tests median = 0, non-parametric).
         ``'t'``: one-sample t-test (tests mean = 0).
     pvalue_fmt : {'stars', 'numeric'}, default 'stars'
+    fill_by : str, optional
+        Column name in ``model.meta`` used to colour jitter points.  Each unique
+        value gets a distinct colour from *fill_palette* (or auto-generated from
+        ``tab10``).  When set, jitter is automatically enabled.
+    fill_palette : dict {value -> colour}, optional
+        Explicit colour mapping for *fill_by* values.  Any values absent from
+        the dict fall back to *jitter_color*.
     axes : list of 3 matplotlib Axes, optional
         Pre-created axes.  If None a new figure is created.
     show : bool, default True
@@ -2175,6 +2190,32 @@ def plot_additivity_residuals(model, response='x_obs',
         [ax_single, ax_ntc_target, ax_dual]
     """
     _require_high_moi(model, 'plot_additivity_residuals')
+
+    # ── fill_by setup ────────────────────────────────────────────────────────
+    cell_fill_vals = None
+    palette = None
+    if fill_by is not None:
+        if fill_by not in model.meta.columns:
+            raise ValueError(
+                f"fill_by={fill_by!r} not found in model.meta columns: "
+                f"{list(model.meta.columns)}"
+            )
+        cell_fill_vals = model.meta[fill_by].values
+        unique_vals = sorted(set(cell_fill_vals), key=str)
+        if fill_palette is not None:
+            palette = fill_palette
+        else:
+            import matplotlib.cm as _cm
+            cmap = _cm.get_cmap('tab10')
+            palette = {v: cmap(i % 10) for i, v in enumerate(unique_vals)}
+        jitter = True  # auto-enable jitter so fill_by is visible
+
+    def _fill(mask_or_idxs, is_idx=False):
+        if cell_fill_vals is None:
+            return None
+        if is_idx:
+            return cell_fill_vals[np.array(mask_or_idxs)]
+        return cell_fill_vals[mask_or_idxs]
 
     log2_vals = _cell_log2_response(model, response, sum_factor_col, epsilon)
     ntc_mean, guide_log2fc, single_mask, multi_mask, ntc_mask, is_ntc_guide = \
@@ -2193,7 +2234,7 @@ def plot_additivity_residuals(model, response='x_obs',
     panel1 = []
     ntc_resids = log2_vals[ntc_mask] - ntc_mean
     if len(ntc_resids) >= min_single_cells:
-        panel1.append(('NTC', ntc_resids, '#888888'))
+        panel1.append(('NTC', ntc_resids, '#888888', _fill(ntc_mask)))
 
     single_entries = []
     for j, gname in enumerate(guide_names):
@@ -2203,7 +2244,7 @@ def plot_additivity_residuals(model, response='x_obs',
         vals = log2_vals[cell_mask]
         if len(vals) >= min_single_cells:
             pred = ntc_mean + guide_log2fc[gname]
-            single_entries.append((gname, vals - pred, '#4C72B0'))
+            single_entries.append((gname, vals - pred, '#4C72B0', _fill(cell_mask)))
     single_entries.sort(key=lambda t: float(np.nanmean(t[1])))
     panel1.extend(single_entries)
 
@@ -2217,7 +2258,8 @@ def plot_additivity_residuals(model, response='x_obs',
         vals = log2_vals[cell_mask]
         if len(vals) >= min_single_cells:
             pred = ntc_mean + guide_log2fc[gname]
-            ntc_target_entries.append((f'NTC+{gname}', vals - pred, '#55A868'))
+            ntc_target_entries.append((f'NTC+{gname}', vals - pred, '#55A868',
+                                       _fill(cell_mask)))
     ntc_target_entries.sort(key=lambda t: float(np.nanmean(t[1])))
     panel2.extend(ntc_target_entries)
 
@@ -2240,7 +2282,7 @@ def plot_additivity_residuals(model, response='x_obs',
         label = '+'.join(combo)
         vals = log2_vals[np.array(idxs)]
         pred = ntc_mean + sum(guide_log2fc[g] for g in combo)
-        panel3.append((label, vals - pred, '#DD8452'))
+        panel3.append((label, vals - pred, '#DD8452', _fill(idxs, is_idx=True)))
 
     # ── Figure layout ────────────────────────────────────────────────────────
     n1 = max(len(panel1), 1)
@@ -2258,7 +2300,7 @@ def plot_additivity_residuals(model, response='x_obs',
 
     panel_kwargs = dict(jitter=jitter, jitter_alpha=jitter_alpha,
                         jitter_size=jitter_size, jitter_color=jitter_color,
-                        test=test, pvalue_fmt=pvalue_fmt)
+                        test=test, pvalue_fmt=pvalue_fmt, fill_palette=palette)
 
     row_labels = ['single guide', 'NTC + target (null)', '2× target']
     for ax_i, panel, row_label in zip(axes, [panel1, panel2, panel3], row_labels):
@@ -2273,6 +2315,15 @@ def plot_additivity_residuals(model, response='x_obs',
 
     cis_gene = getattr(model, 'cis_gene', 'cis')
     fig.suptitle(f'{cis_gene}: additivity residuals', fontsize=12, y=1.01)
+
+    if palette is not None:
+        from matplotlib.patches import Patch
+        legend_handles = [Patch(facecolor=col, label=str(val))
+                          for val, col in palette.items()]
+        fig.legend(handles=legend_handles, title=fill_by,
+                   loc='upper right', bbox_to_anchor=(1.12, 0.98),
+                   fontsize=8, title_fontsize=9, framealpha=0.9)
+
     plt.tight_layout()
 
     if show:
