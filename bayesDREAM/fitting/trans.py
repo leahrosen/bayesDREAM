@@ -52,7 +52,21 @@ class TransFitter:
     """Handles trans effects fitting."""
 
     def _save_checkpoint_atomic(self, checkpoint_path: str, data: dict) -> None:
-        """Write checkpoint atomically (tmp → rename) and keep previous as .bak."""
+        """Write checkpoint atomically (tmp → rename) and keep previous as .bak.
+
+        Three-step protocol:
+          1. torch.save  →  <path>.tmp        (new data, not yet visible)
+          2. os.replace  old <path>  →  .bak  (old data safely preserved)
+          3. os.replace  .tmp  →  <path>      (atomic on POSIX; new data visible)
+
+        Failure modes:
+          Die in step 1 (during write): .tmp corrupt, <path> unchanged → resume loads <path>.
+          Die between 1 and 2: .tmp complete, <path> unchanged → resume loads <path>.
+          Die between 2 and 3: .tmp complete, <path> gone (→ .bak) → resume tries .tmp
+                                first (complete), falls back to .bak (one interval behind).
+          Die during step 3:  os.replace is atomic on POSIX → either completes or not,
+                              leaving either <path> or .tmp visible; .bak always intact.
+        """
         backup_path = checkpoint_path + '.bak'
         tmp_path = checkpoint_path + '.tmp'
         torch.save(data, tmp_path)
@@ -1280,6 +1294,7 @@ class TransFitter:
         k_prior_center: str = 'middle',
         checkpoint_interval: int = 10_000,
         checkpoint_dir: str = None,
+        predictive_checkpoint: str = None,
         **kwargs
     ):
         """
@@ -1356,6 +1371,41 @@ class TransFitter:
             - 'upper'  : 95th percentile of x_true guide means. Use when the EC50 is
                          expected near the top of the observed range (e.g. repressors
                          where the effect only kicks in at high cis expression).
+        predictive_checkpoint : str, optional
+            Path to a checkpoint file to use for Predictive sampling only.  When set,
+            all prior-computation setup runs as normal (same arguments as the original
+            fit_trans call), but the training loop is skipped and the param_store is
+            loaded from the checkpoint instead.  Use this to draw posterior samples
+            from any intermediate checkpoint without re-running training.
+
+            **function_type is auto-detected**: every checkpoint stores
+            ``effective_function_type`` — the function that was *actually being
+            fitted* when that checkpoint was written (``'single_hill'`` during
+            warmup, the target type afterwards).  ``fit_trans`` reads this value
+            before initialising the guide, so the guide architecture always matches
+            the checkpoint.  ``warmup`` is also forced to ``False`` automatically.
+            You therefore only need to pass ``sum_factor_col`` (and any other
+            data-access arguments from the original call)::
+
+                model.fit_trans(
+                    sum_factor_col='sum_factor_adj',
+                    predictive_checkpoint='outdir/label/trans_checkpoint_gene_warmup.pt',
+                )
+
+            The same minimal call works for any checkpoint — mid-warmup, post-warmup,
+            or complete.
+
+            To inspect a checkpoint manually::
+
+                import torch
+                ckpt = torch.load('trans_checkpoint_gene_step0030000.pt',
+                                  map_location='cpu', weights_only=False)
+                # Was this step in warmup?
+                print(ckpt['effective_function_type'])  # 'single_hill' → yes, 'additive_hill' → no
+                print(ckpt['phase2_announced'])         # False → in warmup, True → past it
+
+            Structural mismatches (N, T, K, C) raise an error; ``distribution``
+            mismatches produce a warning.
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
         **kwargs
@@ -1407,13 +1457,40 @@ class TransFitter:
             # niters always means Phase 2 (additive/nested hill) steps.
             if distribution == 'multinomial':
                 niters = 200_000
-                print(f"[INFO] Using default niters=200,000 for multivariate distribution '{distribution}'")
+                if predictive_checkpoint is None:
+                    print(f"[INFO] Using default niters=200,000 for multivariate distribution '{distribution}'")
             elif function_type == 'polynomial':
                 niters = 200_000
-                print(f"[INFO] Using default niters=200,000 for polynomial function")
+                if predictive_checkpoint is None:
+                    print(f"[INFO] Using default niters=200,000 for polynomial function")
             else:
                 niters = 100_000
-                print(f"[INFO] Using default niters=100,000 for distribution '{distribution}' and function_type '{function_type}'")
+                if predictive_checkpoint is None:
+                    print(f"[INFO] Using default niters=100,000 for distribution '{distribution}' and function_type '{function_type}'")
+
+        # ---------------------------
+        # When predictive_checkpoint is given, read function_type directly from
+        # the checkpoint's effective_function_type so the caller doesn't have to
+        # specify it.  This must happen before _do_warmup and guide initialisation,
+        # both of which depend on function_type.
+        # ---------------------------
+        if predictive_checkpoint is not None:
+            try:
+                _peek = torch.load(predictive_checkpoint, map_location='cpu', weights_only=False)
+                _peek_ft = _peek.get('effective_function_type', _peek.get('function_type'))
+                if _peek_ft is not None:
+                    if _peek_ft != function_type:
+                        print(f"[INFO] predictive_checkpoint: overriding "
+                              f"function_type={function_type!r} → {_peek_ft!r} "
+                              f"(read from checkpoint)")
+                    function_type = _peek_ft
+                # Suppress warmup — there's nothing to warm up when loading from a checkpoint
+                warmup = False
+            except Exception as e:
+                warnings.warn(
+                    f"Could not peek at predictive_checkpoint for function_type: {e}. "
+                    f"Using caller-provided function_type={function_type!r}."
+                )
 
         # ---------------------------
         # Curriculum warmup: compute warmup_steps so Phase 1 cools at the same
@@ -2006,7 +2083,11 @@ class TransFitter:
 
         else:
             # WITHOUT GUIDES: Use overall percentiles
-            print("[INFO] No guides found or only 1 guide. Using overall data percentiles for priors.")
+            if getattr(self.model, 'is_high_moi', False):
+                print("[INFO] High MOI mode: guide_code is not meaningful per-cell; "
+                      "using overall data percentiles for priors.")
+            else:
+                print("[INFO] Only 1 unique guide found. Using overall data percentiles for priors.")
 
             # Compute 5th and 95th percentiles across all cells for each feature
             if y_obs_for_prior.ndim == 2:  # [N, T]
@@ -2305,42 +2386,117 @@ class TransFitter:
         start_step = 0
 
         # ── Checkpoint setup ──────────────────────────────────────────────────
+        # Metadata stored in every checkpoint; validated on reload to catch
+        # mismatches (e.g. different gene set, different number of cells).
+        _ckpt_metadata = dict(
+            N=N, T=T, K=K, C=C,
+            modality_name=modality_name,
+            function_type=function_type,
+            distribution=distribution,
+        )
+
+        def _load_and_validate_ckpt(path, context="loading checkpoint"):
+            """Load checkpoint and validate structural metadata against current call."""
+            try:
+                ckpt = torch.load(path, map_location=self.model.device, weights_only=False)
+            except Exception as e:
+                print(f"[WARNING] Could not load checkpoint ({e}): {path}")
+                return None
+            # Structural mismatches → error (param shapes won't match)
+            _bad = []
+            for key, expected, label in [
+                ('N', N, 'number of cells'),
+                ('T', T, 'number of features'),
+                ('K', K, 'number of categories (K)'),
+                ('C', C, 'number of technical groups (C)'),
+            ]:
+                stored = ckpt.get(key)
+                if stored is not None and stored != expected:
+                    _bad.append(f"  {label}: checkpoint={stored}, current call={expected}")
+            if _bad:
+                raise ValueError(
+                    f"[{context}] Checkpoint metadata mismatch — cannot resume "
+                    f"(parameter shapes differ):\n" + "\n".join(_bad)
+                )
+            # Non-structural mismatches → warn only
+            # Use effective_function_type when available (warmup checkpoints store
+            # 'single_hill' even though target function_type may be 'additive_hill').
+            _stored_ft = ckpt.get('effective_function_type', ckpt.get('function_type'))
+            if _stored_ft is not None and _stored_ft != function_type:
+                warnings.warn(
+                    f"[{context}] function_type mismatch: checkpoint effective={_stored_ft!r}, "
+                    f"current call={function_type!r}. Ensure model and guide are compatible."
+                )
+            _stored_dist = ckpt.get('distribution')
+            if _stored_dist is not None and _stored_dist != distribution:
+                warnings.warn(
+                    f"[{context}] distribution mismatch: checkpoint={_stored_dist!r}, "
+                    f"current call={distribution!r}."
+                )
+            return ckpt
+
+        _predictive_only_mode = predictive_checkpoint is not None
         checkpoint_path = None
-        if checkpoint_interval is not None:
+
+        if _predictive_only_mode:
+            # ── Predictive-only: load specified checkpoint, skip training ──────
+            print(f"[INFO] Predictive-only mode: loading checkpoint {predictive_checkpoint}")
+            ckpt = _load_and_validate_ckpt(predictive_checkpoint, context="predictive_checkpoint")
+            if ckpt is None:
+                raise FileNotFoundError(
+                    f"Could not load predictive checkpoint: {predictive_checkpoint}"
+                )
+            self.losses_trans = ckpt.get('losses', [])
+            smoothed_loss = ckpt.get('smoothed_loss')
+            _phase2_announced = ckpt.get('phase2_announced', False)
+            pyro.get_param_store().set_state(ckpt['param_store'])
+            start_step = total_steps  # skip training loop entirely
+            print(f"[INFO] Loaded checkpoint: step={ckpt['step']}, "
+                  f"complete={ckpt.get('complete', False)}, "
+                  f"phase2_announced={_phase2_announced}")
+
+        elif checkpoint_interval is not None:
+            # ── Normal checkpoint resume ──────────────────────────────────────
             _ckpt_dir = (checkpoint_dir if checkpoint_dir is not None
                          else os.path.join(self.model.output_dir, self.model.label))
             os.makedirs(_ckpt_dir, exist_ok=True)
-            checkpoint_path = os.path.join(_ckpt_dir, f'trans_checkpoint_{modality_name}.pt')
+            checkpoint_path = os.path.join(_ckpt_dir, f'trans_checkpoint_{modality_name}_latest.pt')
             _backup_path = checkpoint_path + '.bak'
-            # Try to load checkpoint; fall back to .bak if primary is corrupt
-            _ckpt_to_load = None
-            if os.path.exists(checkpoint_path):
-                _ckpt_to_load = checkpoint_path
-            elif os.path.exists(_backup_path):
-                print(f"[WARNING] Primary checkpoint missing; loading backup: {_backup_path}")
-                _ckpt_to_load = _backup_path
-            if _ckpt_to_load is not None:
-                print(f"[INFO] Resuming trans fit from checkpoint: {_ckpt_to_load}")
+            _tmp_path = checkpoint_path + '.tmp'
+            # Try candidates in priority order:
+            #   1. _latest.pt  — normal case
+            #   2. _latest.pt.tmp  — process died after torch.save but before renames;
+            #                        .tmp may be a complete, valid checkpoint
+            #   3. _latest.pt.bak  — previous interval; always valid but one step behind
+            _ckpt = None
+            for _cand, _label in [
+                (checkpoint_path, 'primary (_latest.pt)'),
+                (_tmp_path,       '.tmp (rename interrupted)'),
+                (_backup_path,    '.bak (previous interval)'),
+            ]:
+                if os.path.exists(_cand):
+                    print(f"[INFO] Attempting to load {_label}: {os.path.basename(_cand)}")
+                    _ckpt = _load_and_validate_ckpt(_cand, context="resume")
+                    if _ckpt is not None:
+                        break
+                    print(f"[WARNING] {_label} failed to load; trying next fallback…")
+            if _ckpt is not None:
+                if _ckpt.get('complete', False):
+                    print(f"[INFO] Checkpoint is marked complete — training already finished. "
+                          f"Skipping to Predictive sampling.")
+                start_step = _ckpt['step'] + 1
+                self.losses_trans = _ckpt['losses']
+                smoothed_loss = _ckpt['smoothed_loss']
+                _phase2_announced = _ckpt.get('phase2_announced', False)
+                pyro.get_param_store().set_state(_ckpt['param_store'])
                 try:
-                    ckpt = torch.load(_ckpt_to_load, map_location=self.model.device, weights_only=False)
+                    optimizer.set_state(_ckpt['optimizer_state'])
                 except Exception as e:
-                    print(f"[WARNING] Could not load checkpoint ({e}); starting from scratch.")
-                    ckpt = None
-                if ckpt is not None:
-                    if ckpt.get('complete', False):
-                        print(f"[INFO] Checkpoint is marked complete — training already finished. "
-                              f"Skipping to Predictive sampling.")
-                    start_step = ckpt['step'] + 1
-                    self.losses_trans = ckpt['losses']
-                    smoothed_loss = ckpt['smoothed_loss']
-                    _phase2_announced = ckpt.get('phase2_announced', False)
-                    pyro.get_param_store().set_state(ckpt['param_store'])
-                    try:
-                        optimizer.set_state(ckpt['optimizer_state'])
-                    except Exception as e:
-                        print(f"[WARNING] Could not restore optimizer state: {e}. Continuing with fresh optimizer.")
-                    print(f"[INFO] Resumed from step {start_step} / {total_steps}")
+                    print(f"[WARNING] Could not restore optimizer state: {e}. "
+                          f"Continuing with fresh optimizer.")
+                print(f"[INFO] Resumed from step {start_step} / {total_steps}")
 
+        prev_finite = None  # initialize NaN tracker (before loop so checkpoint-resume works)
         for step in range(start_step, total_steps):
             # ── Curriculum: choose effective function type and temperature ──
             if _do_warmup and step < warmup_steps:
@@ -2353,6 +2509,23 @@ class TransFitter:
                 if _do_warmup and not _phase2_announced:
                     print(f"[INFO] Warmup complete at step {step}. Switching to {function_type}.")
                     _phase2_announced = True
+                    if checkpoint_path is not None:
+                        _warmup_data = {
+                            'step': step,
+                            'losses': self.losses_trans,
+                            'smoothed_loss': smoothed_loss,
+                            'phase2_announced': True,
+                            'param_store': pyro.get_param_store().get_state(),
+                            'optimizer_state': optimizer.get_state(),
+                            'complete': False,
+                            # effective_function_type='single_hill' lets the user pass
+                            # function_type='single_hill' to predictive_checkpoint= without a warning
+                            'effective_function_type': 'single_hill',
+                            **_ckpt_metadata,
+                        }
+                        _warmup_path = checkpoint_path.replace('_latest.pt', '_warmup.pt')
+                        self._save_checkpoint_atomic(_warmup_path, _warmup_data)
+                        print(f"[CKPT] Warmup checkpoint saved at step {step} → {os.path.basename(_warmup_path)}")
                 # Phase 2: restart from init_temp, cool to final_temp over niters steps
                 phase_step = step - warmup_steps if _do_warmup else step
                 phase_fraction = phase_step / float(niters) if niters > 0 else 1.0
@@ -2420,8 +2593,6 @@ class TransFitter:
             )
             '''
 
-            if step == 0:
-                prev_finite = None  # initialize tracker
             try:
                 loss, prev_finite = self._debug_svi_step(
                     svi, step, prev_finite,
@@ -2473,7 +2644,9 @@ class TransFitter:
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {Vmax_mean_tensor.device}")
             if checkpoint_path is not None and step > 0 and step % checkpoint_interval == 0:
-                self._save_checkpoint_atomic(checkpoint_path, {
+                _eff_ft = ('single_hill' if (_do_warmup and step < warmup_steps)
+                           else function_type)
+                _interval_data = {
                     'step': step,
                     'losses': self.losses_trans,
                     'smoothed_loss': smoothed_loss,
@@ -2481,8 +2654,15 @@ class TransFitter:
                     'param_store': pyro.get_param_store().get_state(),
                     'optimizer_state': optimizer.get_state(),
                     'complete': False,
-                })
-                print(f"[CKPT] Checkpoint saved at step {step}")
+                    'effective_function_type': _eff_ft,
+                    **_ckpt_metadata,
+                }
+                # Rolling checkpoint (overwrites previous; used for crash-resume)
+                self._save_checkpoint_atomic(checkpoint_path, _interval_data)
+                # Numbered checkpoint (persistent; named by step for analysis)
+                _numbered_path = checkpoint_path.replace('_latest.pt', f'_step{step:07d}.pt')
+                self._save_checkpoint_atomic(_numbered_path, _interval_data)
+                print(f"[CKPT] Checkpoint saved at step {step} → {os.path.basename(_numbered_path)}")
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
@@ -2491,9 +2671,11 @@ class TransFitter:
                     break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
 
-        # Save complete=True checkpoint so Predictive can be retried if it OOMs
-        if checkpoint_path is not None:
-            self._save_checkpoint_atomic(checkpoint_path, {
+        # Save complete=True checkpoint so Predictive can be retried if it OOMs.
+        # Also save a named _complete.pt that persists after the rolling checkpoint
+        # is cleaned up, so the fitted state is always recoverable.
+        if checkpoint_path is not None and not _predictive_only_mode:
+            _complete_data = {
                 'step': total_steps - 1,
                 'losses': self.losses_trans,
                 'smoothed_loss': smoothed_loss,
@@ -2501,8 +2683,13 @@ class TransFitter:
                 'param_store': pyro.get_param_store().get_state(),
                 'optimizer_state': optimizer.get_state(),
                 'complete': True,
-            })
-            print(f"[CKPT] Final checkpoint saved (complete=True).")
+                'effective_function_type': function_type,
+                **_ckpt_metadata,
+            }
+            self._save_checkpoint_atomic(checkpoint_path, _complete_data)
+            _complete_path = checkpoint_path.replace('_latest.pt', '_complete.pt')
+            self._save_checkpoint_atomic(_complete_path, _complete_data)
+            print(f"[CKPT] Final checkpoint saved (complete=True) → {os.path.basename(_complete_path)}")
 
         # Move to CPU if using too much GPU memory for Predictive
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
@@ -2789,12 +2976,16 @@ class TransFitter:
         gc.collect()
         pyro.clear_param_store()
 
-        # Clean up checkpoint and backup now that results are stored on the model
-        if checkpoint_path is not None:
+        # Remove the rolling checkpoint (_latest.pt) and its temporaries now that
+        # results are stored on the model.  Numbered (_step*.pt), warmup, and
+        # complete checkpoints are retained for post-hoc analysis.
+        if checkpoint_path is not None and not _predictive_only_mode:
             for _p in [checkpoint_path, checkpoint_path + '.bak', checkpoint_path + '.tmp']:
                 if os.path.exists(_p):
                     os.remove(_p)
-            print(f"[INFO] Checkpoint files removed.")
+            print(f"[INFO] Rolling checkpoint removed; "
+                  f"numbered/warmup/complete checkpoints retained in "
+                  f"{os.path.dirname(checkpoint_path)}")
 
         print("Finished fit_trans.")
 
