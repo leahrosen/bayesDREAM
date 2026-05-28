@@ -2411,8 +2411,19 @@ def predict_trans_function(
     # Get feature list from modality (NOT model.trans_genes!)
     # model.trans_genes is only valid for primary modality
     if modality_name == model.primary_modality:
-        # Primary modality: use model.trans_genes if available
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+        # Prefer modality.feature_names over model.trans_genes — the modality is what
+        # was actually fitted, while model.trans_genes may be stale (e.g. set by older
+        # code from the unfiltered counts before zero-count gene removal).
+        # Use whichever list has length == n_genes_posterior; fall back to the other.
+        _mod_obj = model.get_modality(modality_name)
+        _mod_fn = _mod_obj.feature_names if _mod_obj.feature_names is not None else []
+        _trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
+        if len(_mod_fn) == n_genes_posterior:
+            feature_list = _mod_fn
+        elif len(_trans_genes) == n_genes_posterior:
+            feature_list = _trans_genes
+        else:
+            feature_list = _mod_fn or _trans_genes  # best-effort; dim check below will catch mismatch
     else:
         # Non-primary modality: get feature names from modality
         modality = model.get_modality(modality_name)
@@ -3299,7 +3310,17 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
         if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
             return []
         posterior = model.posterior_samples_trans
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+        # Prefer modality.feature_names over model.trans_genes — the modality is what
+        # was actually fitted, and model.trans_genes may be stale (e.g. from pre-filter list).
+        _n_post = posterior['A'].shape[-1] if 'A' in posterior else None
+        _mod_fn = list(modality.feature_names) if modality.feature_names is not None else []
+        _trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
+        if _n_post is not None and len(_mod_fn) == _n_post:
+            feature_list = _mod_fn
+        elif _n_post is not None and len(_trans_genes) == _n_post:
+            feature_list = _trans_genes
+        else:
+            feature_list = _mod_fn or _trans_genes
     else:
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
             return []
