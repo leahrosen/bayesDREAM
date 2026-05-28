@@ -3501,6 +3501,17 @@ def plot_negbinom_xy(
     if 'technical_group_code' in meta_aligned.columns:
         df_data['technical_group_code'] = meta_aligned['technical_group_code'].values
 
+    # Forward any extra meta columns referenced in color_by into df_data now,
+    # before the DataFrame is built, so that the min_counts filter applies to them too.
+    _cb_items = [color_by] if isinstance(color_by, str) else list(color_by)
+    _SPECIAL_CB = {'technical_group', 'targeting'}
+    for _cb in _cb_items:
+        if _cb in _SPECIAL_CB or _cb in df_data:
+            continue
+        if _cb in meta_aligned.columns:
+            df_data[_cb] = meta_aligned[_cb].values
+        # If not found anywhere, _resolve_grouping will warn later.
+
     df = pd.DataFrame(df_data)
 
     # Filter by min_counts (exclude cells with raw counts below threshold)
@@ -3584,6 +3595,22 @@ def plot_negbinom_xy(
             ntc_m = df['target'].str.lower() == 'ntc'
             return [('NTC', ntc_m), ('Targeting', ~ntc_m)]
         if cb in df.columns:
+            n_unique = df[cb].nunique()
+            if n_unique == 0:
+                warnings.warn(f"color_by='{cb}': column has no values after filtering.")
+                return [('All', pd.Series(True, index=df.index))]
+            if pd.api.types.is_float_dtype(df[cb]) and n_unique > 10:
+                warnings.warn(
+                    f"color_by='{cb}' looks continuous (float dtype, {n_unique} unique values). "
+                    f"Coloring by a continuous column will produce many overlapping lines. "
+                    f"Consider binning or using a categorical column instead."
+                )
+            elif n_unique > 30:
+                warnings.warn(
+                    f"color_by='{cb}' has {n_unique} unique values — this will produce "
+                    f"{n_unique} smoothed lines and may be hard to read. "
+                    f"Consider a coarser grouping."
+                )
             uvals = sorted(df[cb].dropna().unique(), key=str)
             return [(str(v), df[cb] == v) for v in uvals]
         return None  # not found
@@ -5106,7 +5133,9 @@ def plot_xy_data(
         What to color smoothed lines by (default: ``'technical_group'``).
         - ``'technical_group'``: one line per cell-line / technical group (default)
         - ``'targeting'``: two lines — ``NTC`` vs ``Targeting``
-        - Any column name in ``model.meta``: one line per unique value in that column
+        - **Any column name in ``model.meta``**: one line per unique value.
+          A warning is issued if the column looks continuous (float dtype with many
+          unique values) or has more than 30 unique values.
         - **List of two** (e.g. ``['technical_group', 'targeting']``): cross-product of
           two groupings — the first sets hue, the second sets shade. When the secondary
           is ``'targeting'``, NTC lines are drawn as a light tint of the group colour

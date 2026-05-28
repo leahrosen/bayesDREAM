@@ -521,30 +521,9 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
             gene_indices = np.where(detected_mask)[0]
             self.counts = self.counts[gene_indices, :]
 
-        # Set trans_genes from the primary modality (created in bayesDREAM.__init__ before super())
-        # IMPORTANT: apply detected_mask so trans_genes matches the filtered self.counts
-        # (gene_mod.feature_names is the pre-filter list; detected_mask was just applied to self.counts above)
-        if hasattr(self, 'primary_modality') and self.primary_modality in getattr(self, 'modalities', {}):
-            gene_mod = self.modalities[self.primary_modality]
-            if gene_mod.feature_names and len(gene_mod.feature_names) == len(detected_mask):
-                # Apply same detected_mask that was used to filter counts
-                self.trans_genes = [name for name, kept in zip(gene_mod.feature_names, detected_mask) if kept]
-            elif isinstance(self.counts, pd.DataFrame):
-                # Fallback: read directly from filtered DataFrame index
-                self.trans_genes = self.counts.index.tolist()
-            elif gene_mod.feature_names:
-                # Lengths don't match and not a DataFrame — use feature_names as-is and warn
-                warnings.warn(
-                    f"[WARN] trans_genes: feature_names length ({len(gene_mod.feature_names)}) "
-                    f"!= detected_mask length ({len(detected_mask)}). Using unfiltered feature_names."
-                )
-                self.trans_genes = gene_mod.feature_names
-            else:
-                self.trans_genes = list(range(self.counts.shape[0]))
-        else:
-            self.trans_genes = []
-
         # zero-count genes removed here from self.counts; Modality.__init__ reports its own filtering
+        # Feature names for trans modelling are read directly from the primary modality
+        # (via model.get_modality(primary_modality).feature_names) so no separate trans_genes attribute.
         
         # Ensure same order of meta and counts
         # Use _cell_names for sparse/dense array compatibility
