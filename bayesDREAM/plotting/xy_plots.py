@@ -2325,7 +2325,8 @@ def predict_trans_function(
     model,
     feature: str,
     x_range: np.ndarray,
-    modality_name: Optional[str] = None
+    modality_name: Optional[str] = None,
+    debug: bool = False
 ) -> Optional[np.ndarray]:
     """
     Predict trans effect function for a feature given x_true values.
@@ -2367,17 +2368,23 @@ def predict_trans_function(
     if modality_name == model.primary_modality:
         # Primary modality: check model-level posterior
         if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
+            if debug: print(f"[predict_trans_function] returning None: no posterior_samples_trans on model")
             return None
         posterior = model.posterior_samples_trans
     else:
         # Non-primary modality: check modality-level posterior
         modality = model.get_modality(modality_name)
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
+            if debug: print(f"[predict_trans_function] returning None: no posterior_samples_trans on modality '{modality_name}'")
             return None
         posterior = modality.posterior_samples_trans
 
+    if debug:
+        print(f"[predict_trans_function] posterior keys: {list(posterior.keys())}")
+
     # Get baseline A (present in all function types)
     if 'A' not in posterior:
+        if debug: print(f"[predict_trans_function] returning None: 'A' not in posterior keys {list(posterior.keys())}")
         return None
 
     A_samples = posterior['A']
@@ -2429,18 +2436,25 @@ def predict_trans_function(
         else:
             # No feature metadata - try to use feature count from posterior
             # Assume features are indexed 0, 1, 2, ... and cannot be matched by name
+            if debug: print(f"[predict_trans_function] returning None: non-primary modality has no feature_names or feature_meta")
             return None
 
     n_features_list = len(feature_list)
+
+    if debug:
+        print(f"[predict_trans_function] n_genes_posterior={n_genes_posterior}, n_features_list={n_features_list}")
+        print(f"[predict_trans_function] feature_list[:5]={feature_list[:5]}, ..., feature_list[-5:]={feature_list[-5:]}")
 
     # Check dimension consistency BEFORE using feature_list for indexing
     if n_genes_posterior != n_features_list:
         # Mismatch - cannot use feature_list for indexing
         # This happens when posterior was fitted on a subset of features
+        if debug: print(f"[predict_trans_function] returning None: dimension mismatch n_genes_posterior={n_genes_posterior} != n_features_list={n_features_list}")
         return None
 
     # Now safe to check if feature is in feature_list and get its index
     if feature not in feature_list:
+        if debug: print(f"[predict_trans_function] returning None: '{feature}' not in feature_list (len={n_features_list})")
         return None
 
     feature_idx = feature_list.index(feature)
@@ -2464,6 +2478,10 @@ def predict_trans_function(
         return val.item() if hasattr(val, 'item') else val
 
     # Determine function type from available parameters
+    if debug:
+        print(f"[predict_trans_function] A={A_mean[feature_idx]:.4g}, feature_idx={feature_idx}")
+        print(f"[predict_trans_function] branch check: Vmax_a={'Vmax_a' in posterior}, Vmax_b={'Vmax_b' in posterior}, upper_limit={'upper_limit' in posterior}, theta={'theta' in posterior}")
+
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL (negbinom/normal/studentt) =====
         try:
@@ -2477,15 +2495,21 @@ def predict_trans_function(
             n_a = _extract_param(posterior['n_a'], feature_idx)
             n_b = _extract_param(posterior['n_b'], feature_idx)
 
+            if debug:
+                print(f"[predict_trans_function] additive_hill: A={A:.4g}, alpha={alpha:.4g}, beta={beta:.4g}, Vmax_a={Vmax_a:.4g}, Vmax_b={Vmax_b:.4g}, K_a={K_a:.4g}, K_b={K_b:.4g}, n_a={n_a:.4g}, n_b={n_b:.4g}")
+
             # Compute Hill functions
             Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
             Hill_b = Hill_based_positive(x_range, Vmax=Vmax_b, A=0, K=K_b, n=n_b)
 
             # Combined prediction
             y_pred = A + alpha * Hill_a + beta * Hill_b
+            if debug:
+                print(f"[predict_trans_function] y_pred range: [{y_pred.min():.4g}, {y_pred.max():.4g}], any>0: {(y_pred > 0).any()}")
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: additive_hill extraction failed: {e}")
             return None
 
     elif 'upper_limit' in posterior and 'Vmax_a' in posterior and 'Vmax_b' in posterior:
@@ -2511,7 +2535,8 @@ def predict_trans_function(
             y_pred = A + alpha * Hill_a + beta * Hill_b
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: upper_limit additive_hill extraction failed: {e}")
             return None
 
     elif 'Vmax_a' in posterior:
@@ -2527,7 +2552,8 @@ def predict_trans_function(
             y_pred = A + alpha * Hill_a
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: single_hill extraction failed: {e}")
             return None
 
     elif 'theta' in posterior:
@@ -2564,11 +2590,13 @@ def predict_trans_function(
 
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: polynomial extraction failed: {e}")
             return None
 
     else:
         # Unknown function type
+        if debug: print(f"[predict_trans_function] returning None: unrecognized function type (posterior keys: {list(posterior.keys())})")
         return None
 
 
