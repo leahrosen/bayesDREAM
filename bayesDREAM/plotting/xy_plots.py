@@ -3529,22 +3529,29 @@ def plot_negbinom_xy(
     is_ntc = df['target'].str.lower() == 'ntc'
 
     # Compute NTC reference offsets for log2FC mode.
-    # x_offset: pooled NTC x_true (x_true is group-independent, so pooling is correct).
-    # y_offset: pooled uncorrected NTC expression, used only as a reference for the Hill
-    #   function overlay (which is a single curve spanning all groups).
-    # Per-group y offsets for the data lines are computed inside _plot_one (see below),
-    #   using the same corrected/uncorrected y_expr formula as the plotted data.
+    # x_offset: pooled NTC x_true (x_true is group-independent).
+    # y_offset: reference group (group_code=0, alpha_y=1.0) NTC uncorrected expression.
+    #   Because alpha_y=1.0 for the reference group, its uncorrected NTC equals the corrected
+    #   NTC for any group — so this is the natural "true NTC" baseline that makes technical
+    #   groups irrelevant after correction, while uncorrected plots still show group offsets.
     if log2fc:
         ntc_df = df[is_ntc]
         x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
-        y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
-        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
         if len(x_ntc_valid) > 0:
             x_offset = np.log2(float(x_ntc_valid.mean()))
         else:
             warnings.warn("log2fc=True: no valid NTC cells found for x; plotting raw log2 instead.")
             x_offset = 0.0
-        # y_offset: pooled fallback used by Hill function overlay
+        # y_offset from reference group (group_code=0) NTC; fall back to pooled if needed
+        if 'technical_group_code' in ntc_df.columns:
+            ntc_ref_df = ntc_df[ntc_df['technical_group_code'] == 0]
+        else:
+            ntc_ref_df = ntc_df
+        y_ntc_expr = ntc_ref_df['y_obs'] / ntc_ref_df['sum_factor']
+        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+        if len(y_ntc_valid) == 0:  # fallback to pooled if reference group has no NTC
+            y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+            y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
         y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
     else:
         x_offset = 0.0
@@ -3589,18 +3596,6 @@ def plot_negbinom_xy(
             else:
                 y_expr = df_group['y_obs'] / df_group['sum_factor']
 
-            # Per-group NTC y_offset for log2fc mode.
-            # Must be computed here (before the x_true > 0 filter) so NTC cells are available,
-            # and must use the same y_expr formula (corrected or not) so the reference matches
-            # the scale of the plotted data for this group.
-            if log2fc:
-                is_ntc_g = df_group['target'].str.lower() == 'ntc'
-                y_ntc_g = y_expr[is_ntc_g]
-                y_ntc_g = y_ntc_g[(y_ntc_g > 0) & np.isfinite(y_ntc_g)]
-                y_off = np.log2(float(y_ntc_g.mean())) if len(y_ntc_g) > 0 else y_offset
-            else:
-                y_off = 0.0
-
             # Filter valid
             valid = (df_group['x_true'] > 0) & np.isfinite(y_expr)
             df_group = df_group[valid].copy()
@@ -3640,7 +3635,7 @@ def plot_negbinom_xy(
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
                     x=np.log2(x_smooth) - x_offset,
-                    y=y_smooth_log - y_off,   # per-group NTC offset
+                    y=y_smooth_log - y_offset,
                     color_values=1 - ntc_prop,  # Darker (group color) = fewer NTCs
                     cmap=group_cmap,
                     ax=ax_plot,
@@ -3679,8 +3674,8 @@ def plot_negbinom_xy(
 
                 # Use standard coloring
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
-                ax_plot.plot(np.log2(x_smooth) - x_offset, y_smooth_log - y_off,
-                             color=color, linewidth=2, label=group_label)  # y_off = per-group NTC offset
+                ax_plot.plot(np.log2(x_smooth) - x_offset, y_smooth_log - y_offset,
+                             color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -3749,7 +3744,7 @@ def plot_negbinom_xy(
                                     ax_plot.axvline(_m['value'] - x_offset, **_kw)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
-        ax_plot.set_ylabel("log2FC(Expression)" if log2fc else "log2(Expression)")
+        ax_plot.set_ylabel("log2FC(counts)" if log2fc else "log2(counts)")
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
         if log2fc:
