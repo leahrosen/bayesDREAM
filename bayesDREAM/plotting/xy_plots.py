@@ -3435,12 +3435,21 @@ def plot_negbinom_xy(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
+    color_by: str = 'technical_group',
     **kwargs
 ) -> plt.Axes:
     """
     Plot negbinom (gene counts) with optional Hill function overlay.
 
-    Y-axis: log2(expression) where expression = counts / (sum_factor * alpha_y)
+    Y-axis: log2(counts / sum_factor), optionally alpha_y-corrected.
+
+    Parameters (selected)
+    ---------------------
+    color_by : str
+        What to color smoothed lines by. Options:
+        - ``'technical_group'`` (default): one line per cell-line / technical group
+        - ``'targeting'``: two lines — NTC vs all targeting cells
+        - Any column name in ``model.meta``: one line per unique value
 
     Parameters
     ----------
@@ -3557,46 +3566,67 @@ def plot_negbinom_xy(
         x_offset = 0.0
         y_offset = 0.0
 
-    # Create colormaps for NTC gradient (per technical group)
-    # Each group gets white → group_color gradient
+    # Build color groups based on color_by.
+    # Alpha_y correction is always per technical_group_code; color_by only controls
+    # how cells are partitioned for smoothing and which color each line gets.
+    if color_by == 'technical_group':
+        if 'technical_group_code' in df.columns:
+            color_groups_list = [(code_to_label[int(gc)], df['technical_group_code'] == gc)
+                                 for gc in group_codes]
+        else:
+            color_groups_list = [('All', pd.Series(True, index=df.index))]
+    elif color_by == 'targeting':
+        ntc_m = df['target'].str.lower() == 'ntc'
+        color_groups_list = [('NTC', ntc_m), ('Targeting', ~ntc_m)]
+    elif color_by in df.columns:
+        uvals = sorted(df[color_by].dropna().unique(), key=str)
+        color_groups_list = [(str(v), df[color_by] == v) for v in uvals]
+    else:
+        warnings.warn(f"color_by='{color_by}' not found in data; falling back to 'technical_group'.")
+        if 'technical_group_code' in df.columns:
+            color_groups_list = [(code_to_label[int(gc)], df['technical_group_code'] == gc)
+                                 for gc in group_codes]
+        else:
+            color_groups_list = [('All', pd.Series(True, index=df.index))]
+
+    # Create colormaps for NTC gradient — one per color group (white → group color)
     group_cmaps = {}
     if show_ntc_gradient:
-        for idx, group_code in enumerate(group_codes):
-            group_code  = int(group_code)
-            group_label = code_to_label[group_code]
-            base_color  = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
+        for idx, (group_label, _) in enumerate(color_groups_list):
+            base_color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
             group_cmaps[group_label] = LinearSegmentedColormap.from_list(
-                f"white_{group_label}",
-                ["white", base_color]
+                f"white_{group_label}", ["white", base_color]
             )
 
     # Plot function
     def _plot_one(ax_plot, corrected):
-        colorbar_added = False  # Track if colorbar added
-
-        
-        for idx, group_code in enumerate(group_codes):
-            group_code = int(group_code)
-            group_label = code_to_label[group_code]
-
-            # Filter by technical group if column exists
+        # Compute per-cell y_expr with alpha_y correction applied per technical group.
+        # This is independent of color_by — correction always uses technical_group_code.
+        if corrected and has_technical_fit:
+            alpha_y_full = modality.alpha_y_prefit  # [C, T] or [S, C, T]
+            y_expr_vals = np.empty(len(df))
             if 'technical_group_code' in df.columns:
-                df_group = df[df['technical_group_code'] == group_code].copy()
+                for gc in df['technical_group_code'].unique():
+                    gc = int(gc)
+                    if alpha_y_full.ndim == 3:
+                        a = _to_scalar(alpha_y_full[:, gc, feature_idx].mean())
+                    else:
+                        a = _to_scalar(alpha_y_full[gc, feature_idx])
+                    mask = df['technical_group_code'].values == gc
+                    y_expr_vals[mask] = (df['y_obs'].values[mask] /
+                                         (df['sum_factor'].values[mask] * a))
             else:
-                df_group = df.copy()
+                y_expr_vals = (df['y_obs'] / df['sum_factor']).values
+        else:
+            y_expr_vals = (df['y_obs'] / df['sum_factor']).values
+        y_expr_all = pd.Series(y_expr_vals, index=df.index)
 
-            if corrected and has_technical_fit:
-                # Apply alpha_y correction
-                alpha_y_full = modality.alpha_y_prefit  # [S or 1, C, T]
-                if alpha_y_full.ndim == 3:
-                    alpha_y_val = _to_scalar(alpha_y_full[:, group_code, feature_idx].mean())
-                else:
-                    alpha_y_val = _to_scalar(alpha_y_full[group_code, feature_idx])
-                y_expr = df_group['y_obs'] / (df_group['sum_factor'] * alpha_y_val)
-            else:
-                y_expr = df_group['y_obs'] / df_group['sum_factor']
+        colorbar_added = False
+        for idx, (group_label, group_mask) in enumerate(color_groups_list):
+            df_group = df[group_mask].copy()
+            y_expr = y_expr_all[group_mask]
 
-            # Filter valid
+            # Filter valid (positive x_true, finite y)
             valid = (df_group['x_true'] > 0) & np.isfinite(y_expr)
             df_group = df_group[valid].copy()
             y_expr = y_expr[valid]
@@ -3604,49 +3634,31 @@ def plot_negbinom_xy(
             if len(df_group) == 0:
                 continue
 
-            # Get is_ntc for this group
             is_ntc_group = is_ntc[df_group.index].values
-
-            # k-NN smoothing in LINEAR space first (matching old code behavior)
-            # Old code: smooth raw y, THEN take log2
-            # This matters because log2(mean(y)) >= mean(log2(y)) by Jensen's inequality
             k = _knn_k(len(df_group), window)
+
+            # k-NN smoothing in LINEAR space first (log2(mean(y)) ≥ mean(log2(y)))
             if show_ntc_gradient:
-                # Smoothing with NTC tracking in LINEAR space
                 x_smooth, y_smooth_linear, ntc_prop = _smooth_knn(
                     df_group['x_true'].values,
-                    y_expr.values if hasattr(y_expr, 'values') else y_expr,
-                    k,
-                    is_ntc=is_ntc_group
+                    y_expr.values if hasattr(y_expr, 'values') else np.asarray(y_expr),
+                    k, is_ntc=is_ntc_group
                 )
-
-                # Filter out zero/negative smoothed values before log transform
                 valid_smooth = y_smooth_linear > 0
                 if not valid_smooth.all():
                     x_smooth = x_smooth[valid_smooth]
                     y_smooth_linear = y_smooth_linear[valid_smooth]
                     ntc_prop = ntc_prop[valid_smooth]
-
-                # Now take log2 of smoothed values
                 y_smooth_log = np.log2(y_smooth_linear)
-
-                # Use per-group gradient coloring (white → group color)
-                # Color value = 1 - ntc_prop: high NTC → 0 → white, low NTC → 1 → group color
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
                     x=np.log2(x_smooth) - x_offset,
                     y=y_smooth_log - y_offset,
-                    color_values=1 - ntc_prop,  # Darker (group color) = fewer NTCs
-                    cmap=group_cmap,
-                    ax=ax_plot,
-                    linewidth=2
+                    color_values=1 - ntc_prop,
+                    cmap=group_cmap, ax=ax_plot, linewidth=2
                 )
-
-                # Add dummy invisible line for legend label (using base group color)
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
                 ax_plot.plot([], [], color=color, linewidth=2, label=group_label)
-
-                # Add colorbar (once per axis) - use grayscale to show NTC gradient
                 if not colorbar_added:
                     fig = ax_plot.get_figure()
                     cmap_gray = LinearSegmentedColormap.from_list("gray_gradient", ["white", "black"])
@@ -3656,23 +3668,16 @@ def plot_negbinom_xy(
                     cbar.set_label('1 - Proportion NTC (darker = fewer NTCs)')
                     colorbar_added = True
             else:
-                # Standard smoothing without NTC tracking in LINEAR space
                 x_smooth, y_smooth_linear = _smooth_knn(
                     df_group['x_true'].values,
-                    y_expr.values if hasattr(y_expr, 'values') else y_expr,
+                    y_expr.values if hasattr(y_expr, 'values') else np.asarray(y_expr),
                     k
                 )
-
-                # Filter out zero/negative smoothed values before log transform
                 valid_smooth = y_smooth_linear > 0
                 if not valid_smooth.all():
                     x_smooth = x_smooth[valid_smooth]
                     y_smooth_linear = y_smooth_linear[valid_smooth]
-
-                # Now take log2 of smoothed values
                 y_smooth_log = np.log2(y_smooth_linear)
-
-                # Use standard coloring
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
                 ax_plot.plot(np.log2(x_smooth) - x_offset, y_smooth_log - y_offset,
                              color=color, linewidth=2, label=group_label)
@@ -4961,6 +4966,7 @@ def plot_xy_data(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
+    color_by: str = 'technical_group',
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -5043,11 +5049,18 @@ def plot_xy_data(
         For non-negbinom distributions, all y-axis markers are in linear space.
         Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
     log2fc : bool
-        If True, plot log2FC relative to NTC instead of raw log2 expression
+        If True, plot log2FC relative to NTC instead of raw log2 counts
         (default: False). Only applies to negbinom modalities.
         x-axis: log2(x_true) - log2(mean NTC x_true)
-        y-axis: log2(expression) - log2(mean NTC expression)
+        y-axis: log2(counts) - log2(mean NTC counts, reference group)
         A grey dotted crosshair is drawn at (0, 0) to mark the NTC reference.
+    color_by : str
+        What to color smoothed lines by (default: ``'technical_group'``).
+        - ``'technical_group'``: one line per cell-line / technical group (default)
+        - ``'targeting'``: two lines — ``NTC`` vs ``Targeting`` (useful for high-MOI)
+        - Any column name in ``model.meta``: one line per unique value in that column
+        Alpha-y technical correction is always applied per technical group regardless
+        of this setting. Override colours via ``color_palette``.
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
@@ -5334,6 +5347,7 @@ def plot_xy_data(
                     subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
                     log2fc=log2fc, reference_df=reference_df,
                     fdr_df=fdr_df, fdr_threshold=fdr_threshold,
+                    color_by=color_by,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -5402,6 +5416,7 @@ def plot_xy_data(
             reference_df=reference_df,
             fdr_df=fdr_df,
             fdr_threshold=fdr_threshold,
+            color_by=color_by,
             **kwargs
         )
 
