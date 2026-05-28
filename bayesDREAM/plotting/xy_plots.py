@@ -99,12 +99,14 @@ def _align_cells_to_modality(
     #   - shape (1, n_cells): row slice from a features×cells matrix → select columns
     #   - shape (n_cells, 1): col slice from a cells×features matrix → select rows, flatten
     if _sp.issparse(y_data):
+        # np.asarray() on a sparse matrix gives a 0-d object array, not dense —
+        # must use .toarray() to get a proper 2D ndarray before flattening.
         if y_data.ndim == 2 and y_data.shape[0] == 1:
             # features×cells orientation: cells are along axis 1
-            y_data_aligned = np.asarray(y_data[:, y_indices]).flatten()
+            y_data_aligned = y_data[:, y_indices].toarray().flatten()
         else:
             # cells×features orientation: cells are along axis 0
-            y_data_aligned = np.asarray(y_data[y_indices]).flatten()
+            y_data_aligned = y_data[y_indices].toarray().flatten()
     else:
         y_data_aligned = y_data[y_indices]
 
