@@ -417,7 +417,7 @@ def sample_trans_priors(
         distribution = modality.distribution
 
     # Get dimensions
-    T = len(model.trans_genes)
+    T = len(modality.feature_names) if modality.feature_names is not None else modality.dims['n_features']
 
     prior_samples = {}
 

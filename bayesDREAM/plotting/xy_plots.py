@@ -1076,24 +1076,20 @@ def predict_trans_derivatives(
 
     A_samples = posterior['A']
 
-    # Get feature list
-    if modality_name == model.primary_modality:
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+    # Get feature list — always from the modality, never from model.trans_genes
+    modality = model.get_modality(modality_name)
+    if modality.feature_names is not None:
+        feature_list = modality.feature_names
+    elif modality.feature_meta is not None:
+        feature_list = None
+        for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
+            if col in modality.feature_meta.columns:
+                feature_list = modality.feature_meta[col].tolist()
+                break
+        if feature_list is None:
+            feature_list = modality.feature_meta.index.tolist()
     else:
-        modality = model.get_modality(modality_name)
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            return None, None, None
+        return None, None, None
 
     # Get dimensions
     if hasattr(A_samples, 'mean'):
@@ -1879,7 +1875,8 @@ def plot_trans_functions(
     ...                            show_first_derivative=True)
 
     >>> # Plot all non-monotonic genes (genes where derivative changes sign)
-    >>> non_monotonic = [g for g in model.trans_genes if is_non_monotonic(model, g)]
+    >>> feature_names = model.get_modality(model.primary_modality).feature_names
+    >>> non_monotonic = [g for g in feature_names if is_non_monotonic(model, g)]
     >>> model.plot_trans_functions(non_monotonic, show_first_derivative=True)
     """
     import matplotlib.pyplot as plt
@@ -2408,22 +2405,12 @@ def predict_trans_function(
             A_mean = A_mean.squeeze(0)
         n_genes_posterior = A_mean.shape[0]
 
-    # Get feature list from modality (NOT model.trans_genes!)
-    # model.trans_genes is only valid for primary modality
+    # Get feature list from modality — always the ground truth
     if modality_name == model.primary_modality:
-        # Prefer modality.feature_names over model.trans_genes — the modality is what
-        # was actually fitted, while model.trans_genes may be stale (e.g. set by older
-        # code from the unfiltered counts before zero-count gene removal).
-        # Use whichever list has length == n_genes_posterior; fall back to the other.
+        # Use modality.feature_names — the modality is always the ground truth,
+        # since it matches the fitted posterior dimensions exactly.
         _mod_obj = model.get_modality(modality_name)
-        _mod_fn = _mod_obj.feature_names if _mod_obj.feature_names is not None else []
-        _trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
-        if len(_mod_fn) == n_genes_posterior:
-            feature_list = _mod_fn
-        elif len(_trans_genes) == n_genes_posterior:
-            feature_list = _trans_genes
-        else:
-            feature_list = _mod_fn or _trans_genes  # best-effort; dim check below will catch mismatch
+        feature_list = _mod_obj.feature_names if _mod_obj.feature_names is not None else []
     else:
         # Non-primary modality: get feature names from modality
         modality = model.get_modality(modality_name)
@@ -2723,24 +2710,20 @@ def predict_trans_function_samples(
     else:
         A_samples = np.array(A_samples)
 
-    # Get feature list
-    if modality_name == model.primary_modality:
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+    # Get feature list — always from the modality, never from model.trans_genes
+    modality = model.get_modality(modality_name)
+    if modality.feature_names is not None:
+        feature_list = modality.feature_names
+    elif modality.feature_meta is not None:
+        feature_list = None
+        for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
+            if col in modality.feature_meta.columns:
+                feature_list = modality.feature_meta[col].tolist()
+                break
+        if feature_list is None:
+            feature_list = modality.feature_meta.index.tolist()
     else:
-        modality = model.get_modality(modality_name)
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            return None
+        return None
 
     # Handle dimension squeezing for non-primary modalities
     # A_samples shape: (S, T) for primary, (S, C, T) for non-primary
@@ -2916,24 +2899,20 @@ def predict_trans_derivatives_samples(
     else:
         A_samples = np.array(A_samples)
 
-    # Get feature list
-    if modality_name == model.primary_modality:
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+    # Get feature list — always from the modality, never from model.trans_genes
+    modality = model.get_modality(modality_name)
+    if modality.feature_names is not None:
+        feature_list = modality.feature_names
+    elif modality.feature_meta is not None:
+        feature_list = None
+        for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
+            if col in modality.feature_meta.columns:
+                feature_list = modality.feature_meta[col].tolist()
+                break
+        if feature_list is None:
+            feature_list = modality.feature_meta.index.tolist()
     else:
-        modality = model.get_modality(modality_name)
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            return None, None, None, None
+        return None, None, None, None
 
     # Handle dimension squeezing
     if A_samples.ndim > 2:
@@ -3310,17 +3289,8 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
         if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
             return []
         posterior = model.posterior_samples_trans
-        # Prefer modality.feature_names over model.trans_genes — the modality is what
-        # was actually fitted, and model.trans_genes may be stale (e.g. from pre-filter list).
-        _n_post = posterior['A'].shape[-1] if 'A' in posterior else None
-        _mod_fn = list(modality.feature_names) if modality.feature_names is not None else []
-        _trans_genes = model.trans_genes if hasattr(model, 'trans_genes') else []
-        if _n_post is not None and len(_mod_fn) == _n_post:
-            feature_list = _mod_fn
-        elif _n_post is not None and len(_trans_genes) == _n_post:
-            feature_list = _trans_genes
-        else:
-            feature_list = _mod_fn or _trans_genes
+        # Use modality.feature_names — always matches the fitted posterior dimensions.
+        feature_list = list(modality.feature_names) if modality.feature_names is not None else []
     else:
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
             return []
