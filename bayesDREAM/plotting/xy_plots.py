@@ -5057,7 +5057,7 @@ def plot_xy_data(
     color_by : str
         What to color smoothed lines by (default: ``'technical_group'``).
         - ``'technical_group'``: one line per cell-line / technical group (default)
-        - ``'targeting'``: two lines — ``NTC`` vs ``Targeting`` (useful for high-MOI)
+        - ``'targeting'``: two lines — ``NTC`` vs ``Targeting``
         - Any column name in ``model.meta``: one line per unique value in that column
         Alpha-y technical correction is always applied per technical group regardless
         of this setting. Override colours via ``color_palette``.
