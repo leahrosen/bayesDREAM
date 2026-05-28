@@ -24,7 +24,7 @@ import pyro.poutine as poutine
 import pyro.distributions as dist
 
 from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
-from ..utils import update_convergence_state
+from ..utils import maybe_to_cpu, predictive_cpu_handoff, update_convergence_state
 
 
 def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
@@ -2410,140 +2410,143 @@ class TransFitter:
         run_on_cpu = self.model.device.type != "cpu"
         if run_on_cpu:
             print("[INFO] Running Predictive on CPU to reduce GPU memory pressure...")
-            guide_y.to("cpu")
-            self.model.device = torch.device("cpu")
-        
-            model_inputs = {
-                "N": N,
-                "T": T,
-                "y_obs_tensor": self._to_cpu(y_obs_tensor),
-                "sum_factor_tensor": self._to_cpu(sum_factor_tensor),
-                "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
-                "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
-                "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
-                "K_max_tensor": self._to_cpu(K_max_tensor),
-                "K_alpha_tensor": self._to_cpu(K_alpha_tensor),
-                "Vmax_mean_tensor": self._to_cpu(Vmax_mean_tensor),
-                "Vmax_alpha_tensor": self._to_cpu(Vmax_alpha_tensor),
-                "n_mu_tensor": self._to_cpu(n_mu_tensor),
-                "Amean_tensor": self._to_cpu(Amean_tensor),
-                "p_n_logits_tensor": self._to_cpu(p_n_logits_tensor),
-                "epsilon_tensor": self._to_cpu(epsilon_tensor),
-                "x_true_sample": self._to_cpu(x_true_subset),
-                "log2_x_true_sample": self._to_cpu(log2_x_true_subset),
-                "nmin": self._to_cpu(nmin),
-                "nmax": self._to_cpu(nmax),
-                "alpha_y_sample": self._to_cpu(alpha_y_prefit) if alpha_y_prefit is not None else None,
-                "C": C,
-                "groups_tensor": self._to_cpu(groups_tensor) if groups_tensor is not None else None,
-                # create on CPU explicitly since we just set self.model.device="cpu"
-                "temperature": torch.tensor(final_temp, dtype=torch.float32, device=torch.device("cpu")),
-                "use_straight_through": True,
-                "function_type": function_type,
-                "polynomial_degree": polynomial_degree,
-                "use_alpha": True,
-                "distribution": distribution,
-                "denominator_tensor": self._to_cpu(denominator_tensor) if denominator_tensor is not None else None,
-                "K": K,
-                "D": D,
-                "mean_within_guide_var": self._to_cpu(mean_within_guide_var) if mean_within_guide_var is not None else None,
-                "x_true_CV": self._to_cpu(x_true_CV) if x_true_CV is not None else None,
-                "use_data_driven_priors": use_data_driven_priors,
-                "use_epsilon": use_epsilon,
-                "vmax_log_sigma_floor_tensor": self._to_cpu(vmax_log_sigma_floor_tensor),
-                "k_log_sigma_min_tensor": self._to_cpu(k_log_sigma_min_tensor),
-                "k_center_tensor": self._to_cpu(k_center_tensor),
-            }
-        else:
-            model_inputs = {
-                "N": N,
-                "T": T,
-                "y_obs_tensor": y_obs_tensor,
-                "sum_factor_tensor": sum_factor_tensor,
-                "beta_o_alpha_tensor": beta_o_alpha_tensor,
-                "beta_o_beta_tensor": beta_o_beta_tensor,
-                "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
-                "K_max_tensor": K_max_tensor,
-                "K_alpha_tensor": K_alpha_tensor,
-                "Vmax_mean_tensor": Vmax_mean_tensor,
-                "Vmax_alpha_tensor": Vmax_alpha_tensor,
-                "n_mu_tensor": n_mu_tensor,
-                "Amean_tensor": Amean_tensor,
-                "p_n_logits_tensor": p_n_logits_tensor,
-                "epsilon_tensor": epsilon_tensor,
-                "x_true_sample": x_true_subset,
-                "log2_x_true_sample": log2_x_true_subset,
-                "nmin": nmin,
-                "nmax": nmax,
-                "alpha_y_sample": alpha_y_prefit,
-                "C": C,
-                "groups_tensor": groups_tensor if groups_tensor is not None else None,
-                "temperature": torch.tensor(final_temp, dtype=torch.float32, device=self.model.device),
-                "use_straight_through": True,
-                "function_type": function_type,
-                "polynomial_degree": polynomial_degree,
-                "use_alpha": True,
-                "distribution": distribution,
-                "denominator_tensor": denominator_tensor if denominator_tensor is not None else None,
-                "K": K,
-                "D": D,
-                "mean_within_guide_var": mean_within_guide_var,
-                "x_true_CV": x_true_CV,
-                "use_data_driven_priors": use_data_driven_priors,
-                "use_epsilon": use_epsilon,
-                "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
-                "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
-                "k_center_tensor": k_center_tensor,
-            }
+        with predictive_cpu_handoff(
+            model=self.model,
+            guide=guide_y,
+            run_on_cpu=run_on_cpu,
+            original_device=_original_device,
+        ):
+            if run_on_cpu:
+                model_inputs = {
+                    "N": N,
+                    "T": T,
+                    "y_obs_tensor": maybe_to_cpu(y_obs_tensor, run_on_cpu),
+                    "sum_factor_tensor": maybe_to_cpu(sum_factor_tensor, run_on_cpu),
+                    "beta_o_alpha_tensor": maybe_to_cpu(beta_o_alpha_tensor, run_on_cpu),
+                    "beta_o_beta_tensor": maybe_to_cpu(beta_o_beta_tensor, run_on_cpu),
+                    "alpha_alpha_mu_tensor": maybe_to_cpu(alpha_alpha_mu_tensor, run_on_cpu),
+                    "K_max_tensor": maybe_to_cpu(K_max_tensor, run_on_cpu),
+                    "K_alpha_tensor": maybe_to_cpu(K_alpha_tensor, run_on_cpu),
+                    "Vmax_mean_tensor": maybe_to_cpu(Vmax_mean_tensor, run_on_cpu),
+                    "Vmax_alpha_tensor": maybe_to_cpu(Vmax_alpha_tensor, run_on_cpu),
+                    "n_mu_tensor": maybe_to_cpu(n_mu_tensor, run_on_cpu),
+                    "Amean_tensor": maybe_to_cpu(Amean_tensor, run_on_cpu),
+                    "p_n_logits_tensor": maybe_to_cpu(p_n_logits_tensor, run_on_cpu),
+                    "epsilon_tensor": maybe_to_cpu(epsilon_tensor, run_on_cpu),
+                    "x_true_sample": maybe_to_cpu(x_true_subset, run_on_cpu),
+                    "log2_x_true_sample": maybe_to_cpu(log2_x_true_subset, run_on_cpu),
+                    "nmin": maybe_to_cpu(nmin, run_on_cpu),
+                    "nmax": maybe_to_cpu(nmax, run_on_cpu),
+                    "alpha_y_sample": maybe_to_cpu(alpha_y_prefit, run_on_cpu) if alpha_y_prefit is not None else None,
+                    "C": C,
+                    "groups_tensor": maybe_to_cpu(groups_tensor, run_on_cpu) if groups_tensor is not None else None,
+                    # create on CPU explicitly since we just set self.model.device="cpu"
+                    "temperature": torch.tensor(final_temp, dtype=torch.float32, device=torch.device("cpu")),
+                    "use_straight_through": True,
+                    "function_type": function_type,
+                    "polynomial_degree": polynomial_degree,
+                    "use_alpha": True,
+                    "distribution": distribution,
+                    "denominator_tensor": maybe_to_cpu(denominator_tensor, run_on_cpu) if denominator_tensor is not None else None,
+                    "K": K,
+                    "D": D,
+                    "mean_within_guide_var": maybe_to_cpu(mean_within_guide_var, run_on_cpu) if mean_within_guide_var is not None else None,
+                    "x_true_CV": maybe_to_cpu(x_true_CV, run_on_cpu) if x_true_CV is not None else None,
+                    "use_data_driven_priors": use_data_driven_priors,
+                    "use_epsilon": use_epsilon,
+                    "vmax_log_sigma_floor_tensor": maybe_to_cpu(vmax_log_sigma_floor_tensor, run_on_cpu),
+                    "k_log_sigma_min_tensor": maybe_to_cpu(k_log_sigma_min_tensor, run_on_cpu),
+                    "k_center_tensor": maybe_to_cpu(k_center_tensor, run_on_cpu),
+                }
+            else:
+                model_inputs = {
+                    "N": N,
+                    "T": T,
+                    "y_obs_tensor": y_obs_tensor,
+                    "sum_factor_tensor": sum_factor_tensor,
+                    "beta_o_alpha_tensor": beta_o_alpha_tensor,
+                    "beta_o_beta_tensor": beta_o_beta_tensor,
+                    "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
+                    "K_max_tensor": K_max_tensor,
+                    "K_alpha_tensor": K_alpha_tensor,
+                    "Vmax_mean_tensor": Vmax_mean_tensor,
+                    "Vmax_alpha_tensor": Vmax_alpha_tensor,
+                    "n_mu_tensor": n_mu_tensor,
+                    "Amean_tensor": Amean_tensor,
+                    "p_n_logits_tensor": p_n_logits_tensor,
+                    "epsilon_tensor": epsilon_tensor,
+                    "x_true_sample": x_true_subset,
+                    "log2_x_true_sample": log2_x_true_subset,
+                    "nmin": nmin,
+                    "nmax": nmax,
+                    "alpha_y_sample": alpha_y_prefit,
+                    "C": C,
+                    "groups_tensor": groups_tensor if groups_tensor is not None else None,
+                    "temperature": torch.tensor(final_temp, dtype=torch.float32, device=self.model.device),
+                    "use_straight_through": True,
+                    "function_type": function_type,
+                    "polynomial_degree": polynomial_degree,
+                    "use_alpha": True,
+                    "distribution": distribution,
+                    "denominator_tensor": denominator_tensor if denominator_tensor is not None else None,
+                    "K": K,
+                    "D": D,
+                    "mean_within_guide_var": mean_within_guide_var,
+                    "x_true_CV": x_true_CV,
+                    "use_data_driven_priors": use_data_driven_priors,
+                    "use_epsilon": use_epsilon,
+                    "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
+                    "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
+                    "k_center_tensor": k_center_tensor,
+                }
 
-        if self.model.device.type == "cuda":
-            torch.cuda.empty_cache()
-        import gc
-        gc.collect()
+            if self.model.device.type == "cuda":
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
-        max_samples = nsamples
-        keep_sites = kwargs.get("keep_sites", lambda name, site: site["value"].ndim <= 2 or name != "y_obs")
+            max_samples = nsamples
+            keep_sites = kwargs.get("keep_sites", lambda name, site: site["value"].ndim <= 2 or name != "y_obs")
 
-        if minibatch_size is not None:
-            from collections import defaultdict
+            if minibatch_size is not None:
+                from collections import defaultdict
 
-            print(f"[INFO] Running Predictive in minibatches of {minibatch_size}...")
-            predictive_y = pyro.infer.Predictive(
-                self._model_y,
-                guide=guide_y,
-                num_samples=minibatch_size,
-                parallel=True
-            )
-            all_samples = defaultdict(list)
-            with torch.no_grad():
-                for i in range(0, max_samples, minibatch_size):
-                    samples = predictive_y(**model_inputs)
-                    for k, v in samples.items():
-                        if keep_sites(k, {"value": v}):
-                            all_samples[k].append(self._to_cpu(v))
+                print(f"[INFO] Running Predictive in minibatches of {minibatch_size}...")
+                predictive_y = pyro.infer.Predictive(
+                    self._model_y,
+                    guide=guide_y,
+                    num_samples=minibatch_size,
+                    parallel=True
+                )
+                all_samples = defaultdict(list)
+                with torch.no_grad():
+                    for i in range(0, max_samples, minibatch_size):
+                        samples = predictive_y(**model_inputs)
+                        for k, v in samples.items():
+                            if keep_sites(k, {"value": v}):
+                                all_samples[k].append(self._to_cpu(v))
+                        if self.model.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        import gc
+                        gc.collect()
+
+                posterior_samples_y = {k: torch.cat(v, dim=0) for k, v in all_samples.items()}
+
+            else:
+                predictive_y = pyro.infer.Predictive(
+                    self._model_y,
+                    guide=guide_y,
+                    num_samples=nsamples#,
+                    #parallel=True
+                )
+                with torch.no_grad():
+                    posterior_samples_y = predictive_y(**model_inputs)
                     if self.model.device.type == "cuda":
                         torch.cuda.empty_cache()
                     import gc
                     gc.collect()
 
-            posterior_samples_y = {k: torch.cat(v, dim=0) for k, v in all_samples.items()}
-
-        else:
-            predictive_y = pyro.infer.Predictive(
-                self._model_y,
-                guide=guide_y,
-                num_samples=nsamples#,
-                #parallel=True
-            )
-            with torch.no_grad():
-                posterior_samples_y = predictive_y(**model_inputs)
-                if self.model.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                import gc
-                gc.collect()
-
         if run_on_cpu:
-            self.model.device = _original_device  # Restore exact original device (not generic "cuda")
             print("[INFO] Reset self.model.device to:", self.model.device)
 
         for k, v in posterior_samples_y.items():

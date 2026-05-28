@@ -17,7 +17,7 @@ import pyro.optim as optim
 import pyro.infer as infer
 import multiprocessing
 
-from ..utils import update_convergence_state
+from ..utils import maybe_to_cpu, predictive_cpu_handoff, update_convergence_state
 
 # Optional dependency for memory detection
 try:
@@ -1664,136 +1664,136 @@ class TechnicalFitter:
         # ---------------------------
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
         run_on_cpu = self.model.device.type != "cpu"
-        if run_on_cpu:
-            guide_cellline.to("cpu")
-            self.model.device = torch.device("cpu")
-    
-            model_inputs = {
-                "N": N, "T": T_fit, "C": C,
-                "groups_ntc_tensor": self._to_cpu(groups_ntc_tensor),
-                "y_obs_ntc_tensor": self._to_cpu(y_obs_ntc_tensor),
-                "sum_factor_ntc_tensor": self._to_cpu(sum_factor_ntc_tensor),
-                "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
-                "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
-                "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
-                "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
-                "epsilon_tensor": self._to_cpu(epsilon_tensor),
-                "distribution": distribution,
-                "denominator_ntc_tensor": self._to_cpu(denominator_ntc_tensor),
-                "K": K, "D": D,
-                "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor),
-            }
-        else:
-            model_inputs = {
-                "N": N, "T": T_fit, "C": C,
-                "groups_ntc_tensor": groups_ntc_tensor,
-                "y_obs_ntc_tensor": y_obs_ntc_tensor,
-                "sum_factor_ntc_tensor": sum_factor_ntc_tensor,
-                "beta_o_alpha_tensor": beta_o_alpha_tensor,
-                "beta_o_beta_tensor": beta_o_beta_tensor,
-                "mu_x_mean_tensor": mu_x_mean_tensor,
-                "mu_x_sd_tensor": mu_x_sd_tensor,
-                "epsilon_tensor": epsilon_tensor,
-                "distribution": distribution,
-                "denominator_ntc_tensor": denominator_ntc_tensor,
-                "K": K, "D": D,
-                "sigma_hat_tensor": sigma_hat_tensor,
-            }
-    
-        if self.model.device.type == "cuda":
-            torch.cuda.empty_cache()
-        import gc; gc.collect()
+        with predictive_cpu_handoff(
+            model=self.model,
+            guide=guide_cellline,
+            run_on_cpu=run_on_cpu,
+            original_device=_original_device,
+        ):
+            if run_on_cpu:
+                model_inputs = {
+                    "N": N, "T": T_fit, "C": C,
+                    "groups_ntc_tensor": maybe_to_cpu(groups_ntc_tensor, run_on_cpu),
+                    "y_obs_ntc_tensor": maybe_to_cpu(y_obs_ntc_tensor, run_on_cpu),
+                    "sum_factor_ntc_tensor": maybe_to_cpu(sum_factor_ntc_tensor, run_on_cpu),
+                    "beta_o_alpha_tensor": maybe_to_cpu(beta_o_alpha_tensor, run_on_cpu),
+                    "beta_o_beta_tensor": maybe_to_cpu(beta_o_beta_tensor, run_on_cpu),
+                    "mu_x_mean_tensor": maybe_to_cpu(mu_x_mean_tensor, run_on_cpu),
+                    "mu_x_sd_tensor": maybe_to_cpu(mu_x_sd_tensor, run_on_cpu),
+                    "epsilon_tensor": maybe_to_cpu(epsilon_tensor, run_on_cpu),
+                    "distribution": distribution,
+                    "denominator_ntc_tensor": maybe_to_cpu(denominator_ntc_tensor, run_on_cpu),
+                    "K": K, "D": D,
+                    "sigma_hat_tensor": maybe_to_cpu(sigma_hat_tensor, run_on_cpu),
+                }
+            else:
+                model_inputs = {
+                    "N": N, "T": T_fit, "C": C,
+                    "groups_ntc_tensor": groups_ntc_tensor,
+                    "y_obs_ntc_tensor": y_obs_ntc_tensor,
+                    "sum_factor_ntc_tensor": sum_factor_ntc_tensor,
+                    "beta_o_alpha_tensor": beta_o_alpha_tensor,
+                    "beta_o_beta_tensor": beta_o_beta_tensor,
+                    "mu_x_mean_tensor": mu_x_mean_tensor,
+                    "mu_x_sd_tensor": mu_x_sd_tensor,
+                    "epsilon_tensor": epsilon_tensor,
+                    "distribution": distribution,
+                    "denominator_ntc_tensor": denominator_ntc_tensor,
+                    "K": K, "D": D,
+                    "sigma_hat_tensor": sigma_hat_tensor,
+                }
 
-        # ========================================
-        # AUTO-DETECT MEMORY AND SET MINIBATCH
-        # ========================================
-        minibatch_size, use_parallel = self._estimate_predictive_memory_and_set_minibatch(
-            N=N, T=T_fit, C=C, nsamples=nsamples,
-            minibatch_size=minibatch_size,
-            distribution=distribution
-        )
+            if self.model.device.type == "cuda":
+                torch.cuda.empty_cache()
+            import gc; gc.collect()
 
-        # CRITICAL MEMORY OPTIMIZATION: Exclude observation predictions from posterior
-        # These are enormous ([S, N, T]) and redundant since we already have the data
-        # Default filter excludes: y_obs_ntc, y_obs (for any distribution)
-        def default_keep_sites(name, site):
-            # Exclude all observation-level predictions (huge memory waste)
-            if name in ('y_obs_ntc', 'y_obs', 'obs'):
-                return False
-            # Keep all parameter posteriors (small: alpha, mu, phi, sigma, etc.)
-            return True
-
-        keep_sites = kwargs.get("keep_sites", default_keep_sites)
-
-        # CRITICAL: Skip observation sampling during Predictive
-        # During Predictive, posterior samples of alpha_y can be extreme due to heavy-tailed priors
-        # This causes NaN/Inf in likelihood evaluation
-        # We only need parameter posteriors (alpha, mu, phi), not observations
-        model_inputs_with_skip = model_inputs.copy()
-        model_inputs_with_skip['skip_obs_sampling'] = True
-
-        if minibatch_size is not None:
-            predictive_technical = pyro.infer.Predictive(
-                self._model_technical, guide=guide_cellline, num_samples=minibatch_size,
-                parallel=use_parallel
+            # ========================================
+            # AUTO-DETECT MEMORY AND SET MINIBATCH
+            # ========================================
+            minibatch_size, use_parallel = self._estimate_predictive_memory_and_set_minibatch(
+                N=N, T=T_fit, C=C, nsamples=nsamples,
+                minibatch_size=minibatch_size,
+                distribution=distribution
             )
 
-            # Run first batch to get shapes, then preallocate full tensors
-            posterior_samples = {}
-            batch_idx = 0
-            with torch.no_grad():
-                for i in range(0, nsamples, minibatch_size):
-                    current_batch_size = min(minibatch_size, nsamples - i)
+            # CRITICAL MEMORY OPTIMIZATION: Exclude observation predictions from posterior
+            # These are enormous ([S, N, T]) and redundant since we already have the data
+            # Default filter excludes: y_obs_ntc, y_obs (for any distribution)
+            def default_keep_sites(name, site):
+                # Exclude all observation-level predictions (huge memory waste)
+                if name in ('y_obs_ntc', 'y_obs', 'obs'):
+                    return False
+                # Keep all parameter posteriors (small: alpha, mu, phi, sigma, etc.)
+                return True
 
-                    # Generate batch
-                    if current_batch_size < minibatch_size:
-                        # Last batch might be smaller
-                        predictive_batch = pyro.infer.Predictive(
-                            self._model_technical, guide=guide_cellline, num_samples=current_batch_size,
-                            parallel=use_parallel
-                        )
-                        samples = predictive_batch(**model_inputs_with_skip)
-                    else:
-                        samples = predictive_technical(**model_inputs_with_skip)
+            keep_sites = kwargs.get("keep_sites", default_keep_sites)
 
-                    # First batch: preallocate full tensors
-                    if batch_idx == 0:
-                        for k, v in samples.items():
-                            if keep_sites(k, {"value": v}):
-                                v_cpu = self._to_cpu(v)
-                                # Preallocate: [nsamples, ...] with same dtype/shape as v
-                                full_shape = (nsamples,) + v_cpu.shape[1:]
-                                posterior_samples[k] = torch.empty(full_shape, dtype=v_cpu.dtype)
-                                # Fill first batch
-                                posterior_samples[k][:current_batch_size] = v_cpu
-                    else:
-                        # Subsequent batches: fill in-place
-                        start_idx = i
-                        end_idx = i + current_batch_size
-                        for k, v in samples.items():
-                            if k in posterior_samples:
-                                posterior_samples[k][start_idx:end_idx] = self._to_cpu(v)
+            # CRITICAL: Skip observation sampling during Predictive
+            # During Predictive, posterior samples of alpha_y can be extreme due to heavy-tailed priors
+            # This causes NaN/Inf in likelihood evaluation
+            # We only need parameter posteriors (alpha, mu, phi), not observations
+            model_inputs_with_skip = model_inputs.copy()
+            model_inputs_with_skip['skip_obs_sampling'] = True
 
-                    batch_idx += 1
+            if minibatch_size is not None:
+                predictive_technical = pyro.infer.Predictive(
+                    self._model_technical, guide=guide_cellline, num_samples=minibatch_size,
+                    parallel=use_parallel
+                )
 
-                    # Clean up after each batch
-                    del samples
+                # Run first batch to get shapes, then preallocate full tensors
+                posterior_samples = {}
+                batch_idx = 0
+                with torch.no_grad():
+                    for i in range(0, nsamples, minibatch_size):
+                        current_batch_size = min(minibatch_size, nsamples - i)
+
+                        # Generate batch
+                        if current_batch_size < minibatch_size:
+                            # Last batch might be smaller
+                            predictive_batch = pyro.infer.Predictive(
+                                self._model_technical, guide=guide_cellline, num_samples=current_batch_size,
+                                parallel=use_parallel
+                            )
+                            samples = predictive_batch(**model_inputs_with_skip)
+                        else:
+                            samples = predictive_technical(**model_inputs_with_skip)
+
+                        # First batch: preallocate full tensors
+                        if batch_idx == 0:
+                            for k, v in samples.items():
+                                if keep_sites(k, {"value": v}):
+                                    v_cpu = self._to_cpu(v)
+                                    # Preallocate: [nsamples, ...] with same dtype/shape as v
+                                    full_shape = (nsamples,) + v_cpu.shape[1:]
+                                    posterior_samples[k] = torch.empty(full_shape, dtype=v_cpu.dtype)
+                                    # Fill first batch
+                                    posterior_samples[k][:current_batch_size] = v_cpu
+                        else:
+                            # Subsequent batches: fill in-place
+                            start_idx = i
+                            end_idx = i + current_batch_size
+                            for k, v in samples.items():
+                                if k in posterior_samples:
+                                    posterior_samples[k][start_idx:end_idx] = self._to_cpu(v)
+
+                        batch_idx += 1
+
+                        # Clean up after each batch
+                        del samples
+                        if self.model.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        gc.collect()
+            else:
+                predictive_technical = pyro.infer.Predictive(
+                    self._model_technical, guide=guide_cellline, num_samples=nsamples,
+                    parallel=use_parallel
+                )
+                with torch.no_grad():
+                    posterior_samples = predictive_technical(**model_inputs_with_skip)
                     if self.model.device.type == "cuda":
                         torch.cuda.empty_cache()
                     gc.collect()
-        else:
-            predictive_technical = pyro.infer.Predictive(
-                self._model_technical, guide=guide_cellline, num_samples=nsamples,
-                parallel=use_parallel
-            )
-            with torch.no_grad():
-                posterior_samples = predictive_technical(**model_inputs_with_skip)
-                if self.model.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
-    
-        if run_on_cpu:
-            self.model.device = _original_device  # Restore exact original device (not generic "cuda")
     
         for k, v in posterior_samples.items():
             posterior_samples[k] = v.cpu()

@@ -15,7 +15,7 @@ from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
 
-from ..utils import update_convergence_state
+from ..utils import maybe_to_cpu, predictive_cpu_handoff, update_convergence_state
 
 
 
@@ -701,106 +701,113 @@ class CisFitter:
 
         if run_on_cpu:
             print(f"[INFO] SVI completed on {original_device}. Running Predictive on CPU to reduce GPU memory pressure...")
-            guide_x.to("cpu")
-            self.model.device = torch.device("cpu")
-            # Also move guide_assignment_tensor to CPU for high MOI mode
+        if run_on_cpu and self.model.is_high_moi:
+            self.model.guide_assignment_tensor = self.model.guide_assignment_tensor.to("cpu")
+
+        def _post_restore_high_moi():
             if self.model.is_high_moi:
-                self.model.guide_assignment_tensor = self.model.guide_assignment_tensor.to("cpu")
+                self.model.guide_assignment_tensor = self.model.guide_assignment_tensor.to(original_device)
 
-            model_inputs = {
-                "N": N,
-                "G": G,
-                "alpha_dirichlet_tensor": self._to_cpu(alpha_dirichlet_tensor),
-                "guides_tensor": self._to_cpu(guides_tensor),
-                "x_obs_tensor": self._to_cpu(x_obs_tensor),
-                "sum_factor_tensor": self._to_cpu(sum_factor_tensor),
-                "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
-                "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
-                "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
-                "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
-                "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
-                "sigma_eff_mean_tensor": self._to_cpu(sigma_eff_mean_tensor.clamp(min=1e-2)),
-                "sigma_eff_sd_tensor": self._to_cpu(sigma_eff_sd_tensor.clamp(min=1e-2)),
-                "epsilon_tensor": self._to_cpu(epsilon_tensor),
-                "C": C,
-                "groups_tensor": self._to_cpu(groups_tensor),
-                "alpha_x_sample": self._to_cpu(self.model.alpha_x_prefit),
-                "o_x_sample": None,
-                "target_per_guide_tensor": self._to_cpu(target_per_guide_tensor),
-                "independent_mu_sigma": independent_mu_sigma,
-            }
-        else:
-            model_inputs = {
-                "N": N,
-                "G": G,
-                "alpha_dirichlet_tensor": alpha_dirichlet_tensor,
-                "guides_tensor": guides_tensor,
-                "x_obs_tensor": x_obs_tensor,
-                "sum_factor_tensor": sum_factor_tensor,
-                "beta_o_alpha_tensor": beta_o_alpha_tensor,
-                "beta_o_beta_tensor": beta_o_beta_tensor,
-                "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
-                "mu_x_mean_tensor": mu_x_mean_tensor,
-                "mu_x_sd_tensor": mu_x_sd_tensor,
-                "sigma_eff_mean_tensor": sigma_eff_mean_tensor.clamp(min=1e-2),
-                "sigma_eff_sd_tensor": sigma_eff_sd_tensor.clamp(min=1e-2),
-                "epsilon_tensor": epsilon_tensor,
-                "C": C,
-                "groups_tensor": groups_tensor,
-                "alpha_x_sample": self.model.alpha_x_prefit,
-                "o_x_sample": None,
-                "target_per_guide_tensor": target_per_guide_tensor if target_per_guide_tensor is not None else None,
-                "independent_mu_sigma": independent_mu_sigma,
-            }
+        post_restore = _post_restore_high_moi if self.model.is_high_moi else None
+        with predictive_cpu_handoff(
+            model=self.model,
+            guide=guide_x,
+            run_on_cpu=run_on_cpu,
+            original_device=original_device,
+            post_restore=post_restore,
+        ):
+            if run_on_cpu:
+                model_inputs = {
+                    "N": N,
+                    "G": G,
+                    "alpha_dirichlet_tensor": maybe_to_cpu(alpha_dirichlet_tensor, run_on_cpu),
+                    "guides_tensor": maybe_to_cpu(guides_tensor, run_on_cpu),
+                    "x_obs_tensor": maybe_to_cpu(x_obs_tensor, run_on_cpu),
+                    "sum_factor_tensor": maybe_to_cpu(sum_factor_tensor, run_on_cpu),
+                    "beta_o_alpha_tensor": maybe_to_cpu(beta_o_alpha_tensor, run_on_cpu),
+                    "beta_o_beta_tensor": maybe_to_cpu(beta_o_beta_tensor, run_on_cpu),
+                    "alpha_alpha_mu_tensor": maybe_to_cpu(alpha_alpha_mu_tensor, run_on_cpu),
+                    "mu_x_mean_tensor": maybe_to_cpu(mu_x_mean_tensor, run_on_cpu),
+                    "mu_x_sd_tensor": maybe_to_cpu(mu_x_sd_tensor, run_on_cpu),
+                    "sigma_eff_mean_tensor": maybe_to_cpu(sigma_eff_mean_tensor.clamp(min=1e-2), run_on_cpu),
+                    "sigma_eff_sd_tensor": maybe_to_cpu(sigma_eff_sd_tensor.clamp(min=1e-2), run_on_cpu),
+                    "epsilon_tensor": maybe_to_cpu(epsilon_tensor, run_on_cpu),
+                    "C": C,
+                    "groups_tensor": maybe_to_cpu(groups_tensor, run_on_cpu),
+                    "alpha_x_sample": maybe_to_cpu(self.model.alpha_x_prefit, run_on_cpu),
+                    "o_x_sample": None,
+                    "target_per_guide_tensor": maybe_to_cpu(target_per_guide_tensor, run_on_cpu),
+                    "independent_mu_sigma": independent_mu_sigma,
+                }
+            else:
+                model_inputs = {
+                    "N": N,
+                    "G": G,
+                    "alpha_dirichlet_tensor": alpha_dirichlet_tensor,
+                    "guides_tensor": guides_tensor,
+                    "x_obs_tensor": x_obs_tensor,
+                    "sum_factor_tensor": sum_factor_tensor,
+                    "beta_o_alpha_tensor": beta_o_alpha_tensor,
+                    "beta_o_beta_tensor": beta_o_beta_tensor,
+                    "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
+                    "mu_x_mean_tensor": mu_x_mean_tensor,
+                    "mu_x_sd_tensor": mu_x_sd_tensor,
+                    "sigma_eff_mean_tensor": sigma_eff_mean_tensor.clamp(min=1e-2),
+                    "sigma_eff_sd_tensor": sigma_eff_sd_tensor.clamp(min=1e-2),
+                    "epsilon_tensor": epsilon_tensor,
+                    "C": C,
+                    "groups_tensor": groups_tensor,
+                    "alpha_x_sample": self.model.alpha_x_prefit,
+                    "o_x_sample": None,
+                    "target_per_guide_tensor": target_per_guide_tensor if target_per_guide_tensor is not None else None,
+                    "independent_mu_sigma": independent_mu_sigma,
+                }
 
-        if self.model.device.type == "cuda":
-            torch.cuda.empty_cache()
-        import gc
-        gc.collect()
+            if self.model.device.type == "cuda":
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
-        max_samples = nsamples
-        keep_sites = kwargs.get("keep_sites", lambda name, site: site["value"].ndim <= 2 or name != "x_obs")
+            max_samples = nsamples
+            keep_sites = kwargs.get("keep_sites", lambda name, site: site["value"].ndim <= 2 or name != "x_obs")
 
-        if minibatch_size is not None:
-            from collections import defaultdict
-            print(f"[INFO] Running Predictive in minibatches of {minibatch_size}...")
-            predictive_x = pyro.infer.Predictive(
-                self._model_x,
-                guide=guide_x,
-                num_samples=minibatch_size,
-                parallel=True
-            )
-            all_samples = defaultdict(list)
-            with torch.no_grad():
-                for i in range(0, max_samples, minibatch_size):
-                    samples = predictive_x(**model_inputs)
-                    for k, v in samples.items():
-                        if keep_sites(k, {"value": v}):
-                            all_samples[k].append(self._to_cpu(v))
+            if minibatch_size is not None:
+                from collections import defaultdict
+                print(f"[INFO] Running Predictive in minibatches of {minibatch_size}...")
+                predictive_x = pyro.infer.Predictive(
+                    self._model_x,
+                    guide=guide_x,
+                    num_samples=minibatch_size,
+                    parallel=True
+                )
+                all_samples = defaultdict(list)
+                with torch.no_grad():
+                    for i in range(0, max_samples, minibatch_size):
+                        samples = predictive_x(**model_inputs)
+                        for k, v in samples.items():
+                            if keep_sites(k, {"value": v}):
+                                all_samples[k].append(self._to_cpu(v))
+                        if self.model.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        import gc
+                        gc.collect()
+                posterior_samples_x = {k: torch.cat(v, dim=0) for k, v in all_samples.items()}
+            else:
+                predictive_x = pyro.infer.Predictive(
+                    self._model_x,
+                    guide=guide_x,
+                    num_samples=nsamples#,
+                    #parallel=True
+                )
+                with torch.no_grad():
+                    posterior_samples_x = predictive_x(**model_inputs)
                     if self.model.device.type == "cuda":
                         torch.cuda.empty_cache()
                     import gc
                     gc.collect()
-            posterior_samples_x = {k: torch.cat(v, dim=0) for k, v in all_samples.items()}
-        else:
-            predictive_x = pyro.infer.Predictive(
-                self._model_x,
-                guide=guide_x,
-                num_samples=nsamples#,
-                #parallel=True
-            )
-            with torch.no_grad():
-                posterior_samples_x = predictive_x(**model_inputs)
-                if self.model.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                import gc
-                gc.collect()
 
         if run_on_cpu:
-            self.model.device = original_device
             print("[INFO] Reset self.model.device to:", self.model.device)
-            if self.model.is_high_moi:
-                self.model.guide_assignment_tensor = self.model.guide_assignment_tensor.to(original_device)
 
         for k, v in posterior_samples_x.items():
             posterior_samples_x[k] = self._to_cpu(v)

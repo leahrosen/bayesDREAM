@@ -9,6 +9,7 @@ This module contains helper functions used throughout the bayesDREAM package:
 """
 
 import os
+from contextlib import contextmanager
 import numpy as np
 import torch
 from scipy.special import betainc
@@ -86,6 +87,28 @@ def calculate_mu_x_guide(guide, x_obs_ntc_factored, guides_ntc):
     """
     mask = guides_ntc == guide
     return torch.mean(x_obs_ntc_factored[mask])
+
+
+def maybe_to_cpu(value, run_on_cpu):
+    """Move a tensor to CPU when running predictive sampling on CPU."""
+    if run_on_cpu and isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return value
+
+
+@contextmanager
+def predictive_cpu_handoff(model, guide, run_on_cpu, original_device, post_restore=None):
+    """Temporarily move a model and guide to CPU for Predictive sampling."""
+    if run_on_cpu:
+        guide.to("cpu")
+        model.device = torch.device("cpu")
+    try:
+        yield
+    finally:
+        if run_on_cpu:
+            model.device = original_device
+            if post_restore is not None:
+                post_restore()
 
 
 def update_convergence_state(loss, smoothed_loss, alpha_ewma, tolerance):
