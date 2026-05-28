@@ -3435,7 +3435,7 @@ def plot_negbinom_xy(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
-    color_by: str = 'technical_group',
+    color_by: Union[str, List[str]] = 'technical_group',
     **kwargs
 ) -> plt.Axes:
     """
@@ -3445,11 +3445,14 @@ def plot_negbinom_xy(
 
     Parameters (selected)
     ---------------------
-    color_by : str
+    color_by : str or list of two str
         What to color smoothed lines by. Options:
         - ``'technical_group'`` (default): one line per cell-line / technical group
         - ``'targeting'``: two lines — NTC vs all targeting cells
         - Any column name in ``model.meta``: one line per unique value
+        - A **list of two** values (e.g. ``['technical_group', 'targeting']``): cross-product
+          of two groupings. The first determines hue; the second determines shade — NTC gets
+          a lighter tint of the group colour, Targeting gets the full colour.
 
     Parameters
     ----------
@@ -3567,27 +3570,72 @@ def plot_negbinom_xy(
         y_offset = 0.0
 
     # Build color groups based on color_by.
-    # Alpha_y correction is always per technical_group_code; color_by only controls
-    # how cells are partitioned for smoothing and which color each line gets.
-    if color_by == 'technical_group':
-        if 'technical_group_code' in df.columns:
-            color_groups_list = [(code_to_label[int(gc)], df['technical_group_code'] == gc)
-                                 for gc in group_codes]
-        else:
-            color_groups_list = [('All', pd.Series(True, index=df.index))]
-    elif color_by == 'targeting':
-        ntc_m = df['target'].str.lower() == 'ntc'
-        color_groups_list = [('NTC', ntc_m), ('Targeting', ~ntc_m)]
-    elif color_by in df.columns:
-        uvals = sorted(df[color_by].dropna().unique(), key=str)
-        color_groups_list = [(str(v), df[color_by] == v) for v in uvals]
+    # color_by can be a str (single grouping) or a list of two str (cross-product).
+    # Alpha_y correction is always per technical_group_code regardless of color_by.
+
+    def _resolve_grouping(cb):
+        """Return list of (label, boolean_mask) for one color_by value, or None if not found."""
+        if cb == 'technical_group':
+            if 'technical_group_code' in df.columns:
+                return [(code_to_label[int(gc)], df['technical_group_code'] == gc)
+                        for gc in group_codes]
+            return [('All', pd.Series(True, index=df.index))]
+        if cb == 'targeting':
+            ntc_m = df['target'].str.lower() == 'ntc'
+            return [('NTC', ntc_m), ('Targeting', ~ntc_m)]
+        if cb in df.columns:
+            uvals = sorted(df[cb].dropna().unique(), key=str)
+            return [(str(v), df[cb] == v) for v in uvals]
+        return None  # not found
+
+    _cb_list = [color_by] if isinstance(color_by, str) else list(color_by)
+
+    if len(_cb_list) == 1:
+        # ── Single grouping ──────────────────────────────────────────────────
+        groups = _resolve_grouping(_cb_list[0])
+        if groups is None:
+            warnings.warn(f"color_by='{_cb_list[0]}' not found in data; "
+                          "falling back to 'technical_group'.")
+            groups = _resolve_grouping('technical_group')
+        color_groups_list = groups
+
     else:
-        warnings.warn(f"color_by='{color_by}' not found in data; falling back to 'technical_group'.")
-        if 'technical_group_code' in df.columns:
-            color_groups_list = [(code_to_label[int(gc)], df['technical_group_code'] == gc)
-                                 for gc in group_codes]
+        # ── Cross-product of two groupings, with auto shade variation ────────
+        # Primary grouping determines hue; secondary determines shade.
+        # For 'targeting' as secondary: NTC → light shade, Targeting → full color.
+        # For any other secondary: shades spread evenly from light to full.
+        primary_cb, secondary_cb = _cb_list[0], _cb_list[1]
+        primary_groups   = _resolve_grouping(primary_cb)   or _resolve_grouping('technical_group')
+        secondary_groups = _resolve_grouping(secondary_cb) or [('All', pd.Series(True, index=df.index))]
+
+        if secondary_cb == 'targeting':
+            _shade_for = {'NTC': 0.35, 'Targeting': 1.0}
         else:
-            color_groups_list = [('All', pd.Series(True, index=df.index))]
+            _n = len(secondary_groups)
+            _shade_for = {lbl: 0.3 + 0.7 * i / max(_n - 1, 1)
+                          for i, (lbl, _) in enumerate(secondary_groups)}
+
+        # Build cross-product; auto-populate color_palette with shade colours.
+        # shade=1.0 → full base colour; shade<1.0 → mixed with white (lighter).
+        from matplotlib.colors import to_rgb, to_hex
+        color_palette = dict(color_palette)  # local copy — do not mutate caller's dict
+        color_groups_list = []
+        for pidx, (plabel, pmask) in enumerate(primary_groups):
+            base_color = _color_for_label(plabel, fallback_idx=pidx, palette=color_palette)
+            try:
+                base_rgb = np.array(to_rgb(base_color))
+            except ValueError:
+                base_rgb = np.array([0.5, 0.5, 0.5])
+            for slabel, smask in secondary_groups:
+                combined_mask = pmask & smask
+                if not combined_mask.any():
+                    continue
+                combined_label = f"{plabel} / {slabel}"
+                if combined_label not in color_palette:
+                    shade = _shade_for.get(slabel, 1.0)
+                    shaded = np.clip(1 - shade * (1 - base_rgb), 0, 1)
+                    color_palette[combined_label] = to_hex(shaded)
+                color_groups_list.append((combined_label, combined_mask))
 
     # Create colormaps for NTC gradient — one per color group (white → group color)
     group_cmaps = {}
@@ -4966,7 +5014,7 @@ def plot_xy_data(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
-    color_by: str = 'technical_group',
+    color_by: Union[str, List[str]] = 'technical_group',
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -5054,13 +5102,19 @@ def plot_xy_data(
         x-axis: log2(x_true) - log2(mean NTC x_true)
         y-axis: log2(counts) - log2(mean NTC counts, reference group)
         A grey dotted crosshair is drawn at (0, 0) to mark the NTC reference.
-    color_by : str
+    color_by : str or list of two str
         What to color smoothed lines by (default: ``'technical_group'``).
         - ``'technical_group'``: one line per cell-line / technical group (default)
         - ``'targeting'``: two lines — ``NTC`` vs ``Targeting``
         - Any column name in ``model.meta``: one line per unique value in that column
+        - **List of two** (e.g. ``['technical_group', 'targeting']``): cross-product of
+          two groupings — the first sets hue, the second sets shade. When the secondary
+          is ``'targeting'``, NTC lines are drawn as a light tint of the group colour
+          and targeting lines as the full colour (matching the classic "shades" style).
+          Override any auto-generated colour via ``color_palette`` using the combined
+          label ``"K562 / NTC"``, ``"K562 / Targeting"``, etc.
         Alpha-y technical correction is always applied per technical group regardless
-        of this setting. Override colours via ``color_palette``.
+        of this setting.
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
