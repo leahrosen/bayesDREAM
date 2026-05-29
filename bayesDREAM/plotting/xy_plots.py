@@ -3401,6 +3401,61 @@ def _save_figure(fig, model, filename):
     print(f"[PLOT] Saved to {save_path}")
 
 
+def _compute_global_log2fc_offsets(
+    model, modality, feature_name: str, x_true: np.ndarray,
+    subset_mask: Optional[np.ndarray], sum_factor_col: str
+) -> Tuple[float, float]:
+    """
+    Compute the NTC log2 x_offset and y_offset from the GLOBAL (non-faceted) data.
+
+    This must be called with only the top-level ``subset_mask`` (no facet mask),
+    so that all panels for the same feature share an identical NTC reference —
+    even panels that contain no NTC cells (e.g. a "Targeting" facet column).
+
+    Returns
+    -------
+    (x_offset, y_offset) : (float, float)
+        Both in log2 space; 0.0 if no valid NTC cells found.
+    """
+    feature_idx = _get_feature_index(feature_name, modality)
+    if feature_idx is None:
+        return 0.0, 0.0
+
+    # Get counts for this feature
+    if modality.cells_axis == 1:
+        y_obs = modality.counts[feature_idx, :]
+    else:
+        y_obs = modality.counts[:, feature_idx]
+
+    # Align cells using the global subset_mask (no facet restriction)
+    x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(
+        model, modality, x_true, y_obs, subset_mask
+    )
+    sf_aligned = modality.sum_factors.loc[
+        meta_aligned['cell'].values, sum_factor_col
+    ].values
+
+    is_ntc = (meta_aligned['target'].str.lower() == 'ntc').values
+
+    # x_offset: mean log2 NTC x_true (pooled, group-independent)
+    x_ntc = x_true_aligned[is_ntc & (x_true_aligned > 0)]
+    x_offset = np.log2(float(x_ntc.mean())) if len(x_ntc) > 0 else 0.0
+
+    # y_offset: reference group (group_code=0, alpha_y=1.0) NTC uncorrected expression
+    if 'technical_group_code' in meta_aligned.columns:
+        ntc_ref_mask = is_ntc & (meta_aligned['technical_group_code'].values == 0)
+    else:
+        ntc_ref_mask = is_ntc
+    y_ntc_expr = y_obs_aligned[ntc_ref_mask] / sf_aligned[ntc_ref_mask]
+    y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+    if len(y_ntc_valid) == 0:           # fallback: pooled NTC (all groups)
+        y_ntc_expr = y_obs_aligned[is_ntc] / sf_aligned[is_ntc]
+        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+    y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+
+    return x_offset, y_offset
+
+
 def _collect_legend_handles(axes):
     """Collect deduplicated (handle, label) pairs from a list of axes."""
     handles, labels = [], []
@@ -3436,6 +3491,8 @@ def plot_negbinom_xy(
     fdr_df=None,
     fdr_threshold: float = 0.05,
     color_by: Union[str, List[str]] = 'technical_group',
+    ntc_x_offset: Optional[float] = None,
+    ntc_y_offset: Optional[float] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3555,27 +3612,35 @@ def plot_negbinom_xy(
     # x_offset: pooled NTC x_true (x_true is group-independent).
     # y_offset: reference group (group_code=0, alpha_y=1.0) NTC uncorrected expression.
     #   Because alpha_y=1.0 for the reference group, its uncorrected NTC equals the corrected
-    #   NTC for any group — so this is the natural "true NTC" baseline that makes technical
-    #   groups irrelevant after correction, while uncorrected plots still show group offsets.
+    #   NTC for any group — so this is the natural "true NTC" baseline.
+    #
+    # ntc_x_offset / ntc_y_offset: pre-computed overrides supplied by the caller
+    # (plot_xy_data passes these when faceting, so that panels without NTC cells —
+    # e.g. the "Targeting" facet — still use the correct global NTC baseline).
     if log2fc:
-        ntc_df = df[is_ntc]
-        x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
-        if len(x_ntc_valid) > 0:
-            x_offset = np.log2(float(x_ntc_valid.mean()))
+        if ntc_x_offset is not None and ntc_y_offset is not None:
+            # Use caller-supplied global offsets (correct even when df has no NTC cells)
+            x_offset = ntc_x_offset
+            y_offset = ntc_y_offset
         else:
-            warnings.warn("log2fc=True: no valid NTC cells found for x; plotting raw log2 instead.")
-            x_offset = 0.0
-        # y_offset from reference group (group_code=0) NTC; fall back to pooled if needed
-        if 'technical_group_code' in ntc_df.columns:
-            ntc_ref_df = ntc_df[ntc_df['technical_group_code'] == 0]
-        else:
-            ntc_ref_df = ntc_df
-        y_ntc_expr = ntc_ref_df['y_obs'] / ntc_ref_df['sum_factor']
-        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-        if len(y_ntc_valid) == 0:  # fallback to pooled if reference group has no NTC
-            y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+            ntc_df = df[is_ntc]
+            x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
+            if len(x_ntc_valid) > 0:
+                x_offset = np.log2(float(x_ntc_valid.mean()))
+            else:
+                warnings.warn("log2fc=True: no valid NTC cells found for x; plotting raw log2 instead.")
+                x_offset = 0.0
+            # y_offset from reference group (group_code=0) NTC; fall back to pooled if needed
+            if 'technical_group_code' in ntc_df.columns:
+                ntc_ref_df = ntc_df[ntc_df['technical_group_code'] == 0]
+            else:
+                ntc_ref_df = ntc_df
+            y_ntc_expr = ntc_ref_df['y_obs'] / ntc_ref_df['sum_factor']
             y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-        y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+            if len(y_ntc_valid) == 0:  # fallback to pooled if reference group has no NTC
+                y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+                y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+            y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
     else:
         x_offset = 0.0
         y_offset = 0.0
@@ -3701,8 +3766,12 @@ def plot_negbinom_xy(
             df_group = df[group_mask].copy()
             y_expr = y_expr_all[group_mask]
 
-            # Filter valid (positive x_true, finite y)
-            valid = (df_group['x_true'] > 0) & np.isfinite(y_expr)
+            # Filter valid: positive x_true AND positive y_expr.
+            # Zero-count cells (y_expr=0) are excluded because:
+            #   - log2(0) = -inf, they can't contribute to a log-space plot
+            #   - y_offset is computed from non-zero NTC cells, so including zeros
+            #     in the kNN smooth would pull lines below the offset baseline
+            valid = (df_group['x_true'] > 0) & (y_expr > 0)
             df_group = df_group[valid].copy()
             y_expr = y_expr[valid]
 
@@ -5625,7 +5694,8 @@ def plot_xy_data(
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False,
                                  constrained_layout=True)
 
-        def _plot_one_grid(feat_name, ax, correction, mask):
+        def _plot_one_grid(feat_name, ax, correction, mask,
+                           ntc_x_offset=None, ntc_y_offset=None):
             """Plot one panel: one feature × one correction × one (optional) facet."""
             if distribution == 'negbinom':
                 plot_negbinom_xy(
@@ -5638,6 +5708,7 @@ def plot_xy_data(
                     log2fc=log2fc, reference_df=reference_df,
                     fdr_df=fdr_df, fdr_threshold=fdr_threshold,
                     color_by=color_by,
+                    ntc_x_offset=ntc_x_offset, ntc_y_offset=ntc_y_offset,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -5663,12 +5734,24 @@ def plot_xy_data(
                 ax.text(0.5, 0.5, f"Grid not supported for {distribution}",
                         ha='center', va='center', transform=ax.transAxes)
 
-        # Iterate: row-facets × features → grid rows;  col-facets × corrections → grid cols
+        # Iterate: features (outer) → row-facets → col-facets → corrections.
+        # Features are outer so we can compute the global NTC log2FC offsets once per
+        # feature (using the global subset_mask, not any facet mask) and reuse them
+        # across all facet panels — ensuring the NTC reference is consistent even when
+        # a facet panel contains no NTC cells (e.g. a "Targeting" column facet).
         facet_col_iter = facet_col_groups if facet_col_groups else [(None, None)]
         facet_row_iter = facet_row_groups if facet_row_groups else [(None, None)]
 
-        for frow_i, (frow_label, frow_mask) in enumerate(facet_row_iter):
-            for feat_i, feat_name in enumerate(feature_names_resolved):
+        for feat_i, feat_name in enumerate(feature_names_resolved):
+            # Pre-compute global NTC log2FC offsets for this feature (negbinom only).
+            if log2fc and distribution == 'negbinom':
+                _ntc_x_off, _ntc_y_off = _compute_global_log2fc_offsets(
+                    model, modality, feat_name, x_true, subset_mask, sum_factor_col
+                )
+            else:
+                _ntc_x_off = _ntc_y_off = None
+
+            for frow_i, (frow_label, frow_mask) in enumerate(facet_row_iter):
                 grid_row = frow_i * n_features + feat_i
                 for fcol_i, (fcol_label, fcol_mask) in enumerate(facet_col_iter):
                     # Combine all masks (global subset_mask AND row-facet AND col-facet)
@@ -5681,7 +5764,8 @@ def plot_xy_data(
                     for corr_i, correction in enumerate(corrections_list):
                         grid_col = fcol_i * n_corrections + corr_i
                         ax = axes[grid_row, grid_col]
-                        _plot_one_grid(feat_name, ax, correction, combined_mask)
+                        _plot_one_grid(feat_name, ax, correction, combined_mask,
+                                       ntc_x_offset=_ntc_x_off, ntc_y_offset=_ntc_y_off)
                         # Strip the per-panel legend — one shared legend is drawn below
                         if ax.get_legend() is not None:
                             ax.get_legend().remove()
