@@ -5146,13 +5146,29 @@ def plot_xy_data(
         Alpha-y technical correction is always applied per technical group regardless
         of this setting.
     facet_by : str, optional
-        Column name in ``model.meta`` to facet by (default: ``None``).
-        Creates one column-group of panels per unique value of the column —
-        analogous to ``facet_grid`` in ggplot2.  Each panel shows only the cells
-        belonging to that facet value (AND-combined with ``subset_meta`` if also
-        provided).  The grid layout becomes:
+        Column name in ``model.meta`` to split into side-by-side panel columns
+        (default: ``None``).  Analogous to ``facet_grid`` in ggplot2.
 
-        ``rows = n_features,  cols = n_facets × n_corrections``
+        **Grid layout** — when ``facet_by`` is set the figure grid becomes::
+
+            rows = n_features  (1 for a single feature)
+            cols = n_facets × n_corrections
+
+        For example, 3 cell lines with ``show_correction='both'`` produces a
+        1 × 6 grid: ``[K562 uncorr | K562 corr | TF1 uncorr | TF1 corr | …]``.
+        Each panel shows only the cells belonging to that facet value.
+
+        **Combining with other parameters:**
+
+        - ``subset_meta``: the facet mask is AND-combined with the global
+          ``subset_meta`` filter, so you can first narrow to CRISPRi cells and
+          then facet by cell line within that subset.
+        - ``color_by``: works independently — e.g. ``facet_by='cell_line'``
+          separates cell lines into columns while
+          ``color_by='targeting'`` still draws separate NTC / Targeting lines
+          *within* each column.
+        - ``legend_outside=True``: recommended when faceting produces many
+          panels, to avoid legend clutter inside each small panel.
 
         Facet labels appear as the first line of each panel title, e.g.
         ``cell_line=K562``.  A warning is issued for columns with more than
@@ -5234,6 +5250,51 @@ def plot_xy_data(
     >>>
     >>> # Plot all junctions for a gene, but only show dependent ones (n_a or n_b CI excludes 0)
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj', only_dependent=True, ci_level=95.0)
+    >>>
+    >>> # ── color_by examples ─────────────────────────────────────────────────
+    >>> # Color by NTC vs targeting instead of technical group
+    >>> model.plot_xy_data('GFI1B', color_by='targeting')
+    >>>
+    >>> # Color by any column in model.meta (warns if continuous or >30 unique values)
+    >>> model.plot_xy_data('GFI1B', color_by='cell_line')
+    >>>
+    >>> # Cross-product: hue = technical group, shade = NTC vs targeting
+    >>> # NTC cells are drawn as a light tint of the group colour;
+    >>> # targeting cells as the full colour.
+    >>> model.plot_xy_data('GFI1B', color_by=['technical_group', 'targeting'])
+    >>>
+    >>> # Cross-product with a custom secondary grouping
+    >>> model.plot_xy_data('GFI1B', color_by=['cell_line', 'perturbation_type'])
+    >>>
+    >>> # ── facet_by examples ─────────────────────────────────────────────────
+    >>> # One column-group of panels per cell line
+    >>> # Grid: 1 row × (n_cell_lines × 2) cols  (default show_correction='both')
+    >>> model.plot_xy_data('GFI1B', facet_by='cell_line')
+    >>>
+    >>> # Facet by cell line, show only corrected, log2FC mode
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by='cell_line',
+    ...     show_correction='corrected',
+    ...     log2fc=True)
+    >>>
+    >>> # Facet by cell line AND color by NTC vs targeting within each facet panel
+    >>> # Grid: 1 row × n_cell_lines cols; two lines per panel (NTC / Targeting)
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by='cell_line',
+    ...     color_by='targeting',
+    ...     show_correction='corrected',
+    ...     legend_outside=True)   # recommended when many panels
+    >>>
+    >>> # First restrict to CRISPRi guides, then facet by cell line within that subset
+    >>> model.plot_xy_data('GFI1B',
+    ...     subset_meta={'guide_type': 'CRISPRi'},
+    ...     facet_by='cell_line')
+    >>>
+    >>> # Multi-feature + facet: rows = features, cols = facets × corrections
+    >>> model.plot_xy_data('HES4', modality_name='splicing_sj',
+    ...     facet_by='cell_line',
+    ...     show_correction='corrected',
+    ...     only_dependent=True)
     """
     # Check x_true is set
     if not hasattr(model, 'x_true') or model.x_true is None:
