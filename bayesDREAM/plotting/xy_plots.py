@@ -3828,6 +3828,15 @@ def plot_negbinom_xy(
             y_expr_vals = (df['y_obs'] / df['sum_factor']).values
         y_expr_all = pd.Series(y_expr_vals, index=df.index)
 
+        # Accumulate bounds from plotted data so we can set explicit axis limits.
+        # axhline / axvline are infinite lines that confuse matplotlib's auto-scaling;
+        # explicit set_xlim / set_ylim ensures the view is driven by the data.
+        _ax_x_segments = []   # (x_min, x_max) from each smooth curve
+        _ax_y_segments = []   # (y_min, y_max) from each smooth curve
+        _ax_y_hill = []       # y values from Hill curve (filtered to displayed x range)
+        _ax_h_markers = []    # y positions of horizontal parameter lines
+        _ax_v_markers = []    # x positions of vertical parameter lines (K / EC50)
+
         colorbar_added = False
         for idx, (group_label, group_mask) in enumerate(color_groups_list):
             df_group = df[group_mask].copy()
@@ -3868,13 +3877,17 @@ def plot_negbinom_xy(
                     y_smooth_linear = y_smooth_linear[valid_smooth]
                     ntc_prop = ntc_prop[valid_smooth]
                 y_smooth_log = np.log2(y_smooth_linear)
+                _xs = np.log2(x_smooth) - x_offset
+                _ys = y_smooth_log - y_offset
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
-                    x=np.log2(x_smooth) - x_offset,
-                    y=y_smooth_log - y_offset,
+                    x=_xs, y=_ys,
                     color_values=1 - ntc_prop,
                     cmap=group_cmap, ax=ax_plot, linewidth=2
                 )
+                if len(_xs) > 0:
+                    _ax_x_segments.append((float(_xs.min()), float(_xs.max())))
+                    _ax_y_segments.append((float(_ys.min()), float(_ys.max())))
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
                 ax_plot.plot([], [], color=color, linewidth=2, label=group_label)
                 if not colorbar_added:
@@ -3896,9 +3909,13 @@ def plot_negbinom_xy(
                     x_smooth = x_smooth[valid_smooth]
                     y_smooth_linear = y_smooth_linear[valid_smooth]
                 y_smooth_log = np.log2(y_smooth_linear)
+                _xs = np.log2(x_smooth) - x_offset
+                _ys = y_smooth_log - y_offset
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
-                ax_plot.plot(np.log2(x_smooth) - x_offset, y_smooth_log - y_offset,
-                             color=color, linewidth=2, label=group_label)
+                ax_plot.plot(_xs, _ys, color=color, linewidth=2, label=group_label)
+                if len(_xs) > 0:
+                    _ax_x_segments.append((float(_xs.min()), float(_xs.max())))
+                    _ax_y_segments.append((float(_ys.min()), float(_ys.max())))
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -3914,11 +3931,20 @@ def plot_negbinom_xy(
                 # Filter out zero/negative predictions
                 valid_pred = y_pred > 0
                 if valid_pred.any():
-                    ax_plot.plot(np.log2(x_range[valid_pred]) - x_offset,
-                                np.log2(y_pred[valid_pred]) - y_offset,
+                    _xh = np.log2(x_range[valid_pred]) - x_offset
+                    _yh = np.log2(y_pred[valid_pred]) - y_offset
+                    ax_plot.plot(_xh, _yh,
                                 color='black', linestyle='--', linewidth=2,
                                 label='Fitted Trans Function')
-
+                    # Collect Hill y values within the smooth x range (extended by
+                    # any V markers below) — done after markers are computed.
+                    # Store the full arrays for now; we trim after markers.
+                    _ax_y_hill_xh = _xh
+                    _ax_y_hill_yh = _yh
+                else:
+                    _ax_y_hill_xh = _ax_y_hill_yh = None
+            else:
+                _ax_y_hill_xh = _ax_y_hill_yh = None
 
             # Full parameter markers (replaces simple A baseline)
             # Use reference_df as FDR source if no explicit fdr_df provided
@@ -3933,9 +3959,31 @@ def plot_negbinom_xy(
                 # that parameter lines (A, Vmax ceiling, EC50) land at the correct
                 # positions — consistent with A_log2fc / EC50_*_log2fc in
                 # save_trans_summary.
+                _moff_x = x_offset if log2fc else 0.0
+                _moff_y = y_offset if log2fc else 0.0
                 _draw_hill_markers(ax_plot, _markers,
-                                   x_offset=x_offset if log2fc else 0.0,
-                                   y_offset=y_offset if log2fc else 0.0)
+                                   x_offset=_moff_x,
+                                   y_offset=_moff_y)
+                # Collect marker positions for axis-limit computation
+                for _m in _markers:
+                    if _m['axis'] == 'h':
+                        _ax_h_markers.append(_m['value'] - _moff_y)
+                    elif _m['axis'] == 'v':
+                        _ax_v_markers.append(_m['value'] - _moff_x)
+
+            # Now that V markers are known, compute final displayed x range and
+            # trim Hill y to that range (so Hill y doesn't set limits for x values
+            # that aren't visible in the smooth).
+            if _ax_x_segments:
+                _x_lo = min(s[0] for s in _ax_x_segments)
+                _x_hi = max(s[1] for s in _ax_x_segments)
+                if _ax_v_markers:             # K markers extend x range
+                    _x_lo = min(_x_lo, min(_ax_v_markers))
+                    _x_hi = max(_x_hi, max(_ax_v_markers))
+                if _ax_y_hill_xh is not None and len(_ax_y_hill_xh) > 0:
+                    _in_xr = (_ax_y_hill_xh >= _x_lo) & (_ax_y_hill_xh <= _x_hi)
+                    if _in_xr.any():
+                        _ax_y_hill.extend(_ax_y_hill_yh[_in_xr].tolist())
 
             # Reference curve overlay (from trans_summary DataFrame)
             if reference_df is not None and (corrected or not has_technical_fit):
@@ -3979,6 +4027,33 @@ def plot_negbinom_xy(
         if log2fc:
             ax_plot.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
             ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
+
+        # ── Explicit axis limits ──────────────────────────────────────────────
+        # X: smooth data range, extended to include K/EC50 vertical markers.
+        # Y: smooth data range + Hill curve (within displayed x range) + h markers.
+        # axhline / axvline don't constrain auto-scaling reliably, so we set
+        # limits manually to keep the view focused on the actual content.
+        if _ax_x_segments:
+            _x_lo = min(s[0] for s in _ax_x_segments)
+            _x_hi = max(s[1] for s in _ax_x_segments)
+            if _ax_v_markers:
+                _x_lo = min(_x_lo, min(_ax_v_markers))
+                _x_hi = max(_x_hi, max(_ax_v_markers))
+
+            _y_lo = min(s[0] for s in _ax_y_segments)
+            _y_hi = max(s[1] for s in _ax_y_segments)
+            if _ax_y_hill:
+                _y_lo = min(_y_lo, min(_ax_y_hill))
+                _y_hi = max(_y_hi, max(_ax_y_hill))
+            if _ax_h_markers:
+                _y_lo = min(_y_lo, min(_ax_h_markers))
+                _y_hi = max(_y_hi, max(_ax_h_markers))
+
+            _x_pad = max(0.05 * (_x_hi - _x_lo), 0.1)
+            _y_pad = max(0.05 * (_y_hi - _y_lo), 0.1)
+            ax_plot.set_xlim(_x_lo - _x_pad, _x_hi + _x_pad)
+            ax_plot.set_ylim(_y_lo - _y_pad, _y_hi + _y_pad)
+
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
