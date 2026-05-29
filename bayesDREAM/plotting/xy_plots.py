@@ -5804,6 +5804,16 @@ def plot_xy_data(
     feature = feature_names_resolved[0]  # Use resolved feature name
 
     if distribution == 'negbinom':
+        # Pre-compute global NTC offsets for log2FC mode (same approach as grid path).
+        # This ensures the NTC reference is computed from ALL NTC cells (ignoring
+        # min_counts and color_by grouping), making y_ntc independent of which colour
+        # or subset is shown.
+        _sf_ntc_x_off = _sf_ntc_y_off = None
+        if log2fc:
+            _sf_ntc_x_off, _sf_ntc_y_off = _compute_global_log2fc_offsets(
+                model, modality, feature, x_true, subset_mask, sum_factor_col
+            )
+
         result = plot_negbinom_xy(
             model=model,
             feature=feature,
@@ -5827,6 +5837,8 @@ def plot_xy_data(
             fdr_df=fdr_df,
             fdr_threshold=fdr_threshold,
             color_by=color_by,
+            ntc_x_offset=_sf_ntc_x_off,
+            ntc_y_offset=_sf_ntc_y_off,
             **kwargs
         )
 
