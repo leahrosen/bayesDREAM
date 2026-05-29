@@ -3833,12 +3833,32 @@ def plot_negbinom_xy(
             df_group = df[group_mask].copy()
             y_expr = y_expr_all[group_mask]
 
-            # Filter valid: positive x_true AND positive y_expr.
-            # Zero-count cells (y_expr=0) are excluded because:
-            #   - log2(0) = -inf, they can't contribute to a log-space plot
-            #   - y_offset is computed from non-zero NTC cells, so including zeros
-            #     in the kNN smooth would pull lines below the offset baseline
-            valid = (df_group['x_true'] > 0) & (y_expr > 0)
+            # Filter valid cells for kNN smoothing.
+            # x_true must be positive (needed for log2-axis and Hill function alignment).
+            #
+            # Zero-count cells (y_expr=0) treatment depends on mode:
+            #
+            # log2fc=True (axes shifted by NTC offsets):
+            #   Exclude zeros → y_expr > 0.
+            #   Reason: the y_offset is the model/empirical NTC mean *excluding zeros*.
+            #   If zeros are included in the smooth they pull it below y_offset, causing
+            #   NTC cells to appear at log2FC < 0 (spuriously below the NTC baseline).
+            #
+            # log2fc=False (absolute log2 axes, y_offset = 0):
+            #   Include zeros → isfinite(y_expr).
+            #   Reason: the Hill function (black dashed line) is the model's *unconditional*
+            #   expected value E[y_obs/sum_factor] = A + α·Hill_a + β·Hill_b, which
+            #   averages over both expressed and zero-count cells.  Excluding zeros raises
+            #   the kNN smooth to E[y_obs/sum_factor | y_obs > 0] > E[y_obs/sum_factor],
+            #   making the smooth appear above the Hill curve — misleadingly suggesting the
+            #   model under-predicts the data.  Including zeros gives the arithmetic mean
+            #   over all cells, which matches the Hill function in expectation.
+            #   Windows where all cells have zero counts are removed by the subsequent
+            #   valid_smooth = y_smooth_linear > 0 filter (no log2(0) is taken).
+            if log2fc:
+                valid = (df_group['x_true'] > 0) & (y_expr > 0)
+            else:
+                valid = (df_group['x_true'] > 0) & np.isfinite(y_expr)
             df_group = df_group[valid].copy()
             y_expr = y_expr[valid]
 
