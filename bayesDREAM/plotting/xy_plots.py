@@ -5042,6 +5042,7 @@ def plot_xy_data(
     fdr_df=None,
     fdr_threshold: float = 0.05,
     color_by: Union[str, List[str]] = 'technical_group',
+    facet_by: Optional[str] = None,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -5144,6 +5145,19 @@ def plot_xy_data(
           label ``"K562 / NTC"``, ``"K562 / Targeting"``, etc.
         Alpha-y technical correction is always applied per technical group regardless
         of this setting.
+    facet_by : str, optional
+        Column name in ``model.meta`` to facet by (default: ``None``).
+        Creates one column-group of panels per unique value of the column —
+        analogous to ``facet_grid`` in ggplot2.  Each panel shows only the cells
+        belonging to that facet value (AND-combined with ``subset_meta`` if also
+        provided).  The grid layout becomes:
+
+        ``rows = n_features,  cols = n_facets × n_corrections``
+
+        Facet labels appear as the first line of each panel title, e.g.
+        ``cell_line=K562``.  A warning is issued for columns with more than
+        20 unique values.  Not yet supported for ``multinomial`` distributions
+        (ignored with a warning in that case).
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
@@ -5271,10 +5285,36 @@ def plot_xy_data(
         # NOTE: Don't subset x_true here - let _align_cells_to_modality() handle it
         # (subsetting here causes IndexError when mask is applied again in alignment)
 
+    # Resolve facet groups (if facet_by is set).
+    # Each facet entry is (label, boolean_mask on model.meta rows).
+    # The mask is combined with subset_mask inside the grid loop.
+    facet_groups = None
+    if facet_by is not None:
+        if facet_by not in model.meta.columns:
+            raise ValueError(
+                f"facet_by='{facet_by}' not found in model.meta. "
+                f"Available columns: {list(model.meta.columns)}"
+            )
+        fvals = sorted(model.meta[facet_by].dropna().unique(), key=str)
+        n_unique_facets = len(fvals)
+        if n_unique_facets > 20:
+            warnings.warn(
+                f"facet_by='{facet_by}' has {n_unique_facets} unique values — this will create "
+                f"{n_unique_facets} column groups. Consider a coarser grouping.",
+                UserWarning
+            )
+        elif n_unique_facets <= 1:
+            warnings.warn(
+                f"facet_by='{facet_by}' has {n_unique_facets} unique value(s) — faceting has no effect.",
+                UserWarning
+            )
+        facet_groups = [(str(v), (model.meta[facet_by] == v).values) for v in fvals]
+
     # Get modality
     if modality_name is None:
         modality_name = model.primary_modality
     modality = model.get_modality(modality_name)
+    distribution = modality.distribution
 
     # Set distribution-specific default for min_counts
     if min_counts is None:
@@ -5379,13 +5419,19 @@ def plot_xy_data(
                     print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
                           f"(CI={ci_level}%, {dep_mask_a.sum()} positive, {dep_mask_b.sum()} negative)")
 
-    # If multiple features (gene input), create multi-panel figure
-    if is_gene and len(feature_indices) > 1:
-        n_features = len(feature_indices)
-        distribution = modality.distribution
+    # ── Grid path: multi-feature (gene input) OR single feature with facet_by ──
+    # Multinomial is handled separately (has its own K-category subplot layout).
+    use_grid = (is_gene and len(feature_indices) > 1) or (facet_by is not None)
 
+    if use_grid:
         # Special handling for multinomial - needs K subplots per feature
         if distribution == 'multinomial':
+            if facet_by is not None:
+                warnings.warn(
+                    "facet_by is not yet supported for multinomial distribution. "
+                    "Ignoring facet_by and plotting without faceting.",
+                    UserWarning
+                )
             return _plot_multinomial_multifeature(
                 model=model,
                 feature_indices=feature_indices,
@@ -5403,15 +5449,14 @@ def plot_xy_data(
                 **kwargs
             )
 
-        # Standard multi-feature plotting for 2D distributions
-        # Layout: features in rows; columns depend on show_correction
-        n_rows = n_features
-        if show_correction == 'both':
-            n_cols = 2
-            col_corrections = ['uncorrected', 'corrected']
-        else:
-            n_cols = 1
-            col_corrections = [show_correction]  # 'uncorrected' or 'corrected'
+        # Standard grid for 2D distributions.
+        # Layout: rows = features,  cols = n_facets × n_corrections.
+        # Facets expand to the left (outermost), corrections nest inside each facet.
+        n_rows = len(feature_indices)
+        corrections_list = ['uncorrected', 'corrected'] if show_correction == 'both' else [show_correction]
+        n_corrections = len(corrections_list)
+        n_facets = len(facet_groups) if facet_groups else 1
+        n_cols = n_facets * n_corrections
 
         if figsize is None:
             figsize = (6 * n_cols, 3 * n_rows)
@@ -5419,7 +5464,8 @@ def plot_xy_data(
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False,
                                  constrained_layout=True)
 
-        def _plot_one_multifeature(feat_name, ax, correction):
+        def _plot_one_grid(feat_name, ax, correction, mask):
+            """Plot one panel: one feature × one correction × one (optional) facet."""
             if distribution == 'negbinom':
                 plot_negbinom_xy(
                     model=model, feature=feat_name, modality=modality,
@@ -5427,7 +5473,7 @@ def plot_xy_data(
                     color_palette=color_palette, show_hill_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
                     min_counts=min_counts, xlabel=xlabel, ax=ax,
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
                     log2fc=log2fc, reference_df=reference_df,
                     fdr_df=fdr_df, fdr_threshold=fdr_threshold,
                     color_by=color_by,
@@ -5440,7 +5486,7 @@ def plot_xy_data(
                     min_counts=min_counts, color_palette=color_palette,
                     show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
                     **kwargs
                 )
             elif distribution in ('normal', 'studentt'):
@@ -5449,32 +5495,51 @@ def plot_xy_data(
                     x_true=x_true, window=window, show_correction=correction,
                     color_palette=color_palette, show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
                     **kwargs
                 )
             else:
-                ax.text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
+                ax.text(0.5, 0.5, f"Grid not supported for {distribution}",
                         ha='center', va='center', transform=ax.transAxes)
 
-        # Plot each feature (one row per feature)
-        for i, (feat_idx, feat_name) in enumerate(zip(feature_indices, feature_names_resolved)):
-            for j, correction in enumerate(col_corrections):
-                _plot_one_multifeature(feat_name, axes[i, j], correction)
+        # Iterate: features (rows) × facets × corrections (cols)
+        facet_iter = facet_groups if facet_groups else [(None, None)]
 
-        plt.suptitle(f"{model.cis_gene} → {feature} (gene, n={n_features} features)")
+        for row_i, feat_name in enumerate(feature_names_resolved):
+            for facet_i, (facet_label, facet_mask_base) in enumerate(facet_iter):
+                # Combine global subset_mask with per-facet mask (AND logic)
+                if subset_mask is not None and facet_mask_base is not None:
+                    combined_mask = subset_mask & facet_mask_base
+                elif facet_mask_base is not None:
+                    combined_mask = facet_mask_base
+                else:
+                    combined_mask = subset_mask  # may be None
+
+                for corr_i, correction in enumerate(corrections_list):
+                    col = facet_i * n_corrections + corr_i
+                    ax = axes[row_i, col]
+                    _plot_one_grid(feat_name, ax, correction, combined_mask)
+                    # Prepend facet label to the title set by the plot function
+                    if facet_label is not None:
+                        current_title = ax.get_title()
+                        ax.set_title(f"{facet_by}={facet_label}\n{current_title}")
+
+        # Overall suptitle for multi-feature plots
+        if is_gene and len(feature_indices) > 1:
+            plt.suptitle(
+                f"{model.cis_gene} → {feature} (gene, n={len(feature_indices)} features)"
+            )
 
         if legend_outside:
             handles, labels = _collect_legend_handles(axes.ravel())
-            axes[-1, -1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5), loc='center left', frameon=False)
+            axes[-1, -1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5),
+                                loc='center left', frameon=False)
 
         _save_figure(fig, model, filename)
         return fig
 
-    # Single feature - use original code path
+    # ── Single-feature path (no faceting) ─────────────────────────────────────
     feature = feature_names_resolved[0]  # Use resolved feature name
-
-    # Route to distribution-specific plotting function
-    distribution = modality.distribution
 
     if distribution == 'negbinom':
         result = plot_negbinom_xy(
