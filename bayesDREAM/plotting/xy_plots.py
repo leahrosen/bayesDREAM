@@ -5580,6 +5580,10 @@ def plot_xy_data(
                     col = facet_i * n_corrections + corr_i
                     ax = axes[row_i, col]
                     _plot_one_grid(feat_name, ax, correction, combined_mask)
+                    # Strip the per-panel legend drawn by the plot function;
+                    # a single shared legend is drawn below for the whole grid.
+                    if ax.get_legend() is not None:
+                        ax.get_legend().remove()
                     # Prepend facet label to the title set by the plot function
                     if facet_label is not None:
                         current_title = ax.get_title()
@@ -5591,10 +5595,15 @@ def plot_xy_data(
                 f"{model.cis_gene} → {feature} (gene, n={len(feature_indices)} features)"
             )
 
-        if legend_outside:
-            handles, labels = _collect_legend_handles(axes.ravel())
-            axes[-1, -1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5),
-                                loc='center left', frameon=False)
+        # One shared legend for the whole grid (no duplicates across panels).
+        handles, labels = _collect_legend_handles(axes.ravel())
+        if handles:
+            if legend_outside:
+                # Anchor to the right edge of the figure (transFigure coords)
+                fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5),
+                           loc='center left', frameon=False)
+            else:
+                axes[-1, -1].legend(handles, labels, frameon=False)
 
         _save_figure(fig, model, filename)
         return fig
