@@ -5042,7 +5042,7 @@ def plot_xy_data(
     fdr_df=None,
     fdr_threshold: float = 0.05,
     color_by: Union[str, List[str]] = 'technical_group',
-    facet_by: Optional[str] = None,
+    facet_by: Optional[Union[str, List[str]]] = None,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -5145,35 +5145,45 @@ def plot_xy_data(
           label ``"K562 / NTC"``, ``"K562 / Targeting"``, etc.
         Alpha-y technical correction is always applied per technical group regardless
         of this setting.
-    facet_by : str, optional
-        Column name in ``model.meta`` to split into side-by-side panel columns
-        (default: ``None``).  Analogous to ``facet_grid`` in ggplot2.
+    facet_by : str or list of str, optional
+        Column name(s) in ``model.meta`` to facet by (default: ``None``).
+        Analogous to ``facet_grid`` in ggplot2.  Accepts either a single
+        string or a list of **at most two** strings:
 
-        **Grid layout** — when ``facet_by`` is set the figure grid becomes::
+        **1 column** (``facet_by='cell_line'``) — all unique values become
+        side-by-side column groups::
 
-            rows = n_features  (1 for a single feature)
-            cols = n_facets × n_corrections
+            rows = n_features,  cols = n_facets × n_corrections
 
-        For example, 3 cell lines with ``show_correction='both'`` produces a
-        1 × 6 grid: ``[K562 uncorr | K562 corr | TF1 uncorr | TF1 corr | …]``.
-        Each panel shows only the cells belonging to that facet value.
+        Example: 3 cell lines + ``show_correction='both'`` →  1 × 6 grid
+        ``[K562 uncorr | K562 corr | TF1 uncorr | TF1 corr | HL60 uncorr | HL60 corr]``
+
+        **2 columns** (``facet_by=['cell_line', 'perturbation']``) — first
+        column maps to grid *rows*, second column maps to grid *columns*::
+
+            rows = n_facet1_values × n_features
+            cols = n_facet2_values × n_corrections
+
+        Example: 3 cell lines × 2 perturbation types + ``show_correction='corrected'``
+        → 3 × 2 grid (cell lines as rows, perturbation types as columns).
 
         **Combining with other parameters:**
 
-        - ``subset_meta``: the facet mask is AND-combined with the global
+        - ``subset_meta``: each facet mask is AND-combined with the global
           ``subset_meta`` filter, so you can first narrow to CRISPRi cells and
           then facet by cell line within that subset.
-        - ``color_by``: works independently — e.g. ``facet_by='cell_line'``
-          separates cell lines into columns while
-          ``color_by='targeting'`` still draws separate NTC / Targeting lines
-          *within* each column.
+        - ``color_by``: works independently within each panel — e.g.
+          ``facet_by='cell_line'`` splits cell lines into columns while
+          ``color_by='targeting'`` still draws NTC / Targeting lines *inside*
+          each panel.
         - ``legend_outside=True``: recommended when faceting produces many
-          panels, to avoid legend clutter inside each small panel.
+          panels, to keep the shared legend out of the plot area.
 
         Facet labels appear as the first line of each panel title, e.g.
-        ``cell_line=K562``.  A warning is issued for columns with more than
-        20 unique values.  Not yet supported for ``multinomial`` distributions
-        (ignored with a warning in that case).
+        ``cell_line=K562`` or ``cell_line=K562  perturbation=CRISPRi``.
+        A warning is issued for columns with more than 20 unique values.
+        Not yet supported for ``multinomial`` distributions (ignored with a
+        warning in that case).
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
@@ -5266,7 +5276,7 @@ def plot_xy_data(
     >>> # Cross-product with a custom secondary grouping
     >>> model.plot_xy_data('GFI1B', color_by=['cell_line', 'perturbation_type'])
     >>>
-    >>> # ── facet_by examples ─────────────────────────────────────────────────
+    >>> # ── facet_by: 1-column (values → columns) ────────────────────────────
     >>> # One column-group of panels per cell line
     >>> # Grid: 1 row × (n_cell_lines × 2) cols  (default show_correction='both')
     >>> model.plot_xy_data('GFI1B', facet_by='cell_line')
@@ -5290,9 +5300,31 @@ def plot_xy_data(
     ...     subset_meta={'guide_type': 'CRISPRi'},
     ...     facet_by='cell_line')
     >>>
-    >>> # Multi-feature + facet: rows = features, cols = facets × corrections
+    >>> # ── facet_by: 2-column (proper row × col grid) ────────────────────────
+    >>> # First column → row groups, second column → column groups
+    >>> # Grid: n_cell_lines rows × n_perturbation_types cols (each corrected only)
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by=['cell_line', 'perturbation_type'],
+    ...     show_correction='corrected')
+    >>>
+    >>> # 2-D facet with color_by and log2FC; legend outside the grid
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by=['cell_line', 'perturbation_type'],
+    ...     color_by='targeting',
+    ...     show_correction='corrected',
+    ...     log2fc=True,
+    ...     legend_outside=True)
+    >>>
+    >>> # Multi-feature + 1-D facet: rows = features, cols = facets × corrections
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj',
     ...     facet_by='cell_line',
+    ...     show_correction='corrected',
+    ...     only_dependent=True)
+    >>>
+    >>> # Multi-feature + 2-D facet:
+    >>> # rows = n_cell_lines × n_features,  cols = n_perturb_types × n_corrections
+    >>> model.plot_xy_data('HES4', modality_name='splicing_sj',
+    ...     facet_by=['cell_line', 'perturbation_type'],
     ...     show_correction='corrected',
     ...     only_dependent=True)
     """
@@ -5347,29 +5379,51 @@ def plot_xy_data(
         # (subsetting here causes IndexError when mask is applied again in alignment)
 
     # Resolve facet groups (if facet_by is set).
-    # Each facet entry is (label, boolean_mask on model.meta rows).
-    # The mask is combined with subset_mask inside the grid loop.
-    facet_groups = None
+    # facet_by can be a single column name (str) or a list of 1-2 column names.
+    #   1 column  → all unique values become column groups (existing behaviour)
+    #   2 columns → first column → row groups, second column → column groups (2-D grid)
+    # Each group is a (label, boolean_mask on model.meta rows) pair.
+    facet_col_groups = None   # unique values of the *column* facet dimension
+    facet_row_groups = None   # unique values of the *row* facet dimension (2-column only)
+    _facet_by_list: List[str] = []  # normalised list, used for title-building later
+
     if facet_by is not None:
-        if facet_by not in model.meta.columns:
+        _facet_by_list = [facet_by] if isinstance(facet_by, str) else list(facet_by)
+        if len(_facet_by_list) > 2:
             raise ValueError(
-                f"facet_by='{facet_by}' not found in model.meta. "
-                f"Available columns: {list(model.meta.columns)}"
+                f"facet_by supports at most 2 columns (got {len(_facet_by_list)}). "
+                f"Pass a string for a 1-D column facet, or a list of two strings for a "
+                f"2-D row × column facet grid."
             )
-        fvals = sorted(model.meta[facet_by].dropna().unique(), key=str)
-        n_unique_facets = len(fvals)
-        if n_unique_facets > 20:
-            warnings.warn(
-                f"facet_by='{facet_by}' has {n_unique_facets} unique values — this will create "
-                f"{n_unique_facets} column groups. Consider a coarser grouping.",
-                UserWarning
-            )
-        elif n_unique_facets <= 1:
-            warnings.warn(
-                f"facet_by='{facet_by}' has {n_unique_facets} unique value(s) — faceting has no effect.",
-                UserWarning
-            )
-        facet_groups = [(str(v), (model.meta[facet_by] == v).values) for v in fvals]
+
+        def _resolve_facet_col(col: str, role: str):
+            """Return [(label, mask), ...] for one facet column; warn on edge cases."""
+            if col not in model.meta.columns:
+                raise ValueError(
+                    f"facet_by column '{col}' not found in model.meta. "
+                    f"Available columns: {list(model.meta.columns)}"
+                )
+            fvals = sorted(model.meta[col].dropna().unique(), key=str)
+            n_uniq = len(fvals)
+            if n_uniq > 20:
+                warnings.warn(
+                    f"facet_by='{col}' ({role}) has {n_uniq} unique values — this will "
+                    f"create {n_uniq} panel {role}s. Consider a coarser grouping.",
+                    UserWarning
+                )
+            elif n_uniq <= 1:
+                warnings.warn(
+                    f"facet_by='{col}' has {n_uniq} unique value(s) — faceting has no effect.",
+                    UserWarning
+                )
+            return [(str(v), (model.meta[col] == v).values) for v in fvals]
+
+        if len(_facet_by_list) == 1:
+            facet_col_groups = _resolve_facet_col(_facet_by_list[0], 'column')
+        else:
+            # Two columns: first → row groups, second → column groups
+            facet_row_groups = _resolve_facet_col(_facet_by_list[0], 'row')
+            facet_col_groups = _resolve_facet_col(_facet_by_list[1], 'column')
 
     # Get modality
     if modality_name is None:
@@ -5511,13 +5565,18 @@ def plot_xy_data(
             )
 
         # Standard grid for 2D distributions.
-        # Layout: rows = features,  cols = n_facets × n_corrections.
-        # Facets expand to the left (outermost), corrections nest inside each facet.
-        n_rows = len(feature_indices)
+        # Layout:
+        #   rows = n_facet_rows × n_features   (facet-row groups nest features)
+        #   cols = n_facet_cols × n_corrections (facet-col groups nest correction mode)
+        # When facet_by is a single column, facet_row_groups is None (n_facet_rows=1),
+        # so the layout reduces to rows=features, cols=n_facets×n_corrections as before.
+        n_features = len(feature_indices)
         corrections_list = ['uncorrected', 'corrected'] if show_correction == 'both' else [show_correction]
         n_corrections = len(corrections_list)
-        n_facets = len(facet_groups) if facet_groups else 1
-        n_cols = n_facets * n_corrections
+        n_facet_rows = len(facet_row_groups) if facet_row_groups else 1
+        n_facet_cols = len(facet_col_groups) if facet_col_groups else 1
+        n_rows = n_facet_rows * n_features
+        n_cols = n_facet_cols * n_corrections
 
         if figsize is None:
             figsize = (6 * n_cols, 3 * n_rows)
@@ -5563,31 +5622,39 @@ def plot_xy_data(
                 ax.text(0.5, 0.5, f"Grid not supported for {distribution}",
                         ha='center', va='center', transform=ax.transAxes)
 
-        # Iterate: features (rows) × facets × corrections (cols)
-        facet_iter = facet_groups if facet_groups else [(None, None)]
+        # Iterate: row-facets × features → grid rows;  col-facets × corrections → grid cols
+        facet_col_iter = facet_col_groups if facet_col_groups else [(None, None)]
+        facet_row_iter = facet_row_groups if facet_row_groups else [(None, None)]
 
-        for row_i, feat_name in enumerate(feature_names_resolved):
-            for facet_i, (facet_label, facet_mask_base) in enumerate(facet_iter):
-                # Combine global subset_mask with per-facet mask (AND logic)
-                if subset_mask is not None and facet_mask_base is not None:
-                    combined_mask = subset_mask & facet_mask_base
-                elif facet_mask_base is not None:
-                    combined_mask = facet_mask_base
-                else:
-                    combined_mask = subset_mask  # may be None
+        for frow_i, (frow_label, frow_mask) in enumerate(facet_row_iter):
+            for feat_i, feat_name in enumerate(feature_names_resolved):
+                grid_row = frow_i * n_features + feat_i
+                for fcol_i, (fcol_label, fcol_mask) in enumerate(facet_col_iter):
+                    # Combine all masks (global subset_mask AND row-facet AND col-facet)
+                    combined_mask = subset_mask
+                    for m in [frow_mask, fcol_mask]:
+                        if m is not None:
+                            combined_mask = (combined_mask & m
+                                             if combined_mask is not None else m)
 
-                for corr_i, correction in enumerate(corrections_list):
-                    col = facet_i * n_corrections + corr_i
-                    ax = axes[row_i, col]
-                    _plot_one_grid(feat_name, ax, correction, combined_mask)
-                    # Strip the per-panel legend drawn by the plot function;
-                    # a single shared legend is drawn below for the whole grid.
-                    if ax.get_legend() is not None:
-                        ax.get_legend().remove()
-                    # Prepend facet label to the title set by the plot function
-                    if facet_label is not None:
-                        current_title = ax.get_title()
-                        ax.set_title(f"{facet_by}={facet_label}\n{current_title}")
+                    for corr_i, correction in enumerate(corrections_list):
+                        grid_col = fcol_i * n_corrections + corr_i
+                        ax = axes[grid_row, grid_col]
+                        _plot_one_grid(feat_name, ax, correction, combined_mask)
+                        # Strip the per-panel legend — one shared legend is drawn below
+                        if ax.get_legend() is not None:
+                            ax.get_legend().remove()
+                        # Build title prefix from active facet labels
+                        title_parts = []
+                        if frow_label is not None:
+                            title_parts.append(f"{_facet_by_list[0]}={frow_label}")
+                        if fcol_label is not None:
+                            col_key = (_facet_by_list[1] if len(_facet_by_list) > 1
+                                       else _facet_by_list[0])
+                            title_parts.append(f"{col_key}={fcol_label}")
+                        if title_parts:
+                            current_title = ax.get_title()
+                            ax.set_title("  ".join(title_parts) + "\n" + current_title)
 
         # Overall suptitle for multi-feature plots
         if is_gene and len(feature_indices) > 1:
