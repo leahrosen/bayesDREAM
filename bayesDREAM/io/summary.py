@@ -1551,16 +1551,23 @@ class ModelSummarizer:
             if _x_ntc is not None:
                 data['x_ntc'] = _x_ntc
 
-            # Get y_ntc from trans modality's technical fit (per-feature, if not manually provided)
+            # Get y_ntc from trans modality's technical fit (per-feature, if not manually provided).
+            # mu_ntc from fit_technical has shape [n_samples, T] (one value per feature per sample;
+            # it encodes the reference-group NTC expression rate).
+            # We average over posterior samples to get the point estimate [T].
             if _y_ntc is None:
                 if hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
                     if 'mu_ntc' in modality.posterior_samples_technical:
                         mu_ntc_trans = modality.posterior_samples_technical['mu_ntc']
                         if isinstance(mu_ntc_trans, torch.Tensor):
                             mu_ntc_trans = mu_ntc_trans.cpu().numpy()
-                        # mu_ntc is [n_samples, n_groups, n_features]
-                        # Average over samples and groups to get [n_features] y_ntc
-                        _y_ntc = mu_ntc_trans.mean(axis=(0, 1))
+                        # mu_ntc shape: [n_samples, T]   (no groups dimension — mu_ntc is the
+                        # reference-group baseline; other groups are scaled by alpha_y_mul).
+                        # Collapse any unexpected leading dimensions beyond the last (feature) axis.
+                        while mu_ntc_trans.ndim > 2:
+                            mu_ntc_trans = mu_ntc_trans.mean(axis=0)
+                        # Average over posterior samples → [T] point estimate
+                        _y_ntc = mu_ntc_trans.mean(axis=0)
 
             if _y_ntc is not None:
                 data['y_ntc'] = _y_ntc

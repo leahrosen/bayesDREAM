@@ -3412,6 +3412,14 @@ def _compute_global_log2fc_offsets(
     so that all panels for the same feature share an identical NTC reference —
     even panels that contain no NTC cells (e.g. a "Targeting" facet column).
 
+    y_offset priority (consistent with ``save_trans_summary``):
+    1. ``mu_ntc`` from ``modality.posterior_samples_technical`` (model-smoothed reference-
+       group NTC expression rate from ``fit_technical``).  Shape [n_samples, T]; we take
+       the posterior mean for the requested feature.
+    2. Fallback (``fit_technical`` not run): empirical mean of ``y_obs / sum_factor`` for
+       NTC reference-group cells (group_code == 0), or all NTC cells if no reference group
+       is tagged.
+
     Returns
     -------
     (x_offset, y_offset) : (float, float)
@@ -3441,17 +3449,40 @@ def _compute_global_log2fc_offsets(
     x_ntc = x_true_aligned[is_ntc & (x_true_aligned > 0)]
     x_offset = np.log2(float(x_ntc.mean())) if len(x_ntc) > 0 else 0.0
 
-    # y_offset: reference group (group_code=0, alpha_y=1.0) NTC uncorrected expression
-    if 'technical_group_code' in meta_aligned.columns:
-        ntc_ref_mask = is_ntc & (meta_aligned['technical_group_code'].values == 0)
-    else:
-        ntc_ref_mask = is_ntc
-    y_ntc_expr = y_obs_aligned[ntc_ref_mask] / sf_aligned[ntc_ref_mask]
-    y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-    if len(y_ntc_valid) == 0:           # fallback: pooled NTC (all groups)
-        y_ntc_expr = y_obs_aligned[is_ntc] / sf_aligned[is_ntc]
+    # y_offset: use mu_ntc from technical fit when available (matches save_trans_summary).
+    # mu_ntc shape in posterior_samples_technical: [n_samples, T].
+    # It represents the reference-group NTC expression rate — the same quantity that
+    # save_trans_summary uses as y_ntc for log2FC parameter computation.
+    y_offset = None
+    if (hasattr(modality, 'posterior_samples_technical')
+            and modality.posterior_samples_technical is not None
+            and 'mu_ntc' in modality.posterior_samples_technical):
+        mu_ntc = modality.posterior_samples_technical['mu_ntc']
+        if hasattr(mu_ntc, 'cpu'):          # torch.Tensor
+            mu_ntc = mu_ntc.cpu().numpy()
+        mu_ntc = np.asarray(mu_ntc, dtype=float)
+        # Collapse any unexpected leading dims beyond (samples, features)
+        while mu_ntc.ndim > 2:
+            mu_ntc = mu_ntc.mean(axis=0)
+        # Average over posterior samples → [T], then pick this feature
+        mu_ntc_mean = mu_ntc.mean(axis=0)   # [T]
+        if feature_idx < len(mu_ntc_mean):
+            y_ntc_val = float(mu_ntc_mean[feature_idx])
+            if np.isfinite(y_ntc_val) and y_ntc_val > 0:
+                y_offset = np.log2(y_ntc_val)
+
+    if y_offset is None:
+        # Fallback: empirical NTC reference-group mean (when fit_technical not run)
+        if 'technical_group_code' in meta_aligned.columns:
+            ntc_ref_mask = is_ntc & (meta_aligned['technical_group_code'].values == 0)
+        else:
+            ntc_ref_mask = is_ntc
+        y_ntc_expr = y_obs_aligned[ntc_ref_mask] / sf_aligned[ntc_ref_mask]
         y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-    y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+        if len(y_ntc_valid) == 0:           # fallback: pooled NTC (all groups)
+            y_ntc_expr = y_obs_aligned[is_ntc] / sf_aligned[is_ntc]
+            y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+        y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
 
     return x_offset, y_offset
 
@@ -3630,17 +3661,40 @@ def plot_negbinom_xy(
             else:
                 warnings.warn("log2fc=True: no valid NTC cells found for x; plotting raw log2 instead.")
                 x_offset = 0.0
-            # y_offset from reference group (group_code=0) NTC; fall back to pooled if needed
-            if 'technical_group_code' in ntc_df.columns:
-                ntc_ref_df = ntc_df[ntc_df['technical_group_code'] == 0]
+            # y_offset: prefer mu_ntc from technical fit (same source as save_trans_summary).
+            # mu_ntc is the model-inferred reference-group NTC expression rate [n_samples, T].
+            # Fall back to empirical NTC reference-group mean when fit_technical not run.
+            _feature_idx = _get_feature_index(feature, modality)
+            _y_offset_from_technical = None
+            if (_feature_idx is not None
+                    and hasattr(modality, 'posterior_samples_technical')
+                    and modality.posterior_samples_technical is not None
+                    and 'mu_ntc' in modality.posterior_samples_technical):
+                _mu_ntc = modality.posterior_samples_technical['mu_ntc']
+                if hasattr(_mu_ntc, 'cpu'):
+                    _mu_ntc = _mu_ntc.cpu().numpy()
+                _mu_ntc = np.asarray(_mu_ntc, dtype=float)
+                while _mu_ntc.ndim > 2:
+                    _mu_ntc = _mu_ntc.mean(axis=0)
+                _mu_ntc_mean = _mu_ntc.mean(axis=0)   # [T]
+                if _feature_idx < len(_mu_ntc_mean):
+                    _val = float(_mu_ntc_mean[_feature_idx])
+                    if np.isfinite(_val) and _val > 0:
+                        _y_offset_from_technical = np.log2(_val)
+            if _y_offset_from_technical is not None:
+                y_offset = _y_offset_from_technical
             else:
-                ntc_ref_df = ntc_df
-            y_ntc_expr = ntc_ref_df['y_obs'] / ntc_ref_df['sum_factor']
-            y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-            if len(y_ntc_valid) == 0:  # fallback to pooled if reference group has no NTC
-                y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+                # Empirical fallback: reference-group NTC mean
+                if 'technical_group_code' in ntc_df.columns:
+                    ntc_ref_df = ntc_df[ntc_df['technical_group_code'] == 0]
+                else:
+                    ntc_ref_df = ntc_df
+                y_ntc_expr = ntc_ref_df['y_obs'] / ntc_ref_df['sum_factor']
                 y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-            y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+                if len(y_ntc_valid) == 0:  # fallback to pooled if reference group has no NTC
+                    y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+                    y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+                y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
     else:
         x_offset = 0.0
         y_offset = 0.0
