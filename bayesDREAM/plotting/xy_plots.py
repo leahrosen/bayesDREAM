@@ -5146,9 +5146,16 @@ def plot_xy_data(
         Alpha-y technical correction is always applied per technical group regardless
         of this setting.
     facet_by : str or list of str, optional
-        Column name(s) in ``model.meta`` to facet by (default: ``None``).
-        Analogous to ``facet_grid`` in ggplot2.  Accepts either a single
-        string or a list of **at most two** strings:
+        Column name(s) to facet by (default: ``None``).  Accepts either a
+        single string or a list of **at most two** strings.  Each value may be
+        a real column name in ``model.meta`` **or** one of the same special
+        keywords supported by ``color_by``:
+
+        - ``'targeting'`` — two panels: ``NTC`` / ``Targeting``
+          (derived from ``model.meta['target']``)
+        - ``'technical_group'`` — one panel per technical group code
+
+        Analogous to ``facet_grid`` in ggplot2.
 
         **1 column** (``facet_by='cell_line'``) — all unique values become
         side-by-side column groups::
@@ -5397,11 +5404,45 @@ def plot_xy_data(
             )
 
         def _resolve_facet_col(col: str, role: str):
-            """Return [(label, mask), ...] for one facet column; warn on edge cases."""
+            """Return [(label, mask), ...] for one facet column; warn on edge cases.
+
+            Supports the same special keywords as color_by:
+              'targeting'       → two groups: NTC / Targeting
+              'technical_group' → one group per technical_group_code
+            Any other value is looked up as a column in model.meta.
+            """
+            # ── Special keyword: 'targeting' ──────────────────────────────────
+            if col == 'targeting':
+                if 'target' not in model.meta.columns:
+                    raise ValueError(
+                        "facet_by='targeting' requires a 'target' column in model.meta."
+                    )
+                ntc_mask = (model.meta['target'].str.lower() == 'ntc').values
+                return [('NTC', ntc_mask), ('Targeting', ~ntc_mask)]
+
+            # ── Special keyword: 'technical_group' ────────────────────────────
+            if col == 'technical_group':
+                if 'technical_group_code' not in model.meta.columns:
+                    warnings.warn(
+                        "facet_by='technical_group' requires technical_group_code in "
+                        "model.meta. Using a single 'All' group.",
+                        UserWarning
+                    )
+                    return [('All', np.ones(len(model.meta), dtype=bool))]
+                grp_labels = get_technical_group_labels(model)
+                codes = np.sort(model.meta['technical_group_code'].unique())
+                return [
+                    (grp_labels[int(c)] if int(c) < len(grp_labels) else str(int(c)),
+                     (model.meta['technical_group_code'] == c).values)
+                    for c in codes
+                ]
+
+            # ── Regular model.meta column ─────────────────────────────────────
             if col not in model.meta.columns:
                 raise ValueError(
                     f"facet_by column '{col}' not found in model.meta. "
-                    f"Available columns: {list(model.meta.columns)}"
+                    f"Available columns: {list(model.meta.columns)}\n"
+                    f"Special keywords also accepted: 'targeting', 'technical_group'."
                 )
             fvals = sorted(model.meta[col].dropna().unique(), key=str)
             n_uniq = len(fvals)
