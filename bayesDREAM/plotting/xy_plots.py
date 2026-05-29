@@ -3370,15 +3370,28 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
     )
 
 
-def _draw_hill_markers(ax, markers):
-    """Draw Hill parameter marker lines (axhline / axvline) on ax."""
+def _draw_hill_markers(ax, markers, x_offset=0.0, y_offset=0.0):
+    """Draw Hill parameter marker lines (axhline / axvline) on ax.
+
+    Parameters
+    ----------
+    x_offset, y_offset : float
+        Subtract these from x/y marker values before drawing.  Pass the
+        log2FC offsets (log2(x_ntc), log2(y_ntc)) when the plot axes are in
+        log2FC space so that markers align with the shifted data.  Labels are
+        automatically updated to say ``log2FC(...)`` when offsets are non-zero.
+    """
+    in_log2fc = (x_offset != 0.0 or y_offset != 0.0)
     for m in markers:
+        label = m['label']
+        if in_log2fc:
+            label = label.replace('log2(', 'log2FC(')
         kw = dict(linestyle=m['linestyle'], color=m['color'],
-                  alpha=m['alpha'], linewidth=1, label=m['label'])
+                  alpha=m['alpha'], linewidth=1, label=label)
         if m['axis'] == 'h':
-            ax.axhline(m['value'], **kw)
+            ax.axhline(m['value'] - y_offset, **kw)
         elif m['axis'] == 'v':
-            ax.axvline(m['value'], **kw)
+            ax.axvline(m['value'] - x_offset, **kw)
 
 
 # ============================================================================
@@ -3909,7 +3922,13 @@ def plot_negbinom_xy(
                     ci_level=ci_level, log2_space=True, y_scale=1.0,
                     fdr_df=_effective_fdr_df, fdr_threshold=fdr_threshold,
                 )
-                _draw_hill_markers(ax_plot, _markers)
+                # In log2FC mode the axes are shifted; pass the same offsets so
+                # that parameter lines (A, Vmax ceiling, EC50) land at the correct
+                # positions — consistent with A_log2fc / EC50_*_log2fc in
+                # save_trans_summary.
+                _draw_hill_markers(ax_plot, _markers,
+                                   x_offset=x_offset if log2fc else 0.0,
+                                   y_offset=y_offset if log2fc else 0.0)
 
             # Reference curve overlay (from trans_summary DataFrame)
             if reference_df is not None and (corrected or not has_technical_fit):
