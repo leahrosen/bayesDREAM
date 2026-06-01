@@ -5936,6 +5936,27 @@ def plot_xy_data(
                             current_title = ax.get_title()
                             ax.set_title("  ".join(title_parts) + "\n" + current_title)
 
+        # ── Uniform axis limits across all panels ────────────────────────────
+        # Each panel has already set its own limits via set_xlim / set_ylim.
+        # Now compute the union across all panels so every facet shares the
+        # same range (the maximum that covers all of them).
+        _all_xlims = []
+        _all_ylims = []
+        for _ax in axes.ravel():
+            # Skip axes that have no plotted lines (empty panels)
+            if not _ax.lines and not _ax.collections:
+                continue
+            _all_xlims.append(_ax.get_xlim())
+            _all_ylims.append(_ax.get_ylim())
+        if _all_xlims:
+            _shared_x = (min(lo for lo, hi in _all_xlims),
+                         max(hi for lo, hi in _all_xlims))
+            _shared_y = (min(lo for lo, hi in _all_ylims),
+                         max(hi for lo, hi in _all_ylims))
+            for _ax in axes.ravel():
+                _ax.set_xlim(_shared_x)
+                _ax.set_ylim(_shared_y)
+
         # Overall suptitle for multi-feature plots
         if is_gene and len(feature_indices) > 1:
             plt.suptitle(
