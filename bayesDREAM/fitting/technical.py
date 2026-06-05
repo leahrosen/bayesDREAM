@@ -253,44 +253,49 @@ class TechnicalFitter:
                     "These should have been filtered out in fit_technical()."
                 )
         
-            # ---- Cell-line logits α for NON-baseline groups (baseline=0 implicit) ----
-            with pyro.plate("c_plate_multi", C - 1, dim=-3), \
-                 pyro.plate("f_plate_multi", T, dim=-2), \
-                 pyro.plate("k_plate", K, dim=-1):
-                alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=self._t(0.0), scale=self._t(20.0)))
-        
-            # Force α to 0 where category is structurally absent
-            alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-
-            # Center over ACTIVE categories only.
-            # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
-            # Dividing by n_active (not K) gives the correct softmax centering constraint
-            # (sum of active alphas = 0).  Dividing by K would leave a residual constant
-            # shift in the active alphas, breaking identifiability for features with
-            # many phantom categories.
-            n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
-            active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
-            alpha_logits_y = alpha_logits_y - active_mean
-            alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-            alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
-        
-            # Build full [C, T, K] (or [S, C, T, K]) with baseline=0
-            if alpha_logits_y.dim() == 3:
-                alpha_full_add_logits = torch.cat(
-                    [torch.zeros(1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
-                     alpha_logits_y.to(self.model.device)], dim=0
-                )
-            elif alpha_logits_y.dim() == 4:
-                S = alpha_logits_y.size(0)
-                alpha_full_add_logits = torch.cat(
-                    [torch.zeros(S, 1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
-                     alpha_logits_y.to(self.model.device)], dim=1
-                )
+            if C == 1:
+                # No group effects to estimate — trivial correction
+                alpha_full_mul = None
+                alpha_full_add = torch.zeros(1, T, K, device=self.model.device)
             else:
-                raise ValueError(f"Unexpected alpha_logits_y shape: {tuple(alpha_logits_y.shape)}")
-        
-            alpha_full_mul = None
-            alpha_full_add = alpha_full_add_logits
+                # ---- Cell-line logits α for NON-baseline groups (baseline=0 implicit) ----
+                with pyro.plate("c_plate_multi", C - 1, dim=-3), \
+                     pyro.plate("f_plate_multi", T, dim=-2), \
+                     pyro.plate("k_plate", K, dim=-1):
+                    alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=self._t(0.0), scale=self._t(20.0)))
+
+                # Force α to 0 where category is structurally absent
+                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
+
+                # Center over ACTIVE categories only.
+                # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
+                # Dividing by n_active (not K) gives the correct softmax centering constraint
+                # (sum of active alphas = 0).  Dividing by K would leave a residual constant
+                # shift in the active alphas, breaking identifiability for features with
+                # many phantom categories.
+                n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
+                active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
+                alpha_logits_y = alpha_logits_y - active_mean
+                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
+                alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
+
+                # Build full [C, T, K] (or [S, C, T, K]) with baseline=0
+                if alpha_logits_y.dim() == 3:
+                    alpha_full_add_logits = torch.cat(
+                        [torch.zeros(1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
+                         alpha_logits_y.to(self.model.device)], dim=0
+                    )
+                elif alpha_logits_y.dim() == 4:
+                    S = alpha_logits_y.size(0)
+                    alpha_full_add_logits = torch.cat(
+                        [torch.zeros(S, 1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
+                         alpha_logits_y.to(self.model.device)], dim=1
+                    )
+                else:
+                    raise ValueError(f"Unexpected alpha_logits_y shape: {tuple(alpha_logits_y.shape)}")
+
+                alpha_full_mul = None
+                alpha_full_add = alpha_full_add_logits
 
             #print(f'[DEBUG], alpha_logits_y shape = {alpha_logits_y.shape}, expect [C-1={C-1}, T={T}, K={K}')
             #print(f'[DEBUG], alpha_full_add shape = {alpha_full_add.shape}')
@@ -298,81 +303,85 @@ class TechnicalFitter:
             # ----------------------------
             # Shared cell-line effects for non-multinomial dists
             # ----------------------------
-            if distribution in ("normal", "studentt"):
-                # For Normal we want additive shifts on the ORIGINAL scale,
-                # with a width that reflects the data:
-                #   alpha ~ StudentT(ν=3, loc=0, scale ~ robust_SD / sqrt(N))
-                #
-                # mu_x_sd_tensor is [T] and encodes robust SD (MAD-based) / sqrt(N).
-                alpha_scale = mu_x_sd_tensor.clamp_min(epsilon_tensor)
-            
-                with f_plate:
-                    with c_plate:  # [C-1, T]
-                        # Name kept as log2_alpha_y for backwards compatibility;
-                        # for Normal it is *literally* the additive shift in y-units.
-                        log2_alpha_y = pyro.sample(
-                            "log2_alpha_y",
-                            dist.StudentT(
-                                df=self._t(3),
-                                loc=self._t(0.0),
-                                scale=alpha_scale,        # [T], broadcast to [C-1, T]
-                            ),
-                        )
-            
-                        # For Normal we don't *use* multiplicative effects at all:
-                        # keep alpha_y_mul around for API compatibility, but fix it to 1.
-                        alpha_y_mul = pyro.deterministic(
-                            "alpha_y_mul",
-                            torch.ones_like(log2_alpha_y)
-                        )
-            
-                        # Additive shift on the mean
-                        delta_y_add = pyro.deterministic(
-                            "delta_y_add",
-                            log2_alpha_y          # direct additive shift on mean
-                        )
-
-
+            if C == 1:
+                # No group effects to estimate — trivial correction tensors
+                alpha_full_mul = torch.ones(1, T, device=self.model.device)
+                alpha_full_add = torch.zeros(1, T, device=self.model.device)
             else:
-                # Original behaviour for negbinom / binomial, etc.
-                with f_plate:
-                    with c_plate:  # [C-1, T]
-                        log2_alpha_y = pyro.sample(
-                            "log2_alpha_y",
-                            dist.StudentT(
-                                df=self._t(3),
-                                loc=self._t(0.0),
-                                scale=self._t(20.0),
-                            ),
-                        )
-                        alpha_y_mul = pyro.deterministic(
-                            "alpha_y_mul", self._t(2.0) ** log2_alpha_y
-                        )
-                        delta_y_add = pyro.deterministic(
-                            "delta_y_add", log2_alpha_y
-                        )
+                if distribution in ("normal", "studentt"):
+                    # For Normal we want additive shifts on the ORIGINAL scale,
+                    # with a width that reflects the data:
+                    #   alpha ~ StudentT(ν=3, loc=0, scale ~ robust_SD / sqrt(N))
+                    #
+                    # mu_x_sd_tensor is [T] and encodes robust SD (MAD-based) / sqrt(N).
+                    alpha_scale = mu_x_sd_tensor.clamp_min(epsilon_tensor)
 
-            if alpha_y_mul.ndim == 2:
-                alpha_full_mul = torch.cat(
-                    [torch.ones(1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
-                    dim=0
-                )
-                alpha_full_add = torch.cat(
-                    [torch.zeros(1, T, device=self.model.device), delta_y_add.to(self.model.device)],
-                    dim=0
-                )
-            elif alpha_y_mul.ndim == 3:
-                S = alpha_y_mul.size(0)
-                alpha_full_mul = torch.cat(
-                    [torch.ones(S, 1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
-                    dim=1
-                )
-                alpha_full_add = torch.cat(
-                    [torch.zeros(S, 1, T, device=self.model.device), delta_y_add.to(self.model.device)],
-                    dim=1
-                )
-            else:
-                raise ValueError(f"Unexpected alpha/log2 shapes: {alpha_y_mul.shape}, {delta_y_add.shape}")
+                    with f_plate:
+                        with c_plate:  # [C-1, T]
+                            # Name kept as log2_alpha_y for backwards compatibility;
+                            # for Normal it is *literally* the additive shift in y-units.
+                            log2_alpha_y = pyro.sample(
+                                "log2_alpha_y",
+                                dist.StudentT(
+                                    df=self._t(3),
+                                    loc=self._t(0.0),
+                                    scale=alpha_scale,        # [T], broadcast to [C-1, T]
+                                ),
+                            )
+
+                            # For Normal we don't *use* multiplicative effects at all:
+                            # keep alpha_y_mul around for API compatibility, but fix it to 1.
+                            alpha_y_mul = pyro.deterministic(
+                                "alpha_y_mul",
+                                torch.ones_like(log2_alpha_y)
+                            )
+
+                            # Additive shift on the mean
+                            delta_y_add = pyro.deterministic(
+                                "delta_y_add",
+                                log2_alpha_y          # direct additive shift on mean
+                            )
+
+                else:
+                    # Original behaviour for negbinom / binomial, etc.
+                    with f_plate:
+                        with c_plate:  # [C-1, T]
+                            log2_alpha_y = pyro.sample(
+                                "log2_alpha_y",
+                                dist.StudentT(
+                                    df=self._t(3),
+                                    loc=self._t(0.0),
+                                    scale=self._t(20.0),
+                                ),
+                            )
+                            alpha_y_mul = pyro.deterministic(
+                                "alpha_y_mul", self._t(2.0) ** log2_alpha_y
+                            )
+                            delta_y_add = pyro.deterministic(
+                                "delta_y_add", log2_alpha_y
+                            )
+
+                if alpha_y_mul.ndim == 2:
+                    alpha_full_mul = torch.cat(
+                        [torch.ones(1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
+                        dim=0
+                    )
+                    alpha_full_add = torch.cat(
+                        [torch.zeros(1, T, device=self.model.device), delta_y_add.to(self.model.device)],
+                        dim=0
+                    )
+                elif alpha_y_mul.ndim == 3:
+                    S = alpha_y_mul.size(0)
+                    alpha_full_mul = torch.cat(
+                        [torch.ones(S, 1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
+                        dim=1
+                    )
+                    alpha_full_add = torch.cat(
+                        [torch.zeros(S, 1, T, device=self.model.device), delta_y_add.to(self.model.device)],
+                        dim=1
+                    )
+                else:
+                    raise ValueError(f"Unexpected alpha/log2 shapes: {alpha_y_mul.shape}, {delta_y_add.shape}")
 
         #print(f'[DEBUG], alpha_full_add shape = {alpha_full_add.shape}')
     
@@ -602,7 +611,7 @@ class TechnicalFitter:
     ########################################################
     # Step 1: Optional Prefit for alpha_y (NTC only)
     ########################################################
-    def fit_technical(
+    def fit_ntc(
         self,
         sum_factor_col: str = 'sum_factor',
         lr: float = 1e-3,
@@ -768,10 +777,12 @@ class TechnicalFitter:
             raise ValueError(f"Distribution '{distribution}' requires denominator parameter")
     
         if "technical_group_code" not in self.model.meta.columns:
-            raise ValueError(
-                "technical_group_code not set. Call set_technical_groups(covariates) before fit_technical().\n"
-                "Example: model.set_technical_groups(['cell_line'])"
+            warnings.warn(
+                "technical_group_code not set — assuming single group (no technical covariate correction). "
+                "Call set_technical_groups(['cell_line', ...]) before fit_ntc() if you have multiple batches or cell lines.",
+                UserWarning,
             )
+            self.model.meta["technical_group_code"] = 0
     
         print("Running prefit_cellline...")
     
@@ -1851,7 +1862,23 @@ class TechnicalFitter:
         # Back-compat: some guides name the mult version "alpha_y_mul"
         if "alpha_y" not in posterior_samples and "alpha_y_mul" in posterior_samples:
             posterior_samples["alpha_y"] = posterior_samples["alpha_y_mul"]
-    
+
+        # C == 1: no group effects were sampled — synthesise trivial posterior entries so
+        # the reconstruction code below sees consistent shapes.
+        if C == 1:
+            _ref_tensor = posterior_samples.get("o_y", posterior_samples.get("mu_ntc"))
+            _S = _ref_tensor.shape[0] if _ref_tensor is not None else 1
+            if distribution != "multinomial":
+                posterior_samples.setdefault("log2_alpha_y", torch.zeros(_S, 0, T_fit))
+                posterior_samples.setdefault("alpha_y_mul",  torch.ones( _S, 0, T_fit))
+                posterior_samples.setdefault("delta_y_add",  torch.zeros(_S, 0, T_fit))
+                posterior_samples.setdefault("alpha_y",      torch.ones( _S, 0, T_fit))
+            else:
+                _K_local = K if K is not None else 1
+                posterior_samples.setdefault("alpha_logits_y",          torch.zeros(_S, 0, T_fit, _K_local))
+                posterior_samples.setdefault("alpha_logits_y_centered", torch.zeros(_S, 0, T_fit, _K_local))
+                posterior_samples.setdefault("alpha_y",                 torch.zeros(_S, 0, T_fit, _K_local))
+
         def _reconstruct_full_2d(alpha_fit, baseline_value, fit_mask_bool):
             fit_idx = np.where(fit_mask_bool)[0]
             if alpha_fit.dim() == 3:           # [S, C-1, T_fit]
@@ -2185,5 +2212,5 @@ class TechnicalFitter:
         pyro.clear_param_store()
         import gc; gc.collect()
     
-        print("Finished fit_technical.")
+        print("Finished fit_ntc.")
 

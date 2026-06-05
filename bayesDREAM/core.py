@@ -1693,9 +1693,15 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         """Delegate to TechnicalFitter."""
         return self._technical_fitter.set_technical_groups(*args, **kwargs)
 
-    def fit_technical(self, *args, **kwargs):
+    def fit_ntc(self, *args, **kwargs):
         """Delegate to TechnicalFitter."""
-        return self._technical_fitter.fit_technical(*args, **kwargs)
+        return self._technical_fitter.fit_ntc(*args, **kwargs)
+
+    def fit_technical(self, *args, **kwargs):
+        """Deprecated alias for fit_ntc(). Use fit_ntc() instead."""
+        import warnings
+        warnings.warn("fit_technical() is deprecated — use fit_ntc() instead.", DeprecationWarning, stacklevel=2)
+        return self.fit_ntc(*args, **kwargs)
 
     def _model_x(self, *args, **kwargs):
         """Delegate to CisFitter."""

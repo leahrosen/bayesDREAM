@@ -50,8 +50,6 @@ class CisFitter:
         guides_tensor,
         x_obs_tensor,
         sum_factor_tensor,
-        beta_o_alpha_tensor,
-        beta_o_beta_tensor,
         alpha_alpha_mu_tensor,
         mu_x_mean_tensor,
         mu_x_sd_tensor,
@@ -82,26 +80,12 @@ class CisFitter:
         ####################
         ## Overdispersion ##
         ####################
-        if (o_x_sample is None) and (groups_tensor is not None):
-            #with cfull_plate:
-            #    beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
-            #    o_x = pyro.sample("o_x", dist.Exponential(beta_o))
-            #    phi_x = 1 / (o_x**2)
-            beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
-            o_x = pyro.sample("o_x", dist.Exponential(beta_o))
-            phi_x = 1 / (o_x**2)
-            #phi_x_used = phi_x[..., groups_tensor] # shape => [N]
-            phi_x_used = phi_x
-        elif (o_x_sample is not None) and (groups_tensor is not None):
-            phi_x = 1/(o_x_sample ** 2)
-            phi_x_used = phi_x[..., groups_tensor]
-        else:
-            ####################
-            ## Overdispersion ##
-            ####################
-            beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
-            o_x = pyro.sample("o_x", dist.Exponential(beta_o))
-            phi_x_used = (1 / (o_x**2))
+        if o_x_sample is None:
+            raise ValueError(
+                "o_x_sample is required for fit_cis. "
+                "Run fit_ntc() before fit_cis() to estimate cis gene overdispersion from NTC cells."
+            )
+        phi_x_used = 1.0 / (o_x_sample ** 2)
 
         ###############################
         ## Mixture model for x_eff_g ##
@@ -217,9 +201,7 @@ class CisFitter:
         niters: int = 100_000,
         nsamples: int = 1000,
         alpha_ewma: float = 0.05,
-        tolerance: float = 1e-4, # recommended to keep based on cell2location
-        beta_o_beta: float = 3, # recommended to keep based on cell2location
-        beta_o_alpha: float = 9, # recommended to keep based on cell2location
+        tolerance: float = 1e-4,
         alpha_alpha_mu: float = 5.8,
         epsilon: float = 1e-6,
         alpha_dirichlet: float = 0.1,
@@ -542,9 +524,19 @@ class CisFitter:
             # Adjust x_obs_factored by alpha_x_used
             x_obs_factored /= alpha_x_used  # Ensure correct shape for division
         
-        # Continue with the rest of the setup
-        beta_o_alpha_tensor = torch.tensor(beta_o_alpha, dtype=torch.float32, device=self.model.device)
-        beta_o_beta_tensor = torch.tensor(beta_o_beta, dtype=torch.float32, device=self.model.device)
+        # --- Extract o_x from the technical fit (cis modality posterior) ---
+        cis_modality = self.model.get_modality('cis')
+        if (cis_modality.posterior_samples_technical is None
+                or 'o_x' not in cis_modality.posterior_samples_technical):
+            raise ValueError(
+                "Cis gene overdispersion not found. Run fit_ntc() before fit_cis().\n"
+                "fit_ntc() estimates o_x for the cis gene from NTC cells, which is required "
+                "to set a data-driven overdispersion prior instead of the generic Gamma(9,3)."
+            )
+        o_x_technical = float(cis_modality.posterior_samples_technical['o_x'].mean().item())
+        o_x_sample = torch.tensor(o_x_technical, dtype=torch.float32, device=self.model.device)
+        print(f"[INFO] fit_cis: using technical o_x = {o_x_technical:.4f} (phi = {1/o_x_technical**2:.2f})")
+
         alpha_alpha_mu_tensor = torch.tensor(alpha_alpha_mu, dtype=torch.float32, device=self.model.device)
         alpha_dirichlet_tensor = torch.tensor(alpha_dirichlet, dtype=torch.float32, device=self.model.device)
         epsilon_tensor = torch.tensor(epsilon, dtype=torch.float32, device=self.model.device)
@@ -653,11 +645,9 @@ class CisFitter:
         original_device = self.model.device
         losses = []
         smoothed_loss = None
+        alpha_x_sample_loop = self.model.alpha_x_prefit if self.model.alpha_x_prefit is not None else None
+
         for step in range(niters):
-            # alpha_x_prefit is always [C] (mean point estimate)
-            alpha_x_sample = self.model.alpha_x_prefit if self.model.alpha_x_prefit is not None else None
-            o_x_sample = None
-            
             loss = svi.step(
                 N,
                 G,
@@ -665,17 +655,15 @@ class CisFitter:
                 guides_tensor,
                 x_obs_tensor,
                 sum_factor_tensor,
-                beta_o_alpha_tensor,
-                beta_o_beta_tensor,
                 alpha_alpha_mu_tensor,
                 mu_x_mean_tensor,
                 mu_x_sd_tensor,
                 sigma_eff_mean_tensor.clamp(min=1e-2),
                 sigma_eff_sd_tensor.clamp(min=1e-2),
                 epsilon_tensor,
-                C = C,
+                C=C,
                 groups_tensor=groups_tensor,
-                alpha_x_sample=alpha_x_sample,
+                alpha_x_sample=alpha_x_sample_loop,
                 o_x_sample=o_x_sample,
                 target_per_guide_tensor=target_per_guide_tensor,
                 independent_mu_sigma=independent_mu_sigma,
@@ -711,8 +699,6 @@ class CisFitter:
                 "guides_tensor": self._to_cpu(guides_tensor),
                 "x_obs_tensor": self._to_cpu(x_obs_tensor),
                 "sum_factor_tensor": self._to_cpu(sum_factor_tensor),
-                "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
-                "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
                 "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
                 "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
                 "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
@@ -722,7 +708,7 @@ class CisFitter:
                 "C": C,
                 "groups_tensor": self._to_cpu(groups_tensor),
                 "alpha_x_sample": self._to_cpu(self.model.alpha_x_prefit),
-                "o_x_sample": None,
+                "o_x_sample": self._to_cpu(o_x_sample),
                 "target_per_guide_tensor": self._to_cpu(target_per_guide_tensor),
                 "independent_mu_sigma": independent_mu_sigma,
             }
@@ -734,8 +720,6 @@ class CisFitter:
                 "guides_tensor": guides_tensor,
                 "x_obs_tensor": x_obs_tensor,
                 "sum_factor_tensor": sum_factor_tensor,
-                "beta_o_alpha_tensor": beta_o_alpha_tensor,
-                "beta_o_beta_tensor": beta_o_beta_tensor,
                 "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
                 "mu_x_mean_tensor": mu_x_mean_tensor,
                 "mu_x_sd_tensor": mu_x_sd_tensor,
@@ -745,7 +729,7 @@ class CisFitter:
                 "C": C,
                 "groups_tensor": groups_tensor,
                 "alpha_x_sample": self.model.alpha_x_prefit,
-                "o_x_sample": None,
+                "o_x_sample": o_x_sample,
                 "target_per_guide_tensor": target_per_guide_tensor if target_per_guide_tensor is not None else None,
                 "independent_mu_sigma": independent_mu_sigma,
             }

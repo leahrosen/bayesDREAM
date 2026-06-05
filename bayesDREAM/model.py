@@ -86,6 +86,7 @@ class bayesDREAM(
         require_ntc: bool = True,
         min_count: int = 1,
         color_scheme: 'ColorScheme' = None,
+        allow_unexpressed_cis: bool = False,
     ):
         """
         Initialize bayesDREAM.
@@ -169,6 +170,12 @@ class bayesDREAM(
             Color scheme for visualizations. If None, auto-built from model
             metadata via ``ColorScheme.from_model(self)`` after initialization.
             Can also be set later via ``set_color_scheme()``.
+        allow_unexpressed_cis : bool, default=False
+            If False (default), raises ValueError when the cis gene falls in
+            the lowest-mean GMM component of log2 sum-factor-normalized NTC
+            expression — indicating it is not meaningfully expressed in NTC
+            cells and overdispersion estimation will be unreliable.
+            Set to True to suppress this error (a warning is still issued).
 
         Raises
         ------
@@ -177,6 +184,7 @@ class bayesDREAM(
             - If cis_feature not found in counts
             - If cis_feature has zero variance
             - If primary modality would be empty after filtering
+            - If cis gene appears unexpressed in NTC cells (unless allow_unexpressed_cis=True)
 
         Examples
         --------
@@ -358,6 +366,11 @@ class bayesDREAM(
         # Must run AFTER super().__init__() and cell subsetting so self.meta is final.
         self._init_sum_factors(sum_factor_col)
 
+        # Check that cis gene is expressed in NTC cells.
+        # Must run AFTER _init_sum_factors so sum_factors are available.
+        if cis_feature is not None:
+            self._check_cis_expression_in_ntc(allow_unexpressed_cis=allow_unexpressed_cis)
+
         # Colour scheme — user-supplied or auto-built from model metadata.
         # Must run AFTER super().__init__() so self.meta / guide_meta are final.
         if color_scheme is not None:
@@ -413,6 +426,251 @@ class bayesDREAM(
 
         print(f"[INIT] sum_factors initialised on '{self.primary_modality}' "
               f"with columns: {list(primary_mod.sum_factors.columns)}")
+
+    def _check_cis_expression_in_ntc(self, allow_unexpressed_cis: bool = False):
+        """
+        Check whether the cis gene is meaningfully expressed in NTC cells.
+
+        Fits a 3-component Gaussian mixture model to per-gene log2
+        sum-factor-normalized mean expression across NTC cells.  If the cis
+        gene falls in the lowest-mean component, it is considered unexpressed
+        in NTC cells, and overdispersion estimation in fit_ntc()/fit_cis()
+        will be unreliable.
+
+        Parameters
+        ----------
+        allow_unexpressed_cis : bool
+            If False, raises ValueError; if True, issues a warning instead.
+        """
+        if 'cis' not in self.modalities:
+            return
+        if 'target' not in self.meta.columns:
+            warnings.warn(
+                "Cannot check cis expression in NTC cells: no 'target' column in meta. "
+                "Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        ntc_meta = self.meta[self.meta['target'] == 'ntc']
+        if len(ntc_meta) == 0:
+            warnings.warn("No NTC cells found. Skipping unexpressed-cis check.", UserWarning)
+            return
+
+        primary_mod = self.modalities[self.primary_modality]
+        if primary_mod.sum_factors is None or primary_mod.sum_factors.empty:
+            warnings.warn(
+                "No sum_factors available. Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        sf_col = primary_mod.sum_factors.columns[0]
+        ntc_cells = ntc_meta['cell'].values
+
+        try:
+            ntc_sf = primary_mod.sum_factors.loc[ntc_cells, sf_col].values.astype(float)
+        except KeyError:
+            warnings.warn(
+                "Cannot align NTC cells with sum_factors. Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        # Replace zero sum factors with median to avoid division by zero
+        pos_sf = ntc_sf[ntc_sf > 0]
+        median_sf = float(np.median(pos_sf)) if len(pos_sf) > 0 else 1.0
+        ntc_sf = np.where(ntc_sf > 0, ntc_sf, median_sf)
+
+        # --- Cis gene mean log2 expression in NTC cells ---
+        cis_mod = self.modalities['cis']
+        if cis_mod.cell_names is None:
+            warnings.warn(
+                "Cis modality has no cell names. Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        cell_to_col_cis = {c: i for i, c in enumerate(cis_mod.cell_names)}
+        ntc_cells_found = [c for c in ntc_cells if c in cell_to_col_cis]
+        ntc_col_idx_cis = np.array([cell_to_col_cis[c] for c in ntc_cells_found], dtype=int)
+
+        if len(ntc_col_idx_cis) == 0:
+            warnings.warn(
+                "No NTC cells found in cis modality. Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        cis_counts_raw = cis_mod.counts  # shape (1, n_cells), cells_axis=1
+        if hasattr(cis_counts_raw, 'toarray'):
+            cis_ntc = np.asarray(cis_counts_raw[0, ntc_col_idx_cis].toarray()).flatten()
+        elif isinstance(cis_counts_raw, pd.DataFrame):
+            cis_ntc = cis_counts_raw.iloc[0, ntc_col_idx_cis].values.astype(float)
+        else:
+            cis_ntc = np.asarray(cis_counts_raw[0, ntc_col_idx_cis]).flatten().astype(float)
+
+        cis_ntc_sf = primary_mod.sum_factors.loc[ntc_cells_found, sf_col].values.astype(float)
+        cis_ntc_sf = np.where(cis_ntc_sf > 0, cis_ntc_sf, median_sf)
+        cis_log2_expr = float(np.mean(np.log2(cis_ntc / cis_ntc_sf + 0.5)))
+
+        # --- Trans gene mean log2 expressions in NTC cells ---
+        if primary_mod.cell_names is None:
+            warnings.warn(
+                "Primary modality has no cell names. Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        cell_to_col_primary = {c: i for i, c in enumerate(primary_mod.cell_names)}
+        ntc_col_idx_primary = np.array(
+            [cell_to_col_primary[c] for c in ntc_cells_found if c in cell_to_col_primary],
+            dtype=int
+        )
+
+        if len(ntc_col_idx_primary) == 0:
+            warnings.warn(
+                "No NTC cells found in primary modality. Skipping unexpressed-cis check.",
+                UserWarning
+            )
+            return
+
+        trans_counts = primary_mod.counts
+        if hasattr(trans_counts, 'toarray'):
+            ntc_trans = trans_counts[:, ntc_col_idx_primary]
+            mean_counts_trans = np.asarray(ntc_trans.mean(axis=1)).flatten()
+        elif isinstance(trans_counts, pd.DataFrame):
+            mean_counts_trans = trans_counts.iloc[:, ntc_col_idx_primary].values.mean(axis=1)
+        else:
+            mean_counts_trans = np.asarray(trans_counts)[:, ntc_col_idx_primary].mean(axis=1)
+
+        log2_expr_trans = np.log2(mean_counts_trans / median_sf + 0.5)
+
+        # Combine all genes for GMM fitting
+        all_log2_expr = np.concatenate([log2_expr_trans, [cis_log2_expr]])
+
+        # --- Fit GMM ---
+        try:
+            from sklearn.mixture import GaussianMixture
+        except ImportError:
+            warnings.warn(
+                "scikit-learn not available. Cannot perform GMM check for unexpressed cis gene.",
+                UserWarning
+            )
+            return
+
+        n_components = 3
+        gmm = GaussianMixture(n_components=n_components, random_state=42, n_init=5)
+        gmm.fit(all_log2_expr.reshape(-1, 1))
+
+        component_means = gmm.means_.flatten()
+        lowest_component = int(np.argmin(component_means))
+        cis_component = int(gmm.predict([[cis_log2_expr]])[0])
+
+        if cis_component == lowest_component:
+            msg = (
+                f"Cis gene '{self.cis_gene}' appears to be unexpressed in NTC cells "
+                f"(mean log2 normalized expression = {cis_log2_expr:.2f}; "
+                f"lowest GMM component mean = {component_means[lowest_component]:.2f}). "
+                f"fit_ntc() cannot reliably estimate overdispersion (o_x) for an unexpressed gene, "
+                f"so fit_cis() results will be unreliable. "
+                f"Pass allow_unexpressed_cis=True to suppress this error."
+            )
+            if allow_unexpressed_cis:
+                warnings.warn(msg, UserWarning)
+            else:
+                raise ValueError(msg)
+        else:
+            print(
+                f"[INFO] Cis gene '{self.cis_gene}' expressed in NTC cells: "
+                f"mean log2 expr = {cis_log2_expr:.2f} "
+                f"(GMM component {cis_component + 1}/{n_components}, "
+                f"mean = {component_means[cis_component]:.2f})"
+            )
+
+    def plot_ntc_overdispersion(
+        self,
+        modality_name: str = None,
+        ax=None,
+        figsize: tuple = (6, 5),
+    ):
+        """
+        Scatter plot of log2(mu_ntc) vs log2(o_y) from the technical fit.
+
+        Highlights the cis gene in red.  Useful for diagnosing whether the
+        cis gene falls in an unusual region of the mu_ntc–o_y relationship.
+
+        Requires fit_ntc() to have been run first.
+
+        Parameters
+        ----------
+        modality_name : str, optional
+            Modality to plot (default: primary modality).
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on.  Creates a new figure if None.
+        figsize : tuple, default=(6, 5)
+            Figure size (width, height) in inches.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+        """
+        import matplotlib.pyplot as plt
+
+        if modality_name is None:
+            modality_name = self.primary_modality
+
+        modality = self.get_modality(modality_name)
+        ps = modality.posterior_samples_technical
+        if ps is None or 'mu_ntc' not in ps or 'o_y' not in ps:
+            raise ValueError(
+                f"No technical fit found for modality '{modality_name}'. "
+                "Run fit_ntc() first."
+            )
+
+        # Extract posterior means — tensors may be [S, T] or [S, C, T]
+        mu_ntc_raw = ps['mu_ntc'].mean(dim=0).detach().numpy()
+        o_y_raw    = ps['o_y'].mean(dim=0).detach().numpy()
+
+        # Flatten multi-group tensors to 1D (take first group = NTC reference)
+        mu_ntc = mu_ntc_raw.reshape(-1) if mu_ntc_raw.ndim == 1 else mu_ntc_raw[0]
+        o_y    = o_y_raw.reshape(-1)    if o_y_raw.ndim == 1    else o_y_raw[0]
+
+        log2_mu = np.log2(np.clip(mu_ntc, 1e-8, None))
+        log2_oy = np.log2(np.clip(o_y,    1e-8, None))
+
+        new_fig = ax is None
+        if new_fig:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.get_figure()
+
+        ax.scatter(log2_mu, log2_oy, alpha=0.25, s=4, c='steelblue', rasterized=True,
+                   label='trans genes')
+
+        # Highlight cis gene if available
+        if 'cis' in self.modalities:
+            cis_ps = self.modalities['cis'].posterior_samples_technical
+            if cis_ps is not None and 'mu_ntc' in cis_ps and 'o_x' in cis_ps:
+                cis_mu = float(cis_ps['mu_ntc'].mean().item())
+                cis_ox = float(cis_ps['o_x'].mean().item())
+                ax.scatter(
+                    np.log2(max(cis_mu, 1e-8)),
+                    np.log2(max(cis_ox, 1e-8)),
+                    s=120, c='red', zorder=10, marker='*',
+                    label=f'{self.cis_gene}'
+                )
+
+        ax.set_xlabel('log$_2$(mu_ntc)', fontsize=11)
+        ax.set_ylabel('log$_2$(o_y)', fontsize=11)
+        ax.set_title('Technical fit: NTC mean expression vs overdispersion', fontsize=11)
+        ax.axhline(0, color='gray', lw=0.5, ls='--')
+        ax.legend(fontsize=9, markerscale=1.5)
+
+        if new_fig:
+            fig.tight_layout()
+
+        return fig
 
     def _filter_features(self, counts, feature_meta, features_to_keep):
         """
