@@ -431,11 +431,12 @@ class bayesDREAM(
         """
         Check whether the cis gene is meaningfully expressed in NTC cells.
 
-        Fits a 3-component Gaussian mixture model to per-gene log2
-        sum-factor-normalized mean expression across NTC cells.  If the cis
-        gene falls in the lowest-mean component, it is considered unexpressed
-        in NTC cells, and overdispersion estimation in fit_ntc()/fit_cis()
-        will be unreliable.
+        Fits Gaussian mixture models with k=2..6 components to per-gene log2
+        sum-factor-normalized mean expression across NTC cells, selects k by
+        BIC, and checks which component the cis gene falls in.  If it falls in
+        the lowest-mean component, the gene is considered unexpressed in NTC
+        cells and overdispersion estimation in fit_ntc()/fit_cis() will be
+        unreliable.
 
         Parameters
         ----------
@@ -549,7 +550,7 @@ class bayesDREAM(
         # Combine all genes for GMM fitting
         all_log2_expr = np.concatenate([log2_expr_trans, [cis_log2_expr]])
 
-        # --- Fit GMM ---
+        # --- Fit GMM with BIC model selection ---
         try:
             from sklearn.mixture import GaussianMixture
         except ImportError:
@@ -559,19 +560,27 @@ class bayesDREAM(
             )
             return
 
-        n_components = 3
-        gmm = GaussianMixture(n_components=n_components, random_state=42, n_init=5)
-        gmm.fit(all_log2_expr.reshape(-1, 1))
+        max_components = 6
+        best_gmm, best_bic = None, np.inf
+        X = all_log2_expr.reshape(-1, 1)
+        for k in range(2, max_components + 1):
+            gmm_k = GaussianMixture(n_components=k, random_state=42, n_init=5)
+            gmm_k.fit(X)
+            bic = gmm_k.bic(X)
+            if bic < best_bic:
+                best_bic, best_gmm = bic, gmm_k
 
-        component_means = gmm.means_.flatten()
+        n_components = best_gmm.n_components
+        component_means = best_gmm.means_.flatten()
         lowest_component = int(np.argmin(component_means))
-        cis_component = int(gmm.predict([[cis_log2_expr]])[0])
+        cis_component = int(best_gmm.predict([[cis_log2_expr]])[0])
 
         if cis_component == lowest_component:
             msg = (
                 f"Cis gene '{self.cis_gene}' appears to be unexpressed in NTC cells "
                 f"(mean log2 normalized expression = {cis_log2_expr:.2f}; "
-                f"lowest GMM component mean = {component_means[lowest_component]:.2f}). "
+                f"lowest GMM component mean = {component_means[lowest_component]:.2f}; "
+                f"BIC-selected k={n_components}). "
                 f"fit_ntc() cannot reliably estimate overdispersion (o_x) for an unexpressed gene, "
                 f"so fit_cis() results will be unreliable. "
                 f"Pass allow_unexpressed_cis=True to suppress this error."
@@ -585,7 +594,7 @@ class bayesDREAM(
                 f"[INFO] Cis gene '{self.cis_gene}' expressed in NTC cells: "
                 f"mean log2 expr = {cis_log2_expr:.2f} "
                 f"(GMM component {cis_component + 1}/{n_components}, "
-                f"mean = {component_means[cis_component]:.2f})"
+                f"mean = {component_means[cis_component]:.2f}; BIC-selected k={n_components})"
             )
 
     def plot_ntc_overdispersion(
