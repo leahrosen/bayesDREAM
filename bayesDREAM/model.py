@@ -1157,6 +1157,22 @@ class bayesDREAM(
         if name in self.modalities and not overwrite:
             raise ValueError(f"Modality '{name}' already exists. Use overwrite=True to replace it.")
 
+        # Negbinom modalities require their own sum_factors for normalisation.
+        # Primary and cis share the same DataFrame (handled by _init_sum_factors),
+        # but all other negbinom modalities must have sum_factors set explicitly
+        # by the caller before fit_trans() is called on them.
+        if (modality.distribution == 'negbinom'
+                and modality.sum_factors is None
+                and name not in (self.primary_modality, 'cis')):
+            import warnings
+            warnings.warn(
+                f"Negbinom modality '{name}' has no sum_factors set. "
+                f"You must assign modality.sum_factors (a cell-indexed DataFrame) "
+                f"before calling fit_trans() on this modality.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         self.modalities[name] = modality
         print(f"[INFO] Added modality '{name}': {modality}")
 

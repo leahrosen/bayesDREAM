@@ -1588,6 +1588,13 @@ class TransFitter:
         if requires_sum_factor(distribution) and sum_factor_col is None:
             raise ValueError(f"Distribution '{distribution}' requires sum_factor_col parameter")
 
+        if requires_sum_factor(distribution) and modality.sum_factors is None:
+            raise ValueError(
+                f"Modality '{modality_name}' has distribution '{distribution}' but no sum_factors "
+                f"DataFrame has been set. Assign a cell-indexed DataFrame to "
+                f"modality.sum_factors before calling fit_trans()."
+            )
+
         if requires_denominator(distribution) and denominator is None:
             raise ValueError(f"Distribution '{distribution}' requires denominator parameter")
 
