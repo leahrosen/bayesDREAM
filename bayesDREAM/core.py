@@ -1712,7 +1712,9 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         return self._cis_fitter.cis_init_loc_fn(*args, **kwargs)
 
     def fit_cis(self, *args, **kwargs):
-        """Delegate to CisFitter."""
+        """Delegate to CisFitter, after verifying cis gene is expressed in NTC cells."""
+        if hasattr(self, '_check_cis_expression_in_ntc'):
+            self._check_cis_expression_in_ntc()
         return self._cis_fitter.fit_cis(*args, **kwargs)
 
     def _model_y(self, *args, **kwargs):
