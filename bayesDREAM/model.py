@@ -435,18 +435,20 @@ class bayesDREAM(
 
     def _compute_ntc_log2_exprs_from_fit(self):
         """
-        Per-gene log2 NTC expression using fit_ntc() posteriors for trans genes.
+        Per-gene log2 NTC expression using fit_ntc() posteriors.
 
-        Trans genes use the fitted ``mu_ntc`` posterior mean — no pseudocount
-        artifact.  The cis gene uses raw NTC mean count / median sum factor
-        (cis modality does not have a technical-fit posterior at check time).
+        fit_ntc() appends the cis gene as the last row of the counts matrix,
+        fits it together with all trans genes, and stores the result in
+        cis_modality.posterior_samples_technical.  Both trans and cis mu_ntc
+        values are therefore available here — no raw-count computation needed.
 
-        Requires fit_ntc() to have been run on the primary modality.
+        Requires fit_ntc() to have been run (populates posterior_samples_technical
+        on both the primary and cis modalities).
 
         Returns
         -------
         dict with keys: all_log2_expr, cis_log2_expr, trans_log2_expr,
-        cis_ntc_counts, cis_ntc_sf, median_sf, n_ntc_cells.
+        cis_ntc_counts (raw counts for plot annotation only), n_ntc_cells.
         Or None on failure (warnings emitted).
         """
         import torch as _torch
@@ -458,79 +460,61 @@ class bayesDREAM(
             warnings.warn(f"Primary modality '{self.primary_modality}' not found.", UserWarning)
             return None
 
-        ps = primary_mod.posterior_samples_technical
-        if ps is None or 'mu_ntc' not in ps:
+        ps_primary = primary_mod.posterior_samples_technical
+        if ps_primary is None or 'mu_ntc' not in ps_primary:
             raise ValueError(
-                "fit_ntc() must be run on the primary modality before checking cis "
-                "expression. Call model.fit_ntc() first."
+                "fit_ntc() must be run before checking cis expression. "
+                "Call model.fit_ntc() first."
             )
 
         if cis_mod is None:
             warnings.warn("No 'cis' modality found.", UserWarning)
             return None
 
-        if 'target' not in self.meta.columns:
-            warnings.warn("No 'target' column in meta.", UserWarning)
-            return None
+        ps_cis = cis_mod.posterior_samples_technical
+        if ps_cis is None or 'mu_ntc' not in ps_cis:
+            raise ValueError(
+                "fit_ntc() did not produce mu_ntc for the cis modality. "
+                "Ensure fit_ntc() completed successfully."
+            )
 
-        ntc_meta  = self.meta[self.meta['target'] == 'ntc']
-        ntc_cells = ntc_meta['cell'].values
-        if len(ntc_cells) == 0:
-            warnings.warn("No NTC cells found.", UserWarning)
-            return None
+        def _to_numpy(t):
+            if isinstance(t, _torch.Tensor):
+                return t.mean(dim=0).detach().cpu().numpy().flatten()
+            return np.asarray(t).mean(axis=0).flatten()
 
-        if primary_mod.sum_factors is None or primary_mod.sum_factors.empty:
-            warnings.warn("No sum_factors on primary modality.", UserWarning)
-            return None
+        # Trans genes
+        log2_trans = np.log2(_to_numpy(ps_primary['mu_ntc']))  # LogNormal → always > 0
 
-        sf_col   = primary_mod.sum_factors.columns[0]
-        all_sf   = primary_mod.sum_factors[sf_col].values.astype(float)
-        pos_sf   = all_sf[all_sf > 0]
-        median_sf = float(np.median(pos_sf)) if len(pos_sf) > 0 else 1.0
-
-        # Trans genes: log2 of fitted NTC mean (no pseudocount)
-        mu_ntc_raw = ps['mu_ntc']
-        if isinstance(mu_ntc_raw, _torch.Tensor):
-            mu_ntc_arr = mu_ntc_raw.mean(dim=0).detach().cpu().numpy().flatten()
-        else:
-            mu_ntc_arr = np.asarray(mu_ntc_raw).mean(axis=0).flatten()
-        log2_trans = np.log2(np.clip(mu_ntc_arr, 1e-4, None))
-
-        # Cis gene: raw NTC mean count / SF (clamp instead of 0.5 pseudocount)
-        cell_to_col_cis = {c: i for i, c in enumerate(cis_mod.cell_names or [])}
-        ntc_cells_cis   = [c for c in ntc_cells if c in cell_to_col_cis]
-        if len(ntc_cells_cis) == 0:
-            warnings.warn("No NTC cells found in cis modality.", UserWarning)
-            return None
-
-        ntc_idx_cis = np.array([cell_to_col_cis[c] for c in ntc_cells_cis], dtype=int)
-        cis_raw = cis_mod.counts
-        if hasattr(cis_raw, 'toarray'):
-            cis_ntc = np.asarray(cis_raw[0, ntc_idx_cis].toarray()).flatten().astype(float)
-        elif isinstance(cis_raw, pd.DataFrame):
-            cis_ntc = cis_raw.iloc[0, ntc_idx_cis].values.astype(float)
-        else:
-            cis_ntc = np.asarray(cis_raw)[0, ntc_idx_cis].astype(float)
-
-        try:
-            cis_ntc_sf = primary_mod.sum_factors.loc[ntc_cells_cis, sf_col].values.astype(float)
-        except KeyError:
-            cis_ntc_sf = np.full(len(ntc_cells_cis), median_sf)
-        cis_ntc_sf = np.where(cis_ntc_sf > 0, cis_ntc_sf, median_sf)
-
-        cis_mean_norm = float(np.mean(cis_ntc / cis_ntc_sf))
-        cis_log2_expr = float(np.log2(max(cis_mean_norm, 1e-4)))
+        # Cis gene (shape [S, 1] → scalar after mean+flatten)
+        cis_mu_ntc = float(_to_numpy(ps_cis['mu_ntc'])[0])
+        cis_log2_expr = float(np.log2(cis_mu_ntc))
 
         all_log2_expr = np.concatenate([log2_trans, [cis_log2_expr]])
+
+        # Raw NTC counts — used only for the plot title annotation, not for the GMM
+        ntc_meta  = self.meta[self.meta.get('target', pd.Series()).eq('ntc')] \
+                    if 'target' in self.meta.columns else self.meta.iloc[:0]
+        ntc_cells = ntc_meta['cell'].values
+        cell_to_col_cis = {c: i for i, c in enumerate(cis_mod.cell_names or [])}
+        ntc_idx_cis = np.array([cell_to_col_cis[c] for c in ntc_cells if c in cell_to_col_cis], dtype=int)
+        if len(ntc_idx_cis) > 0:
+            cis_raw = cis_mod.counts
+            if hasattr(cis_raw, 'toarray'):
+                cis_ntc = np.asarray(cis_raw[0, ntc_idx_cis].toarray()).flatten().astype(float)
+            elif isinstance(cis_raw, pd.DataFrame):
+                cis_ntc = cis_raw.iloc[0, ntc_idx_cis].values.astype(float)
+            else:
+                cis_ntc = np.asarray(cis_raw)[0, ntc_idx_cis].astype(float)
+        else:
+            cis_ntc = np.array([])
 
         return {
             'all_log2_expr':   all_log2_expr,
             'cis_log2_expr':   cis_log2_expr,
             'trans_log2_expr': log2_trans,
             'cis_ntc_counts':  cis_ntc,
-            'cis_ntc_sf':      cis_ntc_sf,
-            'median_sf':       median_sf,
-            'n_ntc_cells':     len(ntc_cells_cis),
+            'n_ntc_cells':     len(ntc_idx_cis),
         }
 
     def _check_cis_expression_in_ntc(self):
