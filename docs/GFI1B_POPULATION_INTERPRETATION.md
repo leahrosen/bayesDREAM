@@ -298,6 +298,95 @@ large Hill_a) are typically well-expressed genes strongly coupled to differentia
 — these are the same genes where the within-bin slope (hence large negative Hill_b) is
 also most visible.
 
+### A and Vmax are prior-determined by NTC expression
+
+Diagnostic plots (Image 2) reveal that both the baseline parameter A and the amplitude
+parameter Vmax are almost entirely determined by the gene's NTC expression level, before
+any dose-response information from the data is used.
+
+**A (baseline intercept)** is sampled from `Exponential(rate ≈ 1/Q05)`, where Q05 is the
+5th percentile of guide-level mean expression. The plot of A in log2FC space vs log2 NTC
+expression shows a near-perfect 1:1 line across all 22,000+ genes: A ≈ NTC expression.
+The prior collapses A to the gene's minimum observed expression level — A is not a free
+parameter but a deterministic encoding of how lowly expressed the gene is in the most
+quiescent state. No dose-response information enters A.
+
+**Vmax (amplitude)** is the prior mean for the Hill arm's maximum fold-change, set to
+Q95 − Q05 (the empirical expression range across guide means). The plot of log2(Vmax_a)
+vs log2 NTC expression shows a similarly tight diagonal: Vmax ∝ NTC expression. Since
+both Q95 and Q05 scale with absolute expression level, Vmax captures the total observed
+variation in expression — including differentiation-state confound, guide-level noise, and
+any genuine GFI1B effect indiscriminately.
+
+Together: A fixes the floor of the Hill function at the gene's minimum expression and Vmax
+spans from that floor to the gene's maximum observed expression. The Hill function therefore
+models "goes from minimum to maximum expression as x_true changes" — which every gene with
+any expression variation will satisfy, regardless of whether that variation is GFI1B-driven.
+
+**The symmetric positive/negative bands (Image 3)** further confirm this. Plotting Hill_a
+coefficient vs EC50_a for a-only significant genes shows two diagonal bands, one positive
+(upper, ~+20) and one negative (lower, ~−30), at the same EC50 values. Both bands have
+|coefficient| increasing as EC50 becomes more negative (further below NTC). This directly
+confirms the shallow-gradient mechanism: when EC50 is pushed far below the observed x_true
+range, the Hill function is flat everywhere observed (plateau), so the model reduces to fitting
+a constant offset. The *direction* of that offset (positive or negative n_a) is determined
+by stochastic variation in mean expression across the x_true range — essentially noise.
+Equal representation in both directions confirms these are not dose-response signals.
+
+---
+
+### Why every gene is significant
+
+This run produced near-universal significance. The reason is the convergence of five
+mechanisms, each contributing across all expression levels:
+
+**1. A and Vmax pre-configure the Hill function to span each gene's observed expression range.**
+Since A = floor and A + Vmax ≈ ceiling of observed expression, the model expects a
+dose-response spanning the full empirical range for every gene. Any systematic variation
+in expression across x_true — including confound — is a sufficient fit target.
+
+**2. x_true is correlated with sum_factor via the differentiation-state confound.**
+Cells with higher GFI1B expression (high x_true) tend to have a different differentiation
+state, which changes total RNA output and hence the sum_factor. After `refit_sumfactor`
+removes the smooth component of this relationship, a residual correlation between x_true
+and effective sum_factor remains for every gene (because differentiation state affects
+the whole transcriptome). This residual creates a non-zero apparent dose-response signal
+for every gene simultaneously, across the whole x_true range.
+
+**3. The EC50 prior (pre-fix) biased EC50 into the shallow-gradient regime for half of all genes.**
+With the median of the EC50 prior at −2.2 log2FC below NTC, many genes had EC50 pushed
+into the regime where the Hill function is flat over the entire observed x_true range.
+In the plateau regime, any mean expression shift (regardless of source) produces a
+credible non-zero Hill coefficient — the model cannot distinguish a constant upward
+confound shift from a genuine saturation response. The near-zero Hill coefficients in
+populations A2 and B4 are the direct signature of this: credible posteriors on negligible
+effect sizes, passing significance not because the effect is real but because the plateau
+makes any offset statistically distinguishable from zero.
+
+**4. The discrete-count structure at the 0→1 boundary creates a genuine step in x_true**
+that the Hill model is optimally designed to fit. For the ~54% of cells with 0 raw GFI1B
+counts, x_true clusters tightly; for the ~27% with 1 count, x_true forms a second cluster.
+The abrupt jump between clusters looks like a perfectly shaped Hill sigmoid input to the
+model. Every well-expressed gene whose expression differs between the 0-count and 1-count
+cells — for any reason — gets a large fitted Hill_a coefficient with EC50 spiked at the
+boundary (population B3).
+
+**5. The additive model has two independent arms, doubling the chance of significance.**
+The additive Hill model can achieve significance in arm a, arm b, or both independently.
+For genes where neither arm has a clean signal, the residual confound variance is split
+between the two arms. Population B4 (both arms ≈ 0, both significant) is the direct
+result: a gene with diffuse confound variation gets marginally credible coefficients in
+both arms simultaneously, passing both significance thresholds without either arm having
+a meaningful effect size.
+
+**Consequence:** In this run, the significance threshold is not a meaningful separator of
+true biology from confound. The permutation null (`--permtype All`) is the only way to
+determine which genes have confounded signal *specifically stronger* than the population
+average, since the null run is subject to the same five mechanisms and the FDR comparison
+cancels the common background.
+
+---
+
 ### What distinguishes true signal from artifact
 
 No single parameter reliably separates true biology from confound in this run. However,
