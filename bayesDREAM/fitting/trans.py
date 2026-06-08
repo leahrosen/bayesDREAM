@@ -714,16 +714,15 @@ class TransFitter:
                                     else self._t(5.0 * 0.6931 / 2.0))
 
                 if x_ntc_mean is not None:
-                    # Centre K prior at NTC mean with ±5 log2FC (95% CI) coverage.
-                    # Note: for one-sided fits (single technical group), K is not
-                    # identifiable from the data when the true EC50 lies outside the observed
-                    # x-range.  The NTC-centred prior then dominates and will under/over-shoot
-                    # the true K.  This is a data limitation, not a code bug — the full dataset
-                    # should be used for reliable EC50 estimation.
-                    K_log_sigma = _K_log_sigma_min  # = 5*ln(2)/2
-                    K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor)) - 0.5 * K_log_sigma ** 2
+                    # K prior: log-normal with MEDIAN at x_ntc_mean (= log2FC 0).
+                    # In log2FC space: log2(K_a) ~ Normal(0, sigma_log2²) where
+                    # sigma_log2 = K_log_sigma / ln(2) = 2.5, giving a 95% CI of ±5 log2FC.
+                    # Setting K_log_mu = log(x_ntc_mean) centres the median (not the mean)
+                    # at NTC, which is the natural reference in log2FC space.
+                    K_log_sigma = _K_log_sigma_min  # = 5*ln(2)/2 → sigma_log2 = 2.5
+                    K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor))
                 else:
-                    # Fallback: centre at user-specified quantile of x_true (k_prior_center).
+                    # Fallback: centre median at user-specified quantile of x_true (k_prior_center).
                     # Default: middle of observed range (K_max/2). Width from CV.
                     # Floor sigma so the prior always spans at least ±5 log2FC.
                     _k_fallback = (k_center_tensor if k_center_tensor is not None
@@ -735,7 +734,7 @@ class TransFitter:
                         K_std_prior = K_max_tensor / (self._t(2.0) * torch.sqrt(K_alpha_tensor))
                     ratio_K = (K_std_prior / K_mean_prior).clamp_min(self._t(1e-6))
                     K_log_sigma = torch.sqrt(torch.log1p(ratio_K ** 2)).clamp_min(_K_log_sigma_min)
-                    K_log_mu = torch.log(K_mean_prior) - 0.5 * K_log_sigma ** 2
+                    K_log_mu = torch.log(K_mean_prior)
 
                 if distribution in ['binomial', 'multinomial']:
                     # For binomial/multinomial: Sample Vmax_a INDEPENDENTLY (like BCD1C4F)
@@ -2920,11 +2919,12 @@ class TransFitter:
                 Vmax_log_sigma_p = None
                 Vmax_log_mu_p    = None
 
-            # K prior (log-normal): usually scalar (NTC-centred or K_max/2 fallback)
+            # K prior (log-normal): median centred at x_ntc_mean or k_center fallback.
+            # K_log_mu = log(centre) with no -0.5*sigma² correction, so the MEDIAN of
+            # K_a equals the centre (log2FC = 0 for the NTC-centred case).
             if x_ntc_mean is not None:
                 K_log_sigma_p = _K_log_sigma_min_val
-                K_log_mu_p    = float(torch.log(x_ntc_mean.clamp_min(epsilon_tensor)).item()
-                                      - 0.5 * K_log_sigma_p ** 2)
+                K_log_mu_p    = float(torch.log(x_ntc_mean.clamp_min(epsilon_tensor)).item())
             else:
                 _K_mean_p  = k_center_tensor.clamp_min(epsilon_tensor)
                 _K_std_p   = (_K_mean_p * x_true_CV if x_true_CV is not None
@@ -2932,7 +2932,7 @@ class TransFitter:
                 _ratio_K_p = (_K_std_p / _K_mean_p).clamp_min(self._t(1e-6))
                 K_log_sigma_p = float(torch.sqrt(torch.log1p(_ratio_K_p ** 2))
                                       .clamp_min(self._t(_K_log_sigma_min_val)).item())
-                K_log_mu_p    = float(torch.log(_K_mean_p).item() - 0.5 * K_log_sigma_p ** 2)
+                K_log_mu_p    = float(torch.log(_K_mean_p).item())
 
             trans_prior_params = {
                 'function_type':    function_type,
