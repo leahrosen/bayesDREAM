@@ -318,6 +318,123 @@ genes are those whose confounded signal is specifically stronger than the averag
 null run does not show these populations, the real run contains genuine structured signal
 that is being misattributed.
 
+### EC50 prior bias and its contribution to false positives
+
+The K_a (EC50) prior is LogNormal. Before a recent fix, `K_log_mu` was set as
+`log(x_ntc_mean) − 0.5 × sigma²`, which centres the **mean** of K_a in linear space
+at x_ntc_mean but shifts the **log2FC distribution** 2.2 log2FC *below* NTC:
+
+| Statistic | Before fix | After fix |
+|-----------|-----------|-----------|
+| Mean of K_a (linear) | x_ntc_mean | 4.5 × x_ntc_mean |
+| Median of K_a (log2FC) | −2.2 | 0 |
+| Mode of K_a (log2FC) | −6.5 | −4.3 |
+| 95% CI (log2FC) | [−7.2, +2.8] | [−5.0, +5.0] |
+
+The pre-fix prior placed most of its density at EC50 values below the NTC level. For a
+CRISPRi dataset, the targeting cells span roughly −6 to 0 log2FC, so the median at −2.2
+was within the range — the bias was non-catastrophic. For a CRISPRa dataset (targeting
+cells > 0 log2FC), the entire prior mode would have been below the observed range, making
+a shallow-gradient fit (EC50 << observed x_true) the prior-preferred explanation for any
+upward trend, strongly amplifying false positives.
+
+The **shallow-gradient mechanism**: when EC50 << the observed x_true range, the Hill
+function is evaluated only on its plateau (≈ Vmax everywhere). Any mean shift in the
+trans gene — including confound-driven variation — produces a credible non-zero Hill
+coefficient because the model fits it as a constant offset rather than a dose-response
+curve. A prior that places EC50 within the observed range forces the model to fit an
+actual sigmoid, which is harder to satisfy with diffuse confound variance.
+
+**Effect on the populations in this run**: populations A1, A2, B2, and B4 are the most
+likely to have been inflated by the prior bias, since they all involve very negative
+EC50_a with near-zero Hill coefficients — exactly the shallow-gradient regime. B3 has
+EC50_a spiked at −1 log2FC (the count boundary), which the data constrains tightly
+regardless of the prior. B1 has genuine large Hill_a, also data-constrained.
+
+The prior fix (now `K_log_mu = log(x_ntc_mean)`, centring the median at log2FC = 0 with
+±5 log2FC 95% CI) should reduce inflation of A1, A2, B2, B4 in future runs, but will
+not eliminate the artifacts rooted in the discrete-count structure (see below).
+
+---
+
+### Discrete GFI1B counts as the primary structural confound
+
+The root cause of the B3 artifact — and a significant contributor to B1 and A1 — is that
+GFI1B has very low raw counts in most cells. The distribution is approximately:
+
+```
+0 counts: ~54% of cells
+1 count:  ~27% of cells
+2 counts: ~11% of cells
+3+ counts: ~8% of cells
+```
+
+This discretisation means x_true (posterior cis expression) is **not continuous**: it
+forms tight clusters at values corresponding to integer raw GFI1B counts, with gaps
+between them. In log2FC space, the 0-count cluster sits at roughly −1 log2FC below the
+NTC mean (because cells with 0 raw counts have x_true pulled by the prior toward a small
+positive value, not exactly 0).
+
+The **0→1 count boundary** is the critical step:
+
+- The jump in x_true between the 0-count cluster and the 1-count cluster is large and
+  abrupt — it cannot be smoothed by `refit_sumfactor` because a spline cannot remove a
+  discontinuity at a single x_true value.
+- For any gene whose expression changes between cells with 0 vs 1 GFI1B count — whether
+  due to genuine GFI1B biology, differentiation-state confound, or stochastic variation —
+  the Hill model sees an apparent step function and fits it with a large Hill_a coefficient
+  and EC50 at the boundary.
+- The spiked EC50_a distribution at ≈ −1 log2FC (population B3) is the definitive
+  signature of this: every gene in B3 has its EC50 at the same location because the step
+  is at the same x_true value for all genes.
+
+Higher-count experiments (e.g., higher MOI or a more highly expressed cis gene) would
+spread x_true more continuously and reduce the severity of this artifact. A model that
+explicitly accounts for the discrete count structure of x_true (e.g., by marginalising
+over raw count values rather than using a point estimate of x_true) would be more robust.
+
+The **within-bin slope** (populations B1 and B3, Hill_b arm) is a secondary consequence:
+within each integer-count bin, cells with higher sum_factor have higher x_true (same
+integer count, larger normalised value), but the trans gene is anti-correlated with
+differentiation state, so the model sees a downward slope inside the 1-count bin and
+fits it as a sharp negative Hill_b near EC50_b ≈ 0.
+
+The o_x underestimation fix (replacing the Gamma(9,3) containment prior with the
+empirical Bayes o_y estimate from fit_ntc) reduces the confidence of individual x_true
+estimates, slightly widening the within-bin clusters. This marginally softens the
+sharpness of the step but does not remove it.
+
+---
+
+### Populations with unclear or uncertain mechanisms
+
+Three populations have proposed mechanisms but remain uncertain:
+
+**A3** (moderate expression, bimodal EC50_a, Hill_a ≈ 0, slightly negative): The bimodal
+EC50 distribution suggests two overlapping sub-populations, one fitting the 0→1 boundary
+step and one fitting variation near the NTC level. The slightly negative Hill_a (genes
+going *down* as GFI1B decreases) is consistent with co-regulated differentiation genes
+rather than direct GFI1B targets, but cannot be confirmed without a permutation null. The
+mechanism for the near-zero coefficient in both sub-populations is unclear: it could be a
+genuine weak dose-response or a shallow-gradient EC50 prior artefact.
+
+**B2** (well-expressed, slightly positive Hill_a, EC50_a < −4, diffuse Hill_b ≈ 0): The
+proposed mechanism is that these are a weaker version of B1 — the same 0→1 boundary
+step and within-bin confound, but for trans genes less tightly coupled to differentiation
+state. However, it is also possible that these genes have genuine but weak GFI1B
+regulation that the Hill_a arm is detecting at the threshold of significance. The diffuse
+Hill_b and near-zero coefficient are consistent with both interpretations.
+
+**B4** (moderate expression, both arms ≈ 0, both significant): Proposed as background
+inflation from the sum_factor confound, where diffuse non-specific variation across the
+x_true range produces statistically credible but negligibly sized Hill coefficients. This
+is plausible but the mechanism is the least well-characterised in the dataset. It is also
+possible that some B4 genes have genuine dose-responses too weak to be interpreted as a
+specific population — they would be indistinguishable from the confound at this
+resolution.
+
+---
+
 ### Population B1 as the most likely reservoir of true biology
 
 Based on the expression level (log2NTC > 0, so reliably detected), the direction of Hill_a
