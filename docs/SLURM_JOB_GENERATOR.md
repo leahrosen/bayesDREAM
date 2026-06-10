@@ -168,7 +168,7 @@ gen = SlurmJobGenerator(
 ```
 
 **Job structure:**
-- `fit_technical`: 1 job (all NTC cells)
+- `fit_ntc`: 1 job (all NTC cells)
 - `fit_cis`: N jobs (1 per cis gene)
 - `fit_trans`: N jobs (1 per cis gene)
 
@@ -189,13 +189,13 @@ gen = SlurmJobGenerator(
 ```
 
 **Job structure:**
-- `fit_technical`: 1 job (all cells, once for all cis genes)
+- `fit_ntc`: 1 job (all cells, once for all cis genes)
 - `fit_cis`: N jobs (1 per cis gene)
 - `fit_trans`: N jobs (1 per cis gene)
 
 **Total jobs:** 1 + 2N
 
-**Benefit:** Same total jobs as low MOI, but `fit_technical` uses all data.
+**Benefit:** Same total jobs as low MOI, but `fit_ntc` uses all data.
 
 **When to use:**
 - Technical variation is batch/lane specific
@@ -204,7 +204,7 @@ gen = SlurmJobGenerator(
 
 **When NOT to use:**
 - Technical groups (e.g., CRISPRi vs CRISPRa) correlate with cis gene expression
-- See warning in `fit_technical` documentation
+- See warning in `fit_ntc` documentation
 
 ---
 
@@ -221,7 +221,7 @@ gen = SlurmJobGenerator(
 ```
 
 **Job structure:**
-- `fit_technical`: N jobs (NTC cells, 1 per cis gene)
+- `fit_ntc`: N jobs (NTC cells, 1 per cis gene)
 - `fit_cis`: N jobs (1 per cis gene)
 - `fit_trans`: N jobs (1 per cis gene)
 
@@ -251,7 +251,7 @@ The generator automatically selects optimal resources for Berzelius:
 
 The generator analyzes memory requirements and selects:
 
-**fit_technical and fit_trans** (same logic):
+**fit_ntc and fit_trans** (same logic):
 ```
 If VRAM ≤ 5 GB and RAM ≤ 64 GB:
     → 1 thin GPU ✓ (most efficient for small datasets)
@@ -312,7 +312,7 @@ The generator automatically estimates wall-clock time based on:
 
 | Step | Base Time | Scales With |
 |------|-----------|-------------|
-| `fit_technical` | 1.5 hours | T × N × (2× if AutoNormal) |
+| `fit_ntc` | 1.5 hours | T × N × (2× if AutoNormal) |
 | `fit_cis` | 0.5 hours/gene | N |
 | `fit_trans` | 3.0 hours/gene | T × N |
 
@@ -323,12 +323,12 @@ All estimates include 1.5× safety margin to reduce timeout risk.
 #### Scaling Examples
 
 **Small dataset (5K genes, 10K cells):**
-- fit_technical: ~0.5 hours
+- fit_ntc: ~0.5 hours
 - fit_cis: ~0.3 hours/gene
 - fit_trans: ~0.8 hours/gene
 
 **Large dataset (50K genes, 100K cells):**
-- fit_technical: ~9 hours (if AutoNormal)
+- fit_ntc: ~9 hours (if AutoNormal)
 - fit_cis: ~1.5 hours/gene
 - fit_trans: ~20 hours/gene
 
@@ -368,7 +368,7 @@ Dataset size matters more than user intuition. A 50K gene dataset takes 10× lon
 
 ```
 slurm_jobs/
-├── 01_fit_technical.sh      # Technical fitting
+├── 01_fit_ntc.sh            # NTC fitting
 ├── 02_fit_cis.sh             # Cis effect fitting (job array)
 ├── 03_fit_trans.sh           # Trans effect fitting (job array)
 ├── submit_all.sh             # Master submission script
@@ -379,7 +379,7 @@ slurm_jobs/
     └── trans_*_*.out
 ```
 
-### 01_fit_technical.sh
+### 01_fit_ntc.sh
 
 **Single job** (low MOI or high MOI with `use_all_cells=True`):
 ```bash
@@ -391,7 +391,7 @@ slurm_jobs/
 #SBATCH --gpus=1
 #SBATCH --mem=11G
 
-# Run fit_technical on NTC cells (or all cells if high MOI)
+# Run fit_ntc on NTC cells (or all cells if high MOI)
 ```
 
 **Job array** (high MOI with NTC per gene):
@@ -434,8 +434,8 @@ slurm_jobs/
 **Master script with dependencies:**
 ```bash
 #!/bin/bash
-# Submit fit_technical
-TECH_JOB=$(sbatch --parsable 01_fit_technical.sh)
+# Submit fit_ntc
+TECH_JOB=$(sbatch --parsable 01_fit_ntc.sh)
 
 # Submit fit_cis (depends on technical)
 CIS_JOB=$(sbatch --parsable --dependency=afterok:$TECH_JOB 02_fit_cis.sh)
@@ -459,7 +459,7 @@ Auto-generated documentation includes:
 - Troubleshooting guide
 
 **Key sections:**
-- **"What Will Be Run"**: Shows exact Python code for fit_technical, fit_cis, and fit_trans with all parameters
+- **"What Will Be Run"**: Shows exact Python code for fit_ntc, fit_cis, and fit_trans with all parameters
 - **"Log Output"**: Shows what you'll see in logs/tech_*.out, logs/cis_*.out, and logs/trans_*.out
 - Includes device selection (cuda/cpu), niters, nsamples, and all other parameters
 
@@ -475,7 +475,7 @@ bash submit_all.sh
 ```
 
 **What happens:**
-1. Submits `fit_technical`
+1. Submits `fit_ntc`
 2. Queues `fit_cis` with dependency on technical
 3. Queues `fit_trans` with dependency on cis
 4. Prints job IDs
@@ -486,7 +486,7 @@ Submitting bayesDREAM pipeline jobs...
 Label: perturb_seq_batch1
 Output directory: ./slurm_jobs
 
-Submitting fit_technical...
+Submitting fit_ntc...
   Job ID: 12345
 Submitting fit_cis (depends on 12345)...
   Job ID: 12346
@@ -502,7 +502,7 @@ Submit jobs one at a time:
 
 ```bash
 # 1. Technical
-sbatch 01_fit_technical.sh
+sbatch 01_fit_ntc.sh
 # Note job ID (e.g., 12345)
 
 # 2. Cis (after technical completes)
@@ -822,7 +822,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '/proj/.../data/meta.csv
 
 2. **Manual submission with explicit IDs:**
    ```bash
-   TECH_JOB=$(sbatch --parsable 01_fit_technical.sh)
+   TECH_JOB=$(sbatch --parsable 01_fit_ntc.sh)
    echo $TECH_JOB  # Should print job ID
    sbatch --dependency=afterok:$TECH_JOB 02_fit_cis.sh
    ```
@@ -972,14 +972,14 @@ Estimate RAM and VRAM for each step.
 
 ```python
 memory = gen.estimate_memory_requirements()
-print(f"Technical: {memory['fit_technical_ram_gb']:.1f} GB RAM")
+print(f"Technical: {memory['fit_ntc_ram_gb']:.1f} GB RAM")
 ```
 
 **Returns:**
 ```python
 {
-    'fit_technical_ram_gb': 5.7,
-    'fit_technical_vram_gb': 7.1,
+    'fit_ntc_ram_gb': 5.7,
+    'fit_ntc_vram_gb': 7.1,
     'fit_cis_ram_gb': 4.3,
     'fit_cis_vram_gb': 4.2,
     'fit_trans_ram_gb': 12.6,
@@ -998,7 +998,7 @@ Estimate wall-clock time.
 
 ```python
 times = gen.estimate_time_requirements(memory)
-print(f"Technical: {times['fit_technical']}")  # "02:15:00"
+print(f"Technical: {times['fit_ntc']}")  # "02:15:00"
 ```
 
 ---

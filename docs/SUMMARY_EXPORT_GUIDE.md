@@ -36,7 +36,7 @@ model = bayesDREAM(
 
 # Run 3-step pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 
@@ -374,7 +374,7 @@ model = bayesDREAM(
 
 # Run full pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 
@@ -400,7 +400,7 @@ print("  - trans_feature_summary_gene.csv")
 
 **Solution:**
 ```python
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.save_ntc_summary()  # Now works
 ```
 
@@ -431,7 +431,7 @@ model.save_trans_summary()  # Now works
 **Solution:**
 ```python
 # Fit the specific modality first
-model.fit_technical(modality_name='atac', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='atac', sum_factor_col='sum_factor')
 model.save_ntc_summary(modality_name='atac')  # Now works
 ```
 

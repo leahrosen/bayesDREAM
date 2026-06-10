@@ -6,7 +6,7 @@ This guide helps you estimate RAM and VRAM requirements for fitting bayesDREAM m
 
 | Step | Typical RAM | Typical VRAM | Bottleneck |
 |------|-------------|--------------|------------|
-| **fit_technical** | 2-4× data size | 4-8× data size | Guide (AutoIAFNormal) |
+| **fit_ntc** | 2-4× data size | 4-8× data size | Guide (AutoIAFNormal) |
 | **fit_cis** | 1-2× data size | 2-4× data size | Data tensors |
 | **fit_trans** | 3-5× data size | 6-10× data size | Gradients + posteriors |
 
@@ -33,7 +33,7 @@ To estimate memory requirements, you'll need:
 
 ---
 
-## 1. fit_technical
+## 1. fit_ntc
 
 ### Fitting Modes
 
@@ -43,7 +43,7 @@ bayesDREAM offers two modes for technical fitting:
 Fits only on **NTC cells** (~20-50% of total cells). This is the recommended approach for most experiments.
 
 ```python
-model.fit_technical(use_all_cells=False)  # Default
+model.fit_ntc(use_all_cells=False)  # Default
 ```
 
 **When to use**:
@@ -55,13 +55,13 @@ model.fit_technical(use_all_cells=False)  # Default
 Fits on **ALL cells** (100% of dataset). Use for high MOI experiments where technical effects are batch/lane specific.
 
 ```python
-model.fit_technical(use_all_cells=True)  # High MOI mode
+model.fit_ntc(use_all_cells=True)  # High MOI mode
 ```
 
 **When to use**:
 - High MOI experiments (multiple guides per cell)
 - Technical variation is batch/lane specific, independent of perturbations
-- Want to run fit_technical once per dataset (not per cis gene)
+- Want to run fit_ntc once per dataset (not per cis gene)
 
 **When NOT to use**:
 - Technical groups correlate with cis gene expression
@@ -127,7 +127,7 @@ Guide_GB = (n_latent² × 4 × 3 × 1.5) / 1e9  # Transformation matrices
 - Falls back to AutoNormal if > (total_VRAM - 10 GB)
 - For large datasets, **always uses AutoNormal** (memory-efficient)
 
-### fit_technical Total Memory
+### fit_ntc Total Memory
 
 | Component | RAM | VRAM (GPU) |
 |-----------|-----|------------|
@@ -248,7 +248,7 @@ VRAM_trans_GB = 8 + (T × function_params × 4 / 1e9) × 5
 
 | Step | RAM | VRAM |
 |------|-----|------|
-| fit_technical | 5-10 GB | 5-10 GB |
+| fit_ntc | 5-10 GB | 5-10 GB |
 | fit_cis | 4-6 GB | 4-6 GB |
 | fit_trans | 10-20 GB | 8-16 GB |
 
@@ -265,7 +265,7 @@ Multinomial_extra_GB = (T × N × K × 4) / 1e9
 
 | Step | RAM | VRAM | Notes |
 |------|-----|------|-------|
-| fit_technical | 8-15 GB | 10-20 GB | K categories increase params |
+| fit_ntc | 8-15 GB | 10-20 GB | K categories increase params |
 | fit_cis | Same as negbinom | Same | Cis gene is still 1D |
 | fit_trans | Not yet implemented | - | - |
 
@@ -282,7 +282,7 @@ Data = 5,000 × 50,000 × 10 × 4 / 1e9 = 10 GB
 
 | Step | RAM | VRAM | Notes |
 |------|-----|------|-------|
-| fit_technical | 6-12 GB | 6-12 GB | 2× negbinom (counts + denom) |
+| fit_ntc | 6-12 GB | 6-12 GB | 2× negbinom (counts + denom) |
 | fit_cis | Same as negbinom | Same | - |
 | fit_trans | 12-24 GB | 10-20 GB | 2× negbinom |
 
@@ -294,7 +294,7 @@ Data = 5,000 × 50,000 × 10 × 4 / 1e9 = 10 GB
 
 | Step | RAM | VRAM | Notes |
 |------|-----|------|-------|
-| fit_technical | 5-10 GB | 5-10 GB | Same as negbinom |
+| fit_ntc | 5-10 GB | 5-10 GB | Same as negbinom |
 | fit_cis | Same as negbinom | Same | - |
 | fit_trans | 10-20 GB | 8-16 GB | Similar to negbinom |
 
@@ -313,7 +313,7 @@ G = 100 guides
 sparsity = 85%
 ```
 
-**fit_technical**:
+**fit_ntc**:
 - N_ntc = 5,000 cells (50% NTC)
 - Data (sparse) = 5,000 × 5,000 × 4 × 0.15 / 1e9 = 0.15 GB
 - Guide (AutoNormal) = (3 × 5,000) × 2 × 4 / 1e9 = 0.12 GB
@@ -341,7 +341,7 @@ G = 500 guides
 sparsity = 85%
 ```
 
-**fit_technical**:
+**fit_ntc**:
 - N_ntc = 12,000 cells
 - Data (sparse) = 20,000 × 12,000 × 4 × 0.15 / 1e9 = 1.44 GB
 - Guide (AutoNormal) = (3 × 20,000) × 2 × 4 / 1e9 = 0.48 GB
@@ -369,7 +369,7 @@ G = 1,000 guides
 sparsity = 85%
 ```
 
-**fit_technical**:
+**fit_ntc**:
 - N_ntc = 20,000 cells
 - Data (sparse) = 30,000 × 20,000 × 4 × 0.15 / 1e9 = 3.6 GB
 - Guide (AutoNormal) = (3 × 30,000) × 2 × 4 / 1e9 = 0.72 GB
@@ -397,7 +397,7 @@ G = 2,000 guides
 sparsity = 90%
 ```
 
-**fit_technical**:
+**fit_ntc**:
 - N_ntc = 30,000 cells
 - Data (sparse) = 50,000 × 30,000 × 4 × 0.10 / 1e9 = 6 GB
 - Guide (AutoNormal) = (5 × 50,000) × 2 × 4 / 1e9 = 2 GB
@@ -426,7 +426,7 @@ sparsity = 85%
 use_all_cells = True  # Compare to Example 3
 ```
 
-**fit_technical** (HIGH MOI MODE):
+**fit_ntc** (HIGH MOI MODE):
 - N_ntc = 50,000 cells (100% of cells, not just NTC)
 - Data (sparse) = 30,000 × 50,000 × 4 × 0.15 / 1e9 = **0.9 GB** (vs 0.36 GB in Example 3, 2.5× increase)
 - Fixed overhead + guide + gradients ≈ 4.8 GB (same as Example 3)
@@ -440,7 +440,7 @@ use_all_cells = True  # Compare to Example 3
 
 **Recommended**: 32 GB RAM, 16 GB VRAM (same as Example 3)
 
-**Key takeaway**: Using `use_all_cells=True` increases fit_technical data memory by 2.5×, but total memory increase is modest (~15%) due to fixed overheads. The computational benefit is significant: fit_technical only needs to run once per dataset instead of once per cis gene.
+**Key takeaway**: Using `use_all_cells=True` increases fit_ntc data memory by 2.5×, but total memory increase is modest (~15%) due to fixed overheads. The computational benefit is significant: fit_ntc only needs to run once per dataset instead of once per cis gene.
 
 ---
 
@@ -457,14 +457,14 @@ model = bayesDREAM(meta=meta, counts=counts_sparse, ...)
 
 ### 2. Reduce Posterior Samples
 ```python
-model.fit_technical(nsamples=500)  # Default: 1000
+model.fit_ntc(nsamples=500)  # Default: 1000
 ```
 
 **Savings**: ~50% reduction in posterior storage
 
 ### 3. Use Minibatching (experimental)
 ```python
-model.fit_technical(minibatch_size=100)  # Sample in batches
+model.fit_ntc(minibatch_size=100)  # Sample in batches
 ```
 
 **Savings**: Reduces peak memory during Predictive sampling
@@ -505,7 +505,7 @@ model = bayesDREAM(meta=meta, counts=counts, device='cpu')
 
 ### "CUDA out of memory" Error
 
-**During fit_technical**:
+**During fit_ntc**:
 1. Check if AutoNormal fallback activated (see console output)
 2. If not, reduce features: `counts = counts[top_genes, :]`
 3. Reduce posterior samples: `nsamples=500`
@@ -546,7 +546,7 @@ sparsity = 0.85
 
 **Calculate**:
 ```python
-# fit_technical
+# fit_ntc
 N_ntc = N * 0.4  # Assume 40% NTC
 data_gb = (T * N_ntc * 4 * (1 - sparsity)) / 1e9
 guide_gb = ((C - 1 + 2) * T * 2 * 4) / 1e9
@@ -563,7 +563,7 @@ grad_gb = (7 * T * 4 * 3) / 1e9
 ram_trans = 10 + data_trans_gb * 2
 vram_trans = 8 + grad_gb * 2
 
-print(f"fit_technical: {ram_tech:.1f} GB RAM, {vram_tech:.1f} GB VRAM")
+print(f"fit_ntc: {ram_tech:.1f} GB RAM, {vram_tech:.1f} GB VRAM")
 print(f"fit_cis: {ram_cis:.1f} GB RAM, {vram_cis:.1f} GB VRAM")
 print(f"fit_trans: {ram_trans:.1f} GB RAM, {vram_trans:.1f} GB VRAM")
 print(f"\nRecommended: {max(ram_tech, ram_cis, ram_trans) * 2:.0f} GB RAM, {max(vram_tech, vram_cis, vram_trans) * 1.5:.0f} GB VRAM")
@@ -573,9 +573,9 @@ print(f"\nRecommended: {max(ram_tech, ram_cis, ram_trans) * 2:.0f} GB RAM, {max(
 
 ## Additional Resources
 
-- **AutoNormal vs AutoIAFNormal**: See `bayesDREAM/fitting/technical.py:1237-1301`
-- **Sparse matrix handling**: See `bayesDREAM/fitting/technical.py:540-547`
-- **Memory optimization**: See `bayesDREAM/fitting/technical.py:980-1035`
+- **AutoNormal vs AutoIAFNormal**: See `bayesDREAM/fitting/ntc.py:1237-1301`
+- **Sparse matrix handling**: See `bayesDREAM/fitting/ntc.py:540-547`
+- **Memory optimization**: See `bayesDREAM/fitting/ntc.py:980-1035`
 - **GPU memory check**: Automatic in `fit_ntc()` (lines 1255-1271)
 
 For questions or issues, see: https://github.com/anthropics/bayesDREAM/issues

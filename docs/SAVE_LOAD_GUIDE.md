@@ -3,7 +3,7 @@
 ## Overview
 
 bayesDREAM provides methods to save and load fitted parameters at each stage of the pipeline:
-1. **Technical fit** (`fit_technical`) → `save_ntc_fit()` / `load_ntc_fit()`
+1. **Technical fit** (`fit_ntc`) → `save_ntc_fit()` / `load_ntc_fit()`
 2. **Cis fit** (`fit_cis`) → `save_cis_fit()` / `load_cis_fit()`
 3. **Trans fit** (`fit_trans`) → `save_trans_fit()` / `load_trans_fit()`
 
@@ -39,7 +39,7 @@ After running `fit_ntc()`:
 ```python
 model = bayesDREAM(...)
 model.set_technical_groups(['cell_line'])
-model.fit_technical(modality_name='gene', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='gene', sum_factor_col='sum_factor')
 
 # Save all modalities to default output_dir
 model.save_ntc_fit()
@@ -223,7 +223,7 @@ model = bayesDREAM(
 
 # Stage 1: Technical
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.save_ntc_fit()
 
 # Stage 2: Cis
@@ -247,7 +247,7 @@ counts = pd.read_csv('counts.csv', index_col=0)
 
 model = bayesDREAM(meta=meta, counts=counts, cis_gene='GFI1B', output_dir='./results/')
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.save_ntc_fit()
 ```
 
@@ -296,7 +296,7 @@ model = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_covari
 model.add_atac_modality(atac_counts, region_meta)
 
 model.set_technical_groups(['cell_line'])
-model.fit_technical(modality_name='gene', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='gene', sum_factor_col='sum_factor')
 model.save_ntc_fit()  # Saves alpha_x_prefit, alpha_y_prefit, alpha_y_prefit_atac
 
 # Stage 2: Load and fit cis
@@ -326,9 +326,9 @@ model.add_atac_modality(atac_counts, region_meta)
 model.add_splicing_modality(sj_counts, sj_meta, splicing_types=['donor'])
 
 model.set_technical_groups(['cell_line'])
-model.fit_technical(modality_name='gene', sum_factor_col='sum_factor')
-model.fit_technical(modality_name='atac', sum_factor_col='sum_factor')
-model.fit_technical(modality_name='splicing_donor', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='gene', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='atac', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='splicing_donor', sum_factor_col='sum_factor')
 
 # Save only specific modalities
 model.save_ntc_fit(modalities=['gene', 'atac'])  # Skip splicing_donor
@@ -398,10 +398,10 @@ model.load_ntc_fit(modalities=['gene'])  # Skip loading large ATAC arrays
 **Use Case 3: Incremental Fitting**
 ```python
 # Fit and save modalities one at a time
-model.fit_technical(modality_name='gene', ...)
+model.fit_ntc(modality_name='gene', ...)
 model.save_ntc_fit(modalities=['gene'])  # Includes model-level (primary)
 
-model.fit_technical(modality_name='atac', ...)
+model.fit_ntc(modality_name='atac', ...)
 model.save_ntc_fit(modalities=['atac'])  # Skips model-level (not primary)
 ```
 
@@ -409,7 +409,7 @@ model.save_ntc_fit(modalities=['atac'])  # Skips model-level (not primary)
 ```python
 # Fit heavy modalities on HPC, lighter ones locally
 # On HPC:
-model.fit_technical(modality_name='atac', ...)
+model.fit_ntc(modality_name='atac', ...)
 model.save_ntc_fit(modalities=['atac'])  # Skips model-level automatically
 
 # On local machine:

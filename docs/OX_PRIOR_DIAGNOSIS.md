@@ -1,14 +1,14 @@
 # o_x Prior Diagnosis: Why Gamma(9, 3) Is Wrong for fit_cis
 
 **Context**: The overdispersion prior structure in bayesDREAM was copied from cell2location. It
-works correctly for `fit_technical` and `fit_trans` but is systematically wrong for `fit_cis`,
+works correctly for `fit_ntc` and `fit_trans` but is systematically wrong for `fit_cis`,
 causing x_true to be discretized by raw integer counts. This document records the diagnosis.
 
 ---
 
 ## The Prior Structure
 
-Both `fit_technical` and `fit_cis` use the same hierarchical prior:
+Both `fit_ntc` and `fit_cis` use the same hierarchical prior:
 
 ```python
 beta_o ~ Gamma(alpha=9, beta=3)       # mean = 3
@@ -37,7 +37,7 @@ The implied prior statistics for `o_x`:
 
 ## Where the Prior Is Appropriate
 
-### fit_technical and fit_trans
+### fit_ntc and fit_trans
 
 The technical fit estimates confirm the prior is reasonable for typical trans genes.
 
@@ -53,7 +53,7 @@ with the collective data across all genes tightly constraining the shared `beta_
 In `fit_trans`, x_true is treated as **fixed** (a point estimate passed in, not a latent
 variable), so there is no variance-absorption problem. The prior behaves as intended.
 
-### Lowly-expressed genes in fit_technical
+### Lowly-expressed genes in fit_ntc
 
 The horizontal band at log2(o_y) ≈ 0 (o_y ≈ 1) visible in the 2D density plot for very low
 expression genes (log2 mu_ntc < −7) is the Gamma(9,3) prior dominating when counts are too
@@ -134,13 +134,13 @@ The technical fit already produces the correct answer: it estimates `o_y` for ev
 (including the cis gene) from NTC cells, without any latent x_true interfering. That value is
 the natural **empirical Bayes prior center** for `o_x` in `fit_cis`.
 
-**Implementation**: after `fit_technical`, look up the cis gene's `o_y` from
+**Implementation**: after `fit_ntc`, look up the cis gene's `o_y` from
 `posterior_samples_ntc`, and either:
 
 1. **Fix `o_x` to this value** (simplest — remove it as an inferred parameter in `fit_cis`)
 2. **Use it as a tight informative prior center** (allows some flexibility around the estimate)
 
-The Gamma(9,3) prior can remain unchanged in `fit_technical` and `fit_trans`, where it behaves
+The Gamma(9,3) prior can remain unchanged in `fit_ntc` and `fit_trans`, where it behaves
 as intended.
 
 ---
@@ -149,6 +149,6 @@ as intended.
 
 | Context | Gamma(9,3) appropriate? | Reason |
 |---------|------------------------|--------|
-| `fit_technical` | Yes | Containment prior across many genes; no latent x_true |
+| `fit_ntc` | Yes | Containment prior across many genes; no latent x_true |
 | `fit_trans` | Yes | x_true is fixed (not latent); same containment logic applies |
 | `fit_cis` | **No** | x_true latent absorbs variance; single gene; prior pulls in wrong direction |

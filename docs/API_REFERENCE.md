@@ -407,7 +407,7 @@ model.set_technical_groups(['cell_line'])
 #### fit_ntc()
 
 ```python
-model.fit_technical(
+model.fit_ntc(
     sum_factor_col='sum_factor',
     lr=1e-3,
     niters=None,
@@ -475,7 +475,7 @@ Fit technical model to estimate baseline overdispersion and cell-line effects fr
 ```python
 # Standard usage with gene counts
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 # For 92 genes (including GFI1B cis gene):
 # - Fits all 92 features
 # - Extracts alpha_x_prefit for GFI1B (shape: [nsamples, 2])
@@ -483,14 +483,14 @@ model.fit_technical(sum_factor_col='sum_factor')
 
 # Continuous scores (normal distribution)
 model.set_technical_groups(['cell_line'])
-model.fit_technical(distribution='normal')
+model.fit_ntc(distribution='normal')
 
 # Specific modality
-model.fit_technical(modality_name='splicing_donor', distribution='multinomial')
+model.fit_ntc(modality_name='splicing_donor', distribution='multinomial')
 
 # High MOI: use all cells for technical estimation
 model.set_technical_groups(['lane', 'batch'])
-model.fit_technical(use_all_cells=True)
+model.fit_ntc(use_all_cells=True)
 ```
 
 ---

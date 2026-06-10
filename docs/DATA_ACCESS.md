@@ -427,7 +427,7 @@ adata.layers['spliz'] = spliz_mod.counts.T
 # Technical fit uses model.counts (includes cis gene)
 # It extracts SEPARATE parameters for cis vs trans
 
-# 1. Alpha for cis gene (extracted during fit_technical)
+# 1. Alpha for cis gene (extracted during fit_ntc)
 if hasattr(model, 'alpha_x_prefit'):
     alpha_x = model.alpha_x_prefit  # Cis gene overdispersion
     print(f"Alpha_x shape: {alpha_x.shape}")  # (n_samples, n_groups)
@@ -708,7 +708,7 @@ exon_mod.set_exon_aggregate_method('mean')
 # This recomputes exon_mod.counts (inclusion) and exon_mod.denominator (total)
 
 # After fit_ntc(), changing is prevented by default
-model.fit_technical(covariates=['cell_line'], distribution='binomial', denominator=exon_mod.denominator)
+model.fit_ntc(covariates=['cell_line'], distribution='binomial', denominator=exon_mod.denominator)
 exon_mod.mark_technical_fit_complete()  # Lock the aggregation method
 
 try:

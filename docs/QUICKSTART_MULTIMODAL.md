@@ -38,7 +38,7 @@ model = bayesDREAM(
 
 # Run 3-step pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 ```
@@ -87,7 +87,7 @@ print(model.list_modalities())
 
 # Run pipeline (operates on gene modality)
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 
@@ -149,14 +149,14 @@ from bayesDREAM import bayesDREAM
 # Example 1: Gene counts (negbinom) - DEFAULT
 model = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_covariates=['cell_line'])
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor', distribution='negbinom')
+model.fit_ntc(sum_factor_col='sum_factor', distribution='negbinom')
 model.fit_trans(sum_factor_col='sum_factor_adj', distribution='negbinom', function_type='additive_hill')
 
 # Example 2: Continuous measurements (normal) - e.g., SpliZ scores
 model = bayesDREAM(meta=meta, counts=spliz_scores, modality_name='spliz',
                    cis_gene='GFI1B', guide_covariates=['cell_line'])
 model.set_technical_groups(['cell_line'])
-model.fit_technical(distribution='normal')
+model.fit_ntc(distribution='normal')
 model.fit_trans(distribution='normal', function_type='polynomial')
 
 # Example 3: Exon skipping PSI (binomial)
@@ -295,7 +295,7 @@ model.add_splicing_modality(
 
 # 3. Run pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 
@@ -323,7 +323,7 @@ model.add_splicing_modality(sj_counts, sj_meta, ['sj', 'exon_skip'])
 
 # 4. Run pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='polynomial')
 

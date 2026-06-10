@@ -65,7 +65,7 @@ bayesDREAM uses a **separate 'cis' modality** for modeling direct perturbation e
 │     └─ Cells: Subset to match filtered meta                    │
 │                                                                  │
 │  3. Base class initialization                                   │
-│     ├─ self.counts: ORIGINAL 92 genes (for fit_technical)     │
+│     ├─ self.counts: ORIGINAL 92 genes (for fit_ntc)     │
 │     ├─ self.meta: Filtered to ntc + GFI1B cells               │
 │     └─ self.cis_gene: 'GFI1B'                                 │
 │                                                                  │
@@ -84,7 +84,7 @@ bayesDREAM uses a **separate 'cis' modality** for modeling direct perturbation e
 │  }                                                               │
 │                                                                  │
 │  self.counts:  DataFrame(92 genes × 4,281 cells)               │
-│                includes GFI1B for fit_technical                 │
+│                includes GFI1B for fit_ntc                 │
 │                                                                  │
 │  self.primary_modality: 'gene'  # Set by modality_name parameter│
 └─────────────────────────────────────────────────────────────────┘
@@ -100,7 +100,7 @@ bayesDREAM uses a **separate 'cis' modality** for modeling direct perturbation e
 
 **Fitting Behavior:**
 ```
-fit_technical(primary modality):
+fit_ntc(primary modality):
   ├─ Uses: self.counts (92 genes, includes GFI1B)
   ├─ Fits: All features including cis
   ├─ Extracts: alpha_x_prefit for GFI1B [nsamples, n_groups]
@@ -309,13 +309,13 @@ normal                    2D: (F, C)             SpliZ scores
 │                    Modeling Pipeline                             │
 │                                                                  │
 │  model.set_technical_groups(['cell_line'])                      │
-│    → Required before fit_technical                              │
+│    → Required before fit_ntc                              │
 │    → Sets technical_group_code for NTC cells                    │
 │                                                                  │
-│  model.fit_technical(sum_factor_col='sum_factor',               │
+│  model.fit_ntc(sum_factor_col='sum_factor',               │
 │                      modality_name='gene')                      │
 │    → For primary modality: Uses self.counts (includes cis gene) │
-│    → Fits _model_technical (distribution-flexible)              │
+│    → Fits _model_ntc (distribution-flexible)              │
 │    → Extracts alpha_x_prefit for cis gene [nsamples, n_groups]  │
 │    → Stores alpha_y_prefit for trans genes [nsamples, ..., 91]  │
 │                                                                  │
@@ -366,12 +366,12 @@ normal                    2D: (F, C)             SpliZ scores
 │    - alpha_y_prefit, alpha_x_prefit: tensors                    │
 │    - x_true: posterior cis expression                           │
 │    - posterior_samples_cis, posterior_samples_trans: dicts      │
-│    - _technical_fitter, _cis_fitter, _trans_fitter: delegates   │
+│    - _ntc_fitter, _cis_fitter, _trans_fitter: delegates   │
 │    - _saver, _loader: save/load delegates                       │
 │                                                                  │
 │  Methods:                                                        │
 │    - set_technical_groups(covariates)                           │
-│    - fit_technical(sum_factor_col, modality_name, ...)          │
+│    - fit_ntc(sum_factor_col, modality_name, ...)          │
 │    - fit_cis(sum_factor_col, ...)                               │
 │    - fit_trans(sum_factor_col, function_type, ...)              │
 │    - set_alpha_x(), set_alpha_y(), set_x_true()                 │
@@ -382,7 +382,7 @@ normal                    2D: (F, C)             SpliZ scores
 │    - save_trans_fit(), load_trans_fit()                         │
 │                                                                  │
 │  Internal Models (used by fitters):                             │
-│    - _model_technical(), _model_x(), _model_y()                 │
+│    - _model_ntc(), _model_x(), _model_y()                 │
 └────────────────────────────┬────────────────────────────────────┘
                              │ inherits
                              ↓
@@ -394,7 +394,7 @@ normal                    2D: (F, C)             SpliZ scores
 │  Additional Attributes:                                          │
 │    - modalities: Dict[str, Modality] (includes 'cis', primary)  │
 │    - primary_modality: str (set by modality_name parameter)     │
-│    - counts_meta: pd.DataFrame (metadata for technical fit)     │
+│    - counts_meta: pd.DataFrame (metadata for NTC fit)     │
 │                                                                  │
 │  Additional Methods (from mixins):                               │
 │    - add_modality(name, modality, overwrite)                    │
@@ -421,7 +421,7 @@ Both fit_ntc() and fit_trans() support all distributions:
 
 ┌─────────────────────────────────────────────────────────────────┐
 │  # Gene counts (negbinom)                                        │
-│  model.fit_technical(covariates=['cell_line'],                  │
+│  model.fit_ntc(covariates=['cell_line'],                  │
 │                      sum_factor_col='sum_factor',               │
 │                      distribution='negbinom')                    │
 │  model.fit_trans(sum_factor_col='sum_factor',                   │
@@ -429,7 +429,7 @@ Both fit_ntc() and fit_trans() support all distributions:
 │                  function_type='additive_hill')                 │
 │                                                                  │
 │  # Continuous measurements (normal)                             │
-│  model.fit_technical(covariates=['cell_line'],                  │
+│  model.fit_ntc(covariates=['cell_line'],                  │
 │                      distribution='normal')                      │
 │  model.fit_trans(distribution='normal',                         │
 │                  function_type='polynomial')                     │
