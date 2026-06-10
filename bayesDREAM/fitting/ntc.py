@@ -202,7 +202,6 @@ class NTCFitter:
         # ----------------------------
         # PLATES for groups and feats
         # ----------------------------
-        c_plate  = pyro.plate("c_plate", C - 1, dim=-2)      # groups except baseline
         f_plate  = pyro.plate("feature_plate_technical", T, dim=-1)
     
         # ----------------------------
@@ -308,6 +307,7 @@ class NTCFitter:
                 alpha_full_mul = torch.ones(1, T, device=self.model.device)
                 alpha_full_add = torch.zeros(1, T, device=self.model.device)
             else:
+                c_plate = pyro.plate("c_plate", C - 1, dim=-2)
                 if distribution in ("normal", "studentt"):
                     # For Normal we want additive shifts on the ORIGINAL scale,
                     # with a width that reflects the data:
@@ -756,7 +756,7 @@ class NTCFitter:
                 print(f"[INFO] Converting COO sparse matrix to CSR for efficient row indexing")
                 counts_to_fit = counts_to_fit.tocsr()
 
-        print(f"[INFO] Fitting technical model for modality '{modality_name}' (distribution: {distribution})")
+        print(f"[INFO] Fitting NTC model for modality '{modality_name}' (distribution: {distribution})")
     
         # ---------------------------
         # Validate requirements
@@ -784,7 +784,7 @@ class NTCFitter:
             )
             self.model.meta["technical_group_code"] = 0
     
-        print("Running prefit_cellline...")
+        print("[INFO] Running NTC prefit...")
     
         # ---------------------------
         # Subset to NTC cells (or use all cells if requested)
@@ -1536,7 +1536,7 @@ class NTCFitter:
                 init_loc_fn=init_loc_fn,
             )
 
-            def guide_cellline(*args, **kwargs):
+            def ntc_guide(*args, **kwargs):
                 # ---- probs_baseline_raw: softmax-parameterised point estimate ----
                 log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
                 log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
@@ -1548,7 +1548,7 @@ class NTCFitter:
 
         elif distribution in ['binomial', 'normal', 'studentt']:
             # Calmer guide for these distributions
-            guide_cellline = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
+            ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
         else:
             # For negbinom and other distributions: check if IAF is feasible
@@ -1612,10 +1612,10 @@ class NTCFitter:
                     use_iaf = True
 
             if use_iaf:
-                guide_cellline = AutoIAFNormal(self._model_ntc, init_loc_fn=init_loc_fn)
+                ntc_guide = AutoIAFNormal(self._model_ntc, init_loc_fn=init_loc_fn)
                 # Initialize the guide by calling it once with the model
                 with torch.no_grad():
-                    guide_cellline(
+                    ntc_guide(
                         N, T_fit, C,
                         groups_ntc_tensor,
                         y_obs_ntc_tensor,
@@ -1630,13 +1630,13 @@ class NTCFitter:
                         K, D,
                         sigma_hat_tensor,
                     )
-                guide_cellline.to(self.model.device)
+                ntc_guide.to(self.model.device)
             else:
                 # Fallback to memory-efficient AutoNormal
-                guide_cellline = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
+                ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
         # Choose ELBO based on guide type
-        if isinstance(guide_cellline, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
+        if isinstance(ntc_guide, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
             # lower-variance estimator for mean-field Normal
             elbo = pyro.infer.TraceMeanField_ELBO(num_particles=1)
         else:
@@ -1671,8 +1671,8 @@ class NTCFitter:
             clip_args={"clip_norm": 10.0},  # gradient clipping
         )
 
-        svi = pyro.infer.SVI(self._model_ntc, guide_cellline, optimizer, loss=elbo)
-        guide_cellline.to(self.model.device)
+        svi = pyro.infer.SVI(self._model_ntc, ntc_guide, optimizer, loss=elbo)
+        ntc_guide.to(self.model.device)
     
         # ---------------------------
         # Optimize
@@ -1722,7 +1722,7 @@ class NTCFitter:
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
         run_on_cpu = self.model.device.type != "cpu"
         if run_on_cpu:
-            guide_cellline.to("cpu")
+            ntc_guide.to("cpu")
             self.model.device = torch.device("cpu")
     
             model_inputs = {
@@ -1791,7 +1791,7 @@ class NTCFitter:
 
         if minibatch_size is not None:
             predictive_technical = pyro.infer.Predictive(
-                self._model_ntc, guide=guide_cellline, num_samples=minibatch_size,
+                self._model_ntc, guide=ntc_guide, num_samples=minibatch_size,
                 parallel=use_parallel
             )
 
@@ -1806,7 +1806,7 @@ class NTCFitter:
                     if current_batch_size < minibatch_size:
                         # Last batch might be smaller
                         predictive_batch = pyro.infer.Predictive(
-                            self._model_ntc, guide=guide_cellline, num_samples=current_batch_size,
+                            self._model_ntc, guide=ntc_guide, num_samples=current_batch_size,
                             parallel=use_parallel
                         )
                         samples = predictive_batch(**model_inputs_with_skip)
@@ -1840,7 +1840,7 @@ class NTCFitter:
                     gc.collect()
         else:
             predictive_technical = pyro.infer.Predictive(
-                self._model_ntc, guide=guide_cellline, num_samples=nsamples,
+                self._model_ntc, guide=ntc_guide, num_samples=nsamples,
                 parallel=use_parallel
             )
             with torch.no_grad():
