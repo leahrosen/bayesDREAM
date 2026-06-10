@@ -483,12 +483,31 @@ class bayesDREAM(
                 return t.mean(dim=0).detach().cpu().numpy().flatten()
             return np.asarray(t).mean(axis=0).flatten()
 
-        # Trans genes
-        log2_trans = np.log2(_to_numpy(ps_primary['mu_ntc']))  # LogNormal → always > 0
+        # Trans genes — NaN where features were excluded from fitting (zero NTC counts, etc.)
+        log2_trans = np.log2(_to_numpy(ps_primary['mu_ntc']))
 
         # Cis gene (shape [S, 1] → scalar after mean+flatten)
         cis_mu_ntc = float(_to_numpy(ps_cis['mu_ntc'])[0])
         cis_log2_expr = float(np.log2(cis_mu_ntc))
+
+        if not np.isfinite(cis_log2_expr):
+            warnings.warn(
+                f"Cis gene '{self.cis_gene}' has non-finite log2 NTC expression "
+                f"(mu_ntc={cis_mu_ntc:.4g}). GMM check skipped.",
+                UserWarning,
+            )
+            return None
+
+        # Drop non-finite trans values (NaN-filled excluded features, any -inf from mu=0)
+        n_raw = len(log2_trans)
+        log2_trans = log2_trans[np.isfinite(log2_trans)]
+        n_dropped = n_raw - len(log2_trans)
+        if n_dropped > 0:
+            warnings.warn(
+                f"{n_dropped} trans gene(s) excluded from GMM (non-finite log2 NTC expression, "
+                f"likely zero-count features skipped during fit_ntc).",
+                UserWarning,
+            )
 
         all_log2_expr = np.concatenate([log2_trans, [cis_log2_expr]])
 
