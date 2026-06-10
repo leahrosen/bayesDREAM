@@ -137,7 +137,7 @@ def sample_technical_priors(
     Returns
     -------
     dict
-        Dictionary of prior samples matching posterior_samples_technical structure
+        Dictionary of prior samples matching posterior_samples_ntc structure
     """
     if modality_name is None:
         modality_name = model.primary_modality

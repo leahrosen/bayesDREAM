@@ -389,7 +389,7 @@ print(model.list_modalities())
 model.set_technical_groups(covariates)
 ```
 
-Set technical group codes based on covariates. **Must be called before `fit_technical()`**.
+Set technical group codes based on covariates. **Must be called before `fit_ntc()`**.
 
 **Parameters:**
 - `covariates` (list of str): Column names in meta to group by (e.g., `['cell_line']`)
@@ -404,7 +404,7 @@ model.set_technical_groups(['cell_line'])
 
 ---
 
-#### fit_technical()
+#### fit_ntc()
 
 ```python
 model.fit_technical(
@@ -466,7 +466,7 @@ Fit technical model to estimate baseline overdispersion and cell-line effects fr
 - Sets `self.alpha_y_prefit` (overdispersion parameters for trans features)
 - Sets `self.alpha_x_prefit` (overdispersion for cis feature, if primary modality)
 - Sets `self.alpha_y_type` and `self.alpha_x_type` to `'posterior'`
-- Sets `self.posterior_samples_technical` (full posterior samples)
+- Sets `self.posterior_samples_ntc` (full posterior samples)
 - Sets `self.loss_technical` (optimization loss history)
 - For modalities: sets `modality.alpha_y_prefit_mult` and `modality.alpha_y_prefit_add`
 - For primary modality with original counts: creates `self.counts_meta` DataFrame with filtering flags
@@ -695,10 +695,10 @@ model.fit_trans(
 
 ### Save/Load Methods
 
-#### save_technical_fit()
+#### save_ntc_fit()
 
 ```python
-model.save_technical_fit(
+model.save_ntc_fit(
     file_path=None,
     modalities=None,
     metadata=None
@@ -720,16 +720,16 @@ Save technical fitting results to HDF5 file.
 
 **Example:**
 ```python
-model.save_technical_fit()
+model.save_ntc_fit()
 # Saves to: ./output/my_run/technical_fit.h5
 ```
 
 ---
 
-#### load_technical_fit()
+#### load_ntc_fit()
 
 ```python
-model.load_technical_fit(
+model.load_ntc_fit(
     file_path=None,
     modalities=None
 )
@@ -742,13 +742,13 @@ Load technical fitting results from HDF5 file.
 - `modalities` (list, optional): Modalities to load. Defaults to all in file
 
 **Restores:**
-- `self.posterior_samples_technical`
+- `self.posterior_samples_ntc`
 - `self.loss_technical`
 - `modality.alpha_y_prefit_mult` and `modality.alpha_y_prefit_add`
 
 **Example:**
 ```python
-model.load_technical_fit()
+model.load_ntc_fit()
 ```
 
 ---
@@ -867,10 +867,10 @@ model.load_trans_fit(suffix='additive_hill')
 
 ---
 
-#### save_technical_summary()
+#### save_ntc_summary()
 
 ```python
-model.save_technical_summary(
+model.save_ntc_summary(
     output_dir=None,
     modalities=None
 )
@@ -888,7 +888,7 @@ Export technical fit results as CSV files for downstream analysis (e.g., R plott
 
 **Example:**
 ```python
-model.save_technical_summary()
+model.save_ntc_summary()
 ```
 
 ---
@@ -1071,7 +1071,7 @@ Useful for testing without technical correction by subsetting to a single cell_l
 - `query` (str, optional): Pandas query string to filter cells (e.g., `"cell_line == 'CRISPRi'"`)
   - Must provide either `cell_mask` or `query`, not both
 - `preserve_fits` (bool): Whether to preserve existing fit results. Default: True
-  - If True, copies `posterior_samples_technical`, `alpha_y_prefit`, etc.
+  - If True, copies `posterior_samples_ntc`, `alpha_y_prefit`, etc.
   - If False, creates a fresh model without fit results
 
 **Returns:** New bayesDREAM instance with subset of cells

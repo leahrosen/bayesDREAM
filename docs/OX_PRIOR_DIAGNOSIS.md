@@ -135,7 +135,7 @@ The technical fit already produces the correct answer: it estimates `o_y` for ev
 the natural **empirical Bayes prior center** for `o_x` in `fit_cis`.
 
 **Implementation**: after `fit_technical`, look up the cis gene's `o_y` from
-`posterior_samples_technical`, and either:
+`posterior_samples_ntc`, and either:
 
 1. **Fix `o_x` to this value** (simplest — remove it as an inferred parameter in `fit_cis`)
 2. **Use it as a tight informative prior center** (allows some flexibility around the estimate)

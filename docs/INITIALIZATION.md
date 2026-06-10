@@ -1,8 +1,8 @@
-# Technical Fitting Initialization Guide
+# NTC Fitting Initialization Guide
 
 ## Overview
 
-This document describes the empirical Bayes initialization strategies used in bayesDREAM's technical fitting step (`fit_technical`) for removing batch effects. The initialization approach varies by distribution type (negative binomial, binomial, multinomial) but follows a consistent philosophy: **use reference group data to set baseline priors and initialize correction parameters based on empirical group differences**.
+This document describes the empirical Bayes initialization strategies used in bayesDREAM's NTC fitting step (`fit_technical`) for removing batch effects. The initialization approach varies by distribution type (negative binomial, binomial, multinomial) but follows a consistent philosophy: **use reference group data to set baseline priors and initialize correction parameters based on empirical group differences**.
 
 ## Key Concepts
 

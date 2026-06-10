@@ -43,7 +43,7 @@ from .modality import Modality
 from .fitting.distributions import get_observation_sampler, requires_denominator, is_3d_distribution
 
 # Import fitters
-from .fitting import TechnicalFitter, CisFitter, TransFitter
+from .fitting import NTCFitter, CisFitter, TransFitter
 from .io import ModelSaver, ModelLoader
 from .plotting.model_plots import PlottingMixin
 from .diagnostics import DiagnosticsMixin
@@ -579,7 +579,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         self.trace_y = None          # from step3
 
         # Initialize fitter objects and helpers
-        self._technical_fitter = TechnicalFitter(self)
+        self._ntc_fitter = NTCFitter(self)
         self._cis_fitter = CisFitter(self)
         self._trans_fitter = TransFitter(self)
         self._saver = ModelSaver(self)
@@ -1608,7 +1608,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
             # NOTE: alpha_y_prefit is a property, not an attribute - it derives from _mult/_add
             modality_attrs = [
                 'alpha_y_prefit_mult', 'alpha_y_prefit_add',
-                'posterior_samples_technical', 'posterior_samples_trans', 'losses_trans'
+                'posterior_samples_ntc', 'posterior_samples_trans', 'losses_trans'
             ]
             for mod_name in self.modalities:
                 if mod_name in model_new.modalities:
@@ -1685,17 +1685,23 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
     # Delegation methods to fitters
     # ========================================================================
 
+    def _model_ntc(self, *args, **kwargs):
+        """Delegate to NTCFitter."""
+        return self._ntc_fitter._model_ntc(*args, **kwargs)
+
     def _model_technical(self, *args, **kwargs):
-        """Delegate to TechnicalFitter."""
-        return self._technical_fitter._model_technical(*args, **kwargs)
+        """Deprecated alias for _model_ntc()."""
+        import warnings
+        warnings.warn("_model_technical() is deprecated — use _model_ntc() instead.", DeprecationWarning, stacklevel=2)
+        return self._model_ntc(*args, **kwargs)
 
     def set_technical_groups(self, *args, **kwargs):
-        """Delegate to TechnicalFitter."""
-        return self._technical_fitter.set_technical_groups(*args, **kwargs)
+        """Delegate to NTCFitter."""
+        return self._ntc_fitter.set_technical_groups(*args, **kwargs)
 
     def fit_ntc(self, *args, **kwargs):
-        """Delegate to TechnicalFitter."""
-        return self._technical_fitter.fit_ntc(*args, **kwargs)
+        """Delegate to NTCFitter."""
+        return self._ntc_fitter.fit_ntc(*args, **kwargs)
 
     def fit_technical(self, *args, **kwargs):
         """Deprecated alias for fit_ntc(). Use fit_ntc() instead."""
@@ -1725,9 +1731,15 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         """Delegate to TransFitter."""
         return self._trans_fitter.fit_trans(*args, **kwargs)
 
-    def save_technical_fit(self, *args, **kwargs):
+    def save_ntc_fit(self, *args, **kwargs):
         """Delegate to ModelSaver."""
-        return self._saver.save_technical_fit(*args, **kwargs)
+        return self._saver.save_ntc_fit(*args, **kwargs)
+
+    def save_technical_fit(self, *args, **kwargs):
+        """Deprecated alias for save_ntc_fit(). Use save_ntc_fit() instead."""
+        import warnings
+        warnings.warn("save_technical_fit() is deprecated — use save_ntc_fit() instead.", DeprecationWarning, stacklevel=2)
+        return self.save_ntc_fit(*args, **kwargs)
 
     def save_cis_fit(self, *args, **kwargs):
         """Delegate to ModelSaver."""
@@ -1737,9 +1749,15 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         """Delegate to ModelSaver."""
         return self._saver.save_trans_fit(*args, **kwargs)
 
-    def load_technical_fit(self, *args, **kwargs):
+    def load_ntc_fit(self, *args, **kwargs):
         """Delegate to ModelLoader."""
-        return self._loader.load_technical_fit(*args, **kwargs)
+        return self._loader.load_ntc_fit(*args, **kwargs)
+
+    def load_technical_fit(self, *args, **kwargs):
+        """Deprecated alias for load_ntc_fit(). Use load_ntc_fit() instead."""
+        import warnings
+        warnings.warn("load_technical_fit() is deprecated — use load_ntc_fit() instead.", DeprecationWarning, stacklevel=2)
+        return self.load_ntc_fit(*args, **kwargs)
 
     def load_cis_fit(self, *args, **kwargs):
         """Delegate to ModelLoader."""
@@ -1750,9 +1768,15 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         return self._loader.load_trans_fit(*args, **kwargs)
 
     # Summary export methods
-    def save_technical_summary(self, *args, **kwargs):
+    def save_ntc_summary(self, *args, **kwargs):
         """Delegate to ModelSummarizer."""
-        return self._summarizer.save_technical_summary(*args, **kwargs)
+        return self._summarizer.save_ntc_summary(*args, **kwargs)
+
+    def save_technical_summary(self, *args, **kwargs):
+        """Deprecated alias for save_ntc_summary(). Use save_ntc_summary() instead."""
+        import warnings
+        warnings.warn("save_technical_summary() is deprecated — use save_ntc_summary() instead.", DeprecationWarning, stacklevel=2)
+        return self.save_ntc_summary(*args, **kwargs)
 
     def save_cis_summary(self, *args, **kwargs):
         """Delegate to ModelSummarizer."""

@@ -343,7 +343,7 @@ class CisFitter:
             if self.model.alpha_x_prefit is None:
                 warnings.warn(
                     f"Technical covariates provided but alpha_x_prefit not set. "
-                    f"You should run fit_technical() on the primary modality ('{self.model.primary_modality}') first "
+                    f"You should run fit_ntc() on the primary modality ('{self.model.primary_modality}') first "
                     f"to estimate technical effects for the cis gene. "
                     f"Proceeding without technical correction for cis gene (alpha_x will be fitted fresh)."
                 )
@@ -516,7 +516,7 @@ class CisFitter:
         x_obs_factored = x_obs_tensor / sum_factor_tensor
         
         if self.model.alpha_x_prefit is not None:
-            # alpha_x_prefit is always a [C] point estimate (mean already taken at fit_technical time)
+            # alpha_x_prefit is always a [C] point estimate (mean already taken at fit_ntc time)
             alpha_x_full = self.model.alpha_x_prefit.flatten()
             # Select the correct alpha_x for each observation (expand for broadcasting)
             alpha_x_used = alpha_x_full[groups_tensor]  # groups_tensor indexes into (C,)
@@ -526,16 +526,16 @@ class CisFitter:
         
         # --- Extract o_x from the technical fit (cis modality posterior) ---
         cis_modality = self.model.get_modality('cis')
-        if (cis_modality.posterior_samples_technical is None
-                or 'o_x' not in cis_modality.posterior_samples_technical):
+        if (cis_modality.posterior_samples_ntc is None
+                or 'o_x' not in cis_modality.posterior_samples_ntc):
             raise ValueError(
                 "Cis gene overdispersion not found. Run fit_ntc() before fit_cis().\n"
                 "fit_ntc() estimates o_x for the cis gene from NTC cells, which is required "
                 "to set a data-driven overdispersion prior instead of the generic Gamma(9,3)."
             )
-        o_x_technical = float(cis_modality.posterior_samples_technical['o_x'].mean().item())
-        o_x_sample = torch.tensor(o_x_technical, dtype=torch.float32, device=self.model.device)
-        print(f"[INFO] fit_cis: using technical o_x = {o_x_technical:.4f} (phi = {1/o_x_technical**2:.2f})")
+        o_x_ntc = float(cis_modality.posterior_samples_ntc['o_x'].mean().item())
+        o_x_sample = torch.tensor(o_x_ntc, dtype=torch.float32, device=self.model.device)
+        print(f"[INFO] fit_cis: using technical o_x = {o_x_ntc:.4f} (phi = {1/o_x_ntc**2:.2f})")
 
         alpha_alpha_mu_tensor = torch.tensor(alpha_alpha_mu, dtype=torch.float32, device=self.model.device)
         alpha_dirichlet_tensor = torch.tensor(alpha_dirichlet, dtype=torch.float32, device=self.model.device)

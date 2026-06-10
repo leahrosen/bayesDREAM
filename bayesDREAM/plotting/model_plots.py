@@ -130,10 +130,10 @@ class PlottingMixin:
         modality = self.get_modality(modality_name)
 
         # Get modality-specific posterior samples
-        if not hasattr(modality, 'posterior_samples_technical') or modality.posterior_samples_technical is None:
-            raise ValueError(f"No technical fit found for modality '{modality_name}'. Run fit_technical(modality_name='{modality_name}') first.")
+        if not hasattr(modality, 'posterior_samples_ntc') or modality.posterior_samples_ntc is None:
+            raise ValueError(f"No technical fit found for modality '{modality_name}'. Run fit_ntc(modality_name='{modality_name}') first.")
 
-        posterior = modality.posterior_samples_technical
+        posterior = modality.posterior_samples_ntc
 
         # Get feature names - will be adjusted based on alpha_y source later
         if 'gene' in modality.feature_meta.columns:
@@ -156,7 +156,7 @@ class PlottingMixin:
         if param == 'beta_o':
             # Scalar parameter
             if 'beta_o' not in posterior:
-                raise ValueError("beta_o not found in posterior_samples_technical")
+                raise ValueError("beta_o not found in posterior_samples_ntc")
 
             post_samples = posterior['beta_o'].numpy() if hasattr(posterior['beta_o'], 'numpy') else posterior['beta_o']
             prior_samples = prior_dict['beta_o'].numpy() if hasattr(prior_dict['beta_o'], 'numpy') else prior_dict['beta_o']
@@ -243,7 +243,7 @@ class PlottingMixin:
                     post_samples = posterior['alpha_y']
                 else:
                     raise ValueError(f"alpha_y not found for modality '{modality.name}'. "
-                                   "Run fit_technical(modality_name='{modality.name}') first.")
+                                   "Run fit_ntc(modality_name='{modality.name}') first.")
 
                 if hasattr(post_samples, 'numpy'):
                     post_samples = post_samples.numpy()
@@ -268,7 +268,7 @@ class PlottingMixin:
                     post_samples = posterior['alpha_y']
                 else:
                     raise ValueError(f"alpha_y not found for modality '{modality.name}'. "
-                                   "Run fit_technical(modality_name='{modality.name}') first.")
+                                   "Run fit_ntc(modality_name='{modality.name}') first.")
 
                 if hasattr(post_samples, 'numpy'):
                     post_samples = post_samples.numpy()

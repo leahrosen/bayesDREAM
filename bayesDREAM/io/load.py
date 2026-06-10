@@ -157,20 +157,20 @@ def _check_nan_features(feat_mask, mod_name, mask_features):
             f"[LOAD] {mod_name}: {n_missing} feature(s) in the current modality were not present "
             f"in the saved technical fit and would be filled with NaN.\n"
             f"Options:\n"
-            f"  • load_technical_fit(..., mask_features=True)  — fill missing features with "
+            f"  • load_ntc_fit(..., mask_features=True)  — fill missing features with "
             f"the baseline alpha_y value (1.0 for negbinom, 0.0 for other distributions), "
             f"exactly as fit_technical does for zero-count features; they are marked in "
             f"modality.fitted_feature_mask.\n"
             f"  • load_trans_fit(..., subset_features=True)  — after loading, subset the "
             f"modality to only features present in the saved fit.\n"
-            f"  • Rerun fit_technical() on the current feature set to produce a matching fit."
+            f"  • Rerun fit_ntc() on the current feature set to produce a matching fit."
         )
 
 
 def _fill_nan_with_baseline(tensor, feat_mask, distribution):
     """
     Replace NaN positions (where feat_mask is False) with the baseline alpha_y value,
-    matching what fit_technical's _reconstruct_full_2d does for excluded features:
+    matching what fit_ntc's _reconstruct_full_2d does for excluded features:
       - negbinom (multiplicative): baseline = 1.0
       - all others (additive: normal, binomial, multinomial): baseline = 0.0
 
@@ -298,7 +298,7 @@ class ModelLoader:
         """
         self.model = model
 
-    def load_technical_fit(self, input_dir: str = None,
+    def load_ntc_fit(self, input_dir: str = None,
                           modalities: list = None, verbose: bool = False,
                           load_model_level: bool = None,
                           mask_features: bool = False):
@@ -370,7 +370,7 @@ class ModelLoader:
                 if verbose:
                     print(f"[LOAD] alpha_y_prefit → {self.model.primary_modality} modality ← {alpha_y_path}")
 
-        # Load per-modality alpha_y_prefit and posterior_samples_technical
+        # Load per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_load:
             mod = self.model.modalities[mod_name]
             mod_loaded = []
@@ -381,11 +381,16 @@ class ModelLoader:
                                      else (list(mod.feature_meta.index)
                                            if mod.feature_meta is not None else None))
 
-            # ── posterior_samples_technical (load first to get saved feature names) ──
+            # ── posterior_samples_ntc (load first to get saved feature names) ──
             saved_feature_names = None
             n_features_saved = None
 
-            posterior_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
+            posterior_path = os.path.join(input_dir, f'posterior_samples_ntc_{mod_name}.pt')
+            if not os.path.exists(posterior_path):
+                # Backward compat: try old filename
+                legacy_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
+                if os.path.exists(legacy_path):
+                    posterior_path = legacy_path
             if os.path.exists(posterior_path):
                 loaded_data = _torch_load(posterior_path)
                 n_features = None
@@ -401,14 +406,14 @@ class ModelLoader:
                             and current_feature_names != saved_feature_names):
                         posterior_raw, feat_mask = _align_posterior_features(
                             posterior_raw, saved_feature_names, current_feature_names, n_features_saved)
-                        _report_alignment(f"{mod_name} technical posterior",
+                        _report_alignment(f"{mod_name} NTC posterior",
                                           saved_feature_names, current_feature_names, feat_mask)
                         _check_nan_features(feat_mask, mod_name, mask_features)
                         if feat_mask is not None:
                             mod.fitted_feature_mask = feat_mask
                             if mask_features and not feat_mask.all():
                                 # Fill NaN positions with baseline alpha_y — same treatment as
-                                # zero-NTC-count features in fit_technical's _reconstruct_full_2d:
+                                # zero-NTC-count features in fit_ntc's _reconstruct_full_2d:
                                 # 1.0 for negbinom (multiplicative), 0.0 for all other distributions.
                                 for k in list(posterior_raw.keys()):
                                     if isinstance(posterior_raw[k], torch.Tensor):
@@ -417,37 +422,37 @@ class ModelLoader:
                                 n_missing = int((~feat_mask).sum())
                                 print(f"[LOAD] {mod_name}: {n_missing} missing feature(s) filled "
                                       f"with baseline alpha_y (mask_features=True).")
-                    mod.posterior_samples_technical = posterior_raw
+                    mod.posterior_samples_ntc = posterior_raw
 
                     # Reconstruct feature_meta DataFrame if present
                     if loaded_data.get('feature_meta') is not None:
                         _ = pd.DataFrame(loaded_data['feature_meta'])  # available if needed
 
-                    loaded[f'posterior_samples_technical_{mod_name}_metadata'] = {
+                    loaded[f'posterior_samples_ntc_{mod_name}_metadata'] = {
                         'modality_name': loaded_data.get('modality_name'),
                         'distribution': loaded_data.get('distribution'),
                         'n_features': n_features
                     }
 
-                    if loaded_data.get('loss_technical') is not None:
-                        mod.loss_technical = loaded_data['loss_technical']
-                        mod_loaded.append(f'loss({len(mod.loss_technical)})')
+                    if loaded_data.get('loss_ntc') is not None:
+                        mod.loss_ntc = loaded_data['loss_ntc']
+                        mod_loaded.append(f'loss({len(mod.loss_ntc)})')
 
                     if verbose:
-                        print(f"[LOAD] {mod_name}.posterior_samples_technical ({n_features} features) ← {posterior_path}")
+                        print(f"[LOAD] {mod_name}.posterior_samples_ntc ({n_features} features) ← {posterior_path}")
                 else:
                     # Old format (backward compatibility) — no alignment possible
-                    mod.posterior_samples_technical = loaded_data
+                    mod.posterior_samples_ntc = loaded_data
                     if verbose:
-                        print(f"[LOAD] {mod_name}.posterior_samples_technical (legacy format) ← {posterior_path}")
+                        print(f"[LOAD] {mod_name}.posterior_samples_ntc (legacy format) ← {posterior_path}")
 
-                loaded[f'posterior_samples_technical_{mod_name}'] = True
+                loaded[f'posterior_samples_ntc_{mod_name}'] = True
                 mod_loaded.append(f'posterior({n_features or "?"} features)')
 
                 # Extract and set specific alpha attributes from posterior_samples
-                if 'alpha_y_add' in mod.posterior_samples_technical:
+                if 'alpha_y_add' in mod.posterior_samples_ntc:
                     if not hasattr(mod, 'alpha_y_prefit_add') or mod.alpha_y_prefit_add is None:
-                        alpha_y_add = mod.posterior_samples_technical['alpha_y_add']
+                        alpha_y_add = mod.posterior_samples_ntc['alpha_y_add']
                         if isinstance(alpha_y_add, torch.Tensor):
                             collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
                             if alpha_y_add.ndim >= collapse_threshold:
@@ -457,12 +462,12 @@ class ModelLoader:
                             if mod.distribution != 'negbinom':
                                 mod.alpha_y_prefit = alpha_y_add
                         if verbose:
-                            print(f"[LOAD] {mod_name}.alpha_y_prefit_add ← extracted from posterior_samples_technical")
+                            print(f"[LOAD] {mod_name}.alpha_y_prefit_add ← extracted from posterior_samples_ntc")
 
-                if 'alpha_y_mult' in mod.posterior_samples_technical or 'alpha_y' in mod.posterior_samples_technical:
-                    alpha_y_mult_key = 'alpha_y_mult' if 'alpha_y_mult' in mod.posterior_samples_technical else 'alpha_y'
+                if 'alpha_y_mult' in mod.posterior_samples_ntc or 'alpha_y' in mod.posterior_samples_ntc:
+                    alpha_y_mult_key = 'alpha_y_mult' if 'alpha_y_mult' in mod.posterior_samples_ntc else 'alpha_y'
                     if not hasattr(mod, 'alpha_y_prefit_mult') or mod.alpha_y_prefit_mult is None:
-                        alpha_y_mult = mod.posterior_samples_technical[alpha_y_mult_key]
+                        alpha_y_mult = mod.posterior_samples_ntc[alpha_y_mult_key]
                         if isinstance(alpha_y_mult, torch.Tensor) and alpha_y_mult.ndim >= 3:
                             alpha_y_mult = alpha_y_mult.mean(dim=0)
                         mod.alpha_y_prefit_mult = alpha_y_mult
@@ -470,7 +475,7 @@ class ModelLoader:
                             if mod.distribution == 'negbinom':
                                 mod.alpha_y_prefit = alpha_y_mult
                         if verbose:
-                            print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ← extracted from posterior_samples_technical")
+                            print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ← extracted from posterior_samples_ntc")
 
             # ── alpha_y_prefit standalone file (align using names from posterior file) ──
             mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
@@ -514,7 +519,7 @@ class ModelLoader:
                 loaded_summary.append(f"{mod_name}: {', '.join(mod_loaded)}")
 
         # Print summary
-        print(f"[LOAD] Technical fit from {input_dir}")
+        print(f"[LOAD] NTC fit from {input_dir}")
         if loaded_summary:
             print(f"[LOAD] Loaded: {'; '.join(loaded_summary)}")
 
@@ -537,8 +542,8 @@ class ModelLoader:
                 f"Check that the following files exist in {input_dir}:\n"
                 f"  - alpha_y_prefit.pt (legacy format for primary modality)\n"
                 f"  - alpha_y_prefit_<modality>.pt (per-modality format)\n"
-                f"  - posterior_samples_technical_<modality>.pt (contains alpha_y in posterior samples)\n"
-                f"If files are in a different directory, use load_technical_fit(input_dir='path/to/saved/fit')",
+                f"  - posterior_samples_ntc_<modality>.pt (contains alpha_y in posterior samples)\n"
+                f"If files are in a different directory, use load_ntc_fit(input_dir='path/to/saved/fit')",
                 UserWarning
             )
 

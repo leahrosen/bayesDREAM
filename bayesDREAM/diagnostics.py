@@ -11,14 +11,14 @@ Supported distributions
 -----------------------
 - negbinom    : Negative-Binomial GAM with log offset (size factors).
                 Dispersion phi = 1/o_y^2 taken from posterior_samples_trans (preferred)
-                or posterior_samples_technical.
+                or posterior_samples_ntc.
 - normal      : Gaussian GAM with fixed scale sigma = o_y taken from
-                posterior_samples_trans (preferred) or posterior_samples_technical.
+                posterior_samples_trans (preferred) or posterior_samples_ntc.
                 Using the model-estimated sigma makes the LRT calibrated; without it
                 the Gaussian GLM estimates scale from the window data.
 - studentt    : Proper Student-t GAM with fixed sigma = o_y and fixed nu = posterior
                 mean of nu_y (per-feature degrees of freedom), both from
-                posterior_samples_trans (preferred) or posterior_samples_technical.
+                posterior_samples_trans (preferred) or posterior_samples_ntc.
                 Optimised via scipy.optimize (L-BFGS-B) over the Student-t log-likelihood
                 with a B-spline basis. Falls back to Gaussian if either parameter is
                 unavailable.
@@ -29,7 +29,7 @@ Theta / sigma extraction priority
 ----------------------------------
 1. User-supplied ``theta`` argument.
 2. ``modality.posterior_samples_trans['o_y']`` (fitted alongside the dose-response).
-3. ``modality.posterior_samples_technical['o_y']`` (NTC-only fit, used as fallback).
+3. ``modality.posterior_samples_ntc['o_y']`` (NTC-only fit, used as fallback).
 
 Requires: statsmodels >= 0.14
 """
@@ -669,7 +669,7 @@ class DiagnosticsMixin:
             - normal/studentt: sigma_y = o_y (residual std dev)
             If None, extracted automatically from ``modality.posterior_samples_trans``
             (preferred; requires ``fit_trans()`` to have been called) or from
-            ``modality.posterior_samples_technical`` as a fallback.
+            ``modality.posterior_samples_ntc`` as a fallback.
 
         Returns
         -------
@@ -689,15 +689,15 @@ class DiagnosticsMixin:
 
         * **negbinom** – NB-GAM with log-offset = log(sum_factor).
           Requires theta (phi = 1/o_y^2 = NB total_count). Auto-extracted from
-          ``posterior_samples_trans`` (preferred) or ``posterior_samples_technical``.
+          ``posterior_samples_trans`` (preferred) or ``posterior_samples_ntc``.
         * **normal** – Gaussian GAM with fixed scale = sigma^2 = o_y^2
           (since sigma_y = o_y in the trans model). Auto-extracted from
-          ``posterior_samples_trans`` (preferred) or ``posterior_samples_technical``.
+          ``posterior_samples_trans`` (preferred) or ``posterior_samples_ntc``.
           If sigma is not available the GAM estimates it from the window data.
           No offset.
         * **studentt** – Proper Student-t GAM optimised via scipy with fixed
           sigma = o_y and nu = posterior mean of nu_y, both from
-          ``posterior_samples_trans`` (preferred) or ``posterior_samples_technical``.
+          ``posterior_samples_trans`` (preferred) or ``posterior_samples_ntc``.
           Falls back to Gaussian GAM if either parameter is unavailable.
         * **binomial** – Binomial GAM (logit link). Denominator from
           ``modality.denominator``.
@@ -892,7 +892,7 @@ class DiagnosticsMixin:
         Extraction priority:
           1. User-supplied ``user_theta``.
           2. modality.posterior_samples_trans  (fitted jointly with dose-response).
-          3. modality.posterior_samples_technical  (NTC-only fallback).
+          3. modality.posterior_samples_ntc  (NTC-only fallback).
 
         If user_theta is supplied it overrides the posterior estimate.
         """
@@ -904,7 +904,7 @@ class DiagnosticsMixin:
 
         # Try trans posteriors first, then technical
         posterior = None
-        for attr in ("posterior_samples_trans", "posterior_samples_technical"):
+        for attr in ("posterior_samples_trans", "posterior_samples_ntc"):
             cand = getattr(modality, attr, None)
             if cand is not None and "o_y" in cand:
                 posterior = cand
@@ -941,7 +941,7 @@ class DiagnosticsMixin:
         Returns a pd.Series indexed by feature name, or a numpy array, or None.
         Only applies to studentt distribution; always prefers trans posteriors.
         """
-        for attr in ("posterior_samples_trans", "posterior_samples_technical"):
+        for attr in ("posterior_samples_trans", "posterior_samples_ntc"):
             cand = getattr(modality, attr, None)
             if cand is not None and "nu_y" in cand:
                 nu_y = cand["nu_y"]
@@ -1036,7 +1036,7 @@ class DiagnosticsMixin:
         if tech_col not in base.columns:
             raise ValueError(
                 f"Column '{tech_col}' not in meta. "
-                "Run set_technical_groups() or fit_technical() first."
+                "Run set_technical_groups() or fit_ntc() first."
             )
 
         base["targeted"] = (base[target_col] == targeted_label).astype(int)

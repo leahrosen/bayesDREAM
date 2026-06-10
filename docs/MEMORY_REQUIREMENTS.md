@@ -576,6 +576,6 @@ print(f"\nRecommended: {max(ram_tech, ram_cis, ram_trans) * 2:.0f} GB RAM, {max(
 - **AutoNormal vs AutoIAFNormal**: See `bayesDREAM/fitting/technical.py:1237-1301`
 - **Sparse matrix handling**: See `bayesDREAM/fitting/technical.py:540-547`
 - **Memory optimization**: See `bayesDREAM/fitting/technical.py:980-1035`
-- **GPU memory check**: Automatic in `fit_technical()` (lines 1255-1271)
+- **GPU memory check**: Automatic in `fit_ntc()` (lines 1255-1271)
 
 For questions or issues, see: https://github.com/anthropics/bayesDREAM/issues

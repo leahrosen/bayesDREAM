@@ -432,6 +432,7 @@ class TransFitter:
         vmax_log_sigma_floor_tensor=None,
         k_log_sigma_min_tensor=None,
         k_center_tensor=None,
+        y_ntc_tensor=None,
         latents_only=False,
     ):
 
@@ -479,7 +480,7 @@ class TransFitter:
         # Only needed if using studentt distribution
         nu_y = None
         if distribution == 'studentt':
-            # Two options (must match fit_technical choice):
+            # Two options (must match fit_ntc choice):
             # Option 1: Fixed value (simpler, faster) - COMMENTED OUT FOR NOW
             # nu_y = self._t(3.0)
             # Option 2: Sample per-feature (more flexible, slower) - ACTIVE
@@ -614,16 +615,27 @@ class TransFitter:
 
             else:
                 # For negbinom: adaptive Exponential prior on A driven by per-gene overdispersion.
-                # rate = (2 - _o_y_weight) / Q05, where _o_y_weight ∈ (0, 1).
+                # mean(A) interpolates between two anchors via w = _o_y_weight ∈ (0, 1):
                 #
-                # For quiet genes (o_y → 0, weight → 0): rate → 2/Q05, P(A ≥ Q05) ≈ 13.5%.
-                #   Likelihood is informative about the floor → allow A to go well below Q05.
-                # For noisy genes (o_y >> prior_mean, weight → 1): rate → 1/Q05, P(A ≥ Q05) ≈ 36.8%.
-                #   Likelihood is weak → stay near the original less-aggressive prior.
+                #   w → 0 (quiet gene, informative likelihood):
+                #     mean(A) → Q05/2.  Data can identify the floor; allow A well below Q05.
+                #     P(A ≥ Q05) = exp(-2) ≈ 13.5%.
                 #
-                # This replaces the old Vmax-blending approach (which inflated A for large-range
-                # genes) with a rate-based interpolation that never pushes A above Q05.
-                rate_A = (2.0 - _o_y_weight) / Amean_tensor
+                #   w → 1 (noisy gene, weak likelihood):
+                #     mean(A) → y_ntc (NTC posterior mean per gene).
+                #     Anchor at NTC expression level — neutral assumption when data is uninformative.
+                #     P(A ≥ y_ntc) = exp(-1) ≈ 36.8%, so y_ntc is well within the prior.
+                #
+                # Amean (Q05) is floored at q01(mu_ntc) before this model is called, so
+                # mean(A) ≥ q01(mu_ntc)/2 even for lowly-expressed genes — prevents the
+                # near-zero initialisation trap that causes spurious A-collapse false positives.
+                # Exponential mode is still 0, preserving the prior's ability to extrapolate
+                # A below Q05 when the likelihood supports it (desirable from simulations).
+                if y_ntc_tensor is not None:
+                    mean_A = (1.0 - _o_y_weight) * Amean_tensor / 2.0 + _o_y_weight * y_ntc_tensor
+                else:
+                    mean_A = Amean_tensor / (2.0 - _o_y_weight)  # fallback: original formula
+                rate_A = 1.0 / mean_A.clamp_min(epsilon_tensor)
                 A = pyro.sample("A", dist.Exponential(rate_A))
 
             if use_alpha:
@@ -1534,8 +1546,8 @@ class TransFitter:
         if (modality.alpha_y_prefit is None
                 and 'technical_group_code' in self.model.meta.columns):
             raise ValueError(
-                f"Modality '{modality_name}' has not been fit with fit_technical(). "
-                f"Please run fit_technical(modality_name='{modality_name}') first."
+                f"Modality '{modality_name}' has not been fit with fit_ntc(). "
+                f"Please run fit_ntc(modality_name='{modality_name}') first."
             )
 
         # Get counts from modality (densify if sparse)
@@ -1569,7 +1581,7 @@ class TransFitter:
             alpha_y_prefit = modality.alpha_y_prefit
             print(f"[WARNING] Distribution-specific alpha_y not found, falling back to generic alpha_y_prefit. "
                   f"This may be incorrect if using old technical fit results. "
-                  f"Consider re-running fit_technical with current code.")
+                  f"Consider re-running fit_ntc with current code.")
 
         print(f"[INFO] Fitting trans model for modality '{modality_name}' (distribution: {distribution})")
 
@@ -1803,7 +1815,7 @@ class TransFitter:
             y_obs_factored = y_obs_tensor
             y_obs_for_prior = y_obs_factored
 
-        # ---- Multinomial zero-category mask (analogous to fit_technical zero_cat_mask) ----
+        # ---- Multinomial zero-category mask (analogous to fit_ntc zero_cat_mask) ----
         # Identifies categories structurally absent across ALL trans cells.
         # These phantom positions are already masked inline inside _model_y; this block
         # performs an early diagnostic check and warns when features have ≤1 active
@@ -1858,19 +1870,19 @@ class TransFitter:
                     print(f"[WARNING] alpha_y_expanded looks like multiplicative correction (mean~1.0). "
                           f"For binomial, expected additive correction on logit scale (mean~0, range~[-5,5]). "
                           f"You may be using technical fit results from old (buggy) code. "
-                          f"Re-run fit_technical with the fixed code.")
+                          f"Re-run fit_ntc with the fixed code.")
 
             if distribution == 'negbinom':
                 # Technical effect: multiplicative (mu_corrected = mu * alpha_y_mult)
                 # Inverse: divide by alpha_y_mult to get baseline
-                # alpha_y_prefit for negbinom is multiplicative (from fit_technical)
+                # alpha_y_prefit for negbinom is multiplicative (from fit_ntc)
                 y_obs_for_prior = y_obs_for_prior / alpha_y_expanded.clamp_min(epsilon_tensor)
                 print(f"[INFO] negbinom: Applied inverse multiplicative correction (divide by alpha_y_mult)")
 
             elif distribution in ['normal', 'studentt']:
                 # Technical effect: additive (mu_corrected = mu + alpha_y_add)
                 # Inverse: subtract alpha_y_add to get baseline
-                # alpha_y_prefit for normal/studentt is additive (from fit_technical)
+                # alpha_y_prefit for normal/studentt is additive (from fit_ntc)
                 y_obs_for_prior = y_obs_for_prior - alpha_y_expanded
                 print(f"[INFO] {distribution}: Applied inverse additive correction (subtract alpha_y_add)")
 
@@ -2231,6 +2243,39 @@ class TransFitter:
                                                    torch.full_like(mean_within_guide_var, valid_var),
                                                    mean_within_guide_var)
 
+        # --- A prior: NTC anchor and Q05 floor (negbinom only) ---
+        # Floor Amean (Q05 of guide means) at q01 of the technical-posterior mu_ntc so that
+        # Amean cannot be near-zero for lowly-expressed genes.  Also extract y_ntc_tensor
+        # (posterior mean of mu_ntc per gene) to anchor the noisy-gene end of the A prior
+        # in _model_y, preventing the A-collapse initialisation trap.
+        y_ntc_tensor = None
+        if distribution == 'negbinom' and Amean_tensor.ndim == 1:
+            try:
+                _post_tech = getattr(modality, 'posterior_samples_ntc', None)
+                if _post_tech is not None and 'mu_ntc' in _post_tech:
+                    _mu_ntc = _post_tech['mu_ntc']
+                    if not torch.is_tensor(_mu_ntc):
+                        _mu_ntc = torch.tensor(_mu_ntc, dtype=torch.float32, device=self.model.device)
+                    else:
+                        _mu_ntc = _mu_ntc.float().to(self.model.device)
+                    if _mu_ntc.ndim == 2 and _mu_ntc.shape[1] == T:
+                        q01_ntc = torch.quantile(_mu_ntc, 0.01, dim=0)  # [T]
+                        y_ntc_tensor = _mu_ntc.mean(dim=0)               # [T]
+                        _old_min = Amean_tensor.min().item()
+                        Amean_tensor = Amean_tensor.clamp_min(q01_ntc)
+                        _new_min = Amean_tensor.min().item()
+                        if _new_min > _old_min * 1.01:
+                            print(f"[INFO] A prior floor: Amean min raised {_old_min:.3e} → {_new_min:.3e} via q01(mu_ntc)")
+                    elif _mu_ntc.ndim == 1 and _mu_ntc.shape[0] == T:
+                        y_ntc_tensor = _mu_ntc
+                        Amean_tensor = Amean_tensor.clamp_min(_mu_ntc)
+                    else:
+                        print(f"[WARNING] mu_ntc shape {tuple(_mu_ntc.shape)} doesn't match T={T}; skipping A prior NTC floor")
+                else:
+                    print("[INFO] No technical posterior mu_ntc available; A prior uses Q05 anchor only")
+            except Exception as _e:
+                print(f"[WARNING] Could not compute y_ntc anchor from technical posterior: {_e}")
+
         # For K: use CV (coefficient of variation) of x_true (works with or without guides)
         # CV = std(x_true) / mean(x_true) - scale-invariant measure of variability
         x_true_mean_global = x_true_mean.mean()
@@ -2340,6 +2385,7 @@ class TransFitter:
                 vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                 k_log_sigma_min_tensor=k_log_sigma_min_tensor,
                 k_center_tensor=k_center_tensor,
+                y_ntc_tensor=y_ntc_tensor,
             )
             # OneCycleLR for polynomial only
             base_lr = 1e-3 if lr is None else lr
@@ -2628,6 +2674,7 @@ class TransFitter:
                     vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                     k_log_sigma_min_tensor=k_log_sigma_min_tensor,
                     k_center_tensor=k_center_tensor,
+                    y_ntc_tensor=y_ntc_tensor,
                 )
             except FloatingPointError as e:
                 print(f"[STOP] {e} at step {step}")
@@ -2786,6 +2833,7 @@ class TransFitter:
                 "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
                 "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
                 "k_center_tensor": k_center_tensor,
+                "y_ntc_tensor": y_ntc_tensor,
             }
 
         if self.model.device.type == "cuda":

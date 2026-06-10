@@ -2,13 +2,16 @@
 Fitting methods for bayesDREAM.
 
 This module contains the model fitting logic separated by stage:
-- technical: Technical variation fitting
+- ntc: NTC fitting (overdispersion estimation and batch effect correction)
 - cis: Cis gene expression fitting
 - trans: Trans effects fitting
 """
 
-from .technical import TechnicalFitter
+from .ntc import NTCFitter
 from .cis import CisFitter
 from .trans import TransFitter
 
-__all__ = ['TechnicalFitter', 'CisFitter', 'TransFitter']
+# Backward-compat alias
+TechnicalFitter = NTCFitter
+
+__all__ = ['NTCFitter', 'CisFitter', 'TransFitter', 'TechnicalFitter']

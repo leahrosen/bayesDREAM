@@ -2,7 +2,7 @@
 Distribution-specific observation samplers for multi-modal bayesDREAM.
 
 This module provides observation likelihoods for different distributions.
-These are called by the main Pyro models (_model_y, _model_technical) after
+These are called by the main Pyro models (_model_y, _model_ntc) after
 computing the dose-response function parameters.
 
 Supported distributions:

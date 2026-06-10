@@ -925,16 +925,16 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     return None
 
 
-# Parameters that come from posterior_samples_technical rather than posterior_samples_trans.
+# Parameters that come from posterior_samples_ntc rather than posterior_samples_trans.
 # NOTE: o_y is sampled in BOTH technical and trans posteriors.
 #   'o_y'      → posterior_samples_trans  (trans fit overdispersion, the usual plotting target)
-#   'o_y_tech' → posterior_samples_technical  (NTC-only technical fit overdispersion)
+#   'o_y_tech' → posterior_samples_ntc  (NTC-only technical fit overdispersion)
 _TECHNICAL_PARAMS = frozenset({'alpha_y', 'alpha_y_mult', 'alpha_y_add', 'log2_alpha_y', 'mu_ntc', 'o_y_tech'})
 
 
 def _get_technical_param_samples(param, tech_posterior, technical_group):
     """
-    Extract samples for a technical parameter from posterior_samples_technical.
+    Extract samples for a technical parameter from posterior_samples_ntc.
 
     Handles the C (technical group) dimension and log2 conversion for multiplicative params.
 
@@ -943,7 +943,7 @@ def _get_technical_param_samples(param, tech_posterior, technical_group):
     param : str
         Parameter name ('alpha_y', 'log2_alpha_y', 'alpha_y_mult', 'alpha_y_add', 'mu_ntc', 'o_y_tech')
     tech_posterior : dict
-        posterior_samples_technical dict
+        posterior_samples_ntc dict
     technical_group : int
         Which technical group index to display (1 = first non-reference group).
         Index 0 is always the reference group (alpha=1 for mult, 0 for add).
@@ -971,7 +971,7 @@ def _get_technical_param_samples(param, tech_posterior, technical_group):
             return raw
         else:
             raise KeyError(
-                f"'alpha_y' not found in posterior_samples_technical. "
+                f"'alpha_y' not found in posterior_samples_ntc. "
                 f"Available: {list(tech_posterior.keys())}"
             )
 
@@ -1207,11 +1207,11 @@ def plot_parameter_ci_panel(
     # Get technical posterior (required when technical params are requested)
     tech_posterior = None
     if tech_params:
-        tech_posterior = modality.posterior_samples_technical
+        tech_posterior = modality.posterior_samples_ntc
         if tech_posterior is None:
             raise ValueError(
-                f"Parameters {tech_params} require posterior_samples_technical. "
-                "Must run fit_technical() first."
+                f"Parameters {tech_params} require posterior_samples_ntc. "
+                "Must run fit_ntc() first."
             )
         # Validate that needed keys are present
         missing_tech = []
@@ -1226,7 +1226,7 @@ def plot_parameter_ci_panel(
                 missing_tech.append(p)
         if missing_tech:
             raise ValueError(
-                f"Technical parameters {missing_tech} not found in posterior_samples_technical. "
+                f"Technical parameters {missing_tech} not found in posterior_samples_ntc. "
                 f"Available: {list(tech_posterior.keys())}"
             )
 
@@ -1243,7 +1243,7 @@ def plot_parameter_ci_panel(
 
     # Extract samples for each parameter
     # Trans params: posterior[param] is typically (S, n_cis, T) where n_cis=1
-    # Technical params: posterior_samples_technical[param] may be (S, C, T) or (S, T)
+    # Technical params: posterior_samples_ntc[param] may be (S, C, T) or (S, T)
     samples_dict = {}
     for param in params:
         if param in _TECHNICAL_PARAMS:

@@ -166,7 +166,7 @@ The high MOI implementation works seamlessly with the standard three-step pipeli
 ```python
 # Step 1: Technical fitting (NTC cells only)
 model.set_technical_groups(['cell_line'])
-model.fit_technical()
+model.fit_ntc()
 
 # Step 2: Adjust sum factors for guide effects
 model.adjust_ntc_sum_factor(

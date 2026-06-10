@@ -1245,7 +1245,7 @@ def predict_trans_log2fc(
     Parameters
     ----------
     model : bayesDREAM
-        Model with fit_trans() completed and posterior_samples_technical available
+        Model with fit_trans() completed and posterior_samples_ntc available
     feature : str
         Feature name (trans gene) to predict
     x_range : np.ndarray
@@ -1273,10 +1273,10 @@ def predict_trans_log2fc(
     # Get NTC means
     # Cis NTC (for x-axis transformation)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1298,10 +1298,10 @@ def predict_trans_log2fc(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1393,10 +1393,10 @@ def predict_trans_log2fc_samples(
 
     # Get NTC means (same logic as predict_trans_log2fc)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None
 
@@ -1417,10 +1417,10 @@ def predict_trans_log2fc_samples(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None
 
@@ -1480,7 +1480,7 @@ def predict_trans_delta_p(
     Parameters
     ----------
     model : bayesDREAM
-        Model with fit_trans() completed and posterior_samples_technical available
+        Model with fit_trans() completed and posterior_samples_ntc available
     feature : str
         Feature name (trans gene/SJ) to predict
     x_range : np.ndarray
@@ -1509,10 +1509,10 @@ def predict_trans_delta_p(
     # Get NTC means
     # Cis NTC (for x-axis transformation)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1534,10 +1534,10 @@ def predict_trans_delta_p(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1643,10 +1643,10 @@ def predict_trans_delta_p_samples(
 
     # Get NTC means (same logic as predict_trans_delta_p)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None
 
@@ -1667,10 +1667,10 @@ def predict_trans_delta_p_samples(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None
 
@@ -1776,7 +1776,7 @@ def plot_trans_functions(
         - x-axis: log2FC = log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
         - y-axis: log2FC = log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
         - Derivatives: dg/du and d²g/du² (chain rule transformed)
-        Requires posterior_samples_technical to be available for both cis and trans modalities.
+        Requires posterior_samples_ntc to be available for both cis and trans modalities.
         Not recommended for binomial modalities (use use_delta_p instead).
     use_delta_p : bool
         If True, plot in probability difference space relative to NTC (default: False).
@@ -1784,7 +1784,7 @@ def plot_trans_functions(
         - x-axis: log2FC = log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
         - y-axis: Δp = p - p_ntc where p is probability and p_ntc is NTC probability
         - Derivatives: dp/du and d²p/du² (chain rule transformed)
-        Requires posterior_samples_technical to be available for both cis and trans modalities.
+        Requires posterior_samples_ntc to be available for both cis and trans modalities.
         Mutually exclusive with use_log2fc.
     show_posterior_samples : bool
         If True, plot individual posterior fits behind the mean line (default: False).
@@ -1919,15 +1919,15 @@ def plot_trans_functions(
         cis_mod = model.get_modality('cis')
         ntc_available = (
             cis_mod is not None
-            and hasattr(cis_mod, 'posterior_samples_technical')
-            and cis_mod.posterior_samples_technical is not None
-            and 'mu_ntc' in cis_mod.posterior_samples_technical
+            and hasattr(cis_mod, 'posterior_samples_ntc')
+            and cis_mod.posterior_samples_ntc is not None
+            and 'mu_ntc' in cis_mod.posterior_samples_ntc
         )
         if not ntc_available:
             import warnings
             flag = 'use_log2fc' if use_log2fc else 'use_delta_p'
             warnings.warn(
-                f"{flag}=True requested but NTC technical fit (posterior_samples_technical) "
+                f"{flag}=True requested but NTC technical fit (posterior_samples_ntc) "
                 f"is not available. Falling back to log2(x) x-axis.",
                 UserWarning
             )
@@ -3426,7 +3426,7 @@ def _compute_global_log2fc_offsets(
     even panels that contain no NTC cells (e.g. a "Targeting" facet column).
 
     y_offset priority (consistent with ``save_trans_summary``):
-    1. ``mu_ntc`` from ``modality.posterior_samples_technical`` (model-smoothed reference-
+    1. ``mu_ntc`` from ``modality.posterior_samples_ntc`` (model-smoothed reference-
        group NTC expression rate from ``fit_technical``).  Shape [n_samples, T]; we take
        the posterior mean for the requested feature.
     2. Fallback (``fit_technical`` not run): empirical mean of ``y_obs / sum_factor`` for
@@ -3463,14 +3463,14 @@ def _compute_global_log2fc_offsets(
     x_offset = np.log2(float(x_ntc.mean())) if len(x_ntc) > 0 else 0.0
 
     # y_offset: use mu_ntc from technical fit when available (matches save_trans_summary).
-    # mu_ntc shape in posterior_samples_technical: [n_samples, T].
+    # mu_ntc shape in posterior_samples_ntc: [n_samples, T].
     # It represents the reference-group NTC expression rate — the same quantity that
     # save_trans_summary uses as y_ntc for log2FC parameter computation.
     y_offset = None
-    if (hasattr(modality, 'posterior_samples_technical')
-            and modality.posterior_samples_technical is not None
-            and 'mu_ntc' in modality.posterior_samples_technical):
-        mu_ntc = modality.posterior_samples_technical['mu_ntc']
+    if (hasattr(modality, 'posterior_samples_ntc')
+            and modality.posterior_samples_ntc is not None
+            and 'mu_ntc' in modality.posterior_samples_ntc):
+        mu_ntc = modality.posterior_samples_ntc['mu_ntc']
         if hasattr(mu_ntc, 'cpu'):          # torch.Tensor
             mu_ntc = mu_ntc.cpu().numpy()
         mu_ntc = np.asarray(mu_ntc, dtype=float)
@@ -3680,10 +3680,10 @@ def plot_negbinom_xy(
             _feature_idx = _get_feature_index(feature, modality)
             _y_offset_from_technical = None
             if (_feature_idx is not None
-                    and hasattr(modality, 'posterior_samples_technical')
-                    and modality.posterior_samples_technical is not None
-                    and 'mu_ntc' in modality.posterior_samples_technical):
-                _mu_ntc = modality.posterior_samples_technical['mu_ntc']
+                    and hasattr(modality, 'posterior_samples_ntc')
+                    and modality.posterior_samples_ntc is not None
+                    and 'mu_ntc' in modality.posterior_samples_ntc):
+                _mu_ntc = modality.posterior_samples_ntc['mu_ntc']
                 if hasattr(_mu_ntc, 'cpu'):
                     _mu_ntc = _mu_ntc.cpu().numpy()
                 _mu_ntc = np.asarray(_mu_ntc, dtype=float)
@@ -4164,16 +4164,16 @@ def plot_binomial_xy(
         raise ValueError(f"No data remaining after filtering (min_counts={min_counts})")
 
     # Check technical correction availability
-    # First check attribute, then fall back to posterior_samples_technical dict
+    # First check attribute, then fall back to posterior_samples_ntc dict
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
             # Set the attribute for future use
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
-            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_technical for modality '{modality.name}'")
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
+            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_ntc for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
         warnings.warn(f"Technical fit not available for modality '{modality.name}' - showing uncorrected only")
@@ -4464,12 +4464,12 @@ def plot_multinomial_xy(
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
             # Set the attribute for future use
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
-            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_technical for modality '{modality.name}'")
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
+            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_ntc for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
         warnings.warn(f"Technical fit not available for modality '{modality.name}' - showing uncorrected only")
@@ -4707,11 +4707,11 @@ def plot_normal_xy(
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
             # Set the attribute for future use
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
             print(f"[INFO] Set alpha_y_prefit_add from poster ior_samples_technical for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
@@ -4985,11 +4985,11 @@ def _plot_multinomial_multifeature(
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
-            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_technical for modality '{modality.name}'")
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
+            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_ntc for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
         warnings.warn(f"Technical fit not available for modality '{modality.name}' - showing uncorrected only")

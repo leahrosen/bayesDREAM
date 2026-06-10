@@ -381,7 +381,7 @@ See `tests/` directory for complete working examples covering:
 
 ## Key Features
 
-✅ **Distribution-Flexible Fitting**: `fit_technical()` and `fit_trans()` support all 5 distributions (negbinom, normal, studentt, binomial, multinomial)
+✅ **Distribution-Flexible Fitting**: `fit_ntc()` and `fit_trans()` support all 5 distributions (negbinom, normal, studentt, binomial, multinomial)
 
 ✅ **Cell-Line Covariate Effects**: Distribution-specific handling (multiplicative for negbinom, additive for normal/studentt, logit-scale for binomial)
 

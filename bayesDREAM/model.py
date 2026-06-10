@@ -4,7 +4,7 @@ bayesDREAM: Bayesian Dosage Response Effects Across Modalities
 Core implementation for bayesDREAM - a three-step Bayesian framework for modeling
 perturbation effects across multiple molecular modalities:
 
-1. fit_technical() - Model technical variation in non-targeting controls
+1. fit_ntc() - Fit NTC cells to estimate gene-specific overdispersion and batch effects
 2. fit_cis() - Model direct effects on targeted genes
 3. fit_trans() - Model downstream effects as dose-response functions
 
@@ -439,10 +439,10 @@ class bayesDREAM(
 
         fit_ntc() appends the cis gene as the last row of the counts matrix,
         fits it together with all trans genes, and stores the result in
-        cis_modality.posterior_samples_technical.  Both trans and cis mu_ntc
+        cis_modality.posterior_samples_ntc.  Both trans and cis mu_ntc
         values are therefore available here — no raw-count computation needed.
 
-        Requires fit_ntc() to have been run (populates posterior_samples_technical
+        Requires fit_ntc() to have been run (populates posterior_samples_ntc
         on both the primary and cis modalities).
 
         Returns
@@ -460,7 +460,7 @@ class bayesDREAM(
             warnings.warn(f"Primary modality '{self.primary_modality}' not found.", UserWarning)
             return None
 
-        ps_primary = primary_mod.posterior_samples_technical
+        ps_primary = primary_mod.posterior_samples_ntc
         if ps_primary is None or 'mu_ntc' not in ps_primary:
             raise ValueError(
                 "fit_ntc() must be run before checking cis expression. "
@@ -471,7 +471,7 @@ class bayesDREAM(
             warnings.warn("No 'cis' modality found.", UserWarning)
             return None
 
-        ps_cis = cis_mod.posterior_samples_technical
+        ps_cis = cis_mod.posterior_samples_ntc
         if ps_cis is None or 'mu_ntc' not in ps_cis:
             raise ValueError(
                 "fit_ntc() did not produce mu_ntc for the cis modality. "
@@ -745,7 +745,7 @@ class bayesDREAM(
             modality_name = self.primary_modality
 
         modality = self.get_modality(modality_name)
-        ps = modality.posterior_samples_technical
+        ps = modality.posterior_samples_ntc
         if ps is None or 'mu_ntc' not in ps or 'o_y' not in ps:
             raise ValueError(
                 f"No technical fit found for modality '{modality_name}'. "
@@ -774,7 +774,7 @@ class bayesDREAM(
 
         # Highlight cis gene if available
         if 'cis' in self.modalities:
-            cis_ps = self.modalities['cis'].posterior_samples_technical
+            cis_ps = self.modalities['cis'].posterior_samples_ntc
             if cis_ps is not None and 'mu_ntc' in cis_ps and 'o_x' in cis_ps:
                 cis_mu = float(cis_ps['mu_ntc'].mean().item())
                 cis_ox = float(cis_ps['o_x'].mean().item())
@@ -1576,20 +1576,20 @@ class bayesDREAM(
             - distribution: Distribution type
             - n_features: Number of features
             - n_cells: Number of cells
-            - fit_technical: ✓ if fitted, ✗ if not fitted, - if not configured
+            - fit_ntc: ✓ if fitted, ✗ if not fitted, - if not configured
             - fit_cis: ✓ if fitted, ✗ if not fitted, - if not applicable
             - fit_trans: ✓ if fitted, ✗ if not fitted
 
         Notes
         -----
-        fit_technical shows:
+        fit_ntc shows:
         - '-' if technical_group_code not set (no technical covariates configured)
-        - '✗' if technical_group_code set but fit_technical() not run
-        - '✓' if fit_technical() completed
+        - '✗' if technical_group_code set but fit_ntc() not run
+        - '✓' if fit_ntc() completed
         """
         if not self.modalities:
             return pd.DataFrame(columns=['name', 'distribution', 'n_features', 'n_cells',
-                                        'fit_technical', 'fit_cis', 'fit_trans'])
+                                        'fit_ntc', 'fit_cis', 'fit_trans'])
 
         # Check if technical groups are configured
         has_technical_groups = 'technical_group_code' in self.meta.columns
@@ -1627,7 +1627,7 @@ class bayesDREAM(
                 'distribution': mod.distribution,
                 'n_features': mod.dims['n_features'],
                 'n_cells': mod.dims['n_cells'],
-                'fit_technical': has_technical,
+                'fit_ntc': has_technical,
                 'fit_cis': has_cis,
                 'fit_trans': has_trans
             })

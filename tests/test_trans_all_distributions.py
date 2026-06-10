@@ -34,9 +34,9 @@ def _base_model(meta, gene_counts, feature_meta):
     )
 
 
-def _fit_technical(model):
+def _fit_ntc(model):
     model.set_technical_groups(["cell_line"])
-    model.fit_technical(
+    model.fit_ntc(
         sum_factor_col="sum_factor",
         niters=NITERS,
         nsamples=NSAMPLES,
@@ -74,7 +74,7 @@ def test_negbinom_hill_variants(shared_test_data):
     feature_meta = shared_test_data["feature_meta"]
     model = _base_model(meta, gene_counts, feature_meta)
 
-    _fit_technical(model)
+    _fit_ntc(model)
     _fit_cis(model)
     _fit_trans(
         model,

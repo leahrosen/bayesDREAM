@@ -22,13 +22,13 @@
 │                        │          │                            │
 │  - set_technical_      │          │  Required: 'cis'           │
 │    groups()            │          │  Primary: 'gene' (default) │
-│  - fit_technical()     │          │  Others: 'transcript',     │
+│  - fit_ntc()     │          │  Others: 'transcript',     │
 │  - fit_cis()           │          │          'splicing_*',     │
 │  - fit_trans()         │          │          'atac',           │
 │  - save/load methods   │          │          custom, etc.      │
 │                        │          │                            │
 │  Delegates to:         │          │  All modalities subset to  │
-│  - TechnicalFitter     │          │  cells in 'cis' modality   │
+│  - NTCFitter     │          │  cells in 'cis' modality   │
 │  - CisFitter           │          │                            │
 │  - TransFitter         │          └────────────────────────────┘
 │  - ModelSaver          │
@@ -377,7 +377,7 @@ normal                    2D: (F, C)             SpliZ scores
 │    - set_alpha_x(), set_alpha_y(), set_x_true()                 │
 │    - adjust_ntc_sum_factor(), refit_sumfactor()                 │
 │    - permute_genes()                                             │
-│    - save_technical_fit(), load_technical_fit()                 │
+│    - save_ntc_fit(), load_ntc_fit()                 │
 │    - save_cis_fit(), load_cis_fit()                             │
 │    - save_trans_fit(), load_trans_fit()                         │
 │                                                                  │
@@ -406,10 +406,10 @@ normal                    2D: (F, C)             SpliZ scores
 │    - list_modalities() → pd.DataFrame                           │
 │                                                                  │
 │  Inherited Methods (delegated to fitters):                       │
-│    - fit_technical(), fit_cis(), fit_trans() [from Core]        │
+│    - fit_ntc(), fit_cis(), fit_trans() [from Core]        │
 │    - All fitting methods accept modality_name parameter         │
 │    - fit_cis() always uses 'cis' modality                       │
-│    - fit_technical() on primary uses self.counts (incl. cis)    │
+│    - fit_ntc() on primary uses self.counts (incl. cis)    │
 │    - fit_trans() uses primary modality (trans genes only)       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -417,7 +417,7 @@ normal                    2D: (F, C)             SpliZ scores
 ## Distribution-Flexible Fitting (Implemented)
 
 ```
-Both fit_technical() and fit_trans() support all distributions:
+Both fit_ntc() and fit_trans() support all distributions:
 
 ┌─────────────────────────────────────────────────────────────────┐
 │  # Gene counts (negbinom)                                        │
@@ -467,7 +467,7 @@ core.py (~909 lines)
   ├── scipy, sklearn
   ├── distributions.py (observation samplers)
   ├── fitting/ (delegated fitters)
-  │   ├── technical.py (TechnicalFitter)
+  │   ├── technical.py (NTCFitter)
   │   ├── cis.py (CisFitter)
   │   └── trans.py (TransFitter)
   └── io/ (save/load)
@@ -488,7 +488,7 @@ splicing.py (Pure Python - no R dependencies)
 
 fitting/
   ├── helpers.py (helper functions)
-  ├── technical.py (TechnicalFitter)
+  ├── technical.py (NTCFitter)
   ├── cis.py (CisFitter)
   └── trans.py (TransFitter)
 

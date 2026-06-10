@@ -1005,15 +1005,15 @@ class ModelSummarizer:
     # Technical Fit Summary
     # ========================================================================
 
-    def save_technical_summary(
+    def save_ntc_summary(
         self,
         output_dir: Optional[str] = None,
         modality_name: Optional[str] = None
     ):
         """
-        Save technical fit parameters as feature-wise CSV.
+        Save NTC fit parameters as feature-wise CSV.
 
-        Creates: technical_feature_summary_{modality}.csv
+        Creates: ntc_feature_summary_{modality}.csv
 
         Columns:
         - feature: Feature name
@@ -1041,7 +1041,7 @@ class ModelSummarizer:
 
         # Check if technical fit has been run for this modality
         if not hasattr(modality, 'alpha_y_prefit') or modality.alpha_y_prefit is None:
-            raise ValueError(f"Technical fit not found for modality '{modality_name}'. Run fit_technical() first.")
+            raise ValueError(f"NTC fit not found for modality '{modality_name}'. Run fit_ntc() first.")
 
         # Get alpha_y for this modality (prefer distribution-specific versions)
         if hasattr(modality, 'alpha_y_prefit_mult') and modality.alpha_y_prefit_mult is not None:
@@ -1089,7 +1089,7 @@ class ModelSummarizer:
 
         # Save
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f'technical_feature_summary_{modality_name}.csv')
+        output_file = os.path.join(output_dir, f'ntc_feature_summary_{modality_name}.csv')
         df.to_csv(output_file, index=False)
 
         print(f"[SAVE] Technical summary saved to {output_file}")
@@ -1459,7 +1459,7 @@ class ModelSummarizer:
 
         Overdispersion and technical group effects (for simulation):
         - phi_y_mean, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2)
-        - group_{g}_alpha_y_mean: Technical group effect for group g (from fit_technical)
+        - group_{g}_alpha_y_mean: Technical group effect for group g (from fit_ntc)
 
         Parameters
         ----------
@@ -1476,15 +1476,15 @@ class ModelSummarizer:
             If True (default), compute parameters in log2FC space relative to NTC:
             - x-axis: log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
             - y-axis: log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
-            Requires posterior_samples_technical to be available, or x_ntc/y_ntc to be
+            Requires posterior_samples_ntc to be available, or x_ntc/y_ntc to be
             provided manually.
         x_ntc : float, optional
             Manually provided NTC mean for the cis gene (x-axis reference point).
-            If None (default), computed from posterior_samples_technical of the cis modality.
+            If None (default), computed from posterior_samples_ntc of the cis modality.
             Useful when fit_technical was not run (e.g., single-group subsets).
         y_ntc : array-like, optional
             Manually provided NTC means for each trans feature (y-axis reference points).
-            Shape: (n_features,). If None (default), computed from posterior_samples_technical
+            Shape: (n_features,). If None (default), computed from posterior_samples_ntc
             of the trans modality.
         """
         if output_dir is None:
@@ -1622,9 +1622,9 @@ class ModelSummarizer:
         if _x_ntc is None:
             try:
                 cis_mod = self.model.get_modality('cis')
-                if hasattr(cis_mod, 'posterior_samples_technical') and cis_mod.posterior_samples_technical is not None:
-                    if 'mu_ntc' in cis_mod.posterior_samples_technical:
-                        mu_ntc_cis = cis_mod.posterior_samples_technical['mu_ntc']
+                if hasattr(cis_mod, 'posterior_samples_ntc') and cis_mod.posterior_samples_ntc is not None:
+                    if 'mu_ntc' in cis_mod.posterior_samples_ntc:
+                        mu_ntc_cis = cis_mod.posterior_samples_ntc['mu_ntc']
                         if isinstance(mu_ntc_cis, torch.Tensor):
                             mu_ntc_cis = mu_ntc_cis.cpu().numpy()
                         _x_ntc = float(mu_ntc_cis.mean())
@@ -1633,9 +1633,9 @@ class ModelSummarizer:
 
         # y_ntc: from trans modality's technical fit (mu_ntc averaged over posterior samples → [T])
         if _y_ntc is None:
-            if hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-                if 'mu_ntc' in modality.posterior_samples_technical:
-                    mu_ntc_trans = modality.posterior_samples_technical['mu_ntc']
+            if hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+                if 'mu_ntc' in modality.posterior_samples_ntc:
+                    mu_ntc_trans = modality.posterior_samples_ntc['mu_ntc']
                     if isinstance(mu_ntc_trans, torch.Tensor):
                         mu_ntc_trans = mu_ntc_trans.cpu().numpy()
                     while mu_ntc_trans.ndim > 2:

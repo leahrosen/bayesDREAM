@@ -239,7 +239,7 @@ class Modality:
         # Distribution-specific alpha_y parameters (use these directly, not alpha_y_prefit)
         self.alpha_y_prefit_mult = None     # For negbinom: multiplicative correction [C, T]
         self.alpha_y_prefit_add = None      # For normal/studentt/binomial/multinomial: additive correction [C, T]
-        self.posterior_samples_technical = None  # Technical fit: full posterior samples
+        self.posterior_samples_ntc = None  # NTC fit: full posterior samples
         self.posterior_samples_trans = None      # Trans fit: full posterior samples
 
         # Sum factors DataFrame (negbinom modalities only).

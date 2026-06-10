@@ -8,7 +8,7 @@ The trans fitting step models downstream effects of perturbations by fitting dos
 
 ### Three-Step Pipeline
 
-1. **fit_technical()**: Model technical variation in NTC cells → estimate `alpha_y` (overdispersion parameters)
+1. **fit_ntc()**: Model technical variation in NTC cells → estimate `alpha_y` (overdispersion parameters)
 2. **fit_cis()**: Model direct effects on the cis feature → estimate `x_true` (true cis expression per cell)
 3. **fit_trans()**: Model trans features as functions of `x_true` → discover dose-response relationships
 
@@ -331,7 +331,7 @@ model = bayesDREAM(
 
 # Step 1: Technical fitting (NTC cells only)
 model.set_technical_groups(['cell_line'])
-model.fit_technical()
+model.fit_ntc()
 
 # Step 2: Adjust sum factors for guide-level effects
 model.adjust_ntc_sum_factor(

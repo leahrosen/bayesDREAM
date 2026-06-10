@@ -25,7 +25,7 @@ def technical_compat_model(shared_test_data):
         label='technical_compat_test',
     )
     model.set_technical_groups(['cell_line'])
-    model.fit_technical(
+    model.fit_ntc(
         sum_factor_col='sum_factor',
         distribution='negbinom',
         niters=NITERS,
@@ -35,7 +35,7 @@ def technical_compat_model(shared_test_data):
     return model
 
 
-def test_fit_technical_negbinom_runs(technical_compat_model):
+def test_fit_ntc_negbinom_runs(technical_compat_model):
     gene_modality = technical_compat_model.get_modality('gene')
     assert gene_modality.alpha_y_prefit is not None
 

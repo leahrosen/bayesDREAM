@@ -23,10 +23,10 @@ class ModelSaver:
     # Save/Load fitted parameters
     ########################################################
 
-    def save_technical_fit(self, output_dir: str = None, modalities: list = None, verbose: bool = False,
+    def save_ntc_fit(self, output_dir: str = None, modalities: list = None, verbose: bool = False,
                           save_model_level: bool = None):
         """
-        Save fitted technical parameters from fit_technical().
+        Save fitted NTC parameters from fit_ntc().
 
         Parameters
         ----------
@@ -47,7 +47,7 @@ class ModelSaver:
         -----
         Saves per-modality:
         - alpha_y_prefit_{modality}.pt: Appropriate alpha_y for distribution (add or mult)
-        - posterior_samples_technical_{modality}.pt: Full posterior samples
+        - posterior_samples_ntc_{modality}.pt: Full posterior samples
 
         Saves model-level (automatically when primary modality is included):
         - alpha_x_prefit.pt: Cis gene overdispersion (if set)
@@ -97,7 +97,7 @@ class ModelSaver:
                 if verbose:
                     print(f"[SAVE] alpha_y_prefit (from {self.model.primary_modality} modality) → {path}")
 
-        # Save per-modality alpha_y_prefit and posterior_samples_technical
+        # Save per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_save:
             mod = self.model.modalities[mod_name]
             mod_saved = []
@@ -129,11 +129,11 @@ class ModelSaver:
                 if verbose:
                     print(f"[SAVE] {mod_name}.alpha_y_prefit ({alpha_type}) → {path}")
 
-            # Save modality-specific posterior_samples_technical
-            if hasattr(mod, 'posterior_samples_technical') and mod.posterior_samples_technical is not None:
+            # Save modality-specific posterior_samples_ntc
+            if hasattr(mod, 'posterior_samples_ntc') and mod.posterior_samples_ntc is not None:
                 # Remove large observation arrays before saving
                 # Also ensure that alpha_y_add and alpha_y_mult are included for backward compatibility
-                posterior_clean = {k: v for k, v in mod.posterior_samples_technical.items()
+                posterior_clean = {k: v for k, v in mod.posterior_samples_ntc.items()
                                  if k not in ['y_obs_ntc', 'y_obs']}
 
                 # Verify critical keys are present for downstream loading
@@ -157,21 +157,21 @@ class ModelSaver:
                     'feature_names': mod.feature_names if hasattr(mod, 'feature_names') else None,
                     'n_features': n_features,
                     'feature_meta': mod.feature_meta.to_dict('records') if hasattr(mod, 'feature_meta') and mod.feature_meta is not None else None,
-                    'loss_technical': mod.loss_technical if hasattr(mod, 'loss_technical') else None
+                    'loss_ntc': mod.loss_ntc if hasattr(mod, 'loss_ntc') else None
                 }
 
-                path = os.path.join(output_dir, f'posterior_samples_technical_{mod_name}.pt')
+                path = os.path.join(output_dir, f'posterior_samples_ntc_{mod_name}.pt')
                 torch.save(posterior_with_meta, path)
-                saved_files[f'posterior_samples_technical_{mod_name}'] = path
+                saved_files[f'posterior_samples_ntc_{mod_name}'] = path
                 mod_saved.append(f'posterior({n_features} features)')
                 if verbose:
-                    print(f"[SAVE] {mod_name}.posterior_samples_technical ({n_features} features) → {path}")
+                    print(f"[SAVE] {mod_name}.posterior_samples_ntc ({n_features} features) → {path}")
 
             if mod_saved:
                 saved_summary.append(f"{mod_name}: {', '.join(mod_saved)}")
 
         # Print summary
-        print(f"[SAVE] Technical fit to {output_dir}")
+        print(f"[SAVE] NTC fit to {output_dir}")
         if saved_summary:
             print(f"[SAVE] Saved: {'; '.join(saved_summary)}")
 

@@ -964,7 +964,7 @@ model.fit_technical(
 )
 ```
 
-**Output**: `alpha_y_prefit.pt`, `posterior_samples_technical.pt`
+**Output**: `alpha_y_prefit.pt`, `posterior_samples_ntc.pt`
 
 ### fit_cis
 
