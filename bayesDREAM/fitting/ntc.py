@@ -1546,6 +1546,12 @@ class NTCFitter:
                 log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
                 log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
                 probs = torch.softmax(log_p_masked, dim=-1)                  # [T, K]
+                # Clamp masked categories away from exact 0.0 (float32 underflow of
+                # softmax(-1e9)).  xlogy(concentration-1, probs) backward = 0/0 = NaN
+                # when concentration=1 (masked) and probs=0.  Any probs>0 gives finite
+                # gradient = 0.  1e-30 >> float32 subnormal floor (~1.2e-38).
+                probs = probs.clamp_min(1e-30)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
                 with pyro.plate(_plate_name, _T_guide, dim=-1):
                     pyro.sample("probs_baseline_raw", dist.Delta(probs, event_dim=1))
                 # ---- everything else: AutoNormal ----
