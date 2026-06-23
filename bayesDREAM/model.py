@@ -414,25 +414,6 @@ class bayesDREAM(
         print(f"[INIT] sum_factors initialised on '{self.primary_modality}' "
               f"with columns: {list(primary_mod.sum_factors.columns)}")
 
-    @staticmethod
-    def _fit_gmm_bic(X: np.ndarray, max_components: int = 6):
-        """
-        Fit GMMs for k=2..max_components, return best by BIC and the BIC curve.
-
-        Returns (best_gmm, ks, bics).
-        """
-        from sklearn.mixture import GaussianMixture
-        ks, bics, best_gmm, best_bic = [], [], None, np.inf
-        for k in range(2, max_components + 1):
-            gmm_k = GaussianMixture(n_components=k, random_state=42, n_init=5)
-            gmm_k.fit(X)
-            bic = gmm_k.bic(X)
-            ks.append(k)
-            bics.append(bic)
-            if bic < best_bic:
-                best_bic, best_gmm = bic, gmm_k
-        return best_gmm, np.array(ks), np.array(bics)
-
     def _compute_ntc_log2_exprs_from_fit(self):
         """
         Per-gene log2 NTC expression using fit_ntc() posteriors.
@@ -536,198 +517,58 @@ class bayesDREAM(
             'n_ntc_cells':     len(ntc_idx_cis),
         }
 
-    def _check_cis_expression_in_ntc(self):
-        """
-        Check whether the cis gene is meaningfully expressed in NTC cells.
-
-        Fits GMMs (k=2..6, BIC selection) to per-gene log2 NTC expression
-        from the technical fit posterior.  Raises ValueError if the cis gene
-        falls in the lowest-mean component (unexpressed cluster).
-
-        Requires fit_ntc() to have been run first (uses mu_ntc posterior).
-        Called automatically by fit_cis(); also callable standalone (use
-        plot_ntc_expression_gmm() to see the full diagnostic figure).
-        """
-        data = self._compute_ntc_log2_exprs_from_fit()
-        if data is None:
-            return
-
-        try:
-            from sklearn.mixture import GaussianMixture  # noqa: F401
-        except ImportError:
-            warnings.warn(
-                "scikit-learn not available. Cannot perform GMM check for unexpressed cis gene.",
-                UserWarning
-            )
-            return
-
-        X = data['all_log2_expr'].reshape(-1, 1)
-        best_gmm, _, _ = self._fit_gmm_bic(X)
-
-        n_components     = best_gmm.n_components
-        component_means  = best_gmm.means_.flatten()
-        lowest_component = int(np.argmin(component_means))
-        cis_component    = int(best_gmm.predict([[data['cis_log2_expr']]])[0])
-
-        if cis_component == lowest_component:
-            raise ValueError(
-                f"Cis gene '{self.cis_gene}' appears to be unexpressed in NTC cells "
-                f"(log2 NTC expression = {data['cis_log2_expr']:.2f}; "
-                f"lowest GMM component mean = {component_means[lowest_component]:.2f}; "
-                f"BIC-selected k={n_components}). "
-                f"fit_ntc() cannot reliably estimate overdispersion (o_x) for an unexpressed "
-                f"gene, so fit_cis() results will be unreliable. "
-                f"Call plot_ntc_expression_gmm() to inspect the expression distribution."
-            )
-        else:
-            print(
-                f"[INFO] Cis gene '{self.cis_gene}' expressed in NTC cells: "
-                f"log2 NTC expr = {data['cis_log2_expr']:.2f} "
-                f"(GMM component {cis_component + 1}/{n_components}, "
-                f"component mean = {component_means[cis_component]:.2f}; BIC k={n_components})"
-            )
-
-    def plot_ntc_expression_gmm(
+    def plot_ntc_expression(
         self,
-        max_components: int = 6,
-        figsize: tuple = (11, 4),
+        figsize: tuple = (7, 4),
         n_bins: int = 80,
+        threshold: float = -1.0,
     ):
         """
-        Diagnostic plot for the NTC expression GMM check.
+        Histogram of per-gene log2 NTC expression with the cis gene marked.
 
-        Produces a two-panel figure:
-
-        Left — Histogram of mean log2 sum-factor-normalized expression across
-        NTC cells for every gene (trans + cis).  Each GMM component is drawn
-        as a filled Gaussian curve (weighted by mixing proportion, scaled to
-        the histogram density).  The cis gene is marked with a vertical line
-        and labelled with its raw count distribution in the title annotation.
-        Components are coloured from cold (low mean) to warm (high mean).
-        The lowest-mean component — the "unexpressed" cluster — is always
-        shown in grey.
-
-        Right — BIC vs number of components k=2..max_components.  The
-        selected k is highlighted with a star.
+        Requires fit_ntc() to have been run first.  Useful for judging whether
+        the cis gene is sufficiently expressed in NTC cells before running
+        fit_cis().  fit_cis() raises a ValueError if the cis gene's log2 NTC
+        expression is below ``threshold`` (default -1); this plot shows exactly
+        where the gene falls relative to that cutoff.
 
         Parameters
         ----------
-        max_components : int, default=6
-            Maximum k to consider during BIC model selection.
-        figsize : tuple, default=(11, 4)
-            Figure size (width, height) in inches.
-        n_bins : int, default=80
-            Number of histogram bins.
+        figsize : tuple, default (7, 4)
+        n_bins : int, default 80
+        threshold : float, default -1.0
+            The log2 expression cutoff used by fit_cis() to flag unexpressed
+            genes.  Drawn as a vertical dotted line for reference.
 
         Returns
         -------
         matplotlib.figure.Figure
         """
         import matplotlib.pyplot as plt
-        from scipy.stats import norm as scipy_norm
-
-        try:
-            from sklearn.mixture import GaussianMixture  # noqa: F401
-        except ImportError:
-            raise ImportError(
-                "scikit-learn is required for plot_ntc_expression_gmm(). "
-                "Install with: pip install scikit-learn"
-            )
 
         data = self._compute_ntc_log2_exprs_from_fit()
         if data is None:
-            raise ValueError(
-                "Cannot compute NTC expression data. "
-                "Ensure fit_ntc() has been run and the model has 'target' column, "
-                "NTC cells, and sum_factors."
-            )
+            raise ValueError("Ensure fit_ntc() has been run before plotting.")
 
-        X = data['all_log2_expr'].reshape(-1, 1)
-        best_gmm, ks, bics = self._fit_gmm_bic(X, max_components=max_components)
-
-        n_k             = best_gmm.n_components
-        component_means = best_gmm.means_.flatten()
-        sort_order      = np.argsort(component_means)  # coldest → warmest
-        lowest_label    = sort_order[0]                # "unexpressed" component
-        cis_component   = int(best_gmm.predict([[data['cis_log2_expr']]])[0])
-        assignments     = best_gmm.predict(X)
-
-        # Colours: grey for lowest, then blue→orange for the rest
-        palette = ['#999999'] + ['#4e9ede', '#e08c3a', '#5ab55a', '#c75f5f', '#9966cc']
-        comp_colors = {}
-        for rank, label in enumerate(sort_order):
-            comp_colors[label] = palette[rank] if rank < len(palette) else f'C{rank}'
-
-        fig, (ax_hist, ax_bic) = plt.subplots(1, 2, figsize=figsize)
-
-        # ---- Left panel: histogram + GMM curves ----
-        all_expr = data['all_log2_expr']
-        counts_hist, bin_edges = np.histogram(all_expr, bins=n_bins, density=True)
-        bin_width = bin_edges[1] - bin_edges[0]
-
-        # Colour each bar by its dominant component
-        bar_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        bar_labels  = best_gmm.predict(bar_centres.reshape(-1, 1))
-        bar_colors  = [comp_colors[lbl] for lbl in bar_labels]
-
-        ax_hist.bar(
-            bar_centres, counts_hist, width=bin_width,
-            color=bar_colors, alpha=0.55, edgecolor='none'
-        )
-
-        # GMM component curves
-        x_plot = np.linspace(all_expr.min() - 0.5, all_expr.max() + 0.5, 500)
-        for k_label in range(n_k):
-            mu     = float(best_gmm.means_[k_label])
-            sigma  = float(np.sqrt(best_gmm.covariances_[k_label, 0, 0]))
-            weight = float(best_gmm.weights_[k_label])
-            y      = weight * scipy_norm.pdf(x_plot, mu, sigma)
-            lw     = 2.0
-            ls     = '-'
-            rank   = int(np.where(sort_order == k_label)[0])
-            label  = f'k={rank + 1} (μ={mu:.2f}, w={weight:.2f})'
-            if k_label == lowest_label:
-                label = f'[unexpressed] {label}'
-            ax_hist.plot(x_plot, y, color=comp_colors[k_label], lw=lw, ls=ls, label=label)
-
-        # Cis gene vertical line
+        all_expr  = data['all_log2_expr']
         cis_val   = data['cis_log2_expr']
-        cis_color = comp_colors[cis_component]
-        is_unexpressed = (cis_component == lowest_label)
-        ax_hist.axvline(
-            cis_val, color=cis_color, lw=2, ls='--',
-            label=f'{self.cis_gene} (log2 expr={cis_val:.2f})'
-        )
+        n_genes   = len(all_expr)
 
-        # Annotation: raw count distribution for cis gene in NTC cells
-        raw_counts  = data['cis_ntc_counts'].astype(int)
-        unique, cnt = np.unique(raw_counts, return_counts=True)
-        count_str   = ', '.join(f'{u}:{c}' for u, c in zip(unique[:6], cnt[:6]))
-        if len(unique) > 6:
-            count_str += ', …'
-        verdict = '⚠ UNEXPRESSED' if is_unexpressed else '✓ expressed'
-        ax_hist.set_title(
-            f'NTC expression distribution — {self.cis_gene} {verdict}\n'
-            f'NTC raw counts: {count_str}  (n={data["n_ntc_cells"]} cells)',
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.hist(all_expr, bins=n_bins, color='steelblue', alpha=0.6, edgecolor='none')
+        ax.axvline(cis_val, color='red', lw=2, ls='--',
+                   label=f'{self.cis_gene}  (log$_2$ = {cis_val:.2f})')
+        ax.axvline(threshold, color='grey', lw=1.5, ls=':',
+                   label=f'fit_cis threshold ({threshold})')
+        ax.set_xlabel('log$_2$(NTC mean expression) from technical fit', fontsize=10)
+        ax.set_ylabel('Number of genes', fontsize=10)
+        ax.set_title(
+            f'NTC expression — {self.cis_gene}  '
+            f'({"BELOW" if cis_val < threshold else "above"} threshold)\n'
+            f'{n_genes} genes, {data["n_ntc_cells"]} NTC cells',
             fontsize=9
         )
-        ax_hist.set_xlabel('log$_2$(NTC mean expression) from technical fit', fontsize=10)
-        ax_hist.set_ylabel('Density', fontsize=10)
-        ax_hist.legend(fontsize=7, loc='upper left')
-
-        # ---- Right panel: BIC curve ----
-        best_k = best_gmm.n_components
-        ax_bic.plot(ks, bics, 'o-', color='steelblue', lw=1.5, ms=5)
-        ax_bic.scatter(
-            [best_k], [bics[ks.tolist().index(best_k)]],
-            marker='*', s=200, color='red', zorder=5, label=f'selected k={best_k}'
-        )
-        ax_bic.set_xlabel('Number of components k', fontsize=10)
-        ax_bic.set_ylabel('BIC', fontsize=10)
-        ax_bic.set_title('GMM model selection (BIC)', fontsize=10)
-        ax_bic.set_xticks(ks)
-        ax_bic.legend(fontsize=8)
-
+        ax.legend(fontsize=9)
         fig.tight_layout()
         return fig
 

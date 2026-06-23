@@ -1678,6 +1678,29 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
 
             print("[INFO] Preserved fitted parameters in subset model")
 
+        # Unconditionally copy sum_factors to all modalities that have them.
+        # _init_sum_factors already seeded primary/cis from meta columns, but
+        # dynamically-added columns (sum_factor_adj, sum_factor_refit, …) live only
+        # on the modality object and must be transferred here.
+        # get_cell_subset() for non-primary modalities leaves sum_factors=None,
+        # so this also fixes those.
+        cells_to_keep_index = set(cells_to_keep)
+        for mod_name, orig_mod in self.modalities.items():
+            if orig_mod.sum_factors is None:
+                continue
+            if mod_name not in model_new.modalities:
+                continue
+            keep_idx = orig_mod.sum_factors.index.intersection(list(cells_to_keep_index))
+            if len(keep_idx) == 0:
+                continue
+            model_new.modalities[mod_name].sum_factors = orig_mod.sum_factors.loc[keep_idx].copy()
+        # cis always shares the same DataFrame object as primary
+        if ('cis' in model_new.modalities
+                and model_new.primary_modality in model_new.modalities):
+            model_new.modalities['cis'].sum_factors = (
+                model_new.modalities[model_new.primary_modality].sum_factors
+            )
+
         return model_new
 
 
@@ -1717,10 +1740,34 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         """Delegate to CisFitter."""
         return self._cis_fitter.cis_init_loc_fn(*args, **kwargs)
 
-    def fit_cis(self, *args, **kwargs):
-        """Delegate to CisFitter, after verifying cis gene is expressed in NTC cells."""
-        if hasattr(self, '_check_cis_expression_in_ntc'):
-            self._check_cis_expression_in_ntc()
+    def fit_cis(self, *args, force: bool = False, **kwargs):
+        """
+        Delegate to CisFitter, after checking the cis gene is expressed in NTC cells.
+
+        Raises ValueError if the cis gene's log2 NTC mean expression (from
+        fit_ntc() posteriors) is below -1, because overdispersion estimation is
+        unreliable at near-zero counts.  Pass force=True to skip this check.
+
+        Parameters
+        ----------
+        force : bool, default False
+            If True, skip the low-expression check and proceed regardless.
+            Use plot_ntc_expression() to inspect the expression distribution
+            before overriding.
+        *args, **kwargs
+            All other arguments are forwarded directly to CisFitter.fit_cis().
+        """
+        if not force and hasattr(self, '_compute_ntc_log2_exprs_from_fit'):
+            data = self._compute_ntc_log2_exprs_from_fit()
+            if data is not None:
+                cis_log2 = data['cis_log2_expr']
+                if cis_log2 < -1:
+                    raise ValueError(
+                        f"Cis gene '{self.cis_gene}' has low NTC expression "
+                        f"(log2 = {cis_log2:.2f} < -1). "
+                        f"Overdispersion estimated from near-zero counts may be unreliable. "
+                        f"Call plot_ntc_expression() to inspect, or pass force=True to proceed anyway."
+                    )
         return self._cis_fitter.fit_cis(*args, **kwargs)
 
     def _model_y(self, *args, **kwargs):
