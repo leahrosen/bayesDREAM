@@ -263,8 +263,14 @@ class NTCFitter:
                      pyro.plate("k_plate", K, dim=-1):
                     alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=self._t(0.0), scale=self._t(20.0)))
 
+                # During CPU-offloaded Predictive, guide params stay on CUDA while model
+                # inputs (including zero_cat_mask) are on CPU.  Align the mask to the
+                # sampled tensor's device so masked_fill / arithmetic don't crash.
+                _alpha_dev = alpha_logits_y.device
+                zero_cat_mask_dev = zero_cat_mask.to(_alpha_dev)
+
                 # Force α to 0 where category is structurally absent
-                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
+                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask_dev.unsqueeze(0), 0.0)
 
                 # Center over ACTIVE categories only.
                 # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
@@ -272,23 +278,23 @@ class NTCFitter:
                 # (sum of active alphas = 0).  Dividing by K would leave a residual constant
                 # shift in the active alphas, breaking identifiability for features with
                 # many phantom categories.
-                n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
-                active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
+                n_active = (~zero_cat_mask_dev).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
+                active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active                 # [C-1, T, 1]
                 alpha_logits_y = alpha_logits_y - active_mean
-                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
+                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask_dev.unsqueeze(0), 0.0)
                 alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
 
                 # Build full [C, T, K] (or [S, C, T, K]) with baseline=0
                 if alpha_logits_y.dim() == 3:
                     alpha_full_add_logits = torch.cat(
-                        [torch.zeros(1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
-                         alpha_logits_y.to(self.model.device)], dim=0
+                        [torch.zeros(1, T, K, device=_alpha_dev, dtype=alpha_logits_y.dtype),
+                         alpha_logits_y], dim=0
                     )
                 elif alpha_logits_y.dim() == 4:
                     S = alpha_logits_y.size(0)
                     alpha_full_add_logits = torch.cat(
-                        [torch.zeros(S, 1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
-                         alpha_logits_y.to(self.model.device)], dim=1
+                        [torch.zeros(S, 1, T, K, device=_alpha_dev, dtype=alpha_logits_y.dtype),
+                         alpha_logits_y], dim=1
                     )
                 else:
                     raise ValueError(f"Unexpected alpha_logits_y shape: {tuple(alpha_logits_y.shape)}")
@@ -487,11 +493,19 @@ class NTCFitter:
                 torch.ones_like(concentration),
                 concentration,
             )
+            # During CPU-offloaded Predictive, input tensors (concentration, zero_cat_mask) are
+            # on CPU but the conditioned guide sample (probs_baseline_raw) comes back on CUDA.
+            # Move concentration to the guide's device so Dirichlet.log_prob doesn't see a
+            # device mismatch.  self._multinomial_zero_cat_mask was built before the CPU offload
+            # and reliably reflects the guide's device.
+            _guide_dev = self._multinomial_zero_cat_mask.device
+            concentration = concentration.to(_guide_dev)
             with f_plate:
                 probs0 = pyro.sample("probs_baseline_raw", dist.Dirichlet(concentration))  # [T, K]
 
             # Hard-zero masked categories and renormalize across active ones
-            probs_masked = probs0 * (~zero_cat_mask).to(probs0.dtype)                 # [T, K]
+            # .to(probs0) copies both dtype AND device (probs0 may be on CUDA during Predictive)
+            probs_masked = probs0 * (~zero_cat_mask).to(probs0)                      # [T, K]
             row_sums = probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             probs_baseline = probs_masked / row_sums                                   # [T, K]
             probs_baseline = pyro.deterministic("probs_baseline", probs_baseline)
