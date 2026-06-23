@@ -1074,12 +1074,12 @@ class ModelSummarizer:
 
         # Build DataFrame
         cis_gene = getattr(self.model, 'cis_gene', None)
-        data = {
-            'feature': feature_names,
-            'is_cis_gene': [f == cis_gene for f in feature_names],
-            'modality': modality_name,
-            'distribution': modality.distribution
-        }
+        is_primary = modality_name == self.model.primary_modality
+        data = {'feature': feature_names}
+        if is_primary and cis_gene is not None:
+            data['is_cis_gene'] = [f == cis_gene for f in feature_names]
+        data['modality'] = modality_name
+        data['distribution'] = modality.distribution
 
         # Add columns for each group
         for g in range(n_groups):
@@ -1091,9 +1091,8 @@ class ModelSummarizer:
 
         # Append cis gene row if this is the primary modality and alpha_x_prefit is available
         alpha_x = getattr(self.model, 'alpha_x_prefit', None)
-        if (cis_gene is not None
-                and modality_name == self.model.primary_modality
-                and alpha_x is not None):
+        cis_appended = False
+        if is_primary and cis_gene is not None and alpha_x is not None:
             alpha_x_np = alpha_x.cpu().numpy() if isinstance(alpha_x, torch.Tensor) else np.asarray(alpha_x)
             cis_row = {
                 'feature': cis_gene,
@@ -1107,6 +1106,7 @@ class ModelSummarizer:
                 cis_row[f'group_{g}_alpha_y_lower'] = val
                 cis_row[f'group_{g}_alpha_y_upper'] = val
             df = pd.concat([df, pd.DataFrame([cis_row])], ignore_index=True)
+            cis_appended = True
 
         # Save
         os.makedirs(output_dir, exist_ok=True)
@@ -1115,7 +1115,7 @@ class ModelSummarizer:
 
         print(f"[SAVE] Technical summary saved to {output_file}")
         print(f"       {len(df)} features × {n_groups} groups ({n_features} trans + cis gene)"
-              if cis_gene is not None and modality_name == self.model.primary_modality and alpha_x is not None
+              if cis_appended
               else f"       {n_features} features × {n_groups} groups")
 
         return df
