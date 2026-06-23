@@ -477,9 +477,14 @@ class NTCFitter:
             concentration = total_counts_ref + 1.0  # [T, K], strictly > 0
             # Zero concentration for phantom categories (masked in zero_cat_mask) so the
             # Dirichlet prior doesn't leak mass to padding positions and bias real categories.
+            # Use concentration=1 (flat/uniform) for zero-masked categories.
+            # concentration < 1 makes Dirichlet improper at the boundary: log_prob(p→0) = +inf
+            # when (concentration-1)*log(p) = negative * (-inf) = +inf, which breaks the ELBO.
+            # Since the model hard-zeros and renormalizes these categories anyway (lines below),
+            # the prior on them doesn't affect fitted values — it just needs to be finite.
             concentration = torch.where(
                 zero_cat_mask,
-                torch.full_like(concentration, 1e-6),
+                torch.ones_like(concentration),
                 concentration,
             )
             with f_plate:
@@ -1672,7 +1677,8 @@ class NTCFitter:
         )
 
         svi = pyro.infer.SVI(self._model_ntc, ntc_guide, optimizer, loss=elbo)
-        ntc_guide.to(self.model.device)
+        if hasattr(ntc_guide, 'to'):
+            ntc_guide.to(self.model.device)
     
         # ---------------------------
         # Optimize
@@ -1722,7 +1728,8 @@ class NTCFitter:
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
         run_on_cpu = self.model.device.type != "cpu"
         if run_on_cpu:
-            ntc_guide.to("cpu")
+            if hasattr(ntc_guide, 'to'):
+                ntc_guide.to("cpu")
             self.model.device = torch.device("cpu")
     
             model_inputs = {
