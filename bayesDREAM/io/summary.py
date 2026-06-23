@@ -1089,13 +1089,34 @@ class ModelSummarizer:
 
         df = pd.DataFrame(data)
 
+        # Append cis gene row if this is the primary modality and alpha_x_prefit is available
+        alpha_x = getattr(self.model, 'alpha_x_prefit', None)
+        if (cis_gene is not None
+                and modality_name == self.model.primary_modality
+                and alpha_x is not None):
+            alpha_x_np = alpha_x.cpu().numpy() if isinstance(alpha_x, torch.Tensor) else np.asarray(alpha_x)
+            cis_row = {
+                'feature': cis_gene,
+                'is_cis_gene': True,
+                'modality': modality_name,
+                'distribution': modality.distribution,
+            }
+            for g in range(n_groups):
+                val = float(alpha_x_np[g]) if g < len(alpha_x_np) else float('nan')
+                cis_row[f'group_{g}_alpha_y_mean'] = val
+                cis_row[f'group_{g}_alpha_y_lower'] = val
+                cis_row[f'group_{g}_alpha_y_upper'] = val
+            df = pd.concat([df, pd.DataFrame([cis_row])], ignore_index=True)
+
         # Save
         os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, f'ntc_feature_summary_{modality_name}.csv')
         df.to_csv(output_file, index=False)
 
         print(f"[SAVE] Technical summary saved to {output_file}")
-        print(f"       {n_features} features × {n_groups} groups")
+        print(f"       {len(df)} features × {n_groups} groups ({n_features} trans + cis gene)"
+              if cis_gene is not None and modality_name == self.model.primary_modality and alpha_x is not None
+              else f"       {n_features} features × {n_groups} groups")
 
         return df
 
