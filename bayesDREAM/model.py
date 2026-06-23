@@ -873,15 +873,19 @@ class bayesDREAM(
 
         print(f"[INFO] Extracting 'cis' modality: {cis_gene}")
 
-        # Use numeric index and keep original gene name
-        cis_feature_meta = pd.DataFrame({
-            'gene': [cis_gene],
-            'gene_name': [cis_gene]  # Store original name
-        }, index=[numeric_idx])
-
-        # Add Ensembl ID if available in feature_meta
-        if feature_meta is not None and 'ens_id' in feature_meta.columns:
-            cis_feature_meta['ens_id'] = feature_meta.loc[numeric_idx, 'ens_id']
+        # Build cis_feature_meta: copy all columns from feature_meta row if available
+        if feature_meta is not None:
+            cis_feature_meta = feature_meta.iloc[[numeric_idx]].copy()
+            cis_feature_meta.index = [numeric_idx]
+            if 'gene' not in cis_feature_meta.columns:
+                cis_feature_meta['gene'] = cis_gene
+            if 'gene_name' not in cis_feature_meta.columns:
+                cis_feature_meta['gene_name'] = cis_gene
+        else:
+            cis_feature_meta = pd.DataFrame({
+                'gene': [cis_gene],
+                'gene_name': [cis_gene],
+            }, index=[numeric_idx])
 
         # Extract cell names from counts or meta
         if isinstance(counts, pd.DataFrame):
