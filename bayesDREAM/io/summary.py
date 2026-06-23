@@ -1073,8 +1073,10 @@ class ModelSummarizer:
         alpha_upper = alpha_y
 
         # Build DataFrame
+        cis_gene = getattr(self.model, 'cis_gene', None)
         data = {
             'feature': feature_names,
+            'is_cis_gene': [f == cis_gene for f in feature_names],
             'modality': modality_name,
             'distribution': modality.distribution
         }
