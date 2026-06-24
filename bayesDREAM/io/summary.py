@@ -1080,8 +1080,8 @@ class ModelSummarizer:
             if isinstance(v, torch.Tensor):
                 v = v.cpu().numpy()
             if v.ndim == 1:
-                return v          # already [T]
-            return v.mean(axis=0) # [S, T] → [T]
+                return v
+            return v.mean(axis=0).flatten()  # collapse samples + any extra dims → [T]
 
         ps = getattr(modality, 'posterior_samples_ntc', None) or {}
         mu_ntc_vals = _extract_scalar_posterior(ps, 'mu_ntc')
