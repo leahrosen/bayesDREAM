@@ -1072,6 +1072,21 @@ class ModelSummarizer:
         alpha_lower = alpha_y  # no uncertainty (point estimate)
         alpha_upper = alpha_y
 
+        # Extract mu_ntc and o_y means from posterior_samples_ntc ([S, T] → [T])
+        def _extract_scalar_posterior(ps, key):
+            v = ps.get(key)
+            if v is None:
+                return None
+            if isinstance(v, torch.Tensor):
+                v = v.cpu().numpy()
+            if v.ndim == 1:
+                return v          # already [T]
+            return v.mean(axis=0) # [S, T] → [T]
+
+        ps = getattr(modality, 'posterior_samples_ntc', None) or {}
+        mu_ntc_vals = _extract_scalar_posterior(ps, 'mu_ntc')
+        o_y_vals    = _extract_scalar_posterior(ps, 'o_y')
+
         # Build DataFrame
         cis_gene = getattr(self.model, 'cis_gene', None)
         is_primary = modality_name == self.model.primary_modality
@@ -1087,6 +1102,11 @@ class ModelSummarizer:
             data[f'group_{g}_alpha_y_lower'] = alpha_lower[g, :]
             data[f'group_{g}_alpha_y_upper'] = alpha_upper[g, :]
 
+        if mu_ntc_vals is not None:
+            data['mu_ntc'] = mu_ntc_vals
+        if o_y_vals is not None:
+            data['o_y'] = o_y_vals
+
         df = pd.DataFrame(data)
 
         # Append cis gene row if this is the primary modality and alpha_x_prefit is available
@@ -1094,6 +1114,9 @@ class ModelSummarizer:
         cis_appended = False
         if is_primary and cis_gene is not None and alpha_x is not None:
             alpha_x_np = alpha_x.cpu().numpy() if isinstance(alpha_x, torch.Tensor) else np.asarray(alpha_x)
+            cis_ps = getattr(self.model.get_modality('cis'), 'posterior_samples_ntc', None) or {}
+            cis_mu = _extract_scalar_posterior(cis_ps, 'mu_ntc')
+            cis_oy = _extract_scalar_posterior(cis_ps, 'o_x')  # stored as o_x in cis modality
             cis_row = {
                 'feature': cis_gene,
                 'is_cis_gene': True,
@@ -1105,6 +1128,10 @@ class ModelSummarizer:
                 cis_row[f'group_{g}_alpha_y_mean'] = val
                 cis_row[f'group_{g}_alpha_y_lower'] = val
                 cis_row[f'group_{g}_alpha_y_upper'] = val
+            if mu_ntc_vals is not None:
+                cis_row['mu_ntc'] = float(cis_mu[0]) if cis_mu is not None else float('nan')
+            if o_y_vals is not None:
+                cis_row['o_y'] = float(cis_oy[0]) if cis_oy is not None else float('nan')
             df = pd.concat([df, pd.DataFrame([cis_row])], ignore_index=True)
             cis_appended = True
 
