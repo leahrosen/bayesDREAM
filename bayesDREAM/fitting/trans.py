@@ -506,22 +506,23 @@ class TransFitter:
             # - negbinom: positive count
             # - binomial/multinomial: probability in [0,1], using NEW reparameterization
             if distribution in ['normal', 'studentt']:
-                # A prior: Normal with noise-adaptive shift, matching negbinom's 13.5% criterion.
+                # A prior: NTC-anchored Normal (analogous to negbinom LogNormal, but in linear
+                # space since normal/studentt values can be negative).
                 #
-                # delta_A = amplitude = Vmax_mean − Amean (≈ Q95 − 2·Q05)
-                # sigma_A = delta_A  (Option B: 1× amplitude — wider than the old 0.5×,
-                #                     so the prior allows A to be well above Q05 if data
-                #                     support it; a gene with range 0.2 gets sigma=0.2
-                #                     rather than 0.1)
-                # shift   = (1 − o_y_weight) × 0.55  ∈ [0, 0.55]
-                #   o_y_weight → 0 (quiet gene): shift = 0.55  → P(A ≥ Q05) ≈ 13.5%
-                #   o_y_weight → 1 (noisy gene):  shift = 0     → P(A ≥ Q05) = 50%  (uninformative)
-                # Note: for normal/studentt, o_y IS the residual standard deviation (sigma_y = o_y),
-                # so _o_y_weight is the natural noise measure (already computed above).
+                # When y_ntc available (fit_ntc has been run):
+                #   w → 0 (quiet feature): prior centred at Amean; y_ntc is 1σ above
+                #   w → 1 (noisy feature): prior centred at y_ntc
+                #   sigma = |y_ntc − Amean| floored at 10% of response amplitude
+                #
+                # Fallback (no NTC posterior): fixed-shift approach using response amplitude.
                 delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
-                sigma_A = delta_A  # 1× amplitude (wider than old 0.5×)
-                _shift_A = (1.0 - _o_y_weight) * 0.55  # [T]: 0.55 quiet → 0 noisy
-                mean_A  = Amean_tensor - _shift_A * delta_A
+                if y_ntc_tensor is not None:
+                    sigma_A = (y_ntc_tensor - Amean_tensor).abs().clamp_min(delta_A * 0.1)
+                    mean_A  = (1.0 - _o_y_weight) * Amean_tensor + _o_y_weight * y_ntc_tensor
+                else:
+                    sigma_A = delta_A
+                    _shift_A = (1.0 - _o_y_weight) * 0.55
+                    mean_A  = Amean_tensor - _shift_A * delta_A
                 A = pyro.sample("A", dist.Normal(mean_A, sigma_A))
 
             elif distribution in ['binomial', 'multinomial']:
@@ -566,27 +567,34 @@ class TransFitter:
                         obs_total = y_obs_tensor.sum(dim=0)  # [T, K]
                         phantom_conc_mask = (obs_total == 0)  # [T, K]
 
-                    # Logit-space prior mean
+                    # Logit-space prior mean (base: from Q05 or uniform)
                     if use_data_driven_priors:
-                        # Shift A mean to 0.5×Q05 (→ P(A ≥ Q05) ≈ 13.5%, consistent with
-                        # the negbinom A prior), normalise, then take log as the logit mean.
                         A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
                         A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
-                        A_logit_mean = torch.log(A_mean_normalized.clamp(min=1e-10))  # [T, K]
+                        A_logit_mean_base = torch.log(A_mean_normalized.clamp(min=1e-10))              # [T, K]
                     else:
-                        # Uniform prior: equal logits → uniform simplex after softmax
-                        A_logit_mean = torch.zeros(T, K_dim, device=self.model.device)
+                        A_logit_mean_base = torch.zeros(T, K_dim, device=self.model.device)
+
+                    # Incorporate y_ntc anchor via w-interpolation (analogous to negbinom/binomial):
+                    #   w → 0 (quiet feature): prior centred at logit(Amean/2); y_ntc within 1σ
+                    #   w → 1 (noisy feature): prior centred at logit(y_ntc)
+                    if (y_ntc_tensor is not None and y_ntc_tensor.ndim == 2
+                            and y_ntc_tensor.shape[0] == T and y_ntc_tensor.shape[1] == K_dim):
+                        logit_y_ntc   = torch.log(y_ntc_tensor.clamp(min=1e-10))   # [T, K], log-simplex
+                        w_expanded    = _o_y_weight.unsqueeze(-1)                   # [T, 1]
+                        A_logit_mean  = (1.0 - w_expanded) * A_logit_mean_base + w_expanded * logit_y_ntc  # [T, K]
+                        sigma_A_logit = (logit_y_ntc - A_logit_mean_base).abs().clamp_min(1.0)             # [T, K]
+                    else:
+                        A_logit_mean  = A_logit_mean_base
+                        sigma_A_logit = self._t(1.0)
 
                     # Push phantom categories to -inf in prior mean so the guide learns
                     # to assign them zero probability.
                     if phantom_conc_mask is not None:
                         A_logit_mean = A_logit_mean.masked_fill(phantom_conc_mask, -1e4)
 
-                    # σ=1.0 in logit space ≈ weakly informative (comparable to Dirichlet α≈1)
-                    sigma_A_logit = self._t(1.0)
-
-                    # Sample in unconstrained logit space — the autoguide uses Normal here,
-                    # no simplex constraint, no stick-breaking transform.
+                    # Sample in unconstrained logit space — no simplex constraint, no stick-breaking.
+                    # sigma_A_logit is [T, K] when y_ntc used, scalar otherwise.
                     A_logit = pyro.sample("A", dist.Normal(A_logit_mean, sigma_A_logit).to_event(1))  # [T, K]
 
                     # Softmax with phantom masking → valid probability vector [T, K]
@@ -595,48 +603,63 @@ class TransFitter:
                     A = torch.softmax(A_logit, dim=-1)  # [T, K]
 
                 else:
-                    # For binomial: Beta priors
-                    if use_data_driven_priors:
-                        # A ~ Beta(1, β) with mean = 0.5×Q05.
-                        # Gives P(A ≥ Q05) ≈ 13.5%, consistent with the negbinom A prior.
-                        # (The previous 0.1× gave P(A ≥ Q05) ≈ 0%, causing false positives
-                        # by forcing A near 0 and inflating effective Vmax.)
+                    # For binomial: Logit-Normal prior when y_ntc available (analogous to negbinom
+                    # LogNormal, adapted to the [0,1] simplex via logit transform).
+                    #
+                    # When y_ntc available:
+                    #   Lower anchor: logit(Amean/2); upper anchor: logit(y_ntc)
+                    #   w → 0 (quiet feature): centred at logit(Amean/2); y_ntc is 1σ above
+                    #   w → 1 (noisy feature): centred at logit(y_ntc)
+                    #   sigma = (logit(y_ntc) − logit(Amean/2)).clamp_min(1 logit unit)
+                    #
+                    # Fallback (no NTC posterior): Beta(1, β) with mean = 0.5×Q05.
+                    if y_ntc_tensor is not None and use_data_driven_priors:
+                        logit_Amean_half = torch.logit((0.5 * Amean_tensor).clamp(1e-6, 1.0 - 1e-6))  # [T]
+                        logit_y_ntc      = torch.logit(y_ntc_tensor.clamp(1e-6, 1.0 - 1e-6))          # [T]
+                        sigma_logit = (logit_y_ntc - logit_Amean_half).clamp_min(1.0)                  # [T]
+                        mu_logit    = (1.0 - _o_y_weight) * logit_Amean_half + _o_y_weight * logit_y_ntc  # [T]
+                        logit_A = pyro.sample("logit_A", dist.Normal(mu_logit, sigma_logit))            # [T]
+                        A = pyro.deterministic("A", torch.sigmoid(logit_A))                             # [T]
+                    elif use_data_driven_priors:
+                        # Fallback Beta(1, β) with mean = 0.5×Q05 when no NTC posterior available.
                         A_mean_shifted = (0.5 * Amean_tensor).clamp_min(epsilon_tensor)
                         beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
-                        alpha_A = self._t(1.0)
-
+                        A = pyro.sample("A", dist.Beta(self._t(1.0), beta_A).expand([T]))  # [T]
                     else:
-                        # Uniform priors: Beta(1, 1) for A
-                        alpha_A = self._t(1.0)
-                        beta_A = self._t(1.0)
-
-                    # Sample per-feature [T]
-                    A = pyro.sample("A", dist.Beta(alpha_A, beta_A).expand([T]))  # [T]
+                        # Uniform prior: Beta(1, 1)
+                        A = pyro.sample("A", dist.Beta(self._t(1.0), self._t(1.0)).expand([T]))  # [T]
 
             else:
-                # For negbinom: adaptive Exponential prior on A driven by per-gene overdispersion.
-                # mean(A) interpolates between two anchors via w = _o_y_weight ∈ (0, 1):
+                # For negbinom: LogNormal A prior (Normal in log2 space) with noise-adaptive mean.
+                # log2(A) ~ Normal(mu_log2_A, sigma_log2_A), so A = 2^log2(A).
                 #
-                #   w → 0 (quiet gene, informative likelihood):
-                #     mean(A) → Q05/2.  Data can identify the floor; allow A well below Q05.
-                #     P(A ≥ Q05) = exp(-2) ≈ 13.5%.
+                # Unlike Exponential (gradient → 0 as A → 0), LogNormal has a restoring force
+                # proportional to displacement: gradient = (mu - log2(A)) / sigma^2.
+                # This prevents collapse to A = 0 even when the likelihood strongly prefers it.
                 #
-                #   w → 1 (noisy gene, weak likelihood):
-                #     mean(A) → y_ntc (NTC posterior mean per gene).
-                #     Anchor at NTC expression level — neutral assumption when data is uninformative.
-                #     P(A ≥ y_ntc) = exp(-1) ≈ 36.8%, so y_ntc is well within the prior.
+                # mu_log2_A interpolates in log2 space between two gene-specific anchors:
+                #   w → 0 (quiet gene, informative likelihood): log2(Amean/2)
+                #   w → 1 (noisy gene, weak likelihood):        log2(y_ntc)
                 #
-                # Amean (Q05) is floored at q01(mu_ntc) before this model is called, so
-                # mean(A) ≥ q01(mu_ntc)/2 even for lowly-expressed genes — prevents the
-                # near-zero initialisation trap that causes spurious A-collapse false positives.
-                # Exponential mode is still 0, preserving the prior's ability to extrapolate
-                # A below Q05 when the likelihood supports it (desirable from simulations).
+                # sigma_log2_A = D = log2(y_ntc) - log2(Amean/2), floored at 1 octave.
+                # This places y_ntc exactly 1 sigma above the prior center at w=0, and
+                # q01_ntc/2 exactly 1 sigma below the prior center at w=1.
+                # When D is small (y_ntc ≈ Amean, non-responding gene), the prior is tight.
+                # When D is large (Q05=0, strong effect or zero-expressed gene), the prior
+                # is wide but the informative likelihood (w→0) correctly locates A.
                 if y_ntc_tensor is not None:
-                    mean_A = (1.0 - _o_y_weight) * Amean_tensor / 2.0 + _o_y_weight * y_ntc_tensor
+                    log2_Amean_half = torch.log2(Amean_tensor / 2.0)
+                    log2_y_ntc      = torch.log2(y_ntc_tensor)
+                    sigma_log2_A    = (log2_y_ntc - log2_Amean_half).clamp_min(1.0)
+                    mu_log2_A       = (1.0 - _o_y_weight) * log2_Amean_half + _o_y_weight * log2_y_ntc
                 else:
-                    mean_A = Amean_tensor / (2.0 - _o_y_weight)  # fallback: original formula
-                rate_A = 1.0 / mean_A.clamp_min(epsilon_tensor)
-                A = pyro.sample("A", dist.Exponential(rate_A))
+                    # Fallback when no technical posterior is available: centre prior at
+                    # log2(Amean/2) with a fixed sigma of 3 octaves.
+                    log2_Amean_half = torch.log2(Amean_tensor / 2.0)
+                    sigma_log2_A    = self._t(3.0)
+                    mu_log2_A       = log2_Amean_half
+                log2_A = pyro.sample("log2_A", dist.Normal(mu_log2_A, sigma_log2_A))
+                A = pyro.deterministic("A", torch.pow(self._t(2.0), log2_A))
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
@@ -2243,36 +2266,69 @@ class TransFitter:
                                                    torch.full_like(mean_within_guide_var, valid_var),
                                                    mean_within_guide_var)
 
-        # --- A prior: NTC anchor and Q05 floor (negbinom only) ---
-        # Floor Amean (Q05 of guide means) at q01 of the technical-posterior mu_ntc so that
-        # Amean cannot be near-zero for lowly-expressed genes.  Also extract y_ntc_tensor
-        # (posterior mean of mu_ntc per gene) to anchor the noisy-gene end of the A prior
-        # in _model_y, preventing the A-collapse initialisation trap.
+        # --- A prior: NTC anchor (all distributions) ---
+        # Extract y_ntc_tensor (posterior mean of NTC expression per feature) to anchor the
+        # noisy-feature end of the A prior in _model_y, preventing A-collapse.
+        # For negbinom: also floors Amean at q01(mu_ntc) to prevent near-zero Q05 estimates.
+        # Keys per distribution:
+        #   negbinom/normal/studentt/binomial: posterior_samples_ntc['mu_ntc']  → [S, T]
+        #   multinomial:                       posterior_samples_ntc['probs_baseline'] → [S, T, K]
         y_ntc_tensor = None
-        if distribution == 'negbinom' and Amean_tensor.ndim == 1:
+        _post_tech = getattr(modality, 'posterior_samples_ntc', None)
+        if _post_tech is not None:
             try:
-                _post_tech = getattr(modality, 'posterior_samples_ntc', None)
-                if _post_tech is not None and 'mu_ntc' in _post_tech:
+                if distribution in ('negbinom', 'normal', 'studentt', 'binomial') and 'mu_ntc' in _post_tech:
                     _mu_ntc = _post_tech['mu_ntc']
                     if not torch.is_tensor(_mu_ntc):
                         _mu_ntc = torch.tensor(_mu_ntc, dtype=torch.float32, device=self.model.device)
                     else:
                         _mu_ntc = _mu_ntc.float().to(self.model.device)
                     if _mu_ntc.ndim == 2 and _mu_ntc.shape[1] == T:
-                        q01_ntc = torch.quantile(_mu_ntc, 0.01, dim=0)  # [T]
-                        y_ntc_tensor = _mu_ntc.mean(dim=0)               # [T]
-                        _old_min = Amean_tensor.min().item()
-                        Amean_tensor = Amean_tensor.clamp_min(q01_ntc)
-                        _new_min = Amean_tensor.min().item()
-                        if _new_min > _old_min * 1.01:
-                            print(f"[INFO] A prior floor: Amean min raised {_old_min:.3e} → {_new_min:.3e} via q01(mu_ntc)")
+                        if distribution == 'negbinom':
+                            n_nonpos = (_mu_ntc <= 0).sum().item()
+                            if n_nonpos > 0:
+                                print(f"[DEBUG] {n_nonpos}/{_mu_ntc.numel()} mu_ntc samples ≤ 0 "
+                                      f"(min={_mu_ntc.min().item():.3e}); possible float32 underflow in NTC posterior")
+                        y_ntc_tensor = _mu_ntc.mean(dim=0)  # [T]
+                        if distribution == 'negbinom':
+                            if y_ntc_tensor.min() <= 0:
+                                raise ValueError(
+                                    f"y_ntc_tensor contains non-positive values "
+                                    f"(min={y_ntc_tensor.min().item():.3e}). "
+                                    f"mu_ntc posterior has strictly positive support — this should not occur."
+                                )
+                            q01_ntc = torch.quantile(_mu_ntc, 0.01, dim=0)  # [T]
+                            _old_min = Amean_tensor.min().item()
+                            Amean_tensor = Amean_tensor.clamp_min(q01_ntc)
+                            _new_min = Amean_tensor.min().item()
+                            if _new_min > _old_min * 1.01:
+                                print(f"[INFO] A prior floor: Amean min raised {_old_min:.3e} → {_new_min:.3e} via q01(mu_ntc)")
                     elif _mu_ntc.ndim == 1 and _mu_ntc.shape[0] == T:
                         y_ntc_tensor = _mu_ntc
-                        Amean_tensor = Amean_tensor.clamp_min(_mu_ntc)
+                        if distribution == 'negbinom':
+                            if _mu_ntc.min() <= 0:
+                                raise ValueError(
+                                    f"y_ntc_tensor contains non-positive values "
+                                    f"(min={_mu_ntc.min().item():.3e}). "
+                                    f"mu_ntc posterior has strictly positive support — this should not occur."
+                                )
+                            Amean_tensor = Amean_tensor.clamp_min(_mu_ntc)
                     else:
-                        print(f"[WARNING] mu_ntc shape {tuple(_mu_ntc.shape)} doesn't match T={T}; skipping A prior NTC floor")
+                        print(f"[WARNING] mu_ntc shape {tuple(_mu_ntc.shape)} doesn't match T={T}; skipping A prior NTC anchor")
+                elif distribution == 'multinomial' and 'probs_baseline' in _post_tech:
+                    _probs = _post_tech['probs_baseline']
+                    if not torch.is_tensor(_probs):
+                        _probs = torch.tensor(_probs, dtype=torch.float32, device=self.model.device)
+                    else:
+                        _probs = _probs.float().to(self.model.device)
+                    if _probs.ndim == 3 and _probs.shape[1] == T:
+                        y_ntc_tensor = _probs.mean(dim=0)  # [T, K]
+                    elif _probs.ndim == 2 and _probs.shape[0] == T:
+                        y_ntc_tensor = _probs               # [T, K]
+                    else:
+                        print(f"[WARNING] probs_baseline shape {tuple(_probs.shape)} doesn't match T={T}; skipping multinomial NTC anchor")
                 else:
-                    print("[INFO] No technical posterior mu_ntc available; A prior uses Q05 anchor only")
+                    print(f"[INFO] No NTC posterior available for distribution='{distribution}'; A prior uses Q05 anchor only")
             except Exception as _e:
                 print(f"[WARNING] Could not compute y_ntc anchor from technical posterior: {_e}")
 
