@@ -146,10 +146,12 @@ class ModelSaver:
                         posterior_clean['alpha_y_mult'] = mod.alpha_y_prefit_mult
 
                 # Add feature metadata (including full DataFrame for excluded features tracking)
-                # Use actual tensor shape (not modality dims which may differ after filtering)
-                _sample_tensor = next((v for v in posterior_clean.values()
-                                       if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
-                n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else mod.dims.get('n_features', None)
+                # Use the modality's authoritative feature count (same reason as trans save)
+                n_features = mod.dims.get('n_features', None)
+                if n_features is None:
+                    _sample_tensor = next((v for v in posterior_clean.values()
+                                           if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
+                    n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else None
                 posterior_with_meta = {
                     'posterior_samples': posterior_clean,
                     'modality_name': mod_name,
@@ -316,11 +318,14 @@ class ModelSaver:
                 primary_mod = self.model.get_modality(self.model.primary_modality)
 
                 # Add modality and feature metadata (including full feature_meta DataFrame)
-                # Use actual tensor shape (not modality dims which may differ after filtering)
-                _sample_tensor = next((v for v in posterior_clean.values()
-                                       if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
-                n_features_primary = (_sample_tensor.shape[-1] if _sample_tensor is not None
-                                      else primary_mod.dims.get('n_features', None))
+                # Use the modality's authoritative feature count (not sample tensor shape[-1],
+                # which can pick a non-feature tensor such as alpha_y [S, C-1, T] whose
+                # last dim could coincidentally be 1 when C-1=1, saving wrong n_features).
+                n_features_primary = primary_mod.dims.get('n_features', None)
+                if n_features_primary is None:
+                    _sample_tensor = next((v for v in posterior_clean.values()
+                                           if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
+                    n_features_primary = _sample_tensor.shape[-1] if _sample_tensor is not None else None
                 posterior_with_meta = {
                     'posterior_samples': posterior_clean,
                     'modality_name': self.model.primary_modality,
@@ -347,10 +352,12 @@ class ModelSaver:
                 posterior_clean = {k: v for k, v in mod.posterior_samples_trans.items()
                                  if k not in ['y_obs', 'x_obs']}
 
-                # Use actual tensor shape (not modality dims which may differ after filtering)
-                _sample_tensor = next((v for v in posterior_clean.values()
-                                       if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
-                n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else mod.dims.get('n_features', None)
+                # Use the modality's authoritative feature count (same reason as primary modality)
+                n_features = mod.dims.get('n_features', None)
+                if n_features is None:
+                    _sample_tensor = next((v for v in posterior_clean.values()
+                                           if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
+                    n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else None
 
                 # Add modality and feature metadata (including full feature_meta DataFrame)
                 posterior_with_meta = {

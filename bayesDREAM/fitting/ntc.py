@@ -2162,14 +2162,14 @@ class NTCFitter:
             trans_idx    = list(range(cis_idx_orig))  # 0 .. n_trans_features-1
             T_all_with_cis = n_trans_features + 1
 
-            # alpha_x_prefit: mean over posterior samples → [C]
-            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
+            # alpha_x_prefit: median over posterior samples → [C]
+            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].median(dim=0).values
 
-            # Modality alpha_y: trans genes only → mean → [C, T]
+            # Modality alpha_y: trans genes only → median → [C, T]
             if modality.distribution == 'negbinom':
-                modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
+                modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].median(dim=0).values
             else:
-                modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
+                modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
 
             # ---- Store cis gene posteriors in cis modality ----
             cis_modality = self.model.get_modality('cis')
@@ -2220,9 +2220,9 @@ class NTCFitter:
         else:
             # No cis gene appended (non-primary modality, or no cis_gene set)
             if modality.distribution == 'negbinom':
-                modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
+                modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].median(dim=0).values
             else:
-                modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
+                modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].median(dim=0).values
 
         modality.posterior_samples_ntc = posterior_samples
 

@@ -2,7 +2,7 @@
 Summary export for bayesDREAM results.
 
 Exports model results as R-friendly CSV files with:
-- Mean and 95% credible intervals for all parameters
+- Median and 95% credible intervals for all parameters
 - Cell-wise and feature-wise summaries
 - Observed log2FC, predicted log2FC, inflection points for trans fits
 - Derivative roots and function classification
@@ -1402,6 +1402,7 @@ class ModelSummarizer:
         compute_inflection: bool = True,
         compute_derivative_roots: bool = True,
         compute_log2fc_params: bool = True,
+        compute_lfc_ci: bool = True,
         x_ntc: Optional[float] = None,
         y_ntc=None,
         verbose: bool = True,
@@ -1421,11 +1422,11 @@ class ModelSummarizer:
 
         For negbinom/normal/studentt distributions:
         - observed_log2fc: log2(y_max / y_min) over observed x range from fitted function
-        - full_log2fc_mean/lower/upper: log2(y_max / y_min) over theoretical x range (0 to ∞)
+        - full_log2fc_median/lower/upper: log2(y_max / y_min) over theoretical x range (0 to ∞)
 
         For binomial distributions (e.g., splicing_sj):
         - observed_delta_p: y_max - y_min over observed x range (probability difference)
-        - full_delta_p_mean/lower/upper: y_max - y_min over theoretical x range
+        - full_delta_p_median/lower/upper: y_max - y_min over theoretical x range
 
         FDR columns (all function types):
         - fdr_alpha: Bayesian q-value for component A (positive Hill, or the single Hill
@@ -1441,20 +1442,20 @@ class ModelSummarizer:
                      fdr_alpha for additive_hill.
 
         For additive_hill (all parameters needed to recreate: y = A + alpha*Vmax_a*Hill(x;K_a,n_a) + beta*Vmax_b*Hill(x;K_b,n_b)):
-        - A_mean, A_lower, A_upper: Baseline (intercept)
-        - Vmax_a_mean, Vmax_a_lower, Vmax_a_upper: Component A magnitude
-        - K_a_mean, K_a_lower, K_a_upper: Component A half-max (EC50)
-        - EC50_a_mean, EC50_a_lower, EC50_a_upper: Same as K_a (alias)
-        - n_a_mean, n_a_lower, n_a_upper: Component A Hill coefficient (cooperativity)
-        - alpha_mean, alpha_lower, alpha_upper: Component A weight
-        - Vmax_b_mean, Vmax_b_lower, Vmax_b_upper: Component B magnitude
-        - K_b_mean, K_b_lower, K_b_upper: Component B half-max (EC50)
-        - EC50_b_mean, EC50_b_lower, EC50_b_upper: Same as K_b (alias)
-        - n_b_mean, n_b_lower, n_b_upper: Component B Hill coefficient (cooperativity)
-        - beta_mean, beta_lower, beta_upper: Component B weight
-        - pi_y_mean, pi_y_lower, pi_y_upper: Sparsity weight (optional)
-        - inflection_a_mean, inflection_a_lower, inflection_a_upper: Component A inflection x
-        - inflection_b_mean, inflection_b_lower, inflection_b_upper: Component B inflection x
+        - A_median, A_lower, A_upper: Baseline (intercept)
+        - Vmax_a_median, Vmax_a_lower, Vmax_a_upper: Component A magnitude
+        - K_a_median, K_a_lower, K_a_upper: Component A half-max (EC50)
+        - EC50_a_median, EC50_a_lower, EC50_a_upper: Same as K_a (alias)
+        - n_a_median, n_a_lower, n_a_upper: Component A Hill coefficient (cooperativity)
+        - alpha_median, alpha_lower, alpha_upper: Component A weight
+        - Vmax_b_median, Vmax_b_lower, Vmax_b_upper: Component B magnitude
+        - K_b_median, K_b_lower, K_b_upper: Component B half-max (EC50)
+        - EC50_b_median, EC50_b_lower, EC50_b_upper: Same as K_b (alias)
+        - n_b_median, n_b_lower, n_b_upper: Component B Hill coefficient (cooperativity)
+        - beta_median, beta_lower, beta_upper: Component B weight
+        - pi_y_median, pi_y_lower, pi_y_upper: Sparsity weight (optional)
+        - inflection_a_median, inflection_a_lower, inflection_a_upper: Component A inflection x
+        - inflection_b_median, inflection_b_lower, inflection_b_upper: Component B inflection x
         - classification: Function shape classification based on dependency masks:
           - 'single_positive': Only one Hill component active, with positive n (increasing)
           - 'single_negative': Only one Hill component active, with negative n (decreasing)
@@ -1463,9 +1464,9 @@ class ModelSummarizer:
           - 'non_monotonic_min': Both active, opposite signs, concave up at x=x_ntc (local min)
           - 'non_monotonic_max': Both active, opposite signs, concave down at x=x_ntc (local max)
           - 'flat': No active components
-        - first_deriv_roots_mean: Roots of first derivative (x values where dy/dx=0)
-        - second_deriv_roots_mean: Roots of second derivative (x values where d²y/dx²=0, inflections)
-        - third_deriv_roots_mean: Roots of third derivative (x values where d³y/dx³=0)
+        - first_deriv_roots_median: Roots of first derivative (x values where dy/dx=0)
+        - second_deriv_roots_median: Roots of second derivative (x values where d²y/dx²=0, inflections)
+        - third_deriv_roots_median: Roots of third derivative (x values where d³y/dx³=0)
         - n_first_deriv_roots: Number of first derivative roots (0 for monotonic)
         - n_second_deriv_roots: Number of second derivative roots (inflection points)
         - n_third_deriv_roots: Number of third derivative roots
@@ -1475,15 +1476,16 @@ class ModelSummarizer:
         - y_ntc: NTC mean for each trans gene
         - log2fc_at_u0: log2FC value at u=0 (x = x_ntc), i.e., g(0) = log2(y(x_ntc)) - log2(y_ntc)
         - EC50_a_log2fc, EC50_b_log2fc: EC50 in log2FC x-space (log2(K) - log2(x_ntc))
-        - inflection_a_log2fc, inflection_b_log2fc: Inflection points in log2FC x-space
+        - inflection_a_log2fc_median, inflection_b_log2fc_median: Inflection points in log2FC x-space
+        - inflection_a_log2fc: Alias for inflection_a_log2fc_median (backwards compatibility)
 
         For negbinom/normal/studentt (log2FC y-space):
         - dg_du_at_u0, dg_du_at_u0_lower, dg_du_at_u0_upper: First derivative of log2FC at u=0 with 95% CI
         - d2g_du2_at_u0, d2g_du2_at_u0_lower, d2g_du2_at_u0_upper: Second derivative at u=0 with 95% CI
         - d3g_du3_at_u0, d3g_du3_at_u0_lower, d3g_du3_at_u0_upper: Third derivative at u=0 with 95% CI
-        - first_deriv_roots_log2fc_mean: Roots of dg/du=0 in u-space (g = log2(y) - log2(y_ntc))
-        - second_deriv_roots_log2fc_mean: Roots of d²g/du²=0
-        - third_deriv_roots_log2fc_mean: Roots of d³g/du³=0
+        - first_deriv_roots_log2fc_median: Roots of dg/du=0 in u-space (g = log2(y) - log2(y_ntc))
+        - second_deriv_roots_log2fc_median: Roots of d²g/du²=0
+        - third_deriv_roots_log2fc_median: Roots of d³g/du³=0
         - A_log2fc: Baseline in log2FC y-space (log2(A) - log2(y_ntc))
 
         For binomial distributions (delta_p y-space):
@@ -1491,24 +1493,25 @@ class ModelSummarizer:
         - dp_du_at_u0, dp_du_at_u0_lower, dp_du_at_u0_upper: First derivative of delta_p at u=0 with 95% CI
         - d2p_du2_at_u0, d2p_du2_at_u0_lower, d2p_du2_at_u0_upper: Second derivative at u=0 with 95% CI
         - d3p_du3_at_u0, d3p_du3_at_u0_lower, d3p_du3_at_u0_upper: Third derivative at u=0 with 95% CI
-        - first_deriv_roots_delta_p_mean: Roots of dp/du=0 in u-space
-        - second_deriv_roots_delta_p_mean: Roots of d²p/du²=0
-        - third_deriv_roots_delta_p_mean: Roots of d³p/du³=0
+        - first_deriv_roots_delta_p_median: Roots of dp/du=0 in u-space
+        - second_deriv_roots_delta_p_median: Roots of d²p/du²=0
+        - third_deriv_roots_delta_p_median: Roots of d³p/du³=0
         - A_delta_p: Baseline in delta_p space (A - y_ntc)
 
         For single_hill:
-        - B_mean, B_lower, B_upper: Hill magnitude
-        - K_mean, K_lower, K_upper: Hill coefficient
-        - xc_mean, xc_lower, xc_upper: Half-max point (EC50 or IC50)
-        - inflection_mean, inflection_lower, inflection_upper: Inflection x
-        - full_log2fc_mean, full_log2fc_lower, full_log2fc_upper: Full dynamic range
+        - B_median, B_lower, B_upper: Hill magnitude
+        - K_median, K_lower, K_upper: Hill coefficient
+        - xc_median, xc_lower, xc_upper: Half-max point (EC50 or IC50)
+        - inflection_median, inflection_lower, inflection_upper: Inflection x
+        - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
 
         For polynomial:
-        - coef_{i}_mean, coef_{i}_lower, coef_{i}_upper: Coefficient i
-        - full_log2fc_mean, full_log2fc_lower, full_log2fc_upper: Full dynamic range
+        - coef_{i}_median, coef_{i}_lower, coef_{i}_upper: Coefficient i
+        - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
 
         Overdispersion and technical group effects (for simulation):
-        - phi_y_mean, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2)
+        - phi_y_median, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2)
+        - o_y_median, o_y_lower, o_y_upper: Posterior o_y (sqrt overdispersion)
         - group_{g}_alpha_y_mean: Technical group effect for group g (from fit_ntc)
 
         Parameters
@@ -1536,6 +1539,13 @@ class ModelSummarizer:
             Manually provided NTC means for each trans feature (y-axis reference points).
             Shape: (n_features,). If None (default), computed from posterior_samples_ntc
             of the trans modality.
+        compute_lfc_ci : bool
+            If True (default), compute 95% credible intervals for observed_log2fc and
+            full_log2fc by iterating over all posterior samples. This is the main
+            bottleneck for large feature sets (~1.5h for 20k features × 1000 samples).
+            Set to False to skip the CI loops and use the posterior mean for lower/upper
+            bounds instead. EC50_log2fc, inflection_log2fc, and all parameter CIs are
+            unaffected — they remain fast vectorised computations.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -1698,6 +1708,36 @@ class ModelSummarizer:
             if _y_ntc_arr.ndim >= 1 and _y_ntc_arr.shape[0] > max_features:
                 _y_ntc = _y_ntc_arr[:max_features]
 
+        # Guard: y_ntc must match n_features.  A common cause of mismatch is that
+        # posterior_samples_ntc['mu_ntc'] was not subsetted when the modality was
+        # subsetted to fewer features (e.g. a random 100-gene subset).  When the
+        # modality has feature_names we try to align by name; otherwise we fall back
+        # to discarding y_ntc so the rest of the summary still completes.
+        if _y_ntc is not None and np.asarray(_y_ntc).shape[0] != n_features:
+            _y_ntc_arr = np.asarray(_y_ntc)
+            aligned = False
+            # Try name-based alignment
+            ntc_feat_names = None
+            if (hasattr(modality, 'posterior_samples_ntc')
+                    and isinstance(modality.posterior_samples_ntc, dict)):
+                ntc_feat_names = modality.posterior_samples_ntc.get('feature_names')
+            cur_feat_names = getattr(modality, 'feature_names', None)
+            if ntc_feat_names is not None and cur_feat_names is not None:
+                ntc_idx_map = {n: i for i, n in enumerate(ntc_feat_names)}
+                subset_idx = [ntc_idx_map.get(n, -1) for n in cur_feat_names]
+                if all(si >= 0 for si in subset_idx):
+                    _y_ntc = _y_ntc_arr[subset_idx]
+                    aligned = True
+            if not aligned:
+                print(
+                    f"[WARNING] y_ntc length ({_y_ntc_arr.shape[0]}) does not match "
+                    f"n_features ({n_features}) and cannot be aligned by feature name. "
+                    f"y_ntc will be ignored for log2FC computation. "
+                    f"To fix: subset posterior_samples_ntc['mu_ntc'] to match the current "
+                    f"modality features, or pass y_ntc manually to save_trans_summary()."
+                )
+                _y_ntc = None
+
         # Always add x_ntc / y_ntc to data if available (useful metadata even without log2fc params)
         if _x_ntc is not None:
             data['x_ntc'] = _x_ntc
@@ -1736,6 +1776,7 @@ class ModelSummarizer:
                 compute_log2fc_params, _x_ntc, _y_ntc,
                 x_obs_min, x_obs_max,
                 n_cats_per_feature=n_cats_per_feature,
+                compute_lfc_ci=compute_lfc_ci,
                 verbose=verbose,
             )
         elif function_type == 'single_hill':
@@ -1747,6 +1788,7 @@ class ModelSummarizer:
                 x_obs_min=x_obs_min,
                 x_obs_max=x_obs_max,
                 compute_log2fc_params=compute_log2fc_params,
+                compute_lfc_ci=compute_lfc_ci,
                 x_ntc=_x_ntc,
                 y_ntc=_y_ntc,
                 verbose=verbose,
@@ -1773,6 +1815,7 @@ class ModelSummarizer:
             print(f"  _compute_bayesian_fdr:      {time.time() - _t0:.1f}s")
 
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
+        # Also add o_y directly.
         if 'o_y' in posterior:
             o_y = posterior['o_y']
             if isinstance(o_y, torch.Tensor):
@@ -1782,13 +1825,19 @@ class ModelSummarizer:
                 o_y = o_y.squeeze(1)
             phi_y = 1.0 / (o_y ** 2)
             if phi_y.ndim >= 2:
-                data['phi_y_mean'] = phi_y.mean(axis=0)
+                data['phi_y_median'] = np.median(phi_y, axis=0)
                 data['phi_y_lower'] = np.quantile(phi_y, 0.025, axis=0)
                 data['phi_y_upper'] = np.quantile(phi_y, 0.975, axis=0)
+                data['o_y_median'] = np.median(o_y, axis=0)
+                data['o_y_lower'] = np.quantile(o_y, 0.025, axis=0)
+                data['o_y_upper'] = np.quantile(o_y, 0.975, axis=0)
             else:
-                data['phi_y_mean'] = phi_y
+                data['phi_y_median'] = phi_y
                 data['phi_y_lower'] = phi_y
                 data['phi_y_upper'] = phi_y
+                data['o_y_median'] = o_y
+                data['o_y_lower'] = o_y
+                data['o_y_upper'] = o_y
 
         # Add alpha_y (technical group effects) from modality.alpha_y_prefit
         if hasattr(modality, 'alpha_y_prefit') and modality.alpha_y_prefit is not None:
@@ -2170,7 +2219,7 @@ class ModelSummarizer:
                                     compute_derivative_roots=True, x_range=None,
                                     compute_log2fc_params=False, x_ntc=None, y_ntc=None,
                                     x_obs_min=None, x_obs_max=None, fdr_threshold=0.05,
-                                    n_cats_per_feature=None, verbose=False):
+                                    n_cats_per_feature=None, compute_lfc_ci=True, verbose=False):
         """
         Add additive Hill parameters to data dict.
 
@@ -2198,6 +2247,7 @@ class ModelSummarizer:
             compute_log2fc_params, x_ntc, y_ntc, x_obs_min, x_obs_max,
             fdr_threshold=fdr_threshold,
             n_cats_per_feature=n_cats_per_feature,
+            compute_lfc_ci=compute_lfc_ci,
             verbose=verbose,
         )
 
@@ -2223,7 +2273,7 @@ class ModelSummarizer:
                                               compute_derivative_roots=True, x_range=None,
                                               compute_log2fc_params=False, x_ntc=None, y_ntc=None,
                                               x_obs_min=None, x_obs_max=None, fdr_threshold=0.05,
-                                              n_cats_per_feature=None, verbose=False):
+                                              n_cats_per_feature=None, compute_lfc_ci=True, verbose=False):
         """
         Add additive Hill parameters from individual parameter architecture (Vmax_a, K_a, n_a, etc.).
 
@@ -2272,7 +2322,7 @@ class ModelSummarizer:
                     if param.ndim > 2:
                         param = param.mean(axis=tuple(range(2, param.ndim)))
 
-                mean_val = param.mean(axis=0)
+                mean_val = np.median(param, axis=0)
                 lower_val = np.quantile(param, 0.025, axis=0)
                 upper_val = np.quantile(param, 0.975, axis=0)
             else:
@@ -2318,55 +2368,55 @@ class ModelSummarizer:
                     param = param.mean(axis=tuple(range(2, param.ndim)))
         
             param_abs = np.abs(param)
-        
+
             if param_abs.ndim >= 2:
-                mean_val = param_abs.mean(axis=0)
+                mean_val = np.median(param_abs, axis=0)
                 lower_val = np.quantile(param_abs, 0.025, axis=0)
                 upper_val = np.quantile(param_abs, 0.975, axis=0)
             else:
                 mean_val = lower_val = upper_val = param_abs
-        
-            return mean_val, lower_val, upper_val
-        
-        # Component A (first Hill function)
-        Vmax_a_mean, Vmax_a_lower, Vmax_a_upper = extract_param('Vmax_a')
-        K_a_mean, K_a_lower, K_a_upper = extract_param('K_a')  # EC50
-        n_a_mean, n_a_lower, n_a_upper = extract_param('n_a')  # Hill coefficient
 
-        data['Vmax_a_mean'] = Vmax_a_mean
+            return mean_val, lower_val, upper_val
+
+        # Component A (first Hill function)
+        Vmax_a_median, Vmax_a_lower, Vmax_a_upper = extract_param('Vmax_a')
+        K_a_median, K_a_lower, K_a_upper = extract_param('K_a')  # EC50
+        n_a_median, n_a_lower, n_a_upper = extract_param('n_a')  # Hill coefficient
+
+        data['Vmax_a_median'] = Vmax_a_median
         data['Vmax_a_lower'] = Vmax_a_lower
         data['Vmax_a_upper'] = Vmax_a_upper
-        data['EC50_a_mean'] = K_a_mean
+        data['EC50_a_median'] = K_a_median
         data['EC50_a_lower'] = K_a_lower
         data['EC50_a_upper'] = K_a_upper
-        data['n_a_mean'] = n_a_mean
+        data['n_a_median'] = n_a_median
         data['n_a_lower'] = n_a_lower
         data['n_a_upper'] = n_a_upper
 
         # Component B (second Hill function)
-        Vmax_b_mean, Vmax_b_lower, Vmax_b_upper = extract_param('Vmax_b')
-        K_b_mean, K_b_lower, K_b_upper = extract_param('K_b')  # EC50
-        n_b_mean, n_b_lower, n_b_upper = extract_param('n_b')  # Hill coefficient
+        Vmax_b_median, Vmax_b_lower, Vmax_b_upper = extract_param('Vmax_b')
+        K_b_median, K_b_lower, K_b_upper = extract_param('K_b')  # EC50
+        n_b_median, n_b_lower, n_b_upper = extract_param('n_b')  # Hill coefficient
 
-        data['Vmax_b_mean'] = Vmax_b_mean
+        data['Vmax_b_median'] = Vmax_b_median
         data['Vmax_b_lower'] = Vmax_b_lower
         data['Vmax_b_upper'] = Vmax_b_upper
-        data['EC50_b_mean'] = K_b_mean
+        data['EC50_b_median'] = K_b_median
         data['EC50_b_lower'] = K_b_lower
         data['EC50_b_upper'] = K_b_upper
-        data['n_b_mean'] = n_b_mean
+        data['n_b_median'] = n_b_median
         data['n_b_lower'] = n_b_lower
         data['n_b_upper'] = n_b_upper
 
-        # Use raw posterior means for n; component activity is determined by FDR
+        # Use raw posterior medians for n; component activity is determined by FDR
         # (q_active_a / q_active_b, computed below) rather than CI-based n-zeroing.
-        n_a_used = n_a_mean
-        n_b_used = n_b_mean
-        
+        n_a_used = n_a_median
+        n_b_used = n_b_median
+
         # Pi_y (sparsity weight) - optional
         if 'pi_y' in posterior:
-            pi_y_mean, pi_y_lower, pi_y_upper = extract_param('pi_y')
-            data['pi_y_mean'] = pi_y_mean
+            pi_y_median, pi_y_lower, pi_y_upper = extract_param('pi_y')
+            data['pi_y_median'] = pi_y_median
             data['pi_y_lower'] = pi_y_lower
             data['pi_y_upper'] = pi_y_upper
 
@@ -2381,10 +2431,10 @@ class ModelSummarizer:
             return arr
 
         if 'alpha' in posterior:
-            alpha_mean, alpha_lower, alpha_upper = extract_param('alpha')
+            alpha_median, alpha_lower, alpha_upper = extract_param('alpha')
             alpha_full = extract_param_full('alpha')
             # Broadcast if scalar
-            alpha_mean = _broadcast_to_features(alpha_mean, n_features)
+            alpha_median = _broadcast_to_features(alpha_median, n_features)
             alpha_lower = _broadcast_to_features(alpha_lower, n_features)
             alpha_upper = _broadcast_to_features(alpha_upper, n_features)
             if alpha_full.ndim == 1:
@@ -2394,16 +2444,16 @@ class ModelSummarizer:
                 # (n_samples, 1) scalar → (n_samples, n_features)
                 alpha_full = np.broadcast_to(alpha_full, (alpha_full.shape[0], n_features)).copy()
         else:
-            alpha_mean = np.ones(n_features)
+            alpha_median = np.ones(n_features)
             alpha_lower = np.ones(n_features)
             alpha_upper = np.ones(n_features)
             alpha_full = np.ones((1, n_features))
 
         if 'beta' in posterior:
-            beta_mean, beta_lower, beta_upper = extract_param('beta')
+            beta_median, beta_lower, beta_upper = extract_param('beta')
             beta_full = extract_param_full('beta')
             # Broadcast if scalar
-            beta_mean = _broadcast_to_features(beta_mean, n_features)
+            beta_median = _broadcast_to_features(beta_median, n_features)
             beta_lower = _broadcast_to_features(beta_lower, n_features)
             beta_upper = _broadcast_to_features(beta_upper, n_features)
             if beta_full.ndim == 1:
@@ -2413,44 +2463,44 @@ class ModelSummarizer:
                 # (n_samples, 1) scalar → (n_samples, n_features)
                 beta_full = np.broadcast_to(beta_full, (beta_full.shape[0], n_features)).copy()
         else:
-            beta_mean = np.ones(n_features)
+            beta_median = np.ones(n_features)
             beta_lower = np.ones(n_features)
             beta_upper = np.ones(n_features)
             beta_full = np.ones((1, n_features))
 
-        data['alpha_mean'] = alpha_mean
+        data['alpha_median'] = alpha_median
         data['alpha_lower'] = alpha_lower
         data['alpha_upper'] = alpha_upper
-        data['beta_mean'] = beta_mean
+        data['beta_median'] = beta_median
         data['beta_lower'] = beta_lower
         data['beta_upper'] = beta_upper
 
         # Also save K_a and K_b explicitly (same as EC50 but clearer naming for function recreation)
-        data['K_a_mean'] = K_a_mean
+        data['K_a_median'] = K_a_median
         data['K_a_lower'] = K_a_lower
         data['K_a_upper'] = K_a_upper
-        data['K_b_mean'] = K_b_mean
+        data['K_b_median'] = K_b_median
         data['K_b_lower'] = K_b_lower
         data['K_b_upper'] = K_b_upper
 
         # Get A (baseline) - required to recreate the fitted function
         if 'A' in posterior:
-            A_mean, A_lower, A_upper = extract_param('A')
+            A_median, A_lower, A_upper = extract_param('A')
             A_full = extract_param_full('A')
             # Broadcast if scalar
-            A_mean = _broadcast_to_features(A_mean, n_features)
+            A_median = _broadcast_to_features(A_median, n_features)
             A_lower = _broadcast_to_features(A_lower, n_features)
             A_upper = _broadcast_to_features(A_upper, n_features)
             if A_full.ndim == 1 or A_full.shape[-1] == 1:
                 A_full = np.broadcast_to(A_full.reshape(-1, 1), (A_full.shape[0] if A_full.ndim > 1 else 1, n_features)).copy()
         else:
-            A_mean = np.zeros(n_features)
+            A_median = np.zeros(n_features)
             A_lower = np.zeros(n_features)
             A_upper = np.zeros(n_features)
             A_full = np.zeros((1, n_features))
 
         # Save A (baseline) to data dict
-        data['A_mean'] = A_mean
+        data['A_median'] = A_median
         data['A_lower'] = A_lower
         data['A_upper'] = A_upper
 
@@ -2480,7 +2530,7 @@ class ModelSummarizer:
                     n_cats = cat_arr.shape[2]
                     for k in range(n_cats):
                         ck = cat_arr[:, :, k]  # [S, T]
-                        data[f'{prefix}_cat{k}_mean'] = ck.mean(axis=0)
+                        data[f'{prefix}_cat{k}_median'] = np.median(ck, axis=0)
                         data[f'{prefix}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
                         data[f'{prefix}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
@@ -2496,7 +2546,7 @@ class ModelSummarizer:
                     A_raw = A_raw.squeeze(1)
                 if A_raw.ndim == 3 and A_raw.shape[1] == n_features:
                     AK = A_raw[:, :, -1]  # [S, T] — residual always at K_max-1
-                    data['A_K_mean'] = AK.mean(axis=0)
+                    data['A_K_median'] = np.median(AK, axis=0)
                     data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
                     data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)
 
@@ -2515,12 +2565,12 @@ class ModelSummarizer:
             _ratio_a = alpha_full * Vmax_a_full / np.maximum(A_full, 1e-12)
             p_active_a = (_ratio_a > _ACTIVITY_EPSILON).mean(axis=0)
         else:
-            p_active_a = alpha_mean.copy()  # fallback to E[alpha]
+            p_active_a = alpha_median.copy()  # fallback to median[alpha]
         if (beta_full.ndim >= 2 and Vmax_b_full.ndim >= 2 and A_full.ndim >= 2):
             _ratio_b = beta_full * Vmax_b_full / np.maximum(A_full, 1e-12)
             p_active_b = (_ratio_b > _ACTIVITY_EPSILON).mean(axis=0)
         else:
-            p_active_b = beta_mean.copy()  # fallback to E[beta]
+            p_active_b = beta_median.copy()  # fallback to median[beta]
         p_active_a = np.asarray(p_active_a, dtype=float).ravel()
         p_active_b = np.asarray(p_active_b, dtype=float).ravel()
 
@@ -2560,18 +2610,18 @@ class ModelSummarizer:
             nBabs_lo[_fdr_inactive_b] = 0.0
             nBabs_hi[_fdr_inactive_b] = 0.0
         
-            inflection_a_mean = self._compute_hill_inflection(nA,      K_a_mean)
+            inflection_a_mean = self._compute_hill_inflection(nA,      K_a_median)
             inflection_a_lower = self._compute_hill_inflection(nAabs_lo, K_a_lower)  # magnitude-lower
             inflection_a_upper = self._compute_hill_inflection(nAabs_hi, K_a_upper)  # magnitude-upper
-        
-            inflection_b_mean = self._compute_hill_inflection(nB,      K_b_mean)
+
+            inflection_b_mean = self._compute_hill_inflection(nB,      K_b_median)
             inflection_b_lower = self._compute_hill_inflection(nBabs_lo, K_b_lower)
             inflection_b_upper = self._compute_hill_inflection(nBabs_hi, K_b_upper)
         
-            data['inflection_a_mean'] = inflection_a_mean
+            data['inflection_a_median'] = inflection_a_mean
             data['inflection_a_lower'] = inflection_a_lower
             data['inflection_a_upper'] = inflection_a_upper
-            data['inflection_b_mean'] = inflection_b_mean
+            data['inflection_b_median'] = inflection_b_mean
             data['inflection_b_lower'] = inflection_b_lower
             data['inflection_b_upper'] = inflection_b_upper
 
@@ -2623,16 +2673,16 @@ class ModelSummarizer:
             # Compute FDR activity flag once, used throughout this iteration
             _is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
 
-            # Get mean parameters for this feature
-            alpha_i = alpha_mean[i]
-            beta_i = beta_mean[i]
-            Vmax_a_i = Vmax_a_mean[i]
-            Vmax_b_i = Vmax_b_mean[i]
-            K_a_i = K_a_mean[i]
-            K_b_i = K_b_mean[i]
+            # Get median parameters for this feature
+            alpha_i = alpha_median[i]
+            beta_i = beta_median[i]
+            Vmax_a_i = Vmax_a_median[i]
+            Vmax_b_i = Vmax_b_median[i]
+            K_a_i = K_a_median[i]
+            K_b_i = K_b_median[i]
             n_a_i = float(n_a_used[i])
             n_b_i = float(n_b_used[i])
-            A_i = A_mean[i]
+            A_i = A_median[i]
 
             # Observed-extrema arg-locations (used later for CI candidate points)
             x_minloc = np.nan
@@ -2832,6 +2882,7 @@ class ModelSummarizer:
                 p_active_b=float(q_active_b[i]),
                 fdr_threshold=fdr_threshold
             )
+
             classifications.append(classification)
 
             if verbose: _loop1_t['classify'] += time.time() - _ti; _ti = time.time()
@@ -2880,7 +2931,7 @@ class ModelSummarizer:
                 if verbose: _loop1_t['obs_lfc_mean'] += time.time() - _ti; _ti = time.time()
 
                 # CI for observed dynamic range from all posterior samples
-                if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_a_full.ndim > 1):
+                if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_a_full.ndim > 1) and compute_lfc_ci:
                     S = Vmax_a_full.shape[0]
 
                     x0 = float(max(x_obs_min, 1e-10))
@@ -2945,7 +2996,7 @@ class ModelSummarizer:
                 if verbose: _loop1_t['obs_lfc_ci'] += time.time() - _ti; _ti = time.time()
 
                 # CI for full dynamic range from all posterior samples
-                if Vmax_a_full.ndim > 1:
+                if Vmax_a_full.ndim > 1 and compute_lfc_ci:
                     S = Vmax_a_full.shape[0]
                     x_candidates = first_roots_mean
 
@@ -3013,18 +3064,18 @@ class ModelSummarizer:
         data['n_third_deriv_roots'] = n_third_deriv_roots
 
         # Store derivative roots as strings (list of x values)
-        # For mean parameters
-        data['first_deriv_roots_mean'] = [
+        # Computed at posterior median parameters
+        data['first_deriv_roots_median'] = [
             ';'.join(f'{r:.4f}' for r in roots) if roots else np.nan
             for roots in first_deriv_roots_mean_list
         ]
-        
-        data['second_deriv_roots_mean'] = [
+
+        data['second_deriv_roots_median'] = [
             ';'.join(f'{r:.4f}' for r in roots) if roots else np.nan
             for roots in second_deriv_roots_mean_list
         ]
-        
-        data['third_deriv_roots_mean'] = [
+
+        data['third_deriv_roots_median'] = [
             ';'.join(f'{r:.4f}' for r in roots) if roots else np.nan
             for roots in third_deriv_roots_mean_list
         ]
@@ -3032,25 +3083,25 @@ class ModelSummarizer:
         # Derivative roots in u-space: only add when both flags were True
         if compute_log2fc_params and compute_derivative_roots:
             if is_binomial:
-                data['first_deriv_roots_delta_p_mean']  = first_deriv_roots_log2fc_mean_list
-                data['second_deriv_roots_delta_p_mean'] = second_deriv_roots_log2fc_mean_list
-                data['third_deriv_roots_delta_p_mean']  = third_deriv_roots_log2fc_mean_list
+                data['first_deriv_roots_delta_p_median']  = first_deriv_roots_log2fc_mean_list
+                data['second_deriv_roots_delta_p_median'] = second_deriv_roots_log2fc_mean_list
+                data['third_deriv_roots_delta_p_median']  = third_deriv_roots_log2fc_mean_list
             else:
-                data['first_deriv_roots_log2fc_mean']  = first_deriv_roots_log2fc_mean_list
-                data['second_deriv_roots_log2fc_mean'] = second_deriv_roots_log2fc_mean_list
-                data['third_deriv_roots_log2fc_mean']  = third_deriv_roots_log2fc_mean_list
+                data['first_deriv_roots_log2fc_median']  = first_deriv_roots_log2fc_mean_list
+                data['second_deriv_roots_log2fc_median'] = second_deriv_roots_log2fc_mean_list
+                data['third_deriv_roots_log2fc_median']  = third_deriv_roots_log2fc_mean_list
 
         # Full and observed dynamic ranges: only add when compute_log2fc_params=True
         if compute_log2fc_params:
             if is_binomial:
-                data['full_delta_p_mean'] = full_log2fc_mean_list
+                data['full_delta_p_median'] = full_log2fc_mean_list
                 data['full_delta_p_lower'] = full_log2fc_lower_list
                 data['full_delta_p_upper'] = full_log2fc_upper_list
                 data['observed_delta_p'] = observed_log2fc_list
                 data['observed_delta_p_lower'] = observed_log2fc_lower_list
                 data['observed_delta_p_upper'] = observed_log2fc_upper_list
             else:
-                data['full_log2fc_mean'] = full_log2fc_mean_list
+                data['full_log2fc_median'] = full_log2fc_mean_list
                 data['full_log2fc_lower'] = full_log2fc_lower_list
                 data['full_log2fc_upper'] = full_log2fc_upper_list
                 data['observed_log2fc'] = observed_log2fc_list
@@ -3181,9 +3232,9 @@ class ModelSummarizer:
                 if is_flat_i:
                     y_ntc_i = y_ntc[i] if y_ntc is not None else np.nan
                     # if n==0 for both, Hill(x_ntc)=0.5*Vmax
-                    H_a = 0.5 * Vmax_a_mean[i]
-                    H_b = 0.5 * Vmax_b_mean[i]
-                    y_at_ntc = A_mean[i] + alpha_mean[i] * H_a + beta_mean[i] * H_b
+                    H_a = 0.5 * Vmax_a_median[i]
+                    H_b = 0.5 * Vmax_b_median[i]
+                    y_at_ntc = A_median[i] + alpha_median[i] * H_a + beta_median[i] * H_b
                     if (y_at_ntc > epsilon) and (y_ntc_i > epsilon):
                         log2fc_at_0[i] = np.log2(y_at_ntc) - np.log2(y_ntc_i)
                     else:
@@ -3204,16 +3255,16 @@ class ModelSummarizer:
                         d3g_du3_at_0_upper[i] = 0.0
                     continue
 
-                # Get mean parameters for this feature
-                alpha_i = alpha_mean[i]
-                beta_i = beta_mean[i]
-                Vmax_a_i = Vmax_a_mean[i]
-                Vmax_b_i = Vmax_b_mean[i]
-                K_a_i = K_a_mean[i]
-                K_b_i = K_b_mean[i]
+                # Get median parameters for this feature
+                alpha_i = alpha_median[i]
+                beta_i = beta_median[i]
+                Vmax_a_i = Vmax_a_median[i]
+                Vmax_b_i = Vmax_b_median[i]
+                K_a_i = K_a_median[i]
+                K_b_i = K_b_median[i]
                 n_a_i = float(n_a_used[i])
                 n_b_i = float(n_b_used[i])
-                A_i = A_mean[i]
+                A_i = A_median[i]
                 y_ntc_i = y_ntc[i] if y_ntc is not None else 1.0
 
                 # Compute y(x_ntc) and log2fc_at_u0 for all significant genes (cheap)
@@ -3318,8 +3369,8 @@ class ModelSummarizer:
                     data['d3g_du3_at_u0_upper'] = d3g_du3_at_0_upper
 
             # EC50 in log2FC space: log2(K) - log2(x_ntc)
-            data['EC50_a_log2fc'] = np.log2(np.maximum(K_a_mean, epsilon)) - log2_x_ntc
-            data['EC50_b_log2fc'] = np.log2(np.maximum(K_b_mean, epsilon)) - log2_x_ntc
+            data['EC50_a_log2fc'] = np.log2(np.maximum(K_a_median, epsilon)) - log2_x_ntc
+            data['EC50_b_log2fc'] = np.log2(np.maximum(K_b_median, epsilon)) - log2_x_ntc
 
             # Inflection points in log2FC space
             if compute_inflection:
@@ -3329,25 +3380,25 @@ class ModelSummarizer:
                     out[ok] = np.log2(arr[ok]) - log2_x_ntc
                     return out
 
-                data['inflection_a_log2fc_mean']  = _log2fc_transform(data.get('inflection_a_mean',  np.full(n_features, np.nan)))
-                data['inflection_a_log2fc_lower'] = _log2fc_transform(data.get('inflection_a_lower', np.full(n_features, np.nan)))
-                data['inflection_a_log2fc_upper'] = _log2fc_transform(data.get('inflection_a_upper', np.full(n_features, np.nan)))
+                data['inflection_a_log2fc_median'] = _log2fc_transform(data.get('inflection_a_median', np.full(n_features, np.nan)))
+                data['inflection_a_log2fc_lower']  = _log2fc_transform(data.get('inflection_a_lower', np.full(n_features, np.nan)))
+                data['inflection_a_log2fc_upper']  = _log2fc_transform(data.get('inflection_a_upper', np.full(n_features, np.nan)))
 
-                data['inflection_b_log2fc_mean']  = _log2fc_transform(data.get('inflection_b_mean',  np.full(n_features, np.nan)))
-                data['inflection_b_log2fc_lower'] = _log2fc_transform(data.get('inflection_b_lower', np.full(n_features, np.nan)))
-                data['inflection_b_log2fc_upper'] = _log2fc_transform(data.get('inflection_b_upper', np.full(n_features, np.nan)))
+                data['inflection_b_log2fc_median'] = _log2fc_transform(data.get('inflection_b_median', np.full(n_features, np.nan)))
+                data['inflection_b_log2fc_lower']  = _log2fc_transform(data.get('inflection_b_lower', np.full(n_features, np.nan)))
+                data['inflection_b_log2fc_upper']  = _log2fc_transform(data.get('inflection_b_upper', np.full(n_features, np.nan)))
                             
             # A (baseline) in transformed y-space
             # For negbinom: A_log2fc = log2(A) - log2(y_ntc)
             # For binomial: A_delta_p = A - y_ntc
             if is_binomial:
-                A_delta_p = A_mean - y_ntc
+                A_delta_p = A_median - y_ntc
                 data['A_delta_p'] = A_delta_p
             else:
                 A_log2fc = np.full(n_features, np.nan)
-                valid_A = (A_mean > epsilon) & (y_ntc > epsilon)
+                valid_A = (A_median > epsilon) & (y_ntc > epsilon)
                 if np.any(valid_A):
-                    A_log2fc[valid_A] = np.log2(A_mean[valid_A]) - np.log2(y_ntc[valid_A])
+                    A_log2fc[valid_A] = np.log2(A_median[valid_A]) - np.log2(y_ntc[valid_A])
                 data['A_log2fc'] = A_log2fc
 
         return data
@@ -3360,6 +3411,7 @@ class ModelSummarizer:
         x_obs_min: Optional[float] = None,
         x_obs_max: Optional[float] = None,
         compute_log2fc_params: bool = False,
+        compute_lfc_ci: bool = True,
         x_ntc=None,
         y_ntc=None,
         fdr_threshold: float = 0.05,
@@ -3395,15 +3447,15 @@ class ModelSummarizer:
             # average over extra dims if needed (e.g. multinomial categories)
             if param.ndim > 2:
                 param = param.mean(axis=tuple(range(2, param.ndim)))
-    
+
             if param.ndim == 2:  # [S, T]
-                mean = param.mean(axis=0)
+                mean = np.median(param, axis=0)
                 lo = np.quantile(param, 0.025, axis=0)
                 hi = np.quantile(param, 0.975, axis=0)
             else:                # [T] point
                 mean = lo = hi = param
             return mean, lo, hi
-    
+
         def extract_param_full(name):
             param = posterior[name]
             if isinstance(param, torch.Tensor):
@@ -3422,16 +3474,16 @@ class ModelSummarizer:
                 param = param.squeeze(1)
             if param.ndim > 2:
                 param = param.mean(axis=tuple(range(2, param.ndim)))
-        
+
             param_abs = np.abs(param)
             if param_abs.ndim == 2:
-                mean = param_abs.mean(axis=0)
+                mean = np.median(param_abs, axis=0)
                 lo = np.quantile(param_abs, 0.025, axis=0)
                 hi = np.quantile(param_abs, 0.975, axis=0)
             else:
                 mean = lo = hi = param_abs
             return mean, lo, hi
-    
+
         def _broadcast(arr):
             arr = np.atleast_1d(arr)
             if arr.size == 1:
@@ -3475,19 +3527,19 @@ class ModelSummarizer:
             A_full = np.zeros((1, n_features))
 
         
-        data['Vmax_a_mean'] = Vmax_mean
+        data['Vmax_a_median'] = Vmax_mean
         data['Vmax_a_lower'] = Vmax_lo
         data['Vmax_a_upper'] = Vmax_hi
-        data['K_a_mean'] = K_mean
+        data['K_a_median'] = K_mean
         data['K_a_lower'] = K_lo
         data['K_a_upper'] = K_hi
-        data['n_a_mean'] = n_mean
+        data['n_a_median'] = n_mean
         data['n_a_lower'] = n_lo
         data['n_a_upper'] = n_hi
-        data['alpha_mean'] = alpha_mean
+        data['alpha_median'] = alpha_mean
         data['alpha_lower'] = alpha_lo
         data['alpha_upper'] = alpha_hi
-        data['A_mean'] = A_mean
+        data['A_median'] = A_mean
         data['A_lower'] = A_lo
         data['A_upper'] = A_hi
 
@@ -3515,10 +3567,10 @@ class ModelSummarizer:
             infl_hi   = self._compute_hill_inflection(n_abs_hi,   K_hi)
             
             # (optional) store |n| summaries too
-            data['n_a_abs_mean'] = n_abs_mean
+            data['n_a_abs_median'] = n_abs_mean
             data['n_a_abs_lower'] = n_abs_lo
             data['n_a_abs_upper'] = n_abs_hi
-            data['inflection_a_mean'] = infl_mean
+            data['inflection_a_median'] = infl_mean
             data['inflection_a_lower'] = infl_lo
             data['inflection_a_upper'] = infl_hi
     
@@ -3550,10 +3602,10 @@ class ModelSummarizer:
 
             fdr_inactive = q_active >= fdr_threshold
             log2fc_vals = np.log2(np.maximum(y0, yinf) / np.minimum(y0, yinf))
-            data['full_log2fc_mean'] = np.where(fdr_inactive, 0.0, log2fc_vals)
+            data['full_log2fc_median'] = np.where(fdr_inactive, 0.0, log2fc_vals)
 
             # CI from posterior samples (coherent; use all available samples)
-            if Vmax_full.ndim == 2:
+            if Vmax_full.ndim == 2 and compute_lfc_ci:
                 S = Vmax_full.shape[0]
                 lo = np.full(n_features, np.nan)
                 hi = np.full(n_features, np.nan)
@@ -3590,11 +3642,11 @@ class ModelSummarizer:
                 data['full_log2fc_lower'] = lo
                 data['full_log2fc_upper'] = hi
             else:
-                data['full_log2fc_lower'] = data['full_log2fc_mean']
-                data['full_log2fc_upper'] = data['full_log2fc_mean']
+                data['full_log2fc_lower'] = data['full_log2fc_median']
+                data['full_log2fc_upper'] = data['full_log2fc_median']
 
             if verbose:
-                print(f"    full_log2fc (mean + CI):  {time.time() - _t_sh:.1f}s")
+                print(f"    full_log2fc (median + CI):  {time.time() - _t_sh:.1f}s")
                 _t_sh = time.time()
 
         # --- observed log2FC over observed x-range (gated by compute_log2fc_params) ---
@@ -3611,7 +3663,7 @@ class ModelSummarizer:
                     )
                 data['observed_log2fc'] = obs
 
-            if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_full.ndim == 2):
+            if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_full.ndim == 2) and compute_lfc_ci:
                 eps = 1e-10
                 x0 = float(max(x_obs_min, eps))
                 x1 = float(max(x_obs_max, eps))
@@ -3684,11 +3736,11 @@ class ModelSummarizer:
             data['n_first_deriv_roots'] = n_first
             data['n_second_deriv_roots'] = n_second
             data['n_third_deriv_roots'] = n_third
-            data['first_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
-            data['second_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
-            data['third_deriv_roots_mean']  = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
-    
-        # --- log2FC transforms (unchanged from your version) ---
+            data['first_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
+            data['second_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
+            data['third_deriv_roots_median']  = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
+
+        # --- log2FC transforms ---
         if compute_log2fc_params and (x_ntc is not None) and (y_ntc is not None):
             eps = 1e-10
             log2_x_ntc = np.log2(max(float(x_ntc), eps))
@@ -3696,31 +3748,32 @@ class ModelSummarizer:
     
             if compute_inflection:
                 eps = 1e-10
-                infl_mean = data.get('inflection_a_mean', np.full(n_features, np.nan))
+                infl_mean = data.get('inflection_a_median', np.full(n_features, np.nan))
                 infl_lo   = data.get('inflection_a_lower', np.full(n_features, np.nan))
                 infl_hi   = data.get('inflection_a_upper', np.full(n_features, np.nan))
-            
+
                 def _log2fc(arr):
                     out = np.full(n_features, np.nan)
                     ok = np.isfinite(arr) & (arr > eps)
                     out[ok] = np.log2(arr[ok]) - log2_x_ntc
                     return out
-            
-                data['inflection_a_log2fc_mean']  = _log2fc(infl_mean)
-                data['inflection_a_log2fc_lower'] = _log2fc(infl_lo)
-                data['inflection_a_log2fc_upper'] = _log2fc(infl_hi)
-            
+
+                data['inflection_a_log2fc_median'] = _log2fc(infl_mean)
+                data['inflection_a_log2fc_lower']  = _log2fc(infl_lo)
+                data['inflection_a_log2fc_upper']  = _log2fc(infl_hi)
+
                 # Backwards compat
-                data['inflection_a_log2fc'] = data['inflection_a_log2fc_mean']
+                data['inflection_a_log2fc'] = data['inflection_a_log2fc_median']
     
             y_ntc_arr = np.asarray(y_ntc, dtype=float)
             outA = np.full(n_features, np.nan)
             okA = (A_mean > eps) & (y_ntc_arr > eps)
             outA[okA] = np.log2(A_mean[okA]) - np.log2(y_ntc_arr[okA])
             data['A_log2fc'] = outA
+
     
             # Also roots in log2FC x-space, if present:
-            if compute_derivative_roots and (x_range is not None) and ('first_deriv_roots_mean' in data):
+            if compute_derivative_roots and (x_range is not None) and ('first_deriv_roots_median' in data):
                 first_log = []
                 second_log = []
                 third_log = []
@@ -3734,17 +3787,17 @@ class ModelSummarizer:
                             return []
                         return [float(x) for x in str(s).split(';') if x != '']
 
-                    r1 = _parse(data['first_deriv_roots_mean'][i])
-                    r2 = _parse(data['second_deriv_roots_mean'][i])
-                    r3 = _parse(data['third_deriv_roots_mean'][i])
+                    r1 = _parse(data['first_deriv_roots_median'][i])
+                    r2 = _parse(data['second_deriv_roots_median'][i])
+                    r3 = _parse(data['third_deriv_roots_median'][i])
 
                     # Use np.nan for empty roots (consistent with additive_hill)
                     first_log.append(';'.join([f'{(np.log2(max(r, eps)) - log2_x_ntc):.4f}' for r in r1]) if r1 else np.nan)
                     second_log.append(';'.join([f'{(np.log2(max(r, eps)) - log2_x_ntc):.4f}' for r in r2]) if r2 else np.nan)
                     third_log.append(';'.join([f'{(np.log2(max(r, eps)) - log2_x_ntc):.4f}' for r in r3]) if r3 else np.nan)
-                data['first_deriv_roots_log2fc_mean'] = first_log
-                data['second_deriv_roots_log2fc_mean'] = second_log
-                data['third_deriv_roots_log2fc_mean'] = third_log
+                data['first_deriv_roots_log2fc_median'] = first_log
+                data['second_deriv_roots_log2fc_median'] = second_log
+                data['third_deriv_roots_log2fc_median'] = third_log
     
         return data
 
@@ -3795,15 +3848,15 @@ class ModelSummarizer:
         if coefs.ndim == 3:
             # summary per coefficient
             for i in range(degree + 1):
-                data[f'coef_{i}_mean']  = coefs[:, :, i].mean(axis=0)
-                data[f'coef_{i}_lower'] = np.quantile(coefs[:, :, i], 0.025, axis=0)
-                data[f'coef_{i}_upper'] = np.quantile(coefs[:, :, i], 0.975, axis=0)
-            coefs_mean = coefs.mean(axis=0)  # [T, d+1]
+                data[f'coef_{i}_median'] = np.median(coefs[:, :, i], axis=0)
+                data[f'coef_{i}_lower']  = np.quantile(coefs[:, :, i], 0.025, axis=0)
+                data[f'coef_{i}_upper']  = np.quantile(coefs[:, :, i], 0.975, axis=0)
+            coefs_mean = np.median(coefs, axis=0)  # [T, d+1] — used for function evaluation
         else:
             for i in range(degree + 1):
-                data[f'coef_{i}_mean']  = coefs[:, i]
-                data[f'coef_{i}_lower'] = coefs[:, i]
-                data[f'coef_{i}_upper'] = coefs[:, i]
+                data[f'coef_{i}_median'] = coefs[:, i]
+                data[f'coef_{i}_lower']  = coefs[:, i]
+                data[f'coef_{i}_upper']  = coefs[:, i]
             coefs_mean = coefs  # [T, d+1]
     
         # Determine if polynomial is in log2 space (negbinom) or linear space (others)
@@ -3865,7 +3918,7 @@ class ModelSummarizer:
                         full_mean.append(np.nan)
                         observed_log2fc.append(np.nan)
 
-            data['full_log2fc_mean'] = full_mean
+            data['full_log2fc_median'] = full_mean
             data['full_log2fc_lower'] = full_mean
             data['full_log2fc_upper'] = full_mean
             data['observed_log2fc'] = observed_log2fc
@@ -3916,9 +3969,9 @@ class ModelSummarizer:
             data['n_second_deriv_roots'] = n_second
             data['n_third_deriv_roots'] = n_third
             # Roots are now in linear x space for all distributions
-            data['first_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
-            data['second_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
-            data['third_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
+            data['first_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
+            data['second_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
+            data['third_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
 
             # u-space root conversion: only when compute_log2fc_params is also True
             if compute_log2fc_params and 'x_ntc' in data and data['x_ntc'] is not None and np.isfinite(data['x_ntc']):
@@ -3934,9 +3987,9 @@ class ModelSummarizer:
                     u = [np.log2(max(r, eps)) - log2_x_ntc for r in roots]
                     return ';'.join([f'{val:.4f}' for val in u]) if u else np.nan
 
-                data['first_deriv_roots_log2fc_mean'] = [_to_log2fc_str(s) for s in data['first_deriv_roots_mean']]
-                data['second_deriv_roots_log2fc_mean'] = [_to_log2fc_str(s) for s in data['second_deriv_roots_mean']]
-                data['third_deriv_roots_log2fc_mean'] = [_to_log2fc_str(s) for s in data['third_deriv_roots_mean']]
+                data['first_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['first_deriv_roots_median']]
+                data['second_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['second_deriv_roots_median']]
+                data['third_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['third_deriv_roots_median']]
 
         if verbose:
             print(f"  [polynomial] total: {time.time() - _t_poly:.1f}s")
@@ -4654,7 +4707,7 @@ class ModelSummarizer:
     def classify_second_deriv_roots(
         self,
         df: "pd.DataFrame",
-        root_col: str = "second_deriv_roots_log2fc_mean",
+        root_col: str = "second_deriv_roots_log2fc_median",
         tol_f: float = 1e-10,
         tol_f3: float = 1e-12,
     ) -> "pd.DataFrame":
@@ -4675,13 +4728,13 @@ class ModelSummarizer:
         df : pd.DataFrame
             Summary DataFrame returned by ``save_trans_summary`` (with
             ``compute_derivative_roots=True``).  Required columns:
-            ``feature``, ``x_ntc``, ``A_mean``, ``alpha_mean``, ``beta_mean``,
-            ``Vmax_a_mean``, ``K_a_mean``, ``n_a_mean``, ``Vmax_b_mean``,
-            ``K_b_mean``, ``n_b_mean``, and the root column specified by
+            ``feature``, ``x_ntc``, ``A_median``, ``alpha_median``, ``beta_median``,
+            ``Vmax_a_median``, ``K_a_median``, ``n_a_median``, ``Vmax_b_median``,
+            ``K_b_median``, ``n_b_median``, and the root column specified by
             ``root_col``.
         root_col : str
             Column in *df* containing the semicolon-separated root strings to
-            evaluate (default: ``"second_deriv_roots_log2fc_mean"``).
+            evaluate (default: ``"second_deriv_roots_log2fc_median"``).
         tol_f : float
             Absolute tolerance below which g'(u) is treated as zero (default 1e-10).
         tol_f3 : float
@@ -4708,9 +4761,9 @@ class ModelSummarizer:
         >>> # Keep only clear local maxima of rate of change
         >>> peaks = df_roots[df_roots["extremum_type_abs"] == "local_max_abs"]
         """
-        required_params = ["x_ntc", "A_mean", "alpha_mean", "beta_mean",
-                           "Vmax_a_mean", "K_a_mean", "n_a_mean",
-                           "Vmax_b_mean", "K_b_mean", "n_b_mean"]
+        required_params = ["x_ntc", "A_median", "alpha_median", "beta_median",
+                           "Vmax_a_median", "K_a_median", "n_a_median",
+                           "Vmax_b_median", "K_b_median", "n_b_median"]
         missing = [c for c in ["feature", root_col] + required_params if c not in df.columns]
         if missing:
             raise ValueError(
@@ -4727,15 +4780,15 @@ class ModelSummarizer:
 
             try:
                 x_ntc  = float(r["x_ntc"])
-                A      = float(r["A_mean"])
-                alpha  = float(r["alpha_mean"])
-                beta   = float(r["beta_mean"])
-                Vmax_a = float(r["Vmax_a_mean"])
-                K_a    = float(r["K_a_mean"])
-                n_a    = float(r["n_a_mean"])
-                Vmax_b = float(r["Vmax_b_mean"])
-                K_b    = float(r["K_b_mean"])
-                n_b    = float(r["n_b_mean"])
+                A      = float(r["A_median"])
+                alpha  = float(r["alpha_median"])
+                beta   = float(r["beta_median"])
+                Vmax_a = float(r["Vmax_a_median"])
+                K_a    = float(r["K_a_median"])
+                n_a    = float(r["n_a_median"])
+                Vmax_b = float(r["Vmax_b_median"])
+                K_b    = float(r["K_b_median"])
+                n_b    = float(r["n_b_median"])
             except (KeyError, TypeError, ValueError):
                 continue
 

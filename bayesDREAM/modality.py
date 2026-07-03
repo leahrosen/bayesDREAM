@@ -516,6 +516,7 @@ class Modality:
             denominator=new_denom,
             cells_axis=self.cells_axis,
             feature_names=new_feature_names,
+            cell_names=self.cell_names,
             min_count=self.min_count,
             inc1=new_inc1,
             inc2=new_inc2,

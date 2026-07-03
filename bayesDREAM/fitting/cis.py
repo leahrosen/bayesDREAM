@@ -791,10 +791,10 @@ class CisFitter:
         # Store full posterior on model (not just on CisFitter)
         self.model.posterior_samples_cis = posterior_samples_x
         self.posterior_samples_cis = posterior_samples_x  # Keep for backward compatibility
-        self.model.x_true = posterior_samples_x['x_true'].mean(dim=0)
-        self.model.log2_x_true = posterior_samples_x['log_x_true'].mean(dim=0)
+        self.model.x_true = posterior_samples_x['x_true'].median(dim=0).values
+        self.model.log2_x_true = posterior_samples_x['log_x_true'].median(dim=0).values
         if self.model.alpha_x_prefit is None and technical_covariates:
-            alpha_x_mean = posterior_samples_x["alpha_x"].mean(dim=0)  # [C-1]
+            alpha_x_mean = posterior_samples_x["alpha_x"].median(dim=0).values  # [C-1]
             ones_ = torch.ones(1, device=alpha_x_mean.device)
             self.model.alpha_x_prefit = torch.cat([ones_, alpha_x_mean])  # [C] with reference prepended
 

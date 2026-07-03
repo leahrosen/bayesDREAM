@@ -86,6 +86,12 @@ def _align_posterior_features(posterior_dict, saved_names, target_names, n_featu
     if list(saved_names) == list(target_names):
         return posterior_dict, torch.ones(len(target_names), dtype=torch.bool)
 
+    # Guard: n_features_saved must match len(saved_names) to correctly identify feature
+    # dimensions. If they differ (e.g., save.py picked the wrong tensor to infer the
+    # feature count), fall back to len(saved_names) which is always authoritative.
+    if n_features_saved is not None and n_features_saved != len(saved_names):
+        n_features_saved = len(saved_names)
+
     aligned = {}
     mask = None
     for k, v in posterior_dict.items():

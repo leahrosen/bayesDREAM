@@ -57,8 +57,8 @@ def simulate_from_trans_summary(
     ----------
     trans_summary_df : pd.DataFrame
         Output of save_trans_summary, must contain Hill parameters
-        (A_mean, Vmax_a_mean, K_a_mean, n_a_mean, alpha_mean,
-        Vmax_b_mean, K_b_mean, n_b_mean, beta_mean) and phi_y_mean.
+        (A_median, Vmax_a_median, K_a_median, n_a_median, alpha_median,
+        Vmax_b_median, K_b_median, n_b_median, beta_median) and phi_y_median.
         If technical groups are used, must contain group_{g}_alpha_y_mean columns.
     meta : pd.DataFrame
         Cell metadata with columns: cell, guide, target.
@@ -84,7 +84,7 @@ def simulate_from_trans_summary(
             sim_sum_factor = model.get_modality(model.primary_modality).sum_factors['sum_factor_new'].values
 
         Mathematically, ``plot_xy_data`` displays ``y / (sum_factor_plot * alpha_y)``
-        and overlays ``A_mean + alpha * Hill(x)``.  For these to match in
+        and overlays ``A_median + alpha * Hill(x)``.  For these to match in
         expectation you need ``sim_sum_factor = sum_factor_plot`` (per cell).
         Using the default ``sim_sum_factor=1.0`` only works when the plotting
         sum factor is also ≈ 1.0 for all cells.
@@ -151,31 +151,31 @@ def simulate_from_trans_summary(
     function_type = df['function_type'].iloc[0]
 
     # Check for required columns
-    required_cols = ['A_mean', 'phi_y_mean']
+    required_cols = ['A_median', 'phi_y_median']
     for col in required_cols:
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
 
     # Extract Hill parameters (per gene)
-    A = df['A_mean'].values  # (n_genes,)
-    phi_y = df['phi_y_mean'].values  # (n_genes,)
+    A = df['A_median'].values  # (n_genes,)
+    phi_y = df['phi_y_median'].values  # (n_genes,)
 
     # Compute y_pred for each cell and gene
     # y_pred shape: (n_genes, n_cells)
     if function_type == 'additive_hill':
-        for col in ['Vmax_a_mean', 'K_a_mean', 'n_a_mean', 'alpha_mean',
-                     'Vmax_b_mean', 'K_b_mean', 'n_b_mean', 'beta_mean']:
+        for col in ['Vmax_a_median', 'K_a_median', 'n_a_median', 'alpha_median',
+                     'Vmax_b_median', 'K_b_median', 'n_b_median', 'beta_median']:
             if col not in df.columns:
                 raise ValueError(f"Missing required column for additive_hill: {col}")
 
-        Vmax_a = df['Vmax_a_mean'].values
-        K_a = df['K_a_mean'].values
-        n_a = df['n_a_mean'].values
-        alpha = df['alpha_mean'].values
-        Vmax_b = df['Vmax_b_mean'].values
-        K_b = df['K_b_mean'].values
-        n_b = df['n_b_mean'].values
-        beta = df['beta_mean'].values
+        Vmax_a = df['Vmax_a_median'].values
+        K_a = df['K_a_median'].values
+        n_a = df['n_a_median'].values
+        alpha = df['alpha_median'].values
+        Vmax_b = df['Vmax_b_median'].values
+        K_b = df['K_b_median'].values
+        n_b = df['n_b_median'].values
+        beta = df['beta_median'].values
 
         # Apply FDR gating: zero out components that are not statistically significant.
         # Without gating, beta_mean for a null component is ~0.4-0.5 (from the
@@ -201,14 +201,14 @@ def simulate_from_trans_summary(
                   + beta[:, np.newaxis] * hill_b)  # (n_genes, n_cells)
 
     elif function_type == 'single_hill':
-        for col in ['Vmax_a_mean', 'K_a_mean', 'n_a_mean', 'alpha_mean']:
+        for col in ['Vmax_a_median', 'K_a_median', 'n_a_median', 'alpha_median']:
             if col not in df.columns:
                 raise ValueError(f"Missing required column for single_hill: {col}")
 
-        Vmax_a = df['Vmax_a_mean'].values
-        K_a = df['K_a_mean'].values
-        n_a = df['n_a_mean'].values
-        alpha = df['alpha_mean'].values
+        Vmax_a = df['Vmax_a_median'].values
+        K_a = df['K_a_median'].values
+        n_a = df['n_a_median'].values
+        alpha = df['alpha_median'].values
 
         # Apply FDR gating: for null genes, alpha_mean is ~0.5 (prior) rather than 0.
         if fdr_threshold is not None and 'fdr_alpha' in df.columns:
@@ -223,7 +223,7 @@ def simulate_from_trans_summary(
     elif function_type == 'polynomial':
         # Find coefficient columns
         coef_cols = sorted(
-            [c for c in df.columns if c.startswith('coef_') and c.endswith('_mean')],
+            [c for c in df.columns if c.startswith('coef_') and c.endswith('_median')],
             key=lambda c: int(c.split('_')[1])
         )
         if not coef_cols:

@@ -2235,19 +2235,19 @@ def plot_trans_functions(
                 _parse = _MS._parse_semicolon_roots
 
                 if use_log2fc:
-                    _r1 = _parse(_row.get('first_deriv_roots_log2fc_mean',  None))
-                    _r2 = _parse(_row.get('second_deriv_roots_log2fc_mean', None))
-                    _r3 = _parse(_row.get('third_deriv_roots_log2fc_mean',  None))
+                    _r1 = _parse(_row.get('first_deriv_roots_log2fc_median',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_log2fc_median', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_log2fc_median',  None))
                     _to_plot_x = lambda v: v  # already u-space
                 elif use_delta_p:
-                    _r1 = _parse(_row.get('first_deriv_roots_delta_p_mean',  None))
-                    _r2 = _parse(_row.get('second_deriv_roots_delta_p_mean', None))
-                    _r3 = _parse(_row.get('third_deriv_roots_delta_p_mean',  None))
+                    _r1 = _parse(_row.get('first_deriv_roots_delta_p_median',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_delta_p_median', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_delta_p_median',  None))
                     _to_plot_x = lambda v: v  # already u-space
                 else:
-                    _r1 = _parse(_row.get('first_deriv_roots_mean',  None))
-                    _r2 = _parse(_row.get('second_deriv_roots_mean', None))
-                    _r3 = _parse(_row.get('third_deriv_roots_mean',  None))
+                    _r1 = _parse(_row.get('first_deriv_roots_median',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_median', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_median',  None))
                     _to_plot_x = (lambda v: np.log2(max(v, 1e-300))) if use_log2_x else (lambda v: v)
 
                 # Build a map: plot_type → (ax, roots, label)
@@ -2602,9 +2602,9 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
     """
     Compute a Hill curve from a trans_summary DataFrame row.
 
-    Supports both additive_hill (has Vmax_b_mean) and single_hill rows.
-    Parameters are read from columns named A_mean, alpha_mean, Vmax_a_mean,
-    K_a_mean, n_a_mean, beta_mean, Vmax_b_mean, K_b_mean, n_b_mean.
+    Supports both additive_hill (has Vmax_b_median) and single_hill rows.
+    Parameters are read from columns named A_median, alpha_median, Vmax_a_median,
+    K_a_median, n_a_median, beta_median, Vmax_b_median, K_b_median, n_b_median.
 
     FDR gating: components with fdr_alpha > fdr_threshold (or fdr_beta) are zeroed
     out so the curve reflects only statistically significant effects. Without gating,
@@ -2621,11 +2621,11 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
             return default
         return v if np.isfinite(v) else default
 
-    A       = _g('A_mean', 0.0)
-    alpha   = _g('alpha_mean', 1.0)
-    Vmax_a  = _g('Vmax_a_mean')
-    K_a     = _g('K_a_mean')
-    n_a     = _g('n_a_mean')
+    A       = _g('A_median', 0.0)
+    alpha   = _g('alpha_median', 1.0)
+    Vmax_a  = _g('Vmax_a_median')
+    K_a     = _g('K_a_median')
+    n_a     = _g('n_a_median')
     if Vmax_a is None or K_a is None or n_a is None:
         return None
 
@@ -2637,10 +2637,10 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
     Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
     y_pred = A + alpha * Hill_a
 
-    beta   = _g('beta_mean', 0.0)
-    Vmax_b = _g('Vmax_b_mean')
-    K_b    = _g('K_b_mean')
-    n_b    = _g('n_b_mean')
+    beta   = _g('beta_median', 0.0)
+    Vmax_b = _g('Vmax_b_median')
+    K_b    = _g('K_b_median')
+    n_b    = _g('n_b_median')
 
     # Apply FDR gating to beta component
     fdr_beta = _g('fdr_beta')
@@ -3232,7 +3232,7 @@ def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
     """
     Compute Hill parameter markers from a trans_summary DataFrame row.
 
-    Reads *_mean columns for parameter values and fdr_alpha / fdr_beta for
+    Reads *_median columns for parameter values and fdr_alpha / fdr_beta for
     activity classification.  Returns the same list-of-dicts format as
     _compute_hill_markers / _build_hill_markers_from_params.
     """
@@ -3244,13 +3244,13 @@ def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
             return default
         return v if np.isfinite(v) else default
 
-    A      = _g('A_mean', 0.0);  alpha = _g('alpha_mean', 1.0)
-    Vmax_a = _g('Vmax_a_mean');  K_a   = _g('K_a_mean');  n_a = _g('n_a_mean')
+    A      = _g('A_median', 0.0);  alpha = _g('alpha_median', 1.0)
+    Vmax_a = _g('Vmax_a_median');  K_a   = _g('K_a_median');  n_a = _g('n_a_median')
     if Vmax_a is None or K_a is None or n_a is None:
         return []
 
-    beta   = _g('beta_mean', 0.0)
-    Vmax_b = _g('Vmax_b_mean');  K_b   = _g('K_b_mean');  n_b = _g('n_b_mean')
+    beta   = _g('beta_median', 0.0)
+    Vmax_b = _g('Vmax_b_median');  K_b   = _g('K_b_median');  n_b = _g('n_b_median')
     is_additive = (Vmax_b is not None and K_b is not None and n_b is not None)
 
     fdr_alpha_val = _g('fdr_alpha', 1.0)
@@ -3526,7 +3526,7 @@ def plot_negbinom_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
-    mark_params: bool = False,
+    mark_params = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
@@ -3537,6 +3537,10 @@ def plot_negbinom_xy(
     color_by: Union[str, List[str]] = 'technical_group',
     ntc_x_offset: Optional[float] = None,
     ntc_y_offset: Optional[float] = None,
+    hill_color: str = 'black',
+    hill_label: str = 'Fitted Trans Function',
+    ref_color: str = 'red',
+    ref_label: str = 'Reference Function',
     **kwargs
 ) -> plt.Axes:
     """
@@ -3934,8 +3938,8 @@ def plot_negbinom_xy(
                     _xh = np.log2(x_range[valid_pred]) - x_offset
                     _yh = np.log2(y_pred[valid_pred]) - y_offset
                     ax_plot.plot(_xh, _yh,
-                                color='black', linestyle='--', linewidth=2,
-                                label='Fitted Trans Function')
+                                color=hill_color, linestyle='--', linewidth=2,
+                                label=hill_label)
                     # Collect Hill y values within the smooth x range (extended by
                     # any V markers below) — done after markers are computed.
                     # Store the full arrays for now; we trim after markers.
@@ -3949,7 +3953,9 @@ def plot_negbinom_xy(
             # Full parameter markers (replaces simple A baseline)
             # Use reference_df as FDR source if no explicit fdr_df provided
             _effective_fdr_df = fdr_df if fdr_df is not None else reference_df
-            if mark_params and (corrected or not has_technical_fit):
+            _show_fit_markers = mark_params in (True, 'both', 'fit')
+            _show_ref_markers = mark_params in (True, 'both', 'reference')
+            if _show_fit_markers and (corrected or not has_technical_fit):
                 _markers = _compute_hill_markers(
                     model, feature, modality,
                     ci_level=ci_level, log2_space=True, y_scale=1.0,
@@ -3995,30 +4001,47 @@ def plot_negbinom_xy(
                         _x_ref = x_range if 'x_range' in dir() else (
                             2 ** np.linspace(np.log2(max(x_true.min(), 1e-6)),
                                              np.log2(x_true.max()), 2000))
-                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref, fdr_threshold=fdr_threshold)
+                        # Resolve reference model's NTC baselines.
+                        _y_ntc_ref = float(_ref_row.get('y_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['y_ntc'])
+                        _x_ntc_ref = float(_ref_row.get('x_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['x_ntc'])
+                        _y_ref_offset = np.log2(_y_ntc_ref) if (log2fc and _y_ntc_ref > 0) else y_offset
+                        _x_ref_offset = np.log2(_x_ntc_ref) if (log2fc and _x_ntc_ref > 0) else x_offset
+                        # Build _x_ref so that after subtracting _x_ref_offset it spans
+                        # the same visible log2FC x range as the current plot.  If we used
+                        # x_range directly and the two models have different NTC levels, the
+                        # reference curve would be horizontally shifted off-screen.
+                        _log2fc_x_min = np.log2(max(x_true.min(), 1e-6)) - x_offset
+                        _log2fc_x_max = np.log2(x_true.max()) - x_offset
+                        _x_ref_abs = 2 ** (np.linspace(_log2fc_x_min, _log2fc_x_max, 2000)
+                                           + _x_ref_offset)
+                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref_abs, fdr_threshold=fdr_threshold)
                         if _y_ref is not None:
                             _valid_ref = _y_ref > 0
                             if _valid_ref.any():
                                 ax_plot.plot(
-                                    np.log2(_x_ref[_valid_ref]) - x_offset,
-                                    np.log2(_y_ref[_valid_ref]) - y_offset,
-                                    color='red', linestyle='--', linewidth=2,
-                                    alpha=0.8, label='Reference Function')
+                                    np.log2(_x_ref_abs[_valid_ref]) - _x_ref_offset,
+                                    np.log2(_y_ref[_valid_ref]) - _y_ref_offset,
+                                    color=ref_color, linestyle='--', linewidth=2,
+                                    alpha=0.8, label=ref_label)
                         # Reference mark_params: full set of Hill markers (A, Vmax, K)
-                        if mark_params:
+                        if _show_ref_markers:
                             _ref_markers = _compute_hill_markers_from_summary_row(
                                 _ref_row, log2_space=True, y_scale=1.0,
                                 fdr_threshold=fdr_threshold,
                             )
-                            # Offset reference markers visually (thinner, semi-transparent)
+                            # Reference markers use x_ntc/y_ntc as baselines (same as curve).
+                            _y_ntc_ref_mk = float(_ref_row.get('y_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['y_ntc'])
+                            _x_ntc_ref_mk = float(_ref_row.get('x_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['x_ntc'])
+                            _y_ref_mk_offset = np.log2(_y_ntc_ref_mk) if (log2fc and _y_ntc_ref_mk > 0) else y_offset
+                            _x_ref_mk_offset = np.log2(_x_ntc_ref_mk) if (log2fc and _x_ntc_ref_mk > 0) else x_offset
                             for _m in _ref_markers:
-                                _kw = dict(linestyle=_m['linestyle'], color='red',
+                                _kw = dict(linestyle=_m['linestyle'], color=ref_color,
                                            alpha=0.5, linewidth=1.2,
                                            label=f'Ref {_m["label"]}')
                                 if _m['axis'] == 'h':
-                                    ax_plot.axhline(_m['value'] - y_offset, **_kw)
+                                    ax_plot.axhline(_m['value'] - _y_ref_mk_offset, **_kw)
                                 elif _m['axis'] == 'v':
-                                    ax_plot.axvline(_m['value'] - x_offset, **_kw)
+                                    ax_plot.axvline(_m['value'] - _x_ref_mk_offset, **_kw)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
         ax_plot.set_ylabel("log2FC(counts)" if log2fc else "log2(counts)")
@@ -4087,7 +4110,7 @@ def plot_binomial_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
-    mark_params: bool = False,
+    mark_params = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
@@ -4651,7 +4674,7 @@ def plot_normal_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
-    mark_params: bool = False,
+    mark_params = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
@@ -5258,7 +5281,7 @@ def plot_xy_data(
     subset_meta: Optional[Dict[str, Any]] = None,
     only_dependent: bool = False,
     ci_level: float = 95.0,
-    mark_params: bool = False,
+    mark_params = False,
     legend_outside: bool = False,
     filename: Optional[str] = None,
     log2fc: bool = False,
@@ -5335,10 +5358,14 @@ def plot_xy_data(
         Credible interval level for dependency filtering and parameter marker
         classification (default: 95.0).
         Used by only_dependent=True and mark_params=True.
-    mark_params : bool
+    mark_params : bool or str
         Overlay meaningful parameter markers on the Hill function (default: False).
         Requires show_hill_function=True and fit_trans() completed with
         function_type='single_hill' or 'additive_hill'.
+        - True or 'both': markers for both the fitted curve and the reference curve
+        - 'fit': markers for the fitted curve only
+        - 'reference': markers for the reference curve only (requires reference_df)
+        - False or None: no markers
         Markers drawn depend on the fitted regime:
         - **Single Hill / effectively single**: log2(A), log2(A+α·Vmax), log2(EC50)
         - **Same-sign additive** (both Hills in same direction):
@@ -5428,7 +5455,7 @@ def plot_xy_data(
         for multi-panel plots, or (8, 5) / (14, 5) for single-panel plots.
     reference_df : pd.DataFrame, optional
         A ``trans_summary`` DataFrame whose rows contain fitted Hill parameters
-        (columns ending in ``_mean``, e.g. ``A_mean``, ``Vmax_a_mean``, etc.).
+        (columns ending in ``_median``, e.g. ``A_median``, ``Vmax_a_median``, etc.).
         When provided, a reference Hill curve is overlaid in red dashed on each
         negbinom panel.  The feature name is matched via a ``gene_name`` or
         ``gene`` column.  Only applied to negbinom modalities.
