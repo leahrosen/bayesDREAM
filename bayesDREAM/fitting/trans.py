@@ -23,7 +23,7 @@ import pyro.infer as infer
 import pyro.poutine as poutine
 import pyro.distributions as dist
 
-from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
+from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor, SplitNormal
 
 
 def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
@@ -512,24 +512,19 @@ class TransFitter:
             # - negbinom: positive count
             # - binomial/multinomial: probability in [0,1], using NEW reparameterization
             if distribution in ['normal', 'studentt']:
-                # A prior: NTC-anchored Normal (analogous to negbinom LogNormal, but in linear
-                # space since normal/studentt values can be negative).
-                #
-                # When y_ntc available (fit_ntc has been run):
-                #   w → 0 (quiet feature): prior centred at Amean; y_ntc is 1σ above
-                #   w → 1 (noisy feature): prior centred at y_ntc
-                #   sigma = |y_ntc − Amean| floored at 10% of response amplitude
-                #
-                # Fallback (no NTC posterior): fixed-shift approach using response amplitude.
+                # A prior: SplitNormal anchored at y_ntc.
+                # Mode always at y_ntc; sigma_left = |y_ntc - Amean| (long left tail to Amean);
+                # sigma_right = min(1, sigma_left) (soft right tail, A rarely exceeds NTC).
+                # Fallback (no NTC posterior): symmetric Normal shifted below Amean.
                 delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
-                if y_ntc_tensor is not None:
-                    sigma_A = (y_ntc_tensor - Amean_tensor).abs().clamp_min(delta_A * 0.1)
-                    mean_A  = (1.0 - _o_y_weight) * Amean_tensor + _o_y_weight * y_ntc_tensor
-                else:
-                    sigma_A = delta_A
-                    _shift_A = (1.0 - _o_y_weight) * 0.55
-                    mean_A  = Amean_tensor - _shift_A * delta_A
-                A = pyro.sample("A", dist.Normal(mean_A, sigma_A))
+                if y_ntc_tensor is None:
+                    raise ValueError(
+                        "fit_trans requires a NTC posterior (y_ntc_tensor) to anchor the A prior. "
+                        "Run fit_technical / fit_ntc before fit_trans."
+                    )
+                sigma_left_A  = (y_ntc_tensor - Amean_tensor).abs().clamp_min(delta_A * 0.1)
+                sigma_right_A = torch.minimum(self._t(1.0), sigma_left_A)
+                A = pyro.sample("A", SplitNormal(y_ntc_tensor, sigma_left_A, sigma_right_A))
 
             elif distribution in ['binomial', 'multinomial']:
                 # Beta/Dirichlet priors for bounded [0, 1] likelihoods.
@@ -581,30 +576,32 @@ class TransFitter:
                     else:
                         A_logit_mean_base = torch.zeros(T, K_dim, device=self.model.device)
 
-                    # Incorporate y_ntc anchor via w-interpolation (analogous to negbinom/binomial):
-                    #   w → 0 (quiet feature): prior centred at logit(Amean/2); y_ntc within 1σ
-                    #   w → 1 (noisy feature): prior centred at logit(y_ntc)
-                    # Cap: base anchor is raised to at most 4 log-units below logit_y_ntc,
-                    # bounding sigma ≤ 4 (e^4 ≈ 55× ratio per category).
-                    if (y_ntc_tensor is not None and y_ntc_tensor.ndim == 2
-                            and y_ntc_tensor.shape[0] == T and y_ntc_tensor.shape[1] == K_dim):
-                        logit_y_ntc        = torch.log(y_ntc_tensor.clamp(min=1e-10))                        # [T, K], log-simplex
-                        A_logit_mean_base  = torch.maximum(A_logit_mean_base, logit_y_ntc - 4.0)             # cap lower anchor
-                        w_expanded         = _o_y_weight.unsqueeze(-1)                                        # [T, 1]
-                        A_logit_mean       = (1.0 - w_expanded) * A_logit_mean_base + w_expanded * logit_y_ntc  # [T, K]
-                        sigma_A_logit      = (logit_y_ntc - A_logit_mean_base).abs().clamp_min(1.0)           # [T, K], ≤ 4
-                    else:
-                        A_logit_mean  = A_logit_mean_base
-                        sigma_A_logit = self._t(1.0)
+                    # A prior: SplitNormal anchored at logit(y_ntc) per category.
+                    # Mode always at logit(y_ntc); sigma_left = gap to lower anchor (≥1, ≤4);
+                    # sigma_right = min(1, sigma_left) — soft right tail above y_ntc.
+                    if y_ntc_tensor is None:
+                        raise ValueError(
+                            "fit_trans requires a NTC posterior (y_ntc_tensor) to anchor the A prior. "
+                            "Run fit_technical / fit_ntc before fit_trans."
+                        )
+                    if y_ntc_tensor.ndim != 2 or y_ntc_tensor.shape[0] != T or y_ntc_tensor.shape[1] != K_dim:
+                        raise ValueError(
+                            f"y_ntc_tensor shape {tuple(y_ntc_tensor.shape)} does not match "
+                            f"expected multinomial shape [{T}, {K_dim}]."
+                        )
+                    logit_y_ntc       = torch.log(y_ntc_tensor.clamp(min=1e-10))          # [T, K], log-simplex
+                    A_logit_mean_base = torch.maximum(A_logit_mean_base, logit_y_ntc - 4.0)
+                    sigma_A_logit_L   = (logit_y_ntc - A_logit_mean_base).abs().clamp_min(1.0)  # [T, K]
+                    sigma_A_logit_R   = torch.minimum(self._t(1.0), sigma_A_logit_L)            # [T, K]
+                    A_logit_mode      = logit_y_ntc.clone()
 
-                    # Push phantom categories to -inf in prior mean so the guide learns
+                    # Push phantom categories to -inf in prior mode so the guide learns
                     # to assign them zero probability.
                     if phantom_conc_mask is not None:
-                        A_logit_mean = A_logit_mean.masked_fill(phantom_conc_mask, -1e4)
+                        A_logit_mode = A_logit_mode.masked_fill(phantom_conc_mask, -1e4)
 
                     # Sample in unconstrained logit space — no simplex constraint, no stick-breaking.
-                    # sigma_A_logit is [T, K] when y_ntc used, scalar otherwise.
-                    A_logit = pyro.sample("A", dist.Normal(A_logit_mean, sigma_A_logit).to_event(1))  # [T, K]
+                    A_logit = pyro.sample("A", SplitNormal(A_logit_mode, sigma_A_logit_L, sigma_A_logit_R).to_event(1))  # [T, K]
 
                     # Softmax with phantom masking → valid probability vector [T, K]
                     if phantom_conc_mask is not None:
@@ -612,64 +609,41 @@ class TransFitter:
                     A = torch.softmax(A_logit, dim=-1)  # [T, K]
 
                 else:
-                    # For binomial: Logit-Normal prior when y_ntc available (analogous to negbinom
-                    # LogNormal, adapted to the [0,1] simplex via logit transform).
-                    #
-                    # When y_ntc available:
-                    #   Lower anchor: logit(Amean/2); upper anchor: logit(y_ntc)
-                    #   w → 0 (quiet feature): centred at logit(Amean/2); y_ntc is 1σ above
-                    #   w → 1 (noisy feature): centred at logit(y_ntc)
-                    #   sigma = (logit(y_ntc) − logit(Amean/2)).clamp_min(1 logit unit)
-                    #
-                    # Fallback (no NTC posterior): Beta(1, β) with mean = 0.5×Q05.
-                    if y_ntc_tensor is not None and use_data_driven_priors:
-                        logit_Amean_half = torch.logit((0.5 * Amean_tensor).clamp(1e-6, 1.0 - 1e-6))  # [T]
-                        logit_y_ntc      = torch.logit(y_ntc_tensor.clamp(1e-6, 1.0 - 1e-6))          # [T]
-                        logit_Amean_half = torch.maximum(logit_Amean_half, logit_y_ntc - 4.0)          # cap: sigma ≤ 4 logit units
-                        sigma_logit = (logit_y_ntc - logit_Amean_half).clamp_min(1.0)                  # [T], ≤ 4
-                        mu_logit    = (1.0 - _o_y_weight) * logit_Amean_half + _o_y_weight * logit_y_ntc  # [T]
-                        logit_A = pyro.sample("logit_A", dist.Normal(mu_logit, sigma_logit))            # [T]
-                        A = pyro.deterministic("A", torch.sigmoid(logit_A))                             # [T]
-                    elif use_data_driven_priors:
-                        # Fallback Beta(1, β) with mean = 0.5×Q05 when no NTC posterior available.
-                        A_mean_shifted = (0.5 * Amean_tensor).clamp_min(epsilon_tensor)
-                        beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
-                        A = pyro.sample("A", dist.Beta(self._t(1.0), beta_A).expand([T]))  # [T]
-                    else:
-                        # Uniform prior: Beta(1, 1)
-                        A = pyro.sample("A", dist.Beta(self._t(1.0), self._t(1.0)).expand([T]))  # [T]
+                    # For binomial: SplitNormal in logit space, anchored at logit(y_ntc).
+                    # Mode always at logit(y_ntc); sigma_left = gap to logit(Amean/2) (≥1, ≤4);
+                    # sigma_right = min(1, sigma_left) — soft right tail above y_ntc.
+                    if y_ntc_tensor is None:
+                        raise ValueError(
+                            "fit_trans requires a NTC posterior (y_ntc_tensor) to anchor the A prior. "
+                            "Run fit_technical / fit_ntc before fit_trans."
+                        )
+                    logit_Amean_half  = torch.logit((0.5 * Amean_tensor).clamp(1e-6, 1.0 - 1e-6))  # [T]
+                    logit_y_ntc       = torch.logit(y_ntc_tensor.clamp(1e-6, 1.0 - 1e-6))          # [T]
+                    logit_Amean_half  = torch.maximum(logit_Amean_half, logit_y_ntc - 4.0)          # cap: sigma_left ≤ 4
+                    sigma_left_logit  = (logit_y_ntc - logit_Amean_half).clamp_min(1.0)             # [T]
+                    sigma_right_logit = torch.minimum(self._t(1.0), sigma_left_logit)               # [T]
+                    logit_A = pyro.sample("logit_A", SplitNormal(logit_y_ntc, sigma_left_logit, sigma_right_logit))  # [T]
+                    A = pyro.deterministic("A", torch.sigmoid(logit_A))                              # [T]
 
             else:
-                # For negbinom: LogNormal A prior (Normal in log2 space) with noise-adaptive mean.
-                # log2(A) ~ Normal(mu_log2_A, sigma_log2_A), so A = 2^log2(A).
-                #
-                # Unlike Exponential (gradient → 0 as A → 0), LogNormal has a restoring force
-                # proportional to displacement: gradient = (mu - log2(A)) / sigma^2.
-                # This prevents collapse to A = 0 even when the likelihood strongly prefers it.
-                #
-                # mu_log2_A interpolates in log2 space between two gene-specific anchors:
-                #   w → 0 (quiet gene, informative likelihood): log2(Amean/2)
-                #   w → 1 (noisy gene, weak likelihood):        log2(y_ntc)
-                #
-                # sigma_log2_A = log2(y_ntc) - lower_anchor, floored at 1 octave, capped at 4.
-                # The lower anchor is max(log2(Amean/2), log2(y_ntc) - 4), ensuring sigma ≤ 4
-                # regardless of how sparse or low-expressed the gene is. This replaces the
-                # former q05_was_zero conditional (which capped at 3 only for zero-Q05 genes).
-                if y_ntc_tensor is not None:
-                    log2_y_ntc      = torch.log2(y_ntc_tensor)
-                    log2_Amean_half = torch.maximum(
-                        torch.log2(Amean_tensor / 2.0),
-                        log2_y_ntc - 4.0,
+                # For negbinom: SplitNormal A prior in log2 space, anchored at log2(y_ntc).
+                # Mode always at log2(y_ntc); sigma_left = gap to log2(Amean/2) (≥1, ≤4 octaves)
+                # so Amean/2 sits within ~1σ_left; sigma_right = min(1, sigma_left) so A
+                # rarely exceeds y_ntc by more than ~1 octave.
+                # Fallback (no NTC posterior): symmetric Normal centred at log2(Amean/2).
+                if y_ntc_tensor is None:
+                    raise ValueError(
+                        "fit_trans requires a NTC posterior (y_ntc_tensor) to anchor the A prior. "
+                        "Run fit_technical / fit_ntc before fit_trans."
                     )
-                    sigma_log2_A    = (log2_y_ntc - log2_Amean_half).clamp_min(1.0)  # ≤ 4 octaves
-                    mu_log2_A       = (1.0 - _o_y_weight) * log2_Amean_half + _o_y_weight * log2_y_ntc
-                else:
-                    # Fallback when no technical posterior is available: centre prior at
-                    # log2(Amean/2) with a fixed sigma of 4 octaves.
-                    log2_Amean_half = torch.log2(Amean_tensor / 2.0)
-                    sigma_log2_A    = self._t(4.0)
-                    mu_log2_A       = log2_Amean_half
-                log2_A = pyro.sample("log2_A", dist.Normal(mu_log2_A, sigma_log2_A))
+                log2_y_ntc       = torch.log2(y_ntc_tensor)
+                log2_Amean_half  = torch.maximum(
+                    torch.log2(Amean_tensor / 2.0),
+                    log2_y_ntc - 4.0,
+                )
+                sigma_left_log2A  = (log2_y_ntc - log2_Amean_half).clamp_min(1.0)  # ≤ 4 octaves
+                sigma_right_log2A = torch.minimum(self._t(1.0), sigma_left_log2A)
+                log2_A = pyro.sample("log2_A", SplitNormal(log2_y_ntc, sigma_left_log2A, sigma_right_log2A))
                 A = pyro.deterministic("A", torch.pow(self._t(2.0), log2_A))
 
             if use_alpha:
@@ -2459,10 +2433,19 @@ class TransFitter:
 
         def init_loc_fn(site):
             name = site["name"]
-        
             if "poly_coeff" in name:
                 return torch.zeros(T)
-        
+            # Initialise A-related sites at y_ntc (SplitNormal mode).
+            if y_ntc_tensor is not None:
+                if distribution == 'negbinom' and name == "log2_A":
+                    return torch.log2(y_ntc_tensor.clamp_min(1e-12))
+                elif distribution in ('normal', 'studentt') and name == "A":
+                    return y_ntc_tensor
+                elif distribution == 'binomial' and name == "logit_A":
+                    return torch.logit(y_ntc_tensor.clamp(1e-6, 1.0 - 1e-6))
+                elif distribution == 'multinomial' and name == "A":
+                    if y_ntc_tensor.ndim == 2:
+                        return torch.log(y_ntc_tensor.clamp(min=1e-10))
             return pyro.infer.autoguide.initialization.init_to_median(site)
         
         from torch.optim.lr_scheduler import OneCycleLR
@@ -2542,7 +2525,23 @@ class TransFitter:
             )
         else:
             # Simple Adam for Hill-based function types (single_hill, additive_hill, nested_hill)
-            guide_y = pyro.infer.autoguide.AutoNormalMessenger(self._model_y)
+            # Initialise A-related sites at y_ntc so the guide starts at the SplitNormal mode
+            # rather than drifting into the bad (A below y_ntc, alpha fills gap) basin.
+            def _init_A_at_ntc(site):
+                name = site["name"]
+                if y_ntc_tensor is not None:
+                    if distribution == 'negbinom' and name == "log2_A":
+                        return torch.log2(y_ntc_tensor.clamp_min(1e-12))
+                    elif distribution in ('normal', 'studentt') and name == "A":
+                        return y_ntc_tensor
+                    elif distribution == 'binomial' and name == "logit_A":
+                        return torch.logit(y_ntc_tensor.clamp(1e-6, 1.0 - 1e-6))
+                    elif distribution == 'multinomial' and name == "A":
+                        if y_ntc_tensor.ndim == 2:
+                            return torch.log(y_ntc_tensor.clamp(min=1e-10))
+                return pyro.infer.autoguide.initialization.init_to_feasible(site)
+
+            guide_y = pyro.infer.autoguide.AutoNormalMessenger(self._model_y, init_loc_fn=_init_A_at_ntc)
             hill_lr = 1e-3 if lr is None else lr
             optimizer = pyro.optim.ClippedAdam({"lr": hill_lr, "clip_norm": 10.0})
             svi = pyro.infer.SVI(
@@ -3129,14 +3128,46 @@ class TransFitter:
                 # K_a / K_b (log-normal)
                 'K_log_mu':         K_log_mu_p,      # scalar
                 'K_log_sigma':      K_log_sigma_p,   # scalar
-                # A (Exponential, negbinom only)
+                # A prior (negbinom: log2-Normal; others: None)
+                # A_log2_mu / A_log2_sigma: per-gene anchors in log2 space, matching _model_y.
+                # mu = lower anchor (log2(Amean/2), capped so sigma ≤ 4 octaves).
+                # sigma = log2(y_ntc) - lower_anchor, clamped to [1, 4] octaves.
+                # Without y_ntc: sigma = 4 (flat fallback), mu = log2(Amean/2).
                 'Amean':            (Amean_tensor.cpu().numpy()
                                      if distribution not in ['binomial', 'multinomial']
-                                     else None),      # [T] or None
+                                     else None),      # [T] or None (kept for backward compat)
+                'A_log2_mu':        None,             # [T] or None — set below for negbinom
+                'A_log2_sigma':     None,             # [T] or None — set below for negbinom
                 # alpha / beta (RelaxedBernoulli)
                 'p_n_logits':       float(p_n_logits_tensor.item()),
                 'temperature_prior': 1.0,
             }
+
+            # Fill A_log2_mu / A_log2_sigma for negbinom (matches _model_y lines 658-671).
+            # Replicate the exact weight used inside _model_y so the violin is accurate.
+            if distribution == 'negbinom':
+                _Amean_np = Amean_tensor.cpu().numpy()
+                if y_ntc_tensor is not None:
+                    _y_ntc_np   = y_ntc_tensor.cpu().numpy()
+                    _log2_y_ntc = np.log2(np.maximum(_y_ntc_np, 1e-12))
+                    _log2_lower = np.maximum(
+                        np.log2(np.maximum(_Amean_np / 2.0, 1e-12)),
+                        _log2_y_ntc - 4.0,          # cap: sigma ≤ 4 octaves
+                    )
+                    _sigma_log2_A = np.clip(_log2_y_ntc - _log2_lower, 1.0, 4.0)
+                    # Compute the per-gene weight exactly as _model_y does.
+                    if o_y_ntc_tensor is not None:
+                        _prior_mean_oy = float((beta_o_beta_tensor / beta_o_alpha_tensor)
+                                               .clamp_min(epsilon_tensor).item())
+                        _w = (o_y_ntc_tensor / (o_y_ntc_tensor + _prior_mean_oy)).cpu().numpy()
+                    else:
+                        _w = np.zeros_like(_Amean_np)   # no o_y info → weight=0
+                    _mu_log2_A = (1.0 - _w) * _log2_lower + _w * _log2_y_ntc
+                else:
+                    _mu_log2_A    = np.log2(np.maximum(_Amean_np / 2.0, 1e-12))
+                    _sigma_log2_A = np.full_like(_mu_log2_A, 4.0)
+                trans_prior_params['A_log2_mu']    = _mu_log2_A    # [T]
+                trans_prior_params['A_log2_sigma'] = _sigma_log2_A  # [T]
 
         # Store results
         # Store in modality

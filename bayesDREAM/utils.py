@@ -317,6 +317,58 @@ def sample_or_use_point(name, value, device):
         raise TypeError(f"Expected a tensor, float, or numpy array for {name}, but got {type(value)}.")
 
 
+class SplitNormal(torch.distributions.Distribution):
+    """
+    Asymmetric (two-piece) Normal distribution.
+
+    Mode at `loc`. Uses sigma_left for x < loc and sigma_right for x >= loc.
+    Integrates to 1 because each half of a Normal centred at loc integrates to 0.5.
+
+    Useful as a prior anchored at y_ntc with a longer left tail (down to Amean/2)
+    and a short right tail (A rarely exceeds NTC mean).
+
+    log_prob(x < loc)  = Normal(loc, sigma_left).log_prob(x)
+    log_prob(x >= loc) = Normal(loc, sigma_right).log_prob(x)
+    rsample: z ~ N(0,1), x = loc + (sigma_right if z>=0 else sigma_left) * z
+    """
+    arg_constraints = {
+        'loc': torch.distributions.constraints.real,
+        'sigma_left': torch.distributions.constraints.positive,
+        'sigma_right': torch.distributions.constraints.positive,
+    }
+    support = torch.distributions.constraints.real
+    has_rsample = True
+
+    def __init__(self, loc, sigma_left, sigma_right, validate_args=None):
+        self.loc = loc
+        self.sigma_left = sigma_left
+        self.sigma_right = sigma_right
+        def _shape(x):
+            return x.shape if isinstance(x, torch.Tensor) else torch.Size([])
+        batch_shape = torch.broadcast_shapes(_shape(loc), _shape(sigma_left), _shape(sigma_right))
+        super().__init__(batch_shape=batch_shape, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(SplitNormal, _instance)
+        batch_shape = torch.Size(batch_shape)
+        new.loc = self.loc.expand(batch_shape)
+        new.sigma_left = self.sigma_left.expand(batch_shape)
+        new.sigma_right = self.sigma_right.expand(batch_shape)
+        super(SplitNormal, new).__init__(batch_shape, validate_args=False)
+        return new
+
+    def log_prob(self, x):
+        lp_left = torch.distributions.Normal(self.loc, self.sigma_left).log_prob(x)
+        lp_right = torch.distributions.Normal(self.loc, self.sigma_right).log_prob(x)
+        return torch.where(x < self.loc, lp_left, lp_right)
+
+    def rsample(self, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        z = torch.randn(shape, dtype=self.loc.dtype, device=self.loc.device)
+        sigma = torch.where(z >= 0, self.sigma_right, self.sigma_left)
+        return self.loc + sigma * z
+
+
 def check_tensor(name, tensor):
     """
     Debug utility to check tensor properties.
