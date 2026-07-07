@@ -78,6 +78,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         guide_meta: pd.DataFrame = None,
         guide_target: pd.DataFrame = None,
         exclude_targets: list[str] = None,
+        exclude_guides: list[str] = None,
         require_ntc: bool = True
     ):
         """
@@ -132,6 +133,11 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
             a gene in this list will be removed from analysis, regardless of other guides present.
             Example: exclude_targets=['MYB'] will remove cells with guides targeting MYB,
             even if they also have NTC or cis-targeting guides.
+        exclude_guides : list[str], optional
+            List of guide names to exclude. Cells carrying any guide in this list will be removed
+            from analysis before fitting. Works in both single-guide and high MOI modes.
+            In high MOI mode, a cell is excluded if it has ANY of the listed guides, regardless
+            of other guides it carries.
         require_ntc : bool, optional
             If True (default), requires NTC cells in meta for single-guide mode.
             Set to False when subsetting a model that has already had technical fitting done,
@@ -364,9 +370,13 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
                 if exclude_targets is not None and any(t in exclude_targets for t in targets):
                     exclude_guide_indices.append(pos_idx)
 
+                # Check if this guide itself is excluded by name
+                if exclude_guides is not None and guide_name in exclude_guides:
+                    exclude_guide_indices.append(pos_idx)
+
             ntc_guide_indices = np.array(ntc_guide_indices)
             cis_guide_indices = np.array(cis_guide_indices)
-            exclude_guide_indices = np.array(exclude_guide_indices)
+            exclude_guide_indices = np.array(list(dict.fromkeys(exclude_guide_indices)))  # deduplicate, preserve order
 
             # Determine which cells have these guide types
             if len(exclude_guide_indices) > 0:
@@ -418,8 +428,8 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
             print(f"  NTC cells (NTC guides, no cis): {ntc_count}")
             print(f"  {self.cis_gene}-targeting cells (any cis guides): {cis_count}")
             print(f"  Other-only cells (will be removed): {other_count}")
-            if exclude_targets is not None:
-                print(f"  Excluded cells (guides targeting {exclude_targets}): {excluded_count}")
+            if exclude_targets is not None or exclude_guides is not None:
+                print(f"  Excluded cells (exclude_targets/exclude_guides): {excluded_count}")
 
         # Save original cell order before subsetting (for guide_assignment row alignment in high MOI)
         if self.is_high_moi:
@@ -427,6 +437,16 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
                 _ga_original_cell_names = list(self.counts.columns)
             else:
                 _ga_original_cell_names = list(self._cell_names) if hasattr(self, '_cell_names') and self._cell_names else []
+
+        # Drop cells carrying explicitly excluded guides (single-guide mode only;
+        # high MOI handles this above via exclude_guide_indices → target='excluded')
+        if exclude_guides is not None and not self.is_high_moi:
+            excluded_guide_set = set(exclude_guides)
+            n_before = len(self.meta)
+            self.meta = self.meta[~self.meta['guide'].isin(excluded_guide_set)].copy()
+            n_excluded = n_before - len(self.meta)
+            if n_excluded > 0:
+                print(f"[INFO] Excluded {n_excluded} cells carrying guides in exclude_guides={exclude_guides}")
 
         # Subset meta and counts to relevant cells
         valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()

@@ -83,6 +83,7 @@ class bayesDREAM(
         random_seed: int = 2402,
         cores: int = 1,
         exclude_targets: list = None,
+        exclude_guides: list = None,
         require_ntc: bool = True,
         min_count: int = 1,
         color_scheme: 'ColorScheme' = None,
@@ -332,6 +333,7 @@ class bayesDREAM(
             random_seed=random_seed,
             cores=cores,
             exclude_targets=exclude_targets,
+            exclude_guides=exclude_guides,
             require_ntc=require_ntc
         )
 
