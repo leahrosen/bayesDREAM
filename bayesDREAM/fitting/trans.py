@@ -435,7 +435,7 @@ class TransFitter:
         y_ntc_tensor=None,
         mean_y_corrected_tensor=None,
         o_y_ntc_tensor=None,
-        alpha_n_coupling: float = 20.0,
+        alpha_n_coupling: float = 10.0,
         latents_only=False,
     ):
 
@@ -1364,7 +1364,7 @@ class TransFitter:
         checkpoint_dir: str = None,
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
-        alpha_n_coupling: float = 20.0,
+        alpha_n_coupling: float = 10.0,
         **kwargs
     ):
         """
@@ -2754,6 +2754,12 @@ class TransFitter:
             #    current_temp = 0.1 * (final_temp/0.1) ** ((step - 0.7 * niters) / (0.3 * niters))
 
 
+            # Anneal coupling from 0 → target over first half of total training.
+            # Lets alpha and n co-explore freely early on; identifiability constraint
+            # ramps in gradually rather than blocking from step 0.
+            _coupling_frac = min(1.0, 2.0 * step / total_steps) if total_steps > 0 else 1.0
+            current_coupling = alpha_n_coupling * _coupling_frac
+
             # x_true, log2_x_true, alpha_y_prefit are always point estimates (means)
             x_true_sample = x_true_subset
             log2_x_true_sample = log2_x_true_subset
@@ -2835,7 +2841,7 @@ class TransFitter:
                     y_ntc_tensor=y_ntc_tensor,
                     mean_y_corrected_tensor=mean_y_corrected_tensor,
                     o_y_ntc_tensor=o_y_ntc_tensor,
-                    alpha_n_coupling=alpha_n_coupling,
+                    alpha_n_coupling=current_coupling,
                 )
             except FloatingPointError as e:
                 print(f"[STOP] {e} at step {step}")
