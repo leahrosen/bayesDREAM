@@ -433,8 +433,9 @@ class TransFitter:
         k_log_sigma_min_tensor=None,
         k_center_tensor=None,
         y_ntc_tensor=None,
+        mean_y_corrected_tensor=None,
         o_y_ntc_tensor=None,
-        alpha_n_coupling: float = 10.0,
+        alpha_n_coupling: float = 20.0,
         latents_only=False,
     ):
 
@@ -625,10 +626,15 @@ class TransFitter:
                     #
                     # Fallback (no NTC posterior): Beta(1, β) with mean = 0.5×Q05.
                     if y_ntc_tensor is not None and use_data_driven_priors:
-                        logit_Amean_half = torch.logit((0.5 * Amean_tensor).clamp(1e-6, 1.0 - 1e-6))  # [T]
-                        logit_y_ntc      = torch.logit(y_ntc_tensor.clamp(1e-6, 1.0 - 1e-6))          # [T]
-                        logit_Amean_half = torch.maximum(logit_Amean_half, logit_y_ntc - 4.0)          # cap: sigma ≤ 4
-                        sigma_logit = (logit_y_ntc - logit_Amean_half).clamp_min(1.0)                  # [T]
+                        # Lift upper anchor to mean(y_corrected) when y_ntc < mean.
+                        if mean_y_corrected_tensor is not None:
+                            effective_y_ntc = torch.maximum(y_ntc_tensor, mean_y_corrected_tensor)
+                        else:
+                            effective_y_ntc = y_ntc_tensor
+                        logit_Amean_half = torch.logit((0.5 * Amean_tensor).clamp(1e-6, 1.0 - 1e-6))      # [T]
+                        logit_y_ntc      = torch.logit(effective_y_ntc.clamp(1e-6, 1.0 - 1e-6))            # [T]
+                        logit_Amean_half = torch.maximum(logit_Amean_half, logit_y_ntc - 4.0)              # cap: sigma ≤ 4
+                        sigma_logit = (logit_y_ntc - logit_Amean_half).clamp_min(1.0)                      # [T]
                         mu_logit    = (1.0 - _o_y_weight) * logit_Amean_half + _o_y_weight * logit_y_ntc  # [T]
                         logit_A = pyro.sample("logit_A", dist.Normal(mu_logit, sigma_logit))            # [T]
                         A = pyro.deterministic("A", torch.sigmoid(logit_A))                             # [T]
@@ -649,13 +655,20 @@ class TransFitter:
                 #
                 # sigma_log2_A = log2(y_ntc) - lower_anchor, floored at 1 octave, capped at 4.
                 if y_ntc_tensor is not None:
-                    log2_y_ntc      = torch.log2(y_ntc_tensor)
+                    log2_y_ntc = torch.log2(y_ntc_tensor)
+                    # Lift upper anchor to mean(y_corrected) when y_ntc < mean — prevents
+                    # both anchors collapsing to the floor for genes absent in NTC but
+                    # expressed in perturbed conditions.
+                    if mean_y_corrected_tensor is not None:
+                        log2_upper_anchor = torch.maximum(log2_y_ntc, torch.log2(mean_y_corrected_tensor))
+                    else:
+                        log2_upper_anchor = log2_y_ntc
                     log2_Amean_half = torch.maximum(
                         torch.log2(Amean_tensor / 2.0),
-                        log2_y_ntc - 4.0,
+                        log2_upper_anchor - 4.0,
                     )
-                    sigma_log2_A    = (log2_y_ntc - log2_Amean_half).clamp_min(1.0)  # ≤ 4 octaves
-                    mu_log2_A       = (1.0 - _o_y_weight) * log2_Amean_half + _o_y_weight * log2_y_ntc
+                    sigma_log2_A = (log2_upper_anchor - log2_Amean_half).clamp_min(1.0)  # ≤ 4 octaves
+                    mu_log2_A    = (1.0 - _o_y_weight) * log2_Amean_half + _o_y_weight * log2_upper_anchor
                 else:
                     log2_Amean_half = torch.log2(Amean_tensor / 2.0)
                     sigma_log2_A    = self._t(4.0)
@@ -1351,7 +1364,7 @@ class TransFitter:
         checkpoint_dir: str = None,
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
-        alpha_n_coupling: float = 10.0,
+        alpha_n_coupling: float = 20.0,
         **kwargs
     ):
         """
@@ -2117,6 +2130,7 @@ class TransFitter:
 
         # Compute cell-level Q05/Q95 for Amean/Vmax priors (always, regardless of guide count)
         _q05_was_zero = None
+        mean_y_corrected_tensor = None  # [T]; set below for 2D distributions (negbinom, binomial)
         if y_obs_for_prior.ndim == 2:  # [N, T]
             Amean_list, Vmax_list, cell_var_list = [], [], []
             for t in range(T):
@@ -2159,6 +2173,11 @@ class TransFitter:
                 print(f"[INFO] Q05 floor: {n_q05_zero} features raised to {_amean_floor.item():.3e} (min(q01_ntc, 2^-10))")
             Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))
             Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
+
+            # Mean across all cells — used as a data-driven floor for the A prior upper
+            # anchor. When y_ntc ≈ 0 (gene absent in NTC but expressed in perturbations),
+            # this prevents both anchors collapsing to the same floor value.
+            mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0).clamp_min(self._t(1e-12))  # [T]
 
         elif y_obs_for_prior.ndim == 3:  # [N, T, K] — multinomial
             Amean_list, Vmax_list, cell_var_list = [], [], []
@@ -2519,6 +2538,7 @@ class TransFitter:
                 k_log_sigma_min_tensor=k_log_sigma_min_tensor,
                 k_center_tensor=k_center_tensor,
                 y_ntc_tensor=y_ntc_tensor,
+                mean_y_corrected_tensor=mean_y_corrected_tensor,
                 o_y_ntc_tensor=o_y_ntc_tensor,
                 alpha_n_coupling=alpha_n_coupling,
             )
@@ -2813,6 +2833,7 @@ class TransFitter:
                     k_log_sigma_min_tensor=k_log_sigma_min_tensor,
                     k_center_tensor=k_center_tensor,
                     y_ntc_tensor=y_ntc_tensor,
+                    mean_y_corrected_tensor=mean_y_corrected_tensor,
                     o_y_ntc_tensor=o_y_ntc_tensor,
                     alpha_n_coupling=alpha_n_coupling,
                 )
@@ -3162,21 +3183,26 @@ class TransFitter:
             if distribution == 'negbinom':
                 _Amean_np = Amean_tensor.cpu().numpy()
                 if y_ntc_tensor is not None:
-                    _y_ntc_np   = y_ntc_tensor.cpu().numpy()
-                    _log2_y_ntc = np.log2(np.maximum(_y_ntc_np, 1e-12))
+                    _y_ntc_np = y_ntc_tensor.cpu().numpy()
+                    # Mirror _model_y: lift upper anchor to mean(y_corrected) when y_ntc < mean.
+                    if mean_y_corrected_tensor is not None:
+                        _mean_ycorr_np = mean_y_corrected_tensor.cpu().numpy()
+                        _upper_np = np.maximum(_y_ntc_np, _mean_ycorr_np)
+                    else:
+                        _upper_np = _y_ntc_np
+                    _log2_upper = np.log2(np.maximum(_upper_np, 1e-12))
                     _log2_lower = np.maximum(
                         np.log2(np.maximum(_Amean_np / 2.0, 1e-12)),
-                        _log2_y_ntc - 4.0,          # cap: sigma ≤ 4 octaves
+                        _log2_upper - 4.0,
                     )
-                    _sigma_log2_A = np.clip(_log2_y_ntc - _log2_lower, 1.0, 4.0)
-                    # Compute the per-gene weight exactly as _model_y does.
+                    _sigma_log2_A = np.clip(_log2_upper - _log2_lower, 1.0, 4.0)
                     if o_y_ntc_tensor is not None:
                         _prior_mean_oy = float((beta_o_beta_tensor / beta_o_alpha_tensor)
                                                .clamp_min(epsilon_tensor).item())
                         _w = (o_y_ntc_tensor / (o_y_ntc_tensor + _prior_mean_oy)).cpu().numpy()
                     else:
-                        _w = np.zeros_like(_Amean_np)   # no o_y info → weight=0
-                    _mu_log2_A = (1.0 - _w) * _log2_lower + _w * _log2_y_ntc
+                        _w = np.zeros_like(_Amean_np)
+                    _mu_log2_A = (1.0 - _w) * _log2_lower + _w * _log2_upper
                 else:
                     _mu_log2_A    = np.log2(np.maximum(_Amean_np / 2.0, 1e-12))
                     _sigma_log2_A = np.full_like(_mu_log2_A, 4.0)
