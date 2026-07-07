@@ -368,6 +368,9 @@ class SplitNormal(torch.distributions.Distribution):
         sigma = torch.where(z >= 0, self.sigma_right, self.sigma_left)
         return self.loc + sigma * z
 
+    def __call__(self, sample_shape=torch.Size()):
+        return self.rsample(sample_shape)
+
 
 def check_tensor(name, tensor):
     """

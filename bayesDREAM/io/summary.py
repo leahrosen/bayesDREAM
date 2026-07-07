@@ -1019,7 +1019,7 @@ class ModelSummarizer:
         - feature: Feature name
         - modality: Modality name
         - distribution: Distribution type
-        - group_{i}_alpha_y_mean: Mean alpha_y for group i
+        - group_{i}_alpha_y_median: Median alpha_y for group i (point estimate from fit_ntc)
         - group_{i}_alpha_y_lower: 2.5% quantile for group i
         - group_{i}_alpha_y_upper: 97.5% quantile for group i
 
@@ -1068,11 +1068,11 @@ class ModelSummarizer:
         n_features = len(feature_names)
         n_groups = alpha_y.shape[0]  # [C, T] → C groups
 
-        alpha_mean = alpha_y  # [C, T]
+        alpha_median = alpha_y  # [C, T] — point estimate stored as median at fit time
         alpha_lower = alpha_y  # no uncertainty (point estimate)
         alpha_upper = alpha_y
 
-        # Extract mu_ntc and o_y means from posterior_samples_ntc ([S, T] → [T])
+        # Extract mu_ntc and o_y medians from posterior_samples_ntc ([S, T] → [T])
         def _extract_scalar_posterior(ps, key):
             v = ps.get(key)
             if v is None:
@@ -1081,7 +1081,7 @@ class ModelSummarizer:
                 v = v.cpu().numpy()
             if v.ndim == 1:
                 return v
-            return v.mean(axis=0).flatten()  # collapse samples + any extra dims → [T]
+            return np.median(v, axis=0).flatten()  # collapse samples + any extra dims → [T]
 
         ps = getattr(modality, 'posterior_samples_ntc', None) or {}
         mu_ntc_vals = _extract_scalar_posterior(ps, 'mu_ntc')
@@ -1098,7 +1098,7 @@ class ModelSummarizer:
 
         # Add columns for each group
         for g in range(n_groups):
-            data[f'group_{g}_alpha_y_mean'] = alpha_mean[g, :]
+            data[f'group_{g}_alpha_y_median'] = alpha_median[g, :]
             data[f'group_{g}_alpha_y_lower'] = alpha_lower[g, :]
             data[f'group_{g}_alpha_y_upper'] = alpha_upper[g, :]
 
@@ -1125,7 +1125,7 @@ class ModelSummarizer:
             }
             for g in range(n_groups):
                 val = float(alpha_x_np[g]) if g < len(alpha_x_np) else float('nan')
-                cis_row[f'group_{g}_alpha_y_mean'] = val
+                cis_row[f'group_{g}_alpha_y_median'] = val
                 cis_row[f'group_{g}_alpha_y_lower'] = val
                 cis_row[f'group_{g}_alpha_y_upper'] = val
             if mu_ntc_vals is not None:
@@ -1510,9 +1510,10 @@ class ModelSummarizer:
         - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
 
         Overdispersion and technical group effects (for simulation):
-        - phi_y_median, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2)
-        - o_y_median, o_y_lower, o_y_upper: Posterior o_y (sqrt overdispersion)
-        - group_{g}_alpha_y_mean: Technical group effect for group g (from fit_ntc)
+        - phi_y_median, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2) from fit_trans
+        - o_y_median, o_y_lower, o_y_upper: Posterior o_y (sqrt overdispersion) from fit_trans
+        - o_y_ntc_median: Median o_y from fit_ntc (posterior_samples_ntc)
+        - group_{g}_alpha_y_median: Technical group effect for group g (median, from fit_ntc)
 
         Parameters
         ----------
@@ -1839,6 +1840,19 @@ class ModelSummarizer:
                 data['o_y_lower'] = o_y
                 data['o_y_upper'] = o_y
 
+        # Add fit_ntc o_y (median across posterior samples, per feature)
+        ps_ntc = getattr(modality, 'posterior_samples_ntc', None) or {}
+        ntc_oy = ps_ntc.get('o_y')
+        if ntc_oy is not None:
+            if isinstance(ntc_oy, torch.Tensor):
+                ntc_oy = ntc_oy.cpu().numpy()
+            if ntc_oy.ndim == 3 and ntc_oy.shape[1] == 1:
+                ntc_oy = ntc_oy.squeeze(1)
+            if ntc_oy.ndim >= 2:
+                data['o_y_ntc_median'] = np.median(ntc_oy, axis=0)[:n_features]
+            else:
+                data['o_y_ntc_median'] = ntc_oy[:n_features]
+
         # Add alpha_y (technical group effects) from modality.alpha_y_prefit
         if hasattr(modality, 'alpha_y_prefit') and modality.alpha_y_prefit is not None:
             # Get alpha_y (prefer distribution-specific versions)
@@ -1850,17 +1864,17 @@ class ModelSummarizer:
                 alpha_y_tech = modality.alpha_y_prefit
             if isinstance(alpha_y_tech, torch.Tensor):
                 alpha_y_tech = alpha_y_tech.cpu().numpy()
-            # Shape: [n_samples, n_groups, n_features] (posterior) or [n_groups, n_features] (point)
+            # Shape: [n_samples, n_groups, n_features] (legacy posterior) or [n_groups, n_features] (point)
             if alpha_y_tech.ndim == 3:
-                alpha_y_mean = alpha_y_tech.mean(axis=0)  # [n_groups, n_features]
+                alpha_y_median = np.median(alpha_y_tech, axis=0)  # [n_groups, n_features]
             elif alpha_y_tech.ndim == 2:
-                alpha_y_mean = alpha_y_tech  # already [n_groups, n_features]
+                alpha_y_median = alpha_y_tech  # already [n_groups, n_features] point estimate
             else:
-                alpha_y_mean = None
-            if alpha_y_mean is not None and alpha_y_mean.ndim == 2:
-                n_groups = alpha_y_mean.shape[0]
+                alpha_y_median = None
+            if alpha_y_median is not None and alpha_y_median.ndim == 2:
+                n_groups = alpha_y_median.shape[0]
                 for g in range(n_groups):
-                    data[f'group_{g}_alpha_y_mean'] = alpha_y_mean[g, :n_features]
+                    data[f'group_{g}_alpha_y_median'] = alpha_y_median[g, :n_features]
 
         df = pd.DataFrame(data)
 

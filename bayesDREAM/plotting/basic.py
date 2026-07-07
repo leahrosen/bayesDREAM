@@ -864,7 +864,8 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
                 then soft-clamped to [nmin, nmax]
     Vmax_a/b  : LogNormal(Vmax_log_mu[gene], Vmax_log_sigma)
     K_a/b     : LogNormal(K_log_mu, K_log_sigma)
-    A         : Exponential(rate=1/Amean[gene])
+    A (negbinom): 2^Normal(A_log2_mu[gene], A_log2_sigma[gene])
+                  lower anchor = log2(Amean/2), sigma = 1-4 octaves (NTC-anchored)
     alpha/beta: RelaxedBernoulli(logits=p_n_logits, temperature=1)
     """
     if rng is None:
@@ -902,12 +903,15 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
         return np.exp(rng.normal(mu, float(K_log_sigma), n_samples))
 
     elif param == 'A':
-        Amean = prior_params.get('Amean')
-        if Amean is None:
+        A_log2_mu    = prior_params.get('A_log2_mu')
+        A_log2_sigma = prior_params.get('A_log2_sigma')
+        if A_log2_mu is None or A_log2_sigma is None:
             return None
-        amean_val = (float(Amean[gene_idx])
-                     if hasattr(Amean, '__len__') else float(Amean))
-        return rng.exponential(amean_val, n_samples)   # Exp(rate=1/amean)
+        mu    = (float(A_log2_mu[gene_idx])
+                 if hasattr(A_log2_mu, '__len__') else float(A_log2_mu))
+        sigma = (float(A_log2_sigma[gene_idx])
+                 if hasattr(A_log2_sigma, '__len__') else float(A_log2_sigma))
+        return np.power(2.0, rng.normal(mu, sigma, n_samples))
 
     elif param in ('alpha', 'beta'):
         logits = prior_params.get('p_n_logits', -13.8)
@@ -2426,3 +2430,95 @@ def plot_additivity_residuals(model, response='x_obs',
     if show:
         plt.show()
     return axes
+
+
+def patch_A_prior(model, modality_name=None, beta_o_alpha=9.0, beta_o_beta=3.0):
+    """
+    Compute and store A_log2_mu / A_log2_sigma in trans_prior_params without re-running fit_trans.
+
+    Use this when debugging with a previously fitted model to get a correct prior violin
+    for the A parameter in plot_parameter_ci_panel(show_prior=True).
+
+    Parameters
+    ----------
+    model : bayesDREAM
+    modality_name : str, optional
+        Modality to patch. Defaults to model.primary_modality.
+    beta_o_alpha, beta_o_beta : float
+        Gamma prior hyperparameters for o_y used during fit_trans (defaults: 9, 3).
+        prior_mean_o_y = beta_o_beta / beta_o_alpha = 1/3.
+    """
+    if modality_name is None:
+        modality_name = model.primary_modality
+    modality = model.get_modality(modality_name)
+
+    pp = modality.trans_prior_params
+    if pp is None:
+        raise ValueError("trans_prior_params is None — run fit_trans first.")
+    if pp.get('distribution') != 'negbinom':
+        raise ValueError(f"A prior patch only applies to negbinom; got {pp.get('distribution')}.")
+
+    Amean_np = pp.get('Amean')
+    if Amean_np is None:
+        raise ValueError("trans_prior_params missing 'Amean'.")
+
+    # Extract y_ntc from NTC posterior (same reduction as fit_trans)
+    post_ntc = getattr(modality, 'posterior_samples_ntc', None)
+    y_ntc_np = None
+    if post_ntc is not None and 'mu_ntc' in post_ntc:
+        _mu = post_ntc['mu_ntc']
+        if hasattr(_mu, 'cpu'):
+            _mu = _mu.cpu().numpy()
+        else:
+            _mu = np.asarray(_mu)
+        while _mu.ndim > 1:
+            _mu = np.nanmedian(_mu, axis=0)
+        y_ntc_np = _mu.astype(float)
+
+    # Extract o_y_ntc from NTC posterior (same reduction as fit_trans)
+    o_y_ntc_np = None
+    if post_ntc is not None and 'o_y' in post_ntc:
+        _oy = post_ntc['o_y']
+        if hasattr(_oy, 'cpu'):
+            _oy = _oy.cpu().numpy()
+        else:
+            _oy = np.asarray(_oy)
+        T = len(Amean_np)
+        if _oy.ndim > 1 and _oy.shape[-1] == T:
+            while _oy.ndim > 1:
+                _oy = np.nanmedian(_oy, axis=0)
+            prior_mean_oy = beta_o_beta / beta_o_alpha
+            _oy = np.where(np.isnan(_oy) | (_oy <= 0), prior_mean_oy, _oy)
+            _oy = np.maximum(_oy, 1e-6)
+            o_y_ntc_np = _oy
+
+    if y_ntc_np is not None:
+        _log2_y_ntc = np.log2(np.maximum(y_ntc_np, 1e-12))
+        _log2_lower = np.maximum(
+            np.log2(np.maximum(Amean_np / 2.0, 1e-12)),
+            _log2_y_ntc - 4.0,
+        )
+        sigma_log2_A = np.clip(_log2_y_ntc - _log2_lower, 1.0, 4.0)
+        if o_y_ntc_np is not None:
+            prior_mean_oy = beta_o_beta / beta_o_alpha
+            w = o_y_ntc_np / (o_y_ntc_np + prior_mean_oy)
+        else:
+            w = np.zeros_like(Amean_np)
+        mu_log2_A = (1.0 - w) * _log2_lower + w * _log2_y_ntc
+    else:
+        mu_log2_A    = np.log2(np.maximum(Amean_np / 2.0, 1e-12))
+        sigma_log2_A = np.full_like(mu_log2_A, 4.0)
+
+    pp['A_log2_mu']    = mu_log2_A
+    pp['A_log2_sigma'] = sigma_log2_A
+
+    # Mirror to model-level trans_prior_params if this is the primary modality
+    if modality_name == model.primary_modality and hasattr(model, 'trans_prior_params') \
+            and model.trans_prior_params is not None:
+        model.trans_prior_params['A_log2_mu']    = mu_log2_A
+        model.trans_prior_params['A_log2_sigma'] = sigma_log2_A
+
+    print(f"[patch_A_prior] Patched '{modality_name}': "
+          f"sigma_log2_A range [{sigma_log2_A.min():.2f}, {sigma_log2_A.max():.2f}] octaves, "
+          f"weight range [{w.min():.2f}, {w.max():.2f}]" if y_ntc_np is not None
+          else f"[patch_A_prior] Patched '{modality_name}': no y_ntc, sigma=4 octaves flat.")

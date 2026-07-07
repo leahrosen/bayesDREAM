@@ -3051,6 +3051,83 @@ def predict_trans_derivatives_samples(
 
 
 # ============================================================================
+# Bayesian FDR for plotting (mirrors ModelSaver._compute_bayesian_fdr)
+# ============================================================================
+
+def _compute_posterior_fdr(posterior, activity_epsilon: float = 0.01):
+    """
+    Compute per-component Bayesian q-values from posterior samples.
+
+    Mirrors ModelSaver._compute_bayesian_fdr in io/summary.py:
+      lfdr_i = 1 - P(alpha_i * Vmax_i / A_i > epsilon)
+      q-values = running-min of cumulative-mean(lfdr sorted ascending)
+    For additive_hill, alpha and beta form a single pooled family of 2T tests.
+
+    Returns (fdr_alpha, fdr_beta) each of shape (n_features,).
+    fdr_beta is all-NaN for single_hill / when Vmax_b is absent.
+    Returns (None, None) if the posterior lacks the required keys.
+    """
+    def _to_np(key):
+        if key not in posterior:
+            return None
+        v = posterior[key]
+        if hasattr(v, 'cpu'):
+            v = v.detach().cpu().numpy()
+        v = np.asarray(v, dtype=float)
+        if v.ndim >= 3 and v.shape[1] == 1:
+            v = v.squeeze(1)
+        return v
+
+    def _p_active(alpha_key, vmax_key):
+        alpha_s = _to_np(alpha_key)
+        vmax_s  = _to_np(vmax_key)
+        A_s     = _to_np('A')
+        if (alpha_s is not None and alpha_s.ndim >= 2
+                and vmax_s is not None and vmax_s.ndim >= 2
+                and A_s    is not None and A_s.ndim    >= 2):
+            ratio = alpha_s * vmax_s / np.maximum(A_s, 1e-12)
+            return (ratio > activity_epsilon).mean(axis=0)
+        if alpha_s is not None:
+            m = alpha_s.mean(axis=0) if alpha_s.ndim >= 2 else alpha_s
+            return np.clip(np.asarray(m, dtype=float), 0.0, 1.0)
+        return None
+
+    def _qvalues(lfdr):
+        n = len(lfdr)
+        if n == 0:
+            return np.array([], dtype=float)
+        order = np.argsort(lfdr)
+        cumfdr = np.cumsum(lfdr[order]) / (np.arange(n, dtype=float) + 1.0)
+        qvals_sorted = np.minimum.accumulate(cumfdr[::-1])[::-1]
+        qvals = np.empty(n, dtype=float)
+        qvals[order] = qvals_sorted
+        return qvals
+
+    p_a = _p_active('alpha', 'Vmax_a')
+    if p_a is None:
+        return None, None
+    p_a = np.asarray(p_a, dtype=float).ravel()
+    n = len(p_a)
+    nan_col = np.full(n, np.nan)
+
+    p_b = _p_active('beta', 'Vmax_b') if 'Vmax_b' in posterior else None
+
+    if p_b is not None:
+        p_b = np.asarray(p_b, dtype=float).ravel()
+        # Pool alpha and beta into a single family (matches summary.py)
+        lfdr_all = 1.0 - np.concatenate([p_a, p_b])
+        qvals_all = _qvalues(lfdr_all)
+        fdr_alpha = np.where(p_a < 1e-9, 1.0, qvals_all[:n])
+        fdr_beta  = np.where(p_b < 1e-9, 1.0, qvals_all[n:])
+    else:
+        lfdr_a = 1.0 - p_a
+        fdr_alpha = np.where(p_a < 1e-9, 1.0, _qvalues(lfdr_a))
+        fdr_beta  = nan_col
+
+    return fdr_alpha, fdr_beta
+
+
+# ============================================================================
 # Hill Parameter Marker Helpers
 # ============================================================================
 
@@ -3282,7 +3359,8 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
     y_scale : float
         Multiplicative scale applied to linear y-values before plotting (e.g. 100 for PSI%).
     ci_level : float
-        Credible interval level used to classify additive_hill regime (default 95.0).
+        Kept for API compatibility; no longer used internally (activity is now
+        always determined by Bayesian FDR, not a CI on n).
     """
     # ── Resolve posterior and feature list ─────────────────────────────────
     if modality.name == model.primary_modality:
@@ -3323,13 +3401,6 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
     def pmean(key):
         return float(params[key].mean()) if key in params else None
 
-    def pci(key):
-        if key not in params:
-            return None, None
-        lo = float(np.percentile(params[key], (100 - ci_level) / 2))
-        hi = float(np.percentile(params[key], 100 - (100 - ci_level) / 2))
-        return lo, hi
-
     A      = pmean('A');     alpha = pmean('alpha');  Vmax_a = pmean('Vmax_a')
     K_a    = pmean('K_a');   n_a   = pmean('n_a')
 
@@ -3341,10 +3412,9 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
         beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
         K_b    = pmean('K_b');   n_b    = pmean('n_b')
 
-        n_a_lo, n_a_hi = pci('n_a')
-        n_b_lo, n_b_hi = pci('n_b')
-
-        # Prefer FDR-based null classification; fall back to CI criterion
+        # Null classification: prefer fdr_df (pre-computed summary), then compute
+        # Bayesian FDR from the posterior (same formula as save_trans_summary),
+        # matching on P(alpha*Vmax/A > epsilon) + pooled q-values across all features.
         _fdr_row = None
         if fdr_df is not None:
             _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
@@ -3356,8 +3426,14 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
             a_null = float(_fdr_row.get('fdr_alpha', 1.0)) >= fdr_threshold
             b_null = float(_fdr_row.get('fdr_beta',  1.0)) >= fdr_threshold
         else:
-            a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
-            b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
+            _fdr_a, _fdr_b = _compute_posterior_fdr(posterior)
+            if _fdr_a is not None and feature_idx < len(_fdr_a):
+                a_null = float(_fdr_a[feature_idx]) >= fdr_threshold
+                b_null = (float(_fdr_b[feature_idx]) >= fdr_threshold
+                          if _fdr_b is not None and not np.isnan(_fdr_b[feature_idx])
+                          else not is_additive)
+            else:
+                a_null = b_null = False
     else:
         a_null = b_null = False
 
@@ -3541,6 +3617,8 @@ def plot_negbinom_xy(
     hill_label: str = 'Fitted Trans Function',
     ref_color: str = 'red',
     ref_label: str = 'Reference Function',
+    expand_x_to_params: bool = False,
+    expand_y_to_params: bool = False,
     **kwargs
 ) -> plt.Axes:
     """
@@ -3927,6 +4005,29 @@ def plot_negbinom_xy(
             # Evenly spaced points in log2 space for smooth curve on log-log plot
             log2_min = np.log2(max(x_true.min(), 1e-6))
             log2_max = np.log2(x_true.max())
+            if expand_x_to_params and mark_params:
+                # Extend range to include K_a / K_b posterior means
+                _posterior_ep = (model.posterior_samples_trans
+                                 if modality.name == model.primary_modality
+                                 else getattr(modality, 'posterior_samples_trans', None))
+                if _posterior_ep is not None and 'K_a' in _posterior_ep:
+                    _fnames_ep = (list(modality.feature_names)
+                                  if modality.feature_names is not None else [])
+                    if feature in _fnames_ep:
+                        _fi_ep = _fnames_ep.index(feature)
+                        for _kname in ('K_a', 'K_b'):
+                            if _kname in _posterior_ep:
+                                _ks = _posterior_ep[_kname]
+                                _km = (_ks.mean(dim=0) if hasattr(_ks, 'mean')
+                                       else np.mean(_ks, axis=0))
+                                if hasattr(_km, 'detach'):
+                                    _km = _km.detach().cpu().numpy()
+                                _km = np.asarray(_km).ravel()
+                                if _fi_ep < len(_km):
+                                    _k_val = float(_km[_fi_ep])
+                                    if _k_val > 0:
+                                        log2_min = min(log2_min, np.log2(_k_val))
+                                        log2_max = max(log2_max, np.log2(_k_val))
             x_range = 2 ** np.linspace(log2_min, log2_max, 2000)
             y_pred = predict_trans_function(model, feature, x_range, modality_name=None)
 
@@ -3987,9 +4088,26 @@ def plot_negbinom_xy(
                     _x_lo = min(_x_lo, min(_ax_v_markers))
                     _x_hi = max(_x_hi, max(_ax_v_markers))
                 if _ax_y_hill_xh is not None and len(_ax_y_hill_xh) > 0:
-                    _in_xr = (_ax_y_hill_xh >= _x_lo) & (_ax_y_hill_xh <= _x_hi)
-                    if _in_xr.any():
-                        _ax_y_hill.extend(_ax_y_hill_yh[_in_xr].tolist())
+                    if expand_y_to_params:
+                        _ax_y_hill.extend(_ax_y_hill_yh.tolist())
+                    else:
+                        _in_xr = (_ax_y_hill_xh >= _x_lo) & (_ax_y_hill_xh <= _x_hi)
+                        if _in_xr.any():
+                            _ax_y_hill.extend(_ax_y_hill_yh[_in_xr].tolist())
+
+            # When expand_y_to_params, also sample Hill at x→0 and x→∞ to capture
+            # asymptotes (A floor and A+α·Vmax ceiling) even when they are outside
+            # the data x range or when both Hill components are classified as null
+            # (which suppresses the A+Vmax ceiling h_marker in mark_params mode).
+            if expand_y_to_params and y_pred is not None:
+                _x_asym = np.array([max(x_range[0] * 1e-6, 1e-30), x_range[-1] * 1e6])
+                _y_asym = predict_trans_function(model, feature, _x_asym, modality_name=None)
+                if _y_asym is not None:
+                    _valid_asym = _y_asym > 0
+                    if _valid_asym.any():
+                        _ax_y_hill.extend(
+                            (np.log2(_y_asym[_valid_asym]) - y_offset).tolist()
+                        )
 
             # Reference curve overlay (from trans_summary DataFrame)
             if reference_df is not None and (corrected or not has_technical_fit):
@@ -5290,6 +5408,8 @@ def plot_xy_data(
     fdr_threshold: float = 0.05,
     color_by: Union[str, List[str]] = 'technical_group',
     facet_by: Optional[Union[str, List[str]]] = None,
+    expand_x_to_params: bool = False,
+    expand_y_to_params: bool = False,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -5442,6 +5562,21 @@ def plot_xy_data(
         A warning is issued for columns with more than 20 unique values.
         Not yet supported for ``multinomial`` distributions (ignored with a
         warning in that case).
+    expand_x_to_params : bool
+        When True, extend the x-axis (and the Hill curve) beyond the data range
+        so that all K/EC50 parameters are visible on the plot (default: False).
+        Requires ``show_hill_function=True`` and a fitted trans model.
+        The x-axis minimum and maximum are widened to include the mean K_a and
+        K_b values from the posterior, so any EC50 that falls outside the data
+        range will still appear on the curve.  Ignored for polynomial function
+        types (which have no K parameters).
+    expand_y_to_params : bool
+        When True, extend the y-axis to show the full range of the fitted Hill
+        curve over the entire displayed x range, including any x values added by
+        ``expand_x_to_params`` (default: False).  Normally the Hill curve's y
+        values are only used for y-axis scaling within the data x range; this
+        flag removes that restriction so the y-axis accommodates the Hill
+        curve's y values at K/EC50 positions and at the asymptotes.
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
@@ -5891,6 +6026,8 @@ def plot_xy_data(
                     fdr_df=fdr_df, fdr_threshold=fdr_threshold,
                     color_by=color_by,
                     ntc_x_offset=ntc_x_offset, ntc_y_offset=ntc_y_offset,
+                    expand_x_to_params=expand_x_to_params,
+                    expand_y_to_params=expand_y_to_params,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -6042,6 +6179,8 @@ def plot_xy_data(
             color_by=color_by,
             ntc_x_offset=_sf_ntc_x_off,
             ntc_y_offset=_sf_ntc_y_off,
+            expand_x_to_params=expand_x_to_params,
+            expand_y_to_params=expand_y_to_params,
             **kwargs
         )
 
