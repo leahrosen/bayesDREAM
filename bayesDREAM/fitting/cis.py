@@ -4,6 +4,7 @@ Cis gene expression fitting for bayesDREAM.
 This module contains the cis model and fitting logic.
 """
 
+import gc
 import os
 import warnings
 import numpy as np
@@ -62,6 +63,10 @@ class CisFitter:
         o_x_sample=None,
         target_per_guide_tensor=None,
         independent_mu_sigma=False,
+        phi_x_precomputed=None,
+        rate_alpha_precomputed=None,
+        rate_beta_precomputed=None,
+        scale_2_tensor=None,
     ):
 
         ###################################
@@ -80,12 +85,15 @@ class CisFitter:
         ####################
         ## Overdispersion ##
         ####################
-        if o_x_sample is None:
-            raise ValueError(
-                "o_x_sample is required for fit_cis. "
-                "Run fit_ntc() before fit_cis() to estimate cis gene overdispersion from NTC cells."
-            )
-        phi_x_used = 1.0 / (o_x_sample ** 2)
+        if phi_x_precomputed is not None:
+            phi_x_used = phi_x_precomputed
+        else:
+            if o_x_sample is None:
+                raise ValueError(
+                    "o_x_sample is required for fit_cis. "
+                    "Run fit_ntc() before fit_cis() to estimate cis gene overdispersion from NTC cells."
+                )
+            phi_x_used = 1.0 / (o_x_sample ** 2)
 
         ###############################
         ## Mixture model for x_eff_g ##
@@ -94,9 +102,10 @@ class CisFitter:
             unique_targets = torch.unique(target_per_guide_tensor)
             mu_targets = {}
             sigma_targets = {}
+            _hc_scale = scale_2_tensor if scale_2_tensor is not None else self._t(2.0)
             for t in unique_targets:
                 mu_targets[int(t.item())] = pyro.sample(f"mu_target_{int(t.item())}", dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor))
-                sigma_targets[int(t.item())] = pyro.sample(f"sigma_target_{int(t.item())}", dist.HalfCauchy(scale=torch.tensor(2.0, device=self.model.device)))
+                sigma_targets[int(t.item())] = pyro.sample(f"sigma_target_{int(t.item())}", dist.HalfCauchy(scale=_hc_scale))
             # gather mu and sigma for each guide
             mu_target_tensor = torch.stack([mu_targets[int(t.item())] for t in unique_targets], dim=0)
             sigma_target_tensor = torch.stack([sigma_targets[int(t.item())] for t in unique_targets], dim=0)
@@ -104,12 +113,16 @@ class CisFitter:
             sigma = sigma_target_tensor[target_per_guide_tensor]
         else:
             mu = pyro.sample("mu", dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor))
-            sigma = pyro.sample("sigma", dist.HalfCauchy(scale=torch.tensor(2.0, device=self.model.device)))
+            _hc_scale = scale_2_tensor if scale_2_tensor is not None else self._t(2.0)
+            sigma = pyro.sample("sigma", dist.HalfCauchy(scale=_hc_scale))
             mu = mu.expand(G)
             sigma = sigma.expand(G)
 
         # Non-centered parameterization
-        if (sigma_eff_mean_tensor >= 0.01) and (sigma_eff_sd_tensor >= 0.01):
+        if rate_alpha_precomputed is not None:
+            sigma_eff_alpha = pyro.sample("sigma_eff_alpha", dist.Exponential(rate_alpha_precomputed))
+            sigma_eff_beta = pyro.sample("sigma_eff_beta", dist.Exponential(rate_beta_precomputed))
+        elif (sigma_eff_mean_tensor >= 0.01) and (sigma_eff_sd_tensor >= 0.01):
             rate_alpha = (sigma_eff_sd_tensor ** 2) / (sigma_eff_mean_tensor ** 2)
             rate_beta = (sigma_eff_sd_tensor ** 2) / sigma_eff_mean_tensor
             sigma_eff_alpha = pyro.sample("sigma_eff_alpha", dist.Exponential(rate_alpha))
@@ -120,7 +133,7 @@ class CisFitter:
         with pyro.plate("guides_plate", G):
             eps_x_eff_g = pyro.sample("eps_x_eff_g", dist.StudentT(df=self._t(3.0), loc=self._t(0.0), scale=self._t(1.0)))
             log2_x_eff_g = mu + sigma * eps_x_eff_g
-            x_eff_g = pyro.deterministic("x_eff_g", torch.tensor(self._t(2.0), device=self.model.device) ** log2_x_eff_g)
+            x_eff_g = pyro.deterministic("x_eff_g", 2.0 ** log2_x_eff_g)
         
             sigma_eff = pyro.sample("sigma_eff", dist.Gamma(sigma_eff_alpha, sigma_eff_beta))
                 
@@ -178,7 +191,7 @@ class CisFitter:
                 "log_x_true",
                 dist.Normal(torch.log2(x_mean), sigma_mean)
             )
-            x_true = pyro.deterministic("x_true", self._t(2.0) ** log_x_true)
+            x_true = pyro.deterministic("x_true", 2.0 ** log_x_true)
             mu_obs = alpha_x_used * x_true * sum_factor_tensor
             pyro.sample(
                 "x_obs",
@@ -493,7 +506,7 @@ class CisFitter:
                 target_per_guide_tensor = torch.tensor(target_factorized, dtype=torch.long, device=self.model.device)
                 print(f"[INFO] independent_mu_sigma (high MOI): {len(target_unique)} unique targets")
             else:
-                # Single-guide mode: use existing logic
+                # Single-guide mode: one target code per guide (raises if a guide has multiple targets)
                 self.model.meta['target_code'] = pd.factorize(self.model.meta['target'])[0]
                 target_codes_tensor = torch.tensor(self.model.meta['target_code'].values, dtype=torch.long, device=self.model.device)
 
@@ -502,7 +515,7 @@ class CisFitter:
                     idx = (guides_tensor == g)
                     guide_targets = torch.unique(target_codes_tensor[idx])
                     if guide_targets.shape[0] != 1:
-                        raise ValueError(f"Guide {g} maps to multiple targets: {guide_targets}")
+                        raise ValueError(f"Guide {g} maps to multiple targets: {guide_targets}. independent_mu_sigma=True requires unambiguous target assignment per guide.")
                     target_per_guide_tensor[g] = guide_targets[0]
         else:
             target_per_guide_tensor = None
@@ -541,50 +554,54 @@ class CisFitter:
         alpha_dirichlet_tensor = torch.tensor(alpha_dirichlet, dtype=torch.float32, device=self.model.device)
         epsilon_tensor = torch.tensor(epsilon, dtype=torch.float32, device=self.model.device)
 
-        # Compute guide-level means and MADs (different logic for high MOI vs single-guide)
+        # Compute guide-level means and MADs.
+        # Uses numpy on CPU for per-guide median computation (faster than G GPU boolean masks).
+        x_np = x_obs_factored.detach().cpu().numpy().astype(np.float32)
+
         if self.model.is_high_moi:
-            # High MOI: for each guide, find cells that have it and compute mean
-            guide_means = []
-            guide_mads = []
+            # High MOI: vectorized means via matrix-vector multiply, MADs via sorted numpy slices
+            assign_np = self.model.guide_assignment  # [N, G] numpy array
+            cell_counts_np = assign_np.sum(axis=0).clip(min=1)  # [G]
+            guide_sums_np = x_np @ assign_np  # [G]
+            guide_means_np = np.log2(np.clip(guide_sums_np / cell_counts_np, epsilon, None))
+
+            log2_x_np = np.log2(np.clip(x_np, epsilon, None))
+            guide_mads_np = np.zeros(G, dtype=np.float32)
             for g in range(G):
-                cells_with_guide = self.model.guide_assignment[:, g] == 1
-                if cells_with_guide.sum() > 0:
-                    # Compute mean for this guide
-                    guide_mean = torch.log2(torch.mean(x_obs_factored[cells_with_guide]))
-                    guide_means.append(guide_mean)
+                cell_mask = assign_np[:, g].astype(bool)
+                if cell_mask.sum() > 0:
+                    vals = log2_x_np[cell_mask]
+                    med = np.median(vals)
+                    guide_mads_np[g] = float(np.median(np.abs(vals - med)))
 
-                    # Compute MAD for this guide
-                    x_obs_guide = x_obs_factored[cells_with_guide]
-                    guide_mad = torch.median(
-                        torch.abs(
-                            torch.log2(x_obs_guide + epsilon) -
-                            torch.median(torch.log2(x_obs_guide + epsilon))
-                        )
-                    )
-                    guide_mads.append(guide_mad)
-
-            guide_means = torch.tensor(guide_means, dtype=torch.float32, device=self.model.device)
-            guide_mads_tensor = torch.tensor(guide_mads, dtype=torch.float32, device=self.model.device)
+            guide_means = torch.from_numpy(guide_means_np).to(self.model.device)
+            guide_mads_tensor = torch.from_numpy(guide_mads_np).to(self.model.device)
         else:
-            # Single-guide mode: existing logic
-            unique_guides = torch.unique(guides_tensor)
-            guide_means = torch.tensor([
-                torch.log2(torch.mean(x_obs_factored[guides_tensor == g]))
-                for g in unique_guides
-                if torch.sum(x_obs_factored[guides_tensor == g]) > 0
-            ], dtype=torch.float32, device=self.model.device)
+            # Single-guide mode: vectorized means via bincount, MADs via sorted numpy slices
+            guides_np = guides_tensor.cpu().numpy()
+            n_per_guide_np = np.bincount(guides_np, minlength=G).clip(min=1).astype(np.float32)
+            sum_per_guide_np = np.bincount(guides_np, weights=x_np, minlength=G).astype(np.float32)
+            guide_means_np = np.log2(np.clip(sum_per_guide_np / n_per_guide_np, epsilon, None))
 
-            # Compute guide-level MAD (robust estimate of log2 spread)
-            guide_mads_tensor = torch.tensor([
-                torch.median(torch.abs(torch.log2((x_obs_factored)[guides_tensor == g] + epsilon) -
-                                       torch.median(torch.log2((x_obs_factored)[guides_tensor == g] + epsilon))))
-                for g in unique_guides
-            ], dtype=torch.float32, device=self.model.device)
+            log2_x_np = np.log2(np.clip(x_np, epsilon, None))
+            sort_idx = np.argsort(guides_np, kind='stable')
+            guides_sorted = guides_np[sort_idx]
+            log2_x_sorted = log2_x_np[sort_idx]
+            boundaries = np.searchsorted(guides_sorted, np.arange(G + 1))
 
-        print(f"[DEBUG] guide_means min={guide_means.min()} median={guide_means.median()} mean={guide_means.mean()} max=={guide_means.max()}")
-        mu_x_mean_tensor = torch.mean(guide_means)#.to(self.model.device)
-        print(f"[DEBUG] mu_x_mean_tensor: {mu_x_mean_tensor}")
-        mu_x_sd_tensor = torch.std(guide_means)#.to(self.model.device)
+            guide_mads_np = np.zeros(G, dtype=np.float32)
+            for g in range(G):
+                s, e = boundaries[g], boundaries[g + 1]
+                if e > s:
+                    vals = log2_x_sorted[s:e]
+                    med = np.median(vals)
+                    guide_mads_np[g] = float(np.median(np.abs(vals - med)))
+
+            guide_means = torch.from_numpy(guide_means_np).to(self.model.device)
+            guide_mads_tensor = torch.from_numpy(guide_mads_np).to(self.model.device)
+
+        mu_x_mean_tensor = torch.mean(guide_means)
+        mu_x_sd_tensor = torch.std(guide_means)
 
         guide_mads_tensor = guide_mads_tensor * 1.4826  # Gaussian-equivalent spread
         sigma_eff_mean_tensor = torch.mean(guide_mads_tensor)#.to(self.model.device)
@@ -636,6 +653,18 @@ class CisFitter:
             self.model._ntc_guide_mask = torch.tensor(ntc_flags, dtype=torch.bool,
                                                        device=self.model.device)
 
+        # Precompute model invariants once to avoid repeated computation in every SVI step
+        phi_x_precomputed = torch.tensor(1.0 / (o_x_ntc ** 2), dtype=torch.float32, device=self.model.device)
+        scale_2_tensor = self._t(2.0)
+        _seff_mean = sigma_eff_mean_tensor.clamp(min=1e-2)
+        _seff_sd = sigma_eff_sd_tensor.clamp(min=1e-2)
+        if (_seff_mean >= 0.01) and (_seff_sd >= 0.01):
+            rate_alpha_precomputed = (_seff_sd ** 2) / (_seff_mean ** 2)
+            rate_beta_precomputed = (_seff_sd ** 2) / _seff_mean
+        else:
+            rate_alpha_precomputed = None
+            rate_beta_precomputed = None
+
         guide_x = pyro.infer.autoguide.AutoNormalMessenger(self._model_x, init_loc_fn=init_loc_fn)
         guide_x.to(self.model.device)
         optimizer = pyro.optim.Adam({"lr": lr})
@@ -658,8 +687,8 @@ class CisFitter:
                 alpha_alpha_mu_tensor,
                 mu_x_mean_tensor,
                 mu_x_sd_tensor,
-                sigma_eff_mean_tensor.clamp(min=1e-2),
-                sigma_eff_sd_tensor.clamp(min=1e-2),
+                _seff_mean,
+                _seff_sd,
                 epsilon_tensor,
                 C=C,
                 groups_tensor=groups_tensor,
@@ -667,6 +696,10 @@ class CisFitter:
                 o_x_sample=o_x_sample,
                 target_per_guide_tensor=target_per_guide_tensor,
                 independent_mu_sigma=independent_mu_sigma,
+                phi_x_precomputed=phi_x_precomputed,
+                rate_alpha_precomputed=rate_alpha_precomputed,
+                rate_beta_precomputed=rate_beta_precomputed,
+                scale_2_tensor=scale_2_tensor,
             )
             losses.append(loss)
             if step % 1000 == 0:
@@ -702,8 +735,8 @@ class CisFitter:
                 "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
                 "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
                 "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
-                "sigma_eff_mean_tensor": self._to_cpu(sigma_eff_mean_tensor.clamp(min=1e-2)),
-                "sigma_eff_sd_tensor": self._to_cpu(sigma_eff_sd_tensor.clamp(min=1e-2)),
+                "sigma_eff_mean_tensor": self._to_cpu(_seff_mean),
+                "sigma_eff_sd_tensor": self._to_cpu(_seff_sd),
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "C": C,
                 "groups_tensor": self._to_cpu(groups_tensor),
@@ -711,6 +744,10 @@ class CisFitter:
                 "o_x_sample": self._to_cpu(o_x_sample),
                 "target_per_guide_tensor": self._to_cpu(target_per_guide_tensor),
                 "independent_mu_sigma": independent_mu_sigma,
+                "phi_x_precomputed": self._to_cpu(phi_x_precomputed),
+                "rate_alpha_precomputed": self._to_cpu(rate_alpha_precomputed),
+                "rate_beta_precomputed": self._to_cpu(rate_beta_precomputed),
+                "scale_2_tensor": self._to_cpu(scale_2_tensor),
             }
         else:
             model_inputs = {
@@ -723,20 +760,23 @@ class CisFitter:
                 "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
                 "mu_x_mean_tensor": mu_x_mean_tensor,
                 "mu_x_sd_tensor": mu_x_sd_tensor,
-                "sigma_eff_mean_tensor": sigma_eff_mean_tensor.clamp(min=1e-2),
-                "sigma_eff_sd_tensor": sigma_eff_sd_tensor.clamp(min=1e-2),
+                "sigma_eff_mean_tensor": _seff_mean,
+                "sigma_eff_sd_tensor": _seff_sd,
                 "epsilon_tensor": epsilon_tensor,
                 "C": C,
                 "groups_tensor": groups_tensor,
                 "alpha_x_sample": self.model.alpha_x_prefit,
                 "o_x_sample": o_x_sample,
-                "target_per_guide_tensor": target_per_guide_tensor if target_per_guide_tensor is not None else None,
+                "target_per_guide_tensor": target_per_guide_tensor,
                 "independent_mu_sigma": independent_mu_sigma,
+                "phi_x_precomputed": phi_x_precomputed,
+                "rate_alpha_precomputed": rate_alpha_precomputed,
+                "rate_beta_precomputed": rate_beta_precomputed,
+                "scale_2_tensor": scale_2_tensor,
             }
 
         if self.model.device.type == "cuda":
             torch.cuda.empty_cache()
-        import gc
         gc.collect()
 
         max_samples = nsamples
@@ -760,21 +800,18 @@ class CisFitter:
                             all_samples[k].append(self._to_cpu(v))
                     if self.model.device.type == "cuda":
                         torch.cuda.empty_cache()
-                    import gc
                     gc.collect()
             posterior_samples_x = {k: torch.cat(v, dim=0) for k, v in all_samples.items()}
         else:
             predictive_x = pyro.infer.Predictive(
                 self._model_x,
                 guide=guide_x,
-                num_samples=nsamples#,
-                #parallel=True
+                num_samples=nsamples
             )
             with torch.no_grad():
                 posterior_samples_x = predictive_x(**model_inputs)
                 if self.model.device.type == "cuda":
                     torch.cuda.empty_cache()
-                import gc
                 gc.collect()
 
         if run_on_cpu:
@@ -800,7 +837,6 @@ class CisFitter:
 
         if self.model.device.type == "cuda":
             torch.cuda.empty_cache()
-        import gc
         gc.collect()
         pyro.clear_param_store()
 
