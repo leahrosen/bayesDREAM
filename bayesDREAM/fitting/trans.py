@@ -929,7 +929,8 @@ class TransFitter:
 
                     K_dim = K
                     K_minus_1 = K - 1
-                    x_expanded = x_true.unsqueeze(-1)  # [N, 1]
+                    # x_3d: [N, 1, 1] broadcasts over [1, T, K-1] parameter tensors
+                    x_3d = x_true.unsqueeze(1).unsqueeze(2)  # [N, 1, 1]
 
                     # A is [T, K] from Dirichlet
                     # Extract K-1 for fitting Hills (Kth doesn't get a Hill function)
@@ -939,55 +940,41 @@ class TransFitter:
                     A_kminus1_expanded = A_kminus1.unsqueeze(0)  # [1, T, K-1]
 
                     if function_type == 'single_hill':
-                        # Compute Hills for K-1 categories using log_K_a (numerically stable)
-                        Hilla_list = []
-                        for k in range(K_minus_1):
-                            hill_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                              logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
-                            Hilla_list.append(hill_k.unsqueeze(-1))  # [N, T, 1]
-                        Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
-
-                        # Combine: y = A + alpha_k * Hill_a_k(Vmax=Vmax_a_k)
-                        # alpha is [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        # Vectorized over K-1: Vmax_a/log_K_a/n_a all [T, K-1]
+                        Hilla_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_a.unsqueeze(0), A=0,
+                            logK=log_K_a.unsqueeze(0), n=n_a.unsqueeze(0)
+                        )  # [N, T, K-1]
                         combined_hill = alpha.unsqueeze(0) * Hilla_kminus1  # [N, T, K-1]
-                        y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
+                        y_kminus1 = A_kminus1_expanded + combined_hill      # [N, T, K-1]
 
                     elif function_type == 'additive_hill':
-                        # Compute Hills for K-1 categories using log_K_a/log_K_b (numerically stable)
-                        Hilla_list = []
-                        Hillb_list = []
-                        for k in range(K_minus_1):
-                            hill_a_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                                logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
-                            hill_b_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_b[:, k], A=0,
-                                                                logK=log_K_b[:, k], n=n_b[:, k])  # [N, T]
-                            Hilla_list.append(hill_a_k.unsqueeze(-1))  # [N, T, 1]
-                            Hillb_list.append(hill_b_k.unsqueeze(-1))  # [N, T, 1]
-                        Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
-                        Hillb_kminus1 = torch.cat(Hillb_list, dim=-1)  # [N, T, K-1]
-
-                        # Combine: y = A + (alpha_k * Hill_a_k) + (beta_k * Hill_b_k)
-                        # alpha, beta are [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        # Vectorized over K-1 for both Hill_a and Hill_b
+                        Hilla_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_a.unsqueeze(0), A=0,
+                            logK=log_K_a.unsqueeze(0), n=n_a.unsqueeze(0)
+                        )  # [N, T, K-1]
+                        Hillb_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_b.unsqueeze(0), A=0,
+                            logK=log_K_b.unsqueeze(0), n=n_b.unsqueeze(0)
+                        )  # [N, T, K-1]
                         combined_hill = (alpha.unsqueeze(0) * Hilla_kminus1 +
-                                       beta.unsqueeze(0) * Hillb_kminus1)  # [N, T, K-1]
-                        y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
+                                         beta.unsqueeze(0) * Hillb_kminus1)  # [N, T, K-1]
+                        y_kminus1 = A_kminus1_expanded + combined_hill         # [N, T, K-1]
 
                     elif function_type == 'nested_hill':
-                        # Compute nested Hills for K-1 categories
-                        # First Hill uses log_K_a (stable); second Hill feeds Hilla output as x
-                        Hillb_list = []
-                        for k in range(K_minus_1):
-                            hill_a_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                                logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
-                            hill_b_k = Hill_based_positive(hill_a_k.unsqueeze(-1), Vmax=Vmax_b[:, k], A=0,
-                                                          K=K_b[:, k], n=n_b[:, k],
-                                                          epsilon=epsilon_tensor)  # [N, T]
-                            Hillb_list.append(hill_b_k.unsqueeze(-1))  # [N, T, 1]
-                        Hillb_kminus1 = torch.cat(Hillb_list, dim=-1)  # [N, T, K-1]
-
-                        # alpha is [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        # First Hill vectorized over K-1; its output feeds the second Hill
+                        Hilla_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_a.unsqueeze(0), A=0,
+                            logK=log_K_a.unsqueeze(0), n=n_a.unsqueeze(0)
+                        )  # [N, T, K-1]
+                        Hillb_kminus1 = Hill_based_positive(
+                            Hilla_kminus1, Vmax=Vmax_b.unsqueeze(0), A=0,
+                            K=K_b.unsqueeze(0), n=n_b.unsqueeze(0),
+                            epsilon=epsilon_tensor
+                        )  # [N, T, K-1]
                         combined_hill = alpha.unsqueeze(0) * Hillb_kminus1  # [N, T, K-1]
-                        y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
+                        y_kminus1 = A_kminus1_expanded + combined_hill      # [N, T, K-1]
 
                     # Clamp K-1 probabilities to [epsilon, 1-epsilon] to ensure valid residual
                     y_kminus1 = torch.clamp(y_kminus1, min=epsilon_tensor, max=1.0 - epsilon_tensor)
@@ -1365,6 +1352,7 @@ class TransFitter:
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
+        debug: bool = False,
         **kwargs
     ):
         """
@@ -1478,6 +1466,11 @@ class TransFitter:
             mismatches produce a warning.
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
+        debug : bool, optional
+            If True, run the slow debug SVI step that checks all parameters for
+            non-finite values at every iteration and prints detailed diagnostics
+            when NaN/Inf are detected. Default False (uses fast svi.step path).
+            Enable when chasing NaN gradients or divergent parameters.
         **kwargs
             Additional parameters for specific distributions
 
@@ -1916,16 +1909,13 @@ class TransFitter:
             # alpha_y_expanded is now [N, T] (or [N, T, K] for multinomial), matching y_obs_for_prior
             # NO TRANSPOSE NEEDED - both are [N, T]
 
-            # Diagnostic: Check alpha_y_expanded for issues
+            # Check alpha_y_expanded for issues
             if not torch.isfinite(alpha_y_expanded).all():
                 n_invalid_alpha = (~torch.isfinite(alpha_y_expanded)).sum().item()
                 print(f"[WARNING] alpha_y_expanded contains {n_invalid_alpha} non-finite values before correction")
-            else:
-                # Check if values look like multiplicative (around 1.0) vs additive (logit scale)
+            elif distribution == 'binomial':
                 alpha_mean = alpha_y_expanded.mean().item()
-                alpha_std = alpha_y_expanded.std().item()
-                print(f"[DEBUG] alpha_y_expanded stats: mean={alpha_mean:.4f}, std={alpha_std:.4f}")
-                if distribution == 'binomial' and abs(alpha_mean - 1.0) < 0.5:
+                if abs(alpha_mean - 1.0) < 0.5:
                     print(f"[WARNING] alpha_y_expanded looks like multiplicative correction (mean~1.0). "
                           f"For binomial, expected additive correction on logit scale (mean~0, range~[-5,5]). "
                           f"You may be using technical fit results from old (buggy) code. "
@@ -1954,15 +1944,8 @@ class TransFitter:
                 p_obs_clamped = torch.clamp(y_obs_for_prior, min=epsilon_tensor, max=1.0 - epsilon_tensor)
                 logit_obs = torch.log(p_obs_clamped) - torch.log(1.0 - p_obs_clamped)
 
-                # Diagnostic: Check logit_obs range
-                print(f"[DEBUG] logit_obs range: [{logit_obs.min().item():.2f}, {logit_obs.max().item():.2f}]")
-                print(f"[DEBUG] alpha_y_expanded range: [{alpha_y_expanded.min().item():.4f}, {alpha_y_expanded.max().item():.4f}]")
-
                 # Apply inverse correction on logit scale
                 logit_baseline = logit_obs - alpha_y_expanded
-
-                # Diagnostic: Check logit_baseline range and finite values
-                print(f"[DEBUG] logit_baseline range: [{logit_baseline.min().item():.2f}, {logit_baseline.max().item():.2f}]")
                 if not torch.isfinite(logit_baseline).all():
                     n_invalid = (~torch.isfinite(logit_baseline)).sum().item()
                     print(f"[WARNING] logit_baseline contains {n_invalid} non-finite values after correction")
@@ -1970,25 +1953,6 @@ class TransFitter:
                 # Convert back to probability scale
                 y_obs_for_prior = torch.sigmoid(logit_baseline)
                 print(f"[INFO] binomial: Applied inverse logit correction (subtract alpha_y_add on logit scale)")
-
-                # DIAGNOSTIC: Check correction for specific feature
-                sj_check_idx = 1298  # User's specific SJ position
-                if sj_check_idx < T:
-                    # Get uncorrected values (observed PSI)
-                    y_uncorrected = y_obs_factored[:, sj_check_idx]
-
-                    # Get corrected values (baseline PSI)
-                    y_corrected = y_obs_for_prior[:, sj_check_idx]
-
-                    # Check by group
-                    print(f"[DEBUG] Checking inverse correction for feature {sj_check_idx} (chr6:34236964:34237203):")
-                    for grp in range(C):
-                        grp_mask = groups_tensor == grp
-                        if grp_mask.sum() > 0:
-                            uncorr_mean = y_uncorrected[grp_mask].mean().item()
-                            corr_mean = y_corrected[grp_mask].mean().item()
-                            alpha_val = alpha_y_prefit[grp, sj_check_idx].item() if alpha_y_prefit.ndim == 2 else alpha_y_prefit[0, grp, sj_check_idx].mean().item()
-                            print(f"  Group {grp} (n={grp_mask.sum()}): α={alpha_val:.4f}, Observed PSI={uncorr_mean:.4f}, Baseline PSI={corr_mean:.4f}")
 
             elif distribution == 'multinomial':
                 # Technical effect: log scale (log(probs_corrected) = log(probs) + alpha_y_add)
@@ -2051,62 +2015,6 @@ class TransFitter:
 
         unique_guides = torch.unique(guides_tensor)
 
-        # nanmean and nanvar helpers (in case torch.nanmean/nanvar isn't available)
-        if hasattr(torch, "nanmean"):
-            def nanmean(x, dim):
-                return torch.nanmean(x, dim=dim)
-        else:
-            def nanmean(x, dim):
-                mask = ~torch.isnan(x)
-                num = torch.where(mask, x, torch.zeros_like(x)).sum(dim=dim)
-                den = mask.sum(dim=dim).clamp_min(1)
-                return num / den
-
-        if hasattr(torch, "nanvar"):
-            def nanvar(x, dim):
-                return torch.var(x, dim=dim)  # Note: torch.var ignores NaN in older versions
-        else:
-            def nanvar(x, dim):
-                mask = ~torch.isnan(x)
-                n = mask.sum(dim=dim).clamp_min(2)  # Need at least 2 values for variance
-                x_mean = nanmean(x, dim=dim)
-                # Expand mean to match x shape for broadcasting
-                if dim == 0:
-                    x_mean_expanded = x_mean.unsqueeze(0)
-                else:
-                    x_mean_expanded = x_mean
-                sq_diff = torch.where(mask, (x - x_mean_expanded) ** 2, torch.zeros_like(x))
-                return sq_diff.sum(dim=dim) / (n - 1)  # Unbiased variance
-
-        # nanquantile helper
-        def nanquantile(x, q, dim):
-            """Compute quantile ignoring NaN values."""
-            if x.ndim == 2:  # [G, T]
-                result = []
-                for t in range(x.shape[1]):
-                    vals = x[:, t]
-                    valid = vals[~torch.isnan(vals)]
-                    if valid.numel() > 0:
-                        result.append(torch.quantile(valid, q))
-                    else:
-                        result.append(torch.tensor(float('nan'), device=x.device))
-                return torch.stack(result)  # [T]
-            elif x.ndim == 3:  # [G, T, K]
-                result = []
-                for t in range(x.shape[1]):
-                    result_k = []
-                    for k in range(x.shape[2]):
-                        vals = x[:, t, k]
-                        valid = vals[~torch.isnan(vals)]
-                        if valid.numel() > 0:
-                            result_k.append(torch.quantile(valid, q))
-                        else:
-                            result_k.append(torch.tensor(float('nan'), device=x.device))
-                    result.append(torch.stack(result_k))
-                return torch.stack(result)  # [T, K]
-            else:
-                raise ValueError(f"Unsupported ndim for nanquantile: {x.ndim}")
-
         # Pre-extract q01 of NTC posterior means for the Q05=0 floor below.
         # Only needed for negbinom/binomial; full NTC anchor extraction happens later.
         _q01_ntc_for_floor = None
@@ -2132,22 +2040,16 @@ class TransFitter:
         _q05_was_zero = None
         mean_y_corrected_tensor = None  # [T]; set below for 2D distributions (negbinom, binomial)
         if y_obs_for_prior.ndim == 2:  # [N, T]
-            Amean_list, Vmax_list, cell_var_list = [], [], []
-            for t in range(T):
-                vals_t = y_obs_for_prior[:, t]
-                valid_t = vals_t[~torch.isnan(vals_t)]
-                if valid_t.numel() > 0:
-                    Amean_list.append(torch.quantile(valid_t, 0.05))
-                    Vmax_list.append(torch.quantile(valid_t, 0.95))
-                    cell_var_list.append(torch.var(valid_t))
-                else:
-                    Amean_list.append(torch.tensor(float('nan'), device=self.model.device))
-                    Vmax_list.append(torch.tensor(float('nan'), device=self.model.device))
-                    cell_var_list.append(torch.tensor(float('nan'), device=self.model.device))
-
-            Amean_tensor = torch.stack(Amean_list)    # [T]; cell Q05
-            Vmax_raw     = torch.stack(Vmax_list)     # [T]; cell Q95
-            cell_var     = torch.stack(cell_var_list) # [T]
+            Amean_tensor = torch.nanquantile(y_obs_for_prior, 0.05, dim=0)  # [T]
+            Vmax_raw     = torch.nanquantile(y_obs_for_prior, 0.95, dim=0)  # [T]
+            _y_mean  = torch.nanmean(y_obs_for_prior, dim=0)                # [T]
+            _y_dev   = y_obs_for_prior - _y_mean.unsqueeze(0)               # [N, T]
+            _n_valid = (~torch.isnan(y_obs_for_prior)).sum(dim=0).clamp_min(2)  # [T]
+            cell_var = torch.where(
+                _n_valid >= 2,
+                torch.nansum(_y_dev ** 2, dim=0) / (_n_valid - 1).float(),
+                torch.full((T,), float('nan'), device=self.model.device)
+            )  # [T]
 
             # Q05=0 floor: for count/proportion distributions (negbinom, binomial), Q05=0
             # means the gene is sparse and needs a small positive lower bound because the
@@ -2180,25 +2082,21 @@ class TransFitter:
             mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0).clamp_min(self._t(1e-12))  # [T]
 
         elif y_obs_for_prior.ndim == 3:  # [N, T, K] — multinomial
-            Amean_list, Vmax_list, cell_var_list = [], [], []
-            for t in range(T):
-                Amean_k, Vmax_k, var_k = [], [], []
-                for k in range(y_obs_for_prior.shape[2]):
-                    vals_tk = y_obs_for_prior[:, t, k]
-                    valid_tk = vals_tk[~torch.isnan(vals_tk)]
-                    if valid_tk.numel() > 0:
-                        Amean_k.append(torch.quantile(valid_tk, 0.05))
-                        Vmax_k.append(torch.quantile(valid_tk, 0.95))
-                        var_k.append(torch.var(valid_tk))
-                    else:
-                        Amean_k.append(torch.tensor(float('nan'), device=self.model.device))
-                        Vmax_k.append(torch.tensor(float('nan'), device=self.model.device))
-                        var_k.append(torch.tensor(float('nan'), device=self.model.device))
-                Amean_list.append(torch.stack(Amean_k))
-                Vmax_list.append(torch.stack(Vmax_k))
-                cell_var_list.append(torch.stack(var_k))
-
-            Amean_tensor = torch.stack(Amean_list)  # [T, K]
+            K_obs = y_obs_for_prior.shape[2]
+            _y3   = y_obs_for_prior.reshape(N, T * K_obs)             # [N, T*K]
+            _Amean_flat = torch.nanquantile(_y3, 0.05, dim=0)         # [T*K]
+            _Vmax_flat  = torch.nanquantile(_y3, 0.95, dim=0)         # [T*K]
+            _y3_mean    = torch.nanmean(_y3, dim=0)                   # [T*K]
+            _y3_dev     = _y3 - _y3_mean.unsqueeze(0)                 # [N, T*K]
+            _n3_valid   = (~torch.isnan(_y3)).sum(dim=0).clamp_min(2) # [T*K]
+            _var3_flat  = torch.where(
+                _n3_valid >= 2,
+                torch.nansum(_y3_dev ** 2, dim=0) / (_n3_valid - 1).float(),
+                torch.full((T * K_obs,), float('nan'), device=self.model.device)
+            )  # [T*K]
+            Amean_tensor = _Amean_flat.reshape(T, K_obs)  # [T, K]
+            Vmax_raw     = _Vmax_flat.reshape(T, K_obs)   # [T, K]
+            cell_var     = _var3_flat.reshape(T, K_obs)   # [T, K]
             # Q05=0 floor: use fixed small constant (proportions clamped at 1e-3 below anyway).
             _q05_was_zero = (Amean_tensor <= 0) | torch.isnan(Amean_tensor)
             if _q05_was_zero.any():
@@ -2207,18 +2105,41 @@ class TransFitter:
                 Amean_tensor = torch.where(_q05_was_zero, _amean_floor_mn.expand_as(Amean_tensor), Amean_tensor)
                 print(f"[INFO] Q05=0 floor (multinomial): {n_q05_zero} (feature, category) cells raised to 2^-10={2.0**-10:.3e}")
             Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))   # [T, K]
-            Vmax_raw         = torch.stack(Vmax_list)                    # [T, K]
-            cell_var         = torch.stack(cell_var_list)                # [T, K]
             Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
 
         # mean_within_guide_var: guide-level if guides available, else cell-level
         if 'guide_code' in self.model.meta.columns and len(unique_guides) > 1:
-            _guide_vars = []
-            for g in unique_guides:
-                vals_g = y_obs_for_prior[guides_tensor == g, ...]
-                _guide_vars.append(nanvar(vals_g, dim=0))
-            mean_within_guide_var = nanmean(torch.stack(_guide_vars, dim=0), dim=0)
-            print(f"[INFO] Cell-level Q05/Q95 priors ({T} features, {len(unique_guides)} guides for within-guide variance)")
+            G = len(unique_guides)
+            # Contiguous guide index 0..G-1 via scatter remap
+            g_max = int(unique_guides.max().item())
+            g_remap = torch.full((g_max + 1,), 0, dtype=torch.long, device=self.model.device)
+            g_remap[unique_guides] = torch.arange(G, device=self.model.device)
+            g_idx = g_remap[guides_tensor]  # [N]
+
+            # Flatten trailing dims for vectorized scatter: [N, T] → [N, F] or [N, T*K] → [N, F]
+            _trailing = y_obs_for_prior.shape[1:]
+            F = int(torch.tensor(list(_trailing)).prod().item())
+            _y_flat = torch.nan_to_num(y_obs_for_prior, nan=0.0).reshape(N, F)  # [N, F]
+            _v_flat = (~torch.isnan(y_obs_for_prior)).reshape(N, F).float()      # [N, F]
+            g_idx_F = g_idx.unsqueeze(1).expand(-1, F)                           # [N, F]
+
+            g_cnt = _y_flat.new_zeros(G, F).scatter_add_(0, g_idx_F, _v_flat)
+            g_sum = _y_flat.new_zeros(G, F).scatter_add_(0, g_idx_F, _y_flat)
+            g_mean = g_sum / g_cnt.clamp_min(1.0)  # [G, F]
+
+            # Squared deviations from guide mean; NaN cells contribute 0
+            _dev_sq = torch.nan_to_num(
+                (y_obs_for_prior.reshape(N, F) - g_mean[g_idx]) ** 2, nan=0.0
+            )  # [N, F]
+            g_ss  = _y_flat.new_zeros(G, F).scatter_add_(0, g_idx_F, _dev_sq)
+            g_var = torch.where(
+                g_cnt >= 2,
+                g_ss / (g_cnt - 1).clamp_min(1.0),
+                g_ss.new_full(g_ss.shape, float('nan'))
+            )  # [G, F]
+
+            mean_within_guide_var = torch.nanmean(g_var, dim=0).reshape(_trailing)  # [T] or [T, K]
+            print(f"[INFO] Cell-level Q05/Q95 priors ({T} features, {G} guides for within-guide variance)")
         else:
             mean_within_guide_var = cell_var
             print(f"[INFO] Cell-level Q05/Q95 priors ({T} features, no guide stratification)")
@@ -2438,7 +2359,11 @@ class TransFitter:
 
         # K_max: max of x_true (or max of guide means if guides exist)
         if 'guide_code' in self.model.meta.columns and len(unique_guides) > 1:
-            guide_x_means = torch.stack([x_true_mean[guides_tensor == g].mean() for g in torch.unique(guides_tensor)])
+            # Reuse g_idx/G from _guide_vars scatter above
+            g_sum_x = torch.zeros(G, device=self.model.device).scatter_add_(0, g_idx, x_true_mean)
+            g_cnt_x = torch.zeros(G, device=self.model.device).scatter_add_(
+                0, g_idx, torch.ones(N, device=self.model.device))
+            guide_x_means = g_sum_x / g_cnt_x.clamp_min(1.0)
             K_max_tensor = guide_x_means.max()
         else:
             K_max_tensor = x_true_mean.max()
@@ -2465,13 +2390,6 @@ class TransFitter:
             k_center_tensor = torch.quantile(_x_for_kcenter, 0.95).clamp_min(epsilon_tensor)
         else:  # 'middle'
             k_center_tensor = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
-
-        print("[DEBUG] Amean:", Amean_tensor.min().item(), Amean_tensor.max().item())
-        print("[DEBUG] Vmax_mean:", Vmax_mean_tensor.min().item(), Vmax_mean_tensor.max().item())
-        print("[DEBUG] Mean within-guide variance:", mean_within_guide_var.min().item(), mean_within_guide_var.max().item())
-        print("[DEBUG] x_true CV:", x_true_CV.item(), "K_max:", K_max_tensor.item(),
-              "x_ntc_mean:", x_ntc_mean.item() if x_ntc_mean is not None else "N/A",
-              "k_center:", k_center_tensor.item(), f"(k_prior_center={k_prior_center!r})")
 
         # Diagnostic: Verify alpha_y_prefit is correctly structured
         if alpha_y_prefit is not None and groups_tensor is not None:
@@ -2706,7 +2624,7 @@ class TransFitter:
                           f"Continuing with fresh optimizer.")
                 print(f"[INFO] Resumed from step {start_step} / {total_steps}")
 
-        prev_finite = None  # initialize NaN tracker (before loop so checkpoint-resume works)
+        prev_finite = None  # only used in debug mode; kept here so checkpoint-resume works
         for step in range(start_step, total_steps):
             # ── Curriculum: choose effective function type and temperature ──
             if _do_warmup and step < warmup_steps:
@@ -2768,29 +2686,13 @@ class TransFitter:
             #use_straight_through = step >= int(0.7 * niters)
             use_straight_through = False
 
-            '''
-            loss = svi.step(
-                N,
-                T,
-                y_obs_tensor,
-                sum_factor_tensor,
-                beta_o_alpha_tensor,
-                beta_o_beta_tensor,
-                alpha_alpha_mu_tensor,
-                K_max_tensor,
-                K_alpha_tensor,
-                Vmax_mean_tensor,
-                Vmax_alpha_tensor,
-                n_mu_tensor,
-                Amean_tensor,
-                p_n_logits_tensor,
-                epsilon_tensor,
-                x_true_sample = x_true_sample,
-                log2_x_true_sample = log2_x_true_sample,
-                nmin = nmin,
-                nmax = nmax,
-                alpha_y_sample = alpha_y_sample,
-                C = C,
+            _svi_kwargs = dict(
+                x_true_sample=x_true_sample,
+                log2_x_true_sample=log2_x_true_sample,
+                nmin=nmin,
+                nmax=nmax,
+                alpha_y_sample=alpha_y_sample,
+                C=C,
                 groups_tensor=groups_tensor,
                 temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
                 use_straight_through=use_straight_through,
@@ -2806,46 +2708,33 @@ class TransFitter:
                 x_ntc_mean=x_ntc_mean,
                 use_data_driven_priors=use_data_driven_priors,
                 use_epsilon=use_epsilon,
+                vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
+                k_log_sigma_min_tensor=k_log_sigma_min_tensor,
+                k_center_tensor=k_center_tensor,
+                y_ntc_tensor=y_ntc_tensor,
+                mean_y_corrected_tensor=mean_y_corrected_tensor,
+                o_y_ntc_tensor=o_y_ntc_tensor,
+                alpha_n_coupling=current_coupling,
             )
-            '''
-
-            try:
-                loss, prev_finite = self._debug_svi_step(
-                    svi, step, prev_finite,
+            if debug:
+                try:
+                    loss, prev_finite = self._debug_svi_step(
+                        svi, step, prev_finite,
+                        N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
+                        alpha_alpha_mu_tensor, K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
+                        n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor,
+                        **_svi_kwargs,
+                    )
+                except FloatingPointError as e:
+                    print(f"[STOP] {e} at step {step}")
+                    break
+            else:
+                loss = svi.step(
                     N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
                     alpha_alpha_mu_tensor, K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
                     n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor,
-                    x_true_sample=x_true_sample,
-                    log2_x_true_sample=log2_x_true_sample,
-                    nmin=nmin,
-                    nmax=nmax,
-                    alpha_y_sample=alpha_y_sample,
-                    C=C,
-                    groups_tensor=groups_tensor,
-                    temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
-                    use_straight_through=use_straight_through,
-                    function_type=effective_function_type,
-                    polynomial_degree=polynomial_degree,
-                    use_alpha=True if effective_function_type != 'polynomial' else True if phase_fraction>=0.5 else False,
-                    distribution=distribution,
-                    denominator_tensor=denominator_tensor,
-                    K=K,
-                    D=D,
-                    mean_within_guide_var=mean_within_guide_var,
-                    x_true_CV=x_true_CV,
-                    use_data_driven_priors=use_data_driven_priors,
-                    use_epsilon=use_epsilon,
-                    vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
-                    k_log_sigma_min_tensor=k_log_sigma_min_tensor,
-                    k_center_tensor=k_center_tensor,
-                    y_ntc_tensor=y_ntc_tensor,
-                    mean_y_corrected_tensor=mean_y_corrected_tensor,
-                    o_y_ntc_tensor=o_y_ntc_tensor,
-                    alpha_n_coupling=current_coupling,
+                    **_svi_kwargs,
                 )
-            except FloatingPointError as e:
-                print(f"[STOP] {e} at step {step}")
-                break
 
 
             # NaN detection and early stopping
