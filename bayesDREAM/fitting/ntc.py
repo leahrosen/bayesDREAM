@@ -592,6 +592,25 @@ class NTCFitter:
             raise ValueError(f"Unknown distribution: {distribution}")
     
     def set_technical_groups(self, covariates: list[str]):
+        """
+        Assign a technical-group code to every cell based on covariate combinations.
+
+        Must be called before ``fit_ntc()`` so the model knows how many technical
+        groups (C) exist.  The resulting ``technical_group_code`` column is an integer
+        index (0-based) used internally; index 0 is the reference group.
+
+        Cells in technical groups that have no NTC representation are automatically
+        dropped with a warning, because overdispersion estimation for those groups
+        requires at least some NTC cells.
+
+        Parameters
+        ----------
+        covariates : list of str
+            Column names in ``meta`` whose combinations define technical groups
+            (e.g., ``['cell_line']`` or ``['cell_line', 'lane']``).  Pass an empty
+            list ``[]`` to create a single technical group for the whole dataset (no
+            batch correction).
+        """
         # Allow empty covariates list to create a single technical group
         if not covariates:
             print("[INFO] No covariates specified - creating single technical group (C=1)")
@@ -647,30 +666,77 @@ class NTCFitter:
         **kwargs
     ):
         """
-        Prefit cell-line technical effects for a given modality.
-        Stores both multiplicative ('alpha_y_mult') and additive/logit ('alpha_y_add') effects.
+        Estimate technical batch effects and per-gene overdispersion from NTC cells.
+
+        Fits a Bayesian negative-binomial model to NTC (non-targeting control) cells,
+        estimating multiplicative cell-line/batch scale factors (``alpha_y_mult``) and
+        additive logit-scale corrections (``alpha_y_add``) per technical group.
+        Results are stored on the primary modality as point estimates and are used by
+        ``fit_trans()`` to correct for batch effects.
+
+        Call ``set_technical_groups()`` before this method.
 
         Parameters
         ----------
+        sum_factor_col : str, default 'sum_factor'
+            Column in ``meta`` (or the primary modality's ``sum_factors`` DataFrame)
+            containing size factors for normalisation.
+        lr : float, default 1e-3
+            Adam optimiser learning rate for SVI.
+        niters : int, optional
+            Number of SVI iterations.  Default: 50,000 for most distributions;
+            100,000 for multinomial (which has a larger parameter space).
+        nsamples : int, default 1000
+            Number of posterior samples drawn after SVI for point-estimate summaries.
+        alpha_ewma : float, default 0.05
+            Smoothing weight for the exponential moving average of the ELBO loss used
+            in convergence checking.  Smaller values give a smoother (but slower-
+            reacting) estimate.
+        tolerance : float, default 1e-4
+            Convergence threshold on the smoothed ELBO.  Training stops early when the
+            relative change in the moving average falls below this value.
+        beta_o_beta : float, default 3
+            Beta parameter of the Gamma prior on the overdispersion ``o_y``.
+            Matches the cell2location prior; change with care.
+        beta_o_alpha : float, default 9
+            Alpha parameter of the Gamma prior on ``o_y``.
+            Matches the cell2location prior; change with care.
+        epsilon : float, default 1e-6
+            Small constant added for numerical stability.
+        minibatch_size : int, optional
+            Number of features to use per Predictive minibatch when sampling posteriors.
+            If ``None`` (default), auto-computed from available RAM via ``psutil``.
+        distribution : str, optional
+            Likelihood distribution.  If ``None`` (default), auto-detected from the
+            modality (e.g., ``'negbinom'``, ``'multinomial'``, ``'binomial'``).
+        denominator : np.ndarray, optional
+            Denominator array for binomial distributions.  If ``None``, auto-detected
+            from the modality.
+        modality_name : str, optional
+            Modality to fit.  If ``None`` (default), uses the primary modality.
         use_all_cells : bool, default False
-            If False (default): Fit using NTC cells only (standard approach).
-            If True: Fit using all cells in the dataset.
+            If ``False`` (default): fit using NTC cells only (standard approach).
+            If ``True``: fit using all cells, regardless of target.
 
-            **When to use use_all_cells=True:**
-            - High MOI experiments where technical effects are batch/lane specific
-            - Technical variation is independent of perturbation effects
-            - Saves compute: fit_technical only needs to run once per dataset (not per cis gene)
+            **When to use** ``use_all_cells=True``:
 
-            **When NOT to use use_all_cells=True (use default NTC-only):**
-            - Technical groups correlate with cis gene expression
-              Example: cell lines that differ in perturbation type
-            - Low MOI experiments with clear NTC vs perturbed distinction
-            - When technical correction should be based solely on unperturbed cells
+            - High-MOI experiments where batch effects are independent of perturbation.
+            - When a single technical fit covers all cis genes (saves compute).
+
+            **When NOT to use** ``use_all_cells=True``:
+
+            - Technical groups correlate with cis expression (e.g., different cell
+              lines have different perturbation efficiencies).
+            - Low-MOI experiments with a clear NTC vs. perturbed cell distinction.
+        force_iaf : bool, default False
+            If ``True``, force use of an IAF (Inverse Autoregressive Flow) guide for
+            multinomial models regardless of the number of categories.  By default,
+            IAF is only used when the number of categories exceeds a threshold.
 
         Warnings
         --------
-        Using use_all_cells=True when technical effects correlate with cis expression
-        may lead to over-correction and spurious trans effects.
+        Using ``use_all_cells=True`` when technical effects correlate with cis
+        expression can lead to over-correction and spurious trans-effect calls.
         """
 
         # ---------------------------

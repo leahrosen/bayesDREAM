@@ -235,8 +235,10 @@ class CisFitter:
         sum_factor_col : str
             Column name for size factors
         modality_name : str, optional
-            DEPRECATED: fit_cis always uses the primary modality.
-            This parameter is ignored.
+            .. deprecated::
+                ``fit_cis`` always operates on the ``'cis'`` modality, which is created
+                automatically during ``bayesDREAM.__init__``.  This parameter is ignored
+                and will be removed in a future release.
         cis_feature : str, optional
             Feature ID to use as cis proxy from the primary modality.
             If None, uses self.model.cis_gene (must exist in primary modality).

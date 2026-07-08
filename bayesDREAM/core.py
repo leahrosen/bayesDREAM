@@ -6,24 +6,15 @@ specialized fitters for technical, cis, and trans modeling.
 """
 
 import os
-import subprocess
 import warnings
-from typing import Dict, Optional, List, Union
+from typing import Union
 import numpy as np
 import pandas as pd
 import torch
 import pyro
-import pyro.distributions as dist
-import pyro.poutine as poutine
-from pyro.distributions.transforms import iterated, affine_autoregressive
-import pyro.optim as optim
-import pyro.infer as infer
-import h5py
-import matplotlib.pyplot as plt
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import SplineTransformer
 from sklearn.linear_model import Ridge
-import gc
 from scipy import sparse
 
 # Import utility functions and modules
@@ -614,79 +605,29 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         self.counts = None
         self.is_sparse_counts = None  # no longer meaningful without the matrix
 
-        pass  # init summary printed by bayesDREAM.__init__ after modality setup
-
-    def cis_init_loc_fn(
-        self,
-        mu_init: torch.Tensor,
-        sigma_init: torch.Tensor,
-        beta_o_init: float,
-        o_x_init: float,
-        sigma_eff_init: float,
-        sigma_eff_alpha_init: float,
-        sigma_eff_beta_init: float,
-        alpha_x_init: torch.Tensor = None,
-    ):
-        """
-        Returns a function that uses custom data-driven initial values for certain sites:
-            - 'mu' initialized to `mu_init`
-            - 'sigma' initialized to `sigma_init`
-            - 'alpha_x' (if present) initialized to `alpha_x_init`
-            - 'beta_o' initialized to `beta_o_init`
-            - 'o_x' initialized to `o_x_init`
-            - 'sigma_eff' (the gamma shape or scale for per-guide sigmas) initialized to `sigma_eff_init`
-            - 'sigma_eff_alpha' (the gamma shape or scale for per-guide sigmas) initialized to `sigma_eff_alpha_init`
-            - 'sigma_eff_beta' (the gamma shape or scale for per-guide sigmas) initialized to `sigma_eff_beta_init`
-        Fallback to `init_to_median` for all other sites.
-        """
-
-        def to_tensor(value, device):
-            """Helper function to ensure value is a tensor."""
-            if isinstance(value, torch.Tensor):
-                return value.detach().clone().to(device)
-            return torch.tensor(value, dtype=torch.float32, device=device)
-    
-        def _init_fun(site):
-            name = site["name"]
-            device = self.device
-    
-            if name == "mu":
-                return to_tensor(mu_init, device)
-    
-            elif name == "sigma":
-                return to_tensor(sigma_init, device)
-    
-            elif name == "alpha_x" and alpha_x_init is not None:
-                return to_tensor(alpha_x_init, device)
-    
-            elif name == "beta_o":
-                return to_tensor(beta_o_init, device)
-    
-            elif name == "o_x":
-                return to_tensor(o_x_init, device)
-    
-            elif name == "sigma_eff_alpha":
-                return to_tensor(sigma_eff_alpha_init, device)
-    
-            elif name == "sigma_eff_beta":
-                return to_tensor(sigma_eff_beta_init, device)
-    
-            elif name == "sigma_eff":
-                shape = site["fn"].sample().shape  # Get shape from distribution
-                return to_tensor(sigma_eff_init, device).expand(shape)
-    
-            # Otherwise, fall back to a default
-            return pyro.infer.autoguide.initialization.init_to_sample(site)
-    
-        return _init_fun
-
     def set_alpha_x(
         self,
-        alpha_x,  # expected to be shape [C] or scalar point estimate
-        covariates: list[str] = None # Technical group covariates (e.g., ["cell_line"]). NOT empty.
+        alpha_x,
+        covariates: list[str] = None,
     ):
         """
-        Sets alpha_x as a point estimate tensor of shape [C] (includes reference group at index 0).
+        Set cis-gene overdispersion scaling factors from a pre-fitted or external estimate.
+
+        Stores ``alpha_x`` as a point-estimate tensor of shape ``[C]``, where index 0
+        is the reference group (value fixed to 1.0).  Must be called before
+        ``fit_cis()`` when overdispersion is supplied externally rather than estimated
+        by ``fit_ntc()``.
+
+        Parameters
+        ----------
+        alpha_x : array-like or torch.Tensor
+            Overdispersion scale factors, shape ``[C]`` (including reference group at
+            index 0).  Accepts numpy arrays, lists, or tensors.
+        covariates : list of str, optional
+            Column names in ``meta`` used to define technical groups (e.g.,
+            ``['cell_line']``).  If provided, creates/overwrites
+            ``meta['technical_group_code']``.  If ``None``, assumes
+            ``technical_group_code`` was already set (raises ``ValueError`` if not).
         """
         if covariates:
             if "technical_group_code" in self.meta.columns:
@@ -700,11 +641,28 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
 
     def set_alpha_y(
         self,
-        alpha_y,  # expected to be shape [C, T] point estimate (C includes reference group at index 0)
-        covariates: list[str] = None # Technical group covariates (e.g., ["cell_line"]). NOT empty.
+        alpha_y,
+        covariates: list[str] = None,
     ):
         """
-        Sets alpha_y as a point estimate tensor of shape [C, T] in the primary modality.
+        Set trans-gene overdispersion scaling factors from a pre-fitted or external estimate.
+
+        Stores ``alpha_y`` as a point-estimate tensor of shape ``[C, T]`` on the
+        primary modality, where ``C`` is the number of technical groups (index 0 =
+        reference group) and ``T`` is the number of trans features.  Must be called
+        before ``fit_trans()`` when overdispersion is supplied externally rather than
+        estimated by ``fit_ntc()``.
+
+        Parameters
+        ----------
+        alpha_y : array-like or torch.Tensor
+            Overdispersion scale factors, shape ``[C, T]`` (reference group at index 0).
+            Accepts numpy arrays, lists, or tensors.
+        covariates : list of str, optional
+            Column names in ``meta`` used to define technical groups (e.g.,
+            ``['cell_line']``).  If provided, creates/overwrites
+            ``meta['technical_group_code']``.  If ``None``, assumes
+            ``technical_group_code`` was already set (raises ``ValueError`` if not).
         """
         if covariates:
             if "technical_group_code" in self.meta.columns:
@@ -724,10 +682,26 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
 
     def set_x_true(
         self,
-        x_true
+        x_true,
     ):
         """
-        Sets x_true as a point estimate with shape [N] (one value per cell).
+        Set the posterior cis-gene expression estimate from an external source.
+
+        Stores ``x_true`` as a 1-D point-estimate tensor of shape ``[N]`` (one value
+        per cell, matching ``len(self.meta)``).  Must be called before ``fit_trans()``
+        when ``x_true`` comes from a previously saved fit rather than from running
+        ``fit_cis()`` directly.
+
+        Parameters
+        ----------
+        x_true : array-like or torch.Tensor
+            Posterior mean cis-gene expression, shape ``[N]``.
+            Accepts numpy arrays, lists, or tensors.
+
+        Raises
+        ------
+        ValueError
+            If the provided array does not have exactly ``N`` elements.
         """
         N = len(self.meta)
         x_true = sample_or_use_point("x_true_posterior", x_true, self.device)
@@ -754,7 +728,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         Typical workflow:
             1. adjust_ntc_sum_factor() -> creates 'sum_factor_adj'
             2. fit_cis(sum_factor_col='sum_factor_adj')
-            3. refit_sumfactor() -> creates 'sum_factor_refit'
+            3. refit_sumfactor() -> creates 'sum_factor_refit' (default output name)
             4. fit_trans(sum_factor_col='sum_factor_refit')
 
         Parameters
@@ -948,7 +922,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
     def refit_sumfactor(
         self,
         sum_factor_col_old: str = "sum_factor",
-        sum_factor_col_refit: str = "sum_factor_new",
+        sum_factor_col_refit: str = "sum_factor_refit",
         covariates: list[str] = None,
         n_knots: int = 5,
         degree: int = 3,
@@ -968,7 +942,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         Typical workflow:
             1. adjust_ntc_sum_factor() -> creates 'sum_factor_adj'
             2. fit_cis(sum_factor_col='sum_factor_adj')
-            3. refit_sumfactor() -> creates 'sum_factor_refit'  <-- This step
+            3. refit_sumfactor() -> creates 'sum_factor_refit' (default)  <-- This step
             4. fit_trans(sum_factor_col='sum_factor_refit')
 
         Parameters
@@ -976,7 +950,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         sum_factor_col_old : str
             Name of existing sum factor column (typically from adjust_ntc_sum_factor)
         sum_factor_col_refit : str
-            Name for refitted sum factor column to create (default: 'sum_factor_new')
+            Name for refitted sum factor column to create (default: 'sum_factor_refit')
         covariates : list of str, optional
             Technical group covariates to group by for baseline NTC calculation (e.g., ['cell_line', 'lane'])
         n_knots : int
@@ -1290,20 +1264,39 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
     def permute_genes(
         self,
         genes2permute: list[str] = None,
-        covariates: list[str] = ["cell_line", "lane"],
+        covariates: list[str] = None,
         sum_factor_col: str = 'sum_factor_adj',
-        permute_ntc_x: bool = True
+        permute_ntc_x: bool = True,
     ):
         """
-        Permute specified genes within technical covariates while ensuring consistency with NTC cells.
-        After permutation, the sum factors should be adjusted.
+        Permute guide–gene associations to generate a null distribution for trans effects.
+
+        For each gene in ``genes2permute``, NTC expression values are resampled (with
+        replacement) and assigned to perturbed cells within each covariate group,
+        preserving the overall sum-factor distribution.  Optionally also permutes
+        ``x_true`` values for NTC cells to break any residual cis correlation.
+
+        Call this method *after* ``fit_cis()`` and ``adjust_ntc_sum_factor()``, and
+        *before* ``fit_trans()``.
 
         Parameters
         ----------
-        genes2permute : list of str
-            List of gene names to permute. If 'All', all genes except the cis gene are permuted.
-        covariates : list of str
-            Technical group covariates used to group cells for permutation (e.g., ['cell_line', 'lane']).
+        genes2permute : list of str or 'All', optional
+            Gene names to permute.  Pass ``'All'`` (or ``['All']``) to permute every
+            trans gene.  If ``None``, nothing is permuted.
+        covariates : list of str, optional
+            Column names in ``meta`` defining the groups within which permutation is
+            performed (e.g., ``['cell_line', 'lane']``).  Permutation is stratified so
+            that each group's NTC distribution is preserved separately.  If ``None``
+            (default), all cells are treated as a single group.
+        sum_factor_col : str, default 'sum_factor_adj'
+            Column in the modality's ``sum_factors`` DataFrame used to normalise counts
+            when resampling.  Must exist before calling this method (created by
+            ``adjust_ntc_sum_factor()``).
+        permute_ntc_x : bool, default True
+            If ``True``, also randomly reshuffle ``x_true`` values among NTC cells
+            within each group.  This ensures the cis predictor is uncorrelated with
+            any residual structure in NTC expression.
         """
 
         primary_mod = self.get_modality(self.primary_modality)
@@ -1360,7 +1353,8 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
             else:
                 continue
 
-            for _cov_values, group in meta_sub.groupby(covariates):
+            _gene_groups = meta_sub.groupby(covariates) if covariates else [(None, meta_sub)]
+            for _cov_values, group in _gene_groups:
                 mycells     = group.loc[group["target"] != "ntc", "cell"]
                 my_ntc_cells = group.loc[group["target"] == "ntc", "cell"]
 
@@ -1398,7 +1392,8 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
 
             cis_cell_to_col = {cell: idx for idx, cell in enumerate(cis_mod.cell_names)}
 
-            for _cov_values, group in meta_sub.groupby(covariates):
+            _ntc_groups = meta_sub.groupby(covariates) if covariates else [(None, meta_sub)]
+            for _cov_values, group in _ntc_groups:
                 my_ntc_cells = group.loc[group["target"] == "ntc", "cell"]
 
                 if len(my_ntc_cells) > 0:
@@ -1755,10 +1750,6 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
     def _model_x(self, *args, **kwargs):
         """Delegate to CisFitter."""
         return self._cis_fitter._model_x(*args, **kwargs)
-
-    def cis_init_loc_fn(self, *args, **kwargs):
-        """Delegate to CisFitter."""
-        return self._cis_fitter.cis_init_loc_fn(*args, **kwargs)
 
     def fit_cis(self, *args, force: bool = False, **kwargs):
         """

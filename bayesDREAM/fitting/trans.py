@@ -21,7 +21,6 @@ from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
 import pyro.poutine as poutine
-import pyro.distributions as dist
 
 from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
 

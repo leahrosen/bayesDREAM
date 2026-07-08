@@ -284,8 +284,6 @@ class bayesDREAM(
                     f"but bayesDREAM requires primary modality to be 'negbinom' for cis/trans modeling. "
                     f"The primary modality must represent count data that follows a negative binomial distribution."
                 )
-            if cis_feature is not None:
-                pass
         elif counts is None:
             # No counts provided - user will add modalities later
             warnings.warn(
@@ -1170,13 +1168,6 @@ class bayesDREAM(
         if len(features_to_keep) == 0:
             raise ValueError(f"No features left in '{modality_name}' after filtering!")
 
-        # Report what was filtered
-        n_total = len(feature_meta)
-        n_cis = 1 if cis_feature_idx is not None else 0
-        n_zero_std = n_total - len(features_to_keep) - n_cis
-
-        pass  # Modality.__init__ reports feature counts and filtering
-
         # Filter counts and metadata
         counts_trans, mod_feature_meta = self._filter_features(counts, feature_meta, features_to_keep)
 
@@ -1339,13 +1330,6 @@ class bayesDREAM(
 
         if len(features_to_keep) == 0:
             raise ValueError("No genes left after filtering!")
-
-        # Report what was filtered
-        n_total = len(gene_meta)
-        n_cis = 1 if cis_gene_idx is not None else 0
-        n_zero_std = n_total - len(features_to_keep) - n_cis
-
-        pass  # Modality.__init__ reports feature counts and filtering
 
         # Filter counts and metadata
         counts_trans, gene_feature_meta = self._filter_features(counts, gene_meta, features_to_keep)
