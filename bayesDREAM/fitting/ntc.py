@@ -191,6 +191,12 @@ class NTCFitter:
         D=None,
         sigma_hat_tensor=None,
         skip_obs_sampling=False,
+        log_mu_ntc=None,
+        log_sigma_ntc=None,
+        zero_cat_mask_precomp=None,
+        ref_counts_precomp=None,
+        beta_a_precomp=None,
+        beta_b_precomp=None,
     ):
         """
         Technical model used for NTC-only prefit of cell-line effects.
@@ -214,33 +220,28 @@ class NTCFitter:
         if distribution == 'multinomial':
             assert K is not None, "multinomial requires K"
 
-            # ---- zero-probability category mask per (T,K) from ALL NTC counts ----
-            # (We need ALL NTC data to identify structurally absent categories)
-            total_counts_per_feature = y_obs_ntc_tensor.sum(dim=0)  # [T, K]
-            zero_cat_mask = (total_counts_per_feature == 0)         # [T, K] bool
-
-            # ---- Per-group zero-count masking ----
-            # Mask categories that are 0 in ANY technical group
-            # This prevents fitting corrections for categories with no data in some groups
-            any_group_zero_mask = torch.zeros_like(zero_cat_mask, dtype=torch.bool)
-            for g in range(C):
-                group_mask = (groups_ntc_tensor == g)
-                if group_mask.sum() > 0:
-                    group_counts = y_obs_ntc_tensor[group_mask, :, :].sum(dim=0)  # [T, K]
-                    any_group_zero_mask = any_group_zero_mask | (group_counts == 0)
-
-            # Combine: mask if zero across all data OR zero in any group
-            zero_cat_mask = zero_cat_mask | any_group_zero_mask
-            pyro.deterministic("zero_cat_mask", zero_cat_mask)
-
-            # ---- Compute counts from reference group (group 0) for Dirichlet prior ----
-            ref_mask = (groups_ntc_tensor == 0)
-            if ref_mask.sum() > 0:
-                # Use reference group only for more accurate baseline
-                total_counts_ref = y_obs_ntc_tensor[ref_mask, :, :].sum(dim=0)  # [T, K]
+            if zero_cat_mask_precomp is not None:
+                zero_cat_mask = zero_cat_mask_precomp
+                total_counts_ref = ref_counts_precomp
             else:
-                # Fallback to all data if no reference group
-                total_counts_ref = total_counts_per_feature  # [T, K]
+                # ---- zero-probability category mask per (T,K) from ALL NTC counts ----
+                total_counts_per_feature = y_obs_ntc_tensor.sum(dim=0)  # [T, K]
+                zero_cat_mask = (total_counts_per_feature == 0)         # [T, K] bool
+
+                # ---- Per-group zero-count masking ----
+                any_group_zero_mask = torch.zeros_like(zero_cat_mask, dtype=torch.bool)
+                for g in range(C):
+                    group_mask = (groups_ntc_tensor == g)
+                    if group_mask.sum() > 0:
+                        group_counts = y_obs_ntc_tensor[group_mask, :, :].sum(dim=0)  # [T, K]
+                        any_group_zero_mask = any_group_zero_mask | (group_counts == 0)
+
+                zero_cat_mask = zero_cat_mask | any_group_zero_mask
+
+                ref_mask = (groups_ntc_tensor == 0)
+                total_counts_ref = (y_obs_ntc_tensor[ref_mask, :, :].sum(dim=0)
+                                    if ref_mask.sum() > 0 else total_counts_per_feature)
+            pyro.deterministic("zero_cat_mask", zero_cat_mask)
             # Count active categories after masking
             active_k = (~zero_cat_mask).sum(dim=-1)  # [T]
             
@@ -437,41 +438,37 @@ class NTCFitter:
                     # Matches the convention used by fit_trans for Vmax/K parameters.
                     # Floor on log_sigma prevents the prior from collapsing to a point mass
                     # when σ << μ (very stably expressed genes).
-                    log_sigma = torch.sqrt(
-                        torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
-                    ).clamp(min=0.1)
-                    log_mu = torch.log(mu_x_mean_tensor) - 0.5 * log_sigma ** 2
+                    if log_mu_ntc is not None and log_sigma_ntc is not None:
+                        _log_mu = log_mu_ntc
+                        _log_sigma = log_sigma_ntc
+                    else:
+                        _log_sigma = torch.sqrt(
+                            torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
+                        ).clamp(min=0.1)
+                        _log_mu = torch.log(mu_x_mean_tensor) - 0.5 * _log_sigma ** 2
                     mu_ntc = pyro.sample(
                         "mu_ntc",
-                        dist.LogNormal(log_mu, log_sigma)
+                        dist.LogNormal(_log_mu, _log_sigma)
                     )
             mu_y = mu_ntc  # [T]
     
         elif distribution == 'binomial':
-            # Empirical-Bayes Beta with bounded concentration (stable when denom >> counts)
-            # Use reference group (group 0) only for more accurate baseline
-            ref_mask = (groups_ntc_tensor == 0)
-
-            if ref_mask.sum() > 0:
-                # Compute from reference group only
-                y_sum_ref  = y_obs_ntc_tensor[ref_mask, :].sum(dim=0).float()    # [T]
-                den_sum_ref = denominator_ntc_tensor[ref_mask, :].sum(dim=0).float()  # [T]
+            if beta_a_precomp is not None:
+                a = beta_a_precomp
+                b = beta_b_precomp
             else:
-                # Fallback to all data if no reference group
-                y_sum_ref  = y_obs_ntc_tensor.sum(dim=0).float()    # [T]
-                den_sum_ref = denominator_ntc_tensor.sum(dim=0).float()  # [T]
-
-            # Smooth p-hat to keep it off 0/1 even if den_sum==0
-            p_hat = (y_sum_ref + 0.5) / (den_sum_ref + 1.0)         # [T] in (0,1)
-            p_hat = torch.clamp(p_hat, 1e-6, 1 - 1e-6)
-
-            # Cap effective sample size: informative but not razor-sharp
-            # tune these if needed (e.g., 20..100)
-            kappa = torch.clamp(den_sum_ref, min=20.0, max=200.0)
-
-            # Tiny floor to avoid exactly 0 concentration parameters
-            a = p_hat * kappa + 1e-3
-            b = (1.0 - p_hat) * kappa + 1e-3
+                # Empirical-Bayes Beta with bounded concentration (stable when denom >> counts)
+                ref_mask = (groups_ntc_tensor == 0)
+                if ref_mask.sum() > 0:
+                    y_sum_ref   = y_obs_ntc_tensor[ref_mask, :].sum(dim=0).float()
+                    den_sum_ref = denominator_ntc_tensor[ref_mask, :].sum(dim=0).float()
+                else:
+                    y_sum_ref   = y_obs_ntc_tensor.sum(dim=0).float()
+                    den_sum_ref = denominator_ntc_tensor.sum(dim=0).float()
+                p_hat = torch.clamp((y_sum_ref + 0.5) / (den_sum_ref + 1.0), 1e-6, 1 - 1e-6)
+                kappa = torch.clamp(den_sum_ref, min=20.0, max=200.0)
+                a = p_hat * kappa + 1e-3
+                b = (1.0 - p_hat) * kappa + 1e-3
 
             with f_plate:
                 mu_ntc = pyro.sample("mu_ntc", dist.Beta(a, b))  # [T]
@@ -905,14 +902,12 @@ class NTCFitter:
                             _negbinom_nonref_patch[int(g)] = patchable
 
         if distribution == 'multinomial':
-            for f_idx in range(counts_ntc_array.shape[0]):
-                feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
-                totals = feature_counts.sum(axis=1, keepdims=True)
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    ratios = np.where(totals > 0, feature_counts / totals, 0)
-                ratio_stds = ratios.std(axis=0)
-                if np.all(ratio_stds == 0):
-                    zero_std_mask[f_idx] = True
+            # counts_ntc_array: [F, N, K] — vectorise over F
+            totals = counts_ntc_array.sum(axis=2, keepdims=True)  # [F, N, 1]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratios = np.where(totals > 0, counts_ntc_array / totals, 0.0)  # [F, N, K]
+            ratio_stds = ratios.std(axis=1)  # [F, K]
+            zero_std_mask = np.all(ratio_stds == 0, axis=1)  # [F]
     
         elif distribution == 'binomial':
             if denominator is None:
@@ -921,123 +916,80 @@ class NTCFitter:
                         denominator[ntc_indices, :] if denominator.ndim == 2 else \
                         denominator[:, ntc_indices, :]
 
-            # Get technical group assignments for NTC cells
             groups_ntc_codes = meta_ntc['technical_group_code'].values
 
-            for f_idx in range(counts_ntc_array.shape[0]):
-                if modality.cells_axis == 0:
-                    numer = counts_ntc_array[:, f_idx]
-                    denom = denom_ntc[:, f_idx]
-                else:
-                    numer = counts_ntc_array[f_idx, :]
-                    denom = denom_ntc[f_idx, :]
+            # Arrange as [T, N] (features × cells) for vectorised operations
+            if modality.cells_axis == 0:
+                numer_all = counts_ntc_array.astype(float).T  # [N, T] -> [T, N]
+                denom_all = denom_ntc.astype(float).T
+            else:
+                numer_all = counts_ntc_array.astype(float)    # [T, N]
+                denom_all = denom_ntc.astype(float)
 
-                # Global check: all denominators zero
-                valid = denom > 0
-                if valid.sum() == 0:
-                    zero_std_mask[f_idx] = True
-                    continue
+            valid = denom_all > 0  # [T, N]
 
-                # Global check: zero std across all valid cells
-                ratios = numer[valid] / denom[valid]
-                if ratios.std() == 0:
-                    zero_std_mask[f_idx] = True
-                    continue
+            # Features where every cell has zero denominator
+            all_denom_zero = ~valid.any(axis=1)  # [T]
+            zero_std_mask = all_denom_zero.copy()
 
-                # Per-group boundary checks
-                # Exclude if ANY group has all cells at a boundary (PSI=0, PSI=1, or denom=0)
-                exclude_feature = False
-                for g in np.unique(groups_ntc_codes):
-                    group_mask = (groups_ntc_codes == g)
-                    group_numer = numer[group_mask]
-                    group_denom = denom[group_mask]
+            # Global PSI std (NaN where denominator is zero)
+            psi = np.where(valid, numer_all / np.where(valid, denom_all, 1.0), np.nan)  # [T, N]
+            with np.errstate(invalid='ignore'):
+                global_std = np.nanstd(psi, axis=1)  # [T]
+            zero_std_mask[~all_denom_zero] |= (global_std[~all_denom_zero] == 0)
 
-                    # Check 1: All denominators zero in this group
-                    if (group_denom == 0).all():
-                        exclude_feature = True
-                        break
+            # Per-group boundary checks (vectorised over T)
+            for g in np.unique(groups_ntc_codes):
+                g_mask = (groups_ntc_codes == g)
+                group_numer = numer_all[:, g_mask]  # [T, Ng]
+                group_denom = denom_all[:, g_mask]  # [T, Ng]
+                group_valid = group_denom > 0        # [T, Ng]
 
-                    # Check 2: Among cells with valid denominators, check for boundary PSI
-                    group_valid = group_denom > 0
-                    if group_valid.sum() > 0:
-                        group_numer_valid = group_numer[group_valid]
-                        group_denom_valid = group_denom[group_valid]
+                has_valid = group_valid.any(axis=1)  # [T]
 
-                        # All PSI=0 in this group (all numerators zero)
-                        if (group_numer_valid == 0).all():
-                            exclude_feature = True
-                            break
+                numer_valid_sum = np.where(group_valid, group_numer, 0.0).sum(axis=1)  # [T]
+                denom_valid_sum = np.where(group_valid, group_denom, 0.0).sum(axis=1)  # [T]
 
-                        # All PSI=1 in this group (all numerator==denominator)
-                        if (group_numer_valid == group_denom_valid).all():
-                            exclude_feature = True
-                            break
+                # All PSI=0: valid cells exist but all numerators are 0
+                all_psi_zero = has_valid & (numer_valid_sum == 0)
+                # All PSI=1: sum(numer)==sum(denom) (valid since 0<=numer<=denom per cell)
+                all_psi_one = has_valid & (numer_valid_sum == denom_valid_sum)
 
-                if exclude_feature:
-                    zero_std_mask[f_idx] = True
+                zero_std_mask |= ~has_valid | all_psi_zero | all_psi_one
         
         elif distribution in ("normal", "studentt"):
-            # ---------------------------------------------
-            # NORMAL: exclude features that
-            #  - have zero variance globally (ignoring NaNs), OR
-            #  - are all-NaN in *any* technical group
-            # ---------------------------------------------
             if counts_ntc_array.ndim != 2:
                 raise ValueError(
                     f"Unexpected dims for distribution '{distribution}': {counts_ntc_array.ndim}"
                 )
 
+            # Arrange as [N, F] (cells × features) for vectorised operations
             y_np = counts_ntc_array.astype(float)
-
-            # Figure out which axis is features vs cells
-            if modality.cells_axis == 1:
-                # counts_ntc_array: [features, cells]
-                F = y_np.shape[0]
-                def get_feat_vals(f_idx):
-                    return y_np[f_idx, :]   # [cells]
-            else:
-                # counts_ntc_array: [cells, features]
-                F = y_np.shape[1]
-                def get_feat_vals(f_idx):
-                    return y_np[:, f_idx]   # [cells]
+            y_2d = y_np.T if modality.cells_axis == 1 else y_np  # [N, F]
+            F = y_2d.shape[1]
 
             groups_ntc_codes = meta_ntc['technical_group_code'].values
             unique_groups = np.unique(groups_ntc_codes)
 
-            zero_std_mask = np.zeros(F, dtype=bool)
-            all_nan_any_group_mask = np.zeros(F, dtype=bool)
+            finite_global = np.isfinite(y_2d)            # [N, F]
+            no_finite_mask = ~finite_global.any(axis=0)  # [F]: True if no finite vals anywhere
 
-            for f_idx in range(F):
-                feat_vals = get_feat_vals(f_idx)          # [cells]
-                finite_global = np.isfinite(feat_vals)
+            # Global NaN-aware std
+            with np.errstate(invalid='ignore'):
+                y_2d_nan = np.where(finite_global, y_2d, np.nan)
+                global_std = np.nanstd(y_2d_nan, axis=0)  # [F]
 
-                # If *no* finite values at all across NTC cells:
-                #   feature is hopeless -> exclude
-                if not finite_global.any():
-                    zero_std_mask[f_idx] = True
-                    all_nan_any_group_mask[f_idx] = True
+            zero_std_mask = no_finite_mask | (~no_finite_mask & (global_std == 0))
+
+            # Per-group all-NaN check: feature excluded if any group has no finite values
+            all_nan_any_group_mask = no_finite_mask.copy()
+            for g in unique_groups:
+                g_mask = (groups_ntc_codes == g)
+                if not g_mask.any():
                     continue
+                group_finite = finite_global[g_mask, :]  # [Ng, F]
+                all_nan_any_group_mask |= ~group_finite.any(axis=0)
 
-                # Global std ignoring NaNs
-                if np.nanstd(feat_vals[finite_global]) == 0:
-                    zero_std_mask[f_idx] = True
-
-                # Per-group all-NaN check
-                for g in unique_groups:
-                    g_mask = (groups_ntc_codes == g)
-                    if not g_mask.any():
-                        continue  # shouldn't happen, but safe
-
-                    group_vals = feat_vals[g_mask]
-                    group_finite = np.isfinite(group_vals)
-
-                    # If *within this group* there are no finite values,
-                    # mark feature for exclusion.
-                    if not group_finite.any():
-                        all_nan_any_group_mask[f_idx] = True
-                        break  # no need to check other groups
-
-            # A feature is excluded if it has zero variance OR is all-NaN in any group
             zero_std_mask = zero_std_mask | all_nan_any_group_mask
     
         else:
@@ -1066,32 +1018,24 @@ class NTCFitter:
 
             F, _, K = counts_ntc_array.shape  # [features, cells, categories]
 
-            for f_idx in range(F):
-                feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
-
-                shared_present = None  # will become boolean [K]
-                for g in unique_groups:
-                    g_mask = (groups_ntc_codes == g)
-                    if not np.any(g_mask):
-                        continue  # should not happen, but just in case
-
-                    counts_g = feature_counts[g_mask, :].sum(axis=0)  # [K]
-                    present_g = counts_g > 0                          # category present in this group?
-
-                    if shared_present is None:
-                        shared_present = present_g
-                    else:
-                        shared_present &= present_g  # intersection across groups
-
+            # Vectorise over F: O(G) passes over [F, N, K] instead of O(F*G) Python loops
+            shared_present = None  # [F, K] bool
+            for g in unique_groups:
+                g_mask = (groups_ntc_codes == g)
+                if not np.any(g_mask):
+                    continue
+                group_counts = counts_ntc_array[:, g_mask, :].sum(axis=1)  # [F, K]
+                present_g = group_counts > 0                                # [F, K]
                 if shared_present is None:
-                    n_shared = 0
+                    shared_present = present_g
                 else:
-                    n_shared = int(shared_present.sum())
+                    shared_present &= present_g
 
-                # If 0 or 1 categories survive the "present in all groups" criterion,
-                # the feature cannot support a multinomial cell-line effect.
-                if n_shared <= 1:
-                    only_one_category_mask[f_idx] = True
+            if shared_present is None:
+                n_shared = np.zeros(F, dtype=int)
+            else:
+                n_shared = shared_present.sum(axis=1)  # [F]
+            only_one_category_mask = (n_shared <= 1)
 
     
         needs_filtering_mask = zero_std_mask | only_one_category_mask
@@ -1342,12 +1286,17 @@ class NTCFitter:
         del y_obs_ntc  # Free the 2.5 GB numpy array immediately
         gc.collect()  # Force garbage collection
 
-        # TODO: PERFORMANCE OPTIMIZATION
-        # Pre-compute sums that are currently recomputed in every _model_ntc call:
-        # - For multinomial: total_counts_per_feature, per_group_counts, ref_counts
-        # - For binomial: ref_y_sum, ref_denom_sum
-        # These should be computed once here and passed as parameters to _model_ntc
-    
+        # Precompute invariants once and pass to _model_ntc so they are not recomputed
+        # on every SVI step (50,000-100,000 calls).
+        _model_precomp = {}
+
+        if distribution == 'negbinom':
+            _log_sigma_pc = torch.sqrt(
+                torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
+            ).clamp(min=0.1)
+            _model_precomp['log_sigma_ntc'] = _log_sigma_pc
+            _model_precomp['log_mu_ntc'] = torch.log(mu_x_mean_tensor) - 0.5 * _log_sigma_pc ** 2
+
         denominator_ntc_tensor = None
         if denominator_ntc_for_fit is not None:
             if modality.cells_axis == 1:
@@ -1365,6 +1314,19 @@ class NTCFitter:
             denominator_ntc_tensor = torch.from_numpy(denom_for_tensor.astype(np.float32)).to(self.model.device)
             del denom_for_tensor  # Free numpy array immediately
             gc.collect()
+
+        if distribution == 'binomial' and denominator_ntc_tensor is not None:
+            _ref_m = (groups_ntc_tensor == 0)
+            if _ref_m.sum() > 0:
+                _y_sum = y_obs_ntc_tensor[_ref_m].sum(dim=0).float()
+                _d_sum = denominator_ntc_tensor[_ref_m].sum(dim=0).float()
+            else:
+                _y_sum = y_obs_ntc_tensor.sum(dim=0).float()
+                _d_sum = denominator_ntc_tensor.sum(dim=0).float()
+            _p_hat = torch.clamp((_y_sum + 0.5) / (_d_sum + 1.0), 1e-6, 1 - 1e-6)
+            _kappa = torch.clamp(_d_sum, min=20.0, max=200.0)
+            _model_precomp['beta_a_precomp'] = _p_hat * _kappa + 1e-3
+            _model_precomp['beta_b_precomp'] = (1.0 - _p_hat) * _kappa + 1e-3
     
         # ---------------------------
         # Multinomial precomputations (done once, before guide + SVI)
@@ -1389,6 +1351,13 @@ class NTCFitter:
             # Store for the guide closure
             self._multinomial_zero_cat_mask = _zmask                         # [T, K]
             self._multinomial_log_p_init    = _log_p_init                    # [T, K]
+            # Reuse precomputed masks/counts in the model to avoid per-step recomputation
+            _model_precomp['zero_cat_mask_precomp'] = _zmask
+            _ref_m_multi = (groups_ntc_tensor == 0)
+            _model_precomp['ref_counts_precomp'] = (
+                y_obs_ntc_tensor[_ref_m_multi].sum(dim=0).float()
+                if _ref_m_multi.sum() > 0 else y_obs_ntc_tensor.sum(dim=0).float()
+            )
 
         # ---------------------------
         # Guide + init functions
@@ -1654,6 +1623,7 @@ class NTCFitter:
                         denominator_ntc_tensor,
                         K, D,
                         sigma_hat_tensor,
+                        **_model_precomp,
                     )
                 ntc_guide.to(self.model.device)
             else:
@@ -1703,6 +1673,7 @@ class NTCFitter:
         # ---------------------------
         # Optimize
         # ---------------------------
+        import math
         losses = []
         smoothed_loss = None
         for step in range(niters):
@@ -1719,13 +1690,13 @@ class NTCFitter:
                 distribution,
                 denominator_ntc_tensor,
                 K, D,
-                sigma_hat_tensor,   # ← ADD HERE
+                sigma_hat_tensor,
+                **_model_precomp,
             )
             losses.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {mu_x_mean_tensor.device}")
             # Detect NaN/Inf loss early and give an actionable message
-            import math
             if not math.isfinite(loss):
                 raise RuntimeError(
                     f"fit_technical: loss became {loss} at step {step}. "
@@ -1766,6 +1737,7 @@ class NTCFitter:
                 "denominator_ntc_tensor": self._to_cpu(denominator_ntc_tensor),
                 "K": K, "D": D,
                 "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor),
+                **{k: self._to_cpu(v) for k, v in _model_precomp.items()},
             }
         else:
             model_inputs = {
@@ -1782,6 +1754,7 @@ class NTCFitter:
                 "denominator_ntc_tensor": denominator_ntc_tensor,
                 "K": K, "D": D,
                 "sigma_hat_tensor": sigma_hat_tensor,
+                **_model_precomp,
             }
     
         if self.model.device.type == "cuda":
