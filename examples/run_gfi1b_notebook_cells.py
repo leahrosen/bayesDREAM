@@ -114,11 +114,11 @@ def main() -> None:
     tech_fit_path = run_dir / "posterior_samples_technical_gene.pt"
     if tech_fit_path.exists():
         print("[INFO] Loading existing technical fit...")
-        model.load_technical_fit()
+        model.load_ntc_fit()
     else:
         print("[INFO] Running technical fit (this may take a while)...")
-        model.fit_technical(tolerance=0, niters=args.tech_niters)
-        model.save_technical_fit()
+        model.fit_ntc(tolerance=0, niters=args.tech_niters)
+        model.save_ntc_fit()
 
     if "adjustment_factor" in model.meta.columns:
         model.meta["adjustment_factor_old"] = model.meta["adjustment_factor"].copy()

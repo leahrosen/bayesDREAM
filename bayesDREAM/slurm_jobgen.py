@@ -644,15 +644,15 @@ model = bayesDREAM(
 # Set technical groups
 model.set_technical_groups(['cell_line'])  # Adjust as needed
 
-# Run fit_technical
-print("Running fit_technical...")
-model.fit_technical(
+# Run fit_ntc
+print("Running fit_ntc...")
+model.fit_ntc(
     niters={niters},
     use_all_cells={use_all_cells_flag},
     nsamples={self.nsamples}
 )
 
-print("fit_technical completed successfully")
+print("fit_ntc completed successfully")
 PYEOF
 
 echo "Job completed: $SLURM_JOB_ID"
@@ -957,7 +957,7 @@ model = bayesDREAM(
 )
 
 model.set_technical_groups(['cell_line'])
-model.fit_technical(
+model.fit_ntc(
     niters={niters},
     use_all_cells={str(self.use_all_cells_technical)},
     nsamples={self.nsamples}
@@ -1017,14 +1017,14 @@ model.fit_trans(
 
 Each script produces logs in `logs/` with stdout and stderr:
 
-**fit_technical** (`logs/tech_*.out`):
+**fit_ntc** (`logs/tech_*.out`):
 ```
 Processing cis gene: GFI1B
 Loading data...
 Initializing bayesDREAM for cis_gene: GFI1B
-Running fit_technical...
+Running fit_ntc...
 [Pyro iteration output with ELBO values]
-fit_technical completed successfully
+fit_ntc completed successfully
 Job completed: 123456
 ```
 

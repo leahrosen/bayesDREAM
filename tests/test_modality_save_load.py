@@ -28,7 +28,6 @@ def _build_model(meta, gene_counts, atac_counts, atac_meta, splicing_counts, spl
         cis_gene="GFI1B",
         output_dir=str(output_dir),
         label="modality_test",
-        primary_modality="gene",
     )
 
     model.modalities["atac"] = Modality(

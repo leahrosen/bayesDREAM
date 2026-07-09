@@ -1476,7 +1476,7 @@ class TransFitter:
         Notes
         -----
         Each modality stores its own fitting results.
-        Primary modality results are also stored at model level for backward compatibility.
+        Primary modality results are also stored at model level as ``model.posterior_samples_trans``.
         Trans fitting requires that technical fit has been performed for the modality.
 
         If technical_group_code is set (via set_technical_groups()), it will be used for
@@ -3064,7 +3064,7 @@ class TransFitter:
                 # Without y_ntc: sigma = 4 (flat fallback), mu = log2(Amean/2).
                 'Amean':            (Amean_tensor.cpu().numpy()
                                      if distribution not in ['binomial', 'multinomial']
-                                     else None),      # [T] or None (kept for backward compat)
+                                     else None),      # [T] or None (binomial/multinomial: not applicable)
                 'A_log2_mu':        None,             # [T] or None — set below for negbinom
                 'A_log2_sigma':     None,             # [T] or None — set below for negbinom
                 # alpha / beta (RelaxedBernoulli)
@@ -3113,7 +3113,7 @@ class TransFitter:
         if modality.alpha_y_prefit is None and groups_tensor is not None and "alpha_y" in posterior_samples_y:
             modality.alpha_y_prefit = posterior_samples_y["alpha_y"].median(dim=0).values
 
-        # If primary modality, also store at model level (backward compatibility)
+        # For primary modality, also store at model level for direct access via model.posterior_samples_trans
         if modality_name == self.model.primary_modality:
             self.model.posterior_samples_trans = posterior_samples_y
             self.model.losses_trans = self.losses_trans

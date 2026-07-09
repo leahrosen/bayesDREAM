@@ -165,7 +165,7 @@ def _check_nan_features(feat_mask, mod_name, mask_features):
             f"Options:\n"
             f"  • load_ntc_fit(..., mask_features=True)  — fill missing features with "
             f"the baseline alpha_y value (1.0 for negbinom, 0.0 for other distributions), "
-            f"exactly as fit_technical does for zero-count features; they are marked in "
+            f"exactly as fit_ntc does for zero-count features; they are marked in "
             f"modality.fitted_feature_mask.\n"
             f"  • load_trans_fit(..., subset_features=True)  — after loading, subset the "
             f"modality to only features present in the saved fit.\n"
@@ -447,10 +447,10 @@ class ModelLoader:
                     if verbose:
                         print(f"[LOAD] {mod_name}.posterior_samples_ntc ({n_features} features) ← {posterior_path}")
                 else:
-                    # Old format (backward compatibility) — no alignment possible
+                    # Old format without feature metadata — no alignment possible
                     mod.posterior_samples_ntc = loaded_data
                     if verbose:
-                        print(f"[LOAD] {mod_name}.posterior_samples_ntc (legacy format) ← {posterior_path}")
+                        print(f"[LOAD] {mod_name}.posterior_samples_ntc (old format) ← {posterior_path}")
 
                 loaded[f'posterior_samples_ntc_{mod_name}'] = True
                 mod_loaded.append(f'posterior({n_features or "?"} features)')
@@ -647,10 +647,10 @@ class ModelLoader:
                 if verbose:
                     print(f"[LOAD] posterior_samples_cis (cis_gene: {cis_gene}) ← {posterior_path}")
             else:
-                # Old format (backward compatibility) — no alignment possible
+                # Old format without feature metadata — no alignment possible
                 self.model.posterior_samples_cis = loaded_data
                 if verbose:
-                    print(f"[LOAD] posterior_samples_cis (legacy format) ← {posterior_path}")
+                    print(f"[LOAD] posterior_samples_cis (old format) ← {posterior_path}")
 
             loaded['posterior_samples_cis'] = True
             loaded_summary.append("posterior_cis" + (f" ({cis_gene})" if cis_gene else ""))

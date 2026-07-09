@@ -1057,7 +1057,6 @@ class ModelSummarizer:
 
         # alpha_y is always 2D [C, T] — no samples dimension
         if alpha_y.ndim == 3:
-            # Backward compat: collapse legacy 3D [S, C, T] to mean
             alpha_y = alpha_y.mean(axis=0)
 
         # Get feature names - prefer modality.feature_names (what users see)
@@ -1477,7 +1476,6 @@ class ModelSummarizer:
         - log2fc_at_u0: log2FC value at u=0 (x = x_ntc), i.e., g(0) = log2(y(x_ntc)) - log2(y_ntc)
         - EC50_a_log2fc, EC50_b_log2fc: EC50 in log2FC x-space (log2(K) - log2(x_ntc))
         - inflection_a_log2fc_median, inflection_b_log2fc_median: Inflection points in log2FC x-space
-        - inflection_a_log2fc: Alias for inflection_a_log2fc_median (backwards compatibility)
 
         For negbinom/normal/studentt (log2FC y-space):
         - dg_du_at_u0, dg_du_at_u0_lower, dg_du_at_u0_upper: First derivative of log2FC at u=0 with 95% CI
@@ -1558,8 +1556,8 @@ class ModelSummarizer:
         modality = self.model.get_modality(modality_name)
 
         # Check if trans fit has been run for this modality
-        # Primary modality: check model-level posterior (backward compatibility)
-        # Non-primary modality: check modality-level posterior
+        # Primary modality: use model-level posterior (model.posterior_samples_trans)
+        # Non-primary modality: use modality-level posterior
         if modality_name == self.model.primary_modality:
             if not hasattr(self.model, 'posterior_samples_trans') or self.model.posterior_samples_trans is None:
                 raise ValueError(f"Trans fit not found for primary modality '{modality_name}'. Run fit_trans() first.")
@@ -3776,8 +3774,6 @@ class ModelSummarizer:
                 data['inflection_a_log2fc_lower']  = _log2fc(infl_lo)
                 data['inflection_a_log2fc_upper']  = _log2fc(infl_hi)
 
-                # Backwards compat
-                data['inflection_a_log2fc'] = data['inflection_a_log2fc_median']
     
             y_ntc_arr = np.asarray(y_ntc, dtype=float)
             outA = np.full(n_features, np.nan)

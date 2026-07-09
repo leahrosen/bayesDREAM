@@ -75,7 +75,7 @@ class ATACModalityMixin:
         >>> # Now 'cis' modality exists from ATAC region
         >>>
         >>> # Fit using either approach
-        >>> model.fit_technical()
+        >>> model.fit_ntc()
         >>> model.fit_cis()
         """
         # Validate required columns

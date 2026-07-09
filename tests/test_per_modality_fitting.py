@@ -30,7 +30,6 @@ def fitted_multimodal_model(shared_test_data):
         meta=meta,
         counts=gene_counts,
         cis_gene='GFI1B',
-        primary_modality='gene',
         output_dir='./test_output',
         label='per_modality_test',
         device='cpu',

@@ -74,7 +74,7 @@ if __name__ == "__main__":
 
     # Load technical and cis fits
     print(f"\nLoading technical fit...")
-    model.load_technical_fit()
+    model.load_ntc_fit()
 
     print(f"\nLoading cis fit...")
     model.load_cis_fit()

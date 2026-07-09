@@ -87,16 +87,6 @@ class ModelSaver:
                 if verbose:
                     print(f"[SAVE] alpha_x_prefit → {path}")
 
-            # NOTE: model.alpha_y_prefit is deprecated - alpha_y_prefit is stored per-modality
-            # For backward compatibility, save primary modality's alpha_y_prefit as alpha_y_prefit.pt
-            primary_mod = self.model.get_modality(self.model.primary_modality)
-            if primary_mod.alpha_y_prefit is not None:
-                path = os.path.join(output_dir, 'alpha_y_prefit.pt')
-                torch.save(primary_mod.alpha_y_prefit, path)
-                saved_files['alpha_y_prefit'] = path
-                if verbose:
-                    print(f"[SAVE] alpha_y_prefit (from {self.model.primary_modality} modality) → {path}")
-
         # Save per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_save:
             mod = self.model.modalities[mod_name]
@@ -132,7 +122,7 @@ class ModelSaver:
             # Save modality-specific posterior_samples_ntc
             if hasattr(mod, 'posterior_samples_ntc') and mod.posterior_samples_ntc is not None:
                 # Remove large observation arrays before saving
-                # Also ensure that alpha_y_add and alpha_y_mult are included for backward compatibility
+                # Ensure alpha_y_add and alpha_y_mult are present for downstream loading
                 posterior_clean = {k: v for k, v in mod.posterior_samples_ntc.items()
                                  if k not in ['y_obs_ntc', 'y_obs']}
 

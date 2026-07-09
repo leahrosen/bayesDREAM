@@ -67,7 +67,6 @@ class bayesDREAM(
         meta: pd.DataFrame,
         counts: pd.DataFrame = None,
         modality_name: str = 'gene',
-        primary_modality: str = None,
         feature_meta: pd.DataFrame = None,
         cis_gene: str = None,
         cis_feature: str = None,
@@ -223,10 +222,6 @@ class bayesDREAM(
         """
         # Initialize modalities dict (always start empty, build from counts)
         self.modalities = {}
-
-        # primary_modality is an alias for modality_name
-        if primary_modality is not None:
-            modality_name = primary_modality
 
         # Resolve cis_feature: cis_gene is an alias for cis_feature when modality_name='gene'
         if cis_gene is not None and cis_feature is not None:

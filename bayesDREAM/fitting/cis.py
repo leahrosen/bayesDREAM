@@ -206,7 +206,6 @@ class CisFitter:
         self,
         technical_covariates: list[str] = None,
         sum_factor_col: str = 'sum_factor',
-        modality_name: str = None,
         cis_feature: str = None,
         manual_guide_effects: pd.DataFrame = None,
         prior_strength: float = 1.0,
@@ -234,11 +233,6 @@ class CisFitter:
             Technical covariates for correction
         sum_factor_col : str
             Column name for size factors
-        modality_name : str, optional
-            .. deprecated::
-                ``fit_cis`` always operates on the ``'cis'`` modality, which is created
-                automatically during ``bayesDREAM.__init__``.  This parameter is ignored
-                and will be removed in a future release.
         cis_feature : str, optional
             Feature ID to use as cis proxy from the primary modality.
             If None, uses self.model.cis_gene (must exist in primary modality).
@@ -276,12 +270,6 @@ class CisFitter:
 
         # fit_cis ALWAYS uses the 'cis' modality
         # This modality is created automatically when bayesDREAM is initialized
-        if modality_name is not None:
-            warnings.warn(
-                "modality_name parameter is deprecated. fit_cis always uses the 'cis' modality. "
-                f"Ignoring modality_name='{modality_name}'",
-                DeprecationWarning
-            )
 
         # Get cis modality
         if 'cis' not in self.model.modalities:
@@ -829,7 +817,6 @@ class CisFitter:
         self.model.loss_x = losses
         # Store full posterior on model (not just on CisFitter)
         self.model.posterior_samples_cis = posterior_samples_x
-        self.posterior_samples_cis = posterior_samples_x  # Keep for backward compatibility
         self.model.x_true = posterior_samples_x['x_true'].median(dim=0).values
         self.model.log2_x_true = posterior_samples_x['log_x_true'].median(dim=0).values
         if self.model.alpha_x_prefit is None and technical_covariates:

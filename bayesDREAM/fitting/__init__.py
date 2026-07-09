@@ -11,7 +11,4 @@ from .ntc import NTCFitter
 from .cis import CisFitter
 from .trans import TransFitter
 
-# Backward-compat alias
-TechnicalFitter = NTCFitter
-
-__all__ = ['NTCFitter', 'CisFitter', 'TransFitter', 'TechnicalFitter']
+__all__ = ['NTCFitter', 'CisFitter', 'TransFitter']
