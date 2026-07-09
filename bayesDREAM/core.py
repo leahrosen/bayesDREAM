@@ -1261,181 +1261,98 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         primary_mod.sum_factors[sum_factor_col_refit] = np.maximum(sf_floor, adjusted)
         print(f"[INFO] Created '{sum_factor_col_refit}' in modality sum_factors with x_true-based adjustment.")
 
-    def permute_genes(
+    def permute_x_true(
         self,
-        genes2permute: list[str] = None,
         covariates: list[str] = None,
         sum_factor_col: str = 'sum_factor_adj',
-        permute_ntc_x: bool = True,
     ):
         """
-        Permute guide–gene associations to generate a null distribution for trans effects.
+        Resample ``x_true`` and cis counts among NTC cells to break residual
+        cis correlation before trans fitting.
 
-        For each gene in ``genes2permute``, NTC expression values are resampled (with
-        replacement) and assigned to perturbed cells within each covariate group,
-        preserving the overall sum-factor distribution.  Optionally also permutes
-        ``x_true`` values for NTC cells to break any residual cis correlation.
+        Operates only on NTC cells: within each covariate group, draws a
+        bootstrap resample of the NTC indices (with replacement) and applies
+        it simultaneously to ``self.x_true`` and the ``'cis'`` modality counts,
+        keeping them in sync.
 
-        Call this method *after* ``fit_cis()`` and ``adjust_ntc_sum_factor()``, and
-        *before* ``fit_trans()``.
+        Call *after* ``fit_cis()`` and ``adjust_ntc_sum_factor()``, and
+        *before* ``fit_trans()``.  Typically paired with ``permute_from_ntc``
+        on the trans modality::
+
+            from bayesDREAM.simulation import permute_from_ntc
+            permute_from_ntc(model.get_modality('gene'), model.meta,
+                             covariates=['cell_line'])
+            model.permute_x_true(covariates=['cell_line'])
 
         Parameters
         ----------
-        genes2permute : list of str or 'All', optional
-            Gene names to permute.  Pass ``'All'`` (or ``['All']``) to permute every
-            trans gene.  If ``None``, nothing is permuted.
         covariates : list of str, optional
-            Column names in ``meta`` defining the groups within which permutation is
-            performed (e.g., ``['cell_line', 'lane']``).  Permutation is stratified so
-            that each group's NTC distribution is preserved separately.  If ``None``
-            (default), all cells are treated as a single group.
-        sum_factor_col : str, default 'sum_factor_adj'
-            Column in the modality's ``sum_factors`` DataFrame used to normalise counts
-            when resampling.  Must exist before calling this method (created by
-            ``adjust_ntc_sum_factor()``).
-        permute_ntc_x : bool, default True
-            If ``True``, also randomly reshuffle ``x_true`` values among NTC cells
-            within each group.  This ensures the cis predictor is uncorrelated with
-            any residual structure in NTC expression.
+            Columns in ``meta`` used to stratify permutation.  If ``None``,
+            all cells are treated as one group.
+        sum_factor_col : str, default ``'sum_factor_adj'``
+            Column in the primary modality's ``sum_factors`` used to
+            normalise cis counts before resampling.
         """
+        cis_mod = self.get_modality('cis') if 'cis' in self.modalities else None
+        if cis_mod is None or self.x_true is None:
+            raise ValueError(
+                "permute_x_true requires a fitted 'cis' modality and x_true. "
+                "Run fit_cis() first."
+            )
 
         primary_mod = self.get_modality(self.primary_modality)
-        _sf_available = (
-            primary_mod.sum_factors is not None
-            and sum_factor_col in primary_mod.sum_factors.columns
-        )
-        if not _sf_available:
+        if primary_mod.sum_factors is None or sum_factor_col not in primary_mod.sum_factors.columns:
             raise ValueError(
-                f"No column '{sum_factor_col}' found in modality sum_factors. "
+                f"No column '{sum_factor_col}' in primary modality sum_factors. "
                 "Run adjust_ntc_sum_factor() first."
             )
-            
-        print("Running gene permutation...")
 
-        # --- Use modality counts directly ---
-        gene_mod = self.get_modality(self.primary_modality)
-        cis_mod  = self.get_modality('cis') if 'cis' in self.modalities else None
+        cis_cell_to_col = {cell: i for i, cell in enumerate(cis_mod.cell_names)}
+        cis_counts_work = cis_mod.counts.copy()
+        cis_is_sparse = sparse.issparse(cis_counts_work)
+        cis_row = 0  # cis modality has exactly 1 feature row
 
-        # Build feature-name → row-index lookup for the gene modality
-        feature_names = gene_mod.feature_names  # list[str] or None
-        if feature_names:
-            feat_name_to_idx = {name: idx for idx, name in enumerate(feature_names)}
+        if isinstance(self.x_true, torch.Tensor):
+            x_true_np = self.x_true.detach().cpu().numpy().copy()
         else:
-            feat_name_to_idx = None
+            x_true_np = np.array(self.x_true)
 
-        # If genes2permute is 'All', permute every trans gene
-        if genes2permute == 'All' or genes2permute == ['All']:
-            genes2permute = feature_names if feature_names else list(range(gene_mod.dims['n_features']))
-
-        if isinstance(genes2permute, str):
-            genes2permute = [genes2permute]
-
-        meta_sub = self.meta.copy()
-
-        # Copy gene modality counts for in-place modification
-        counts_sub = gene_mod.counts.copy()
-
-        # Cell-name → column-index mapping (uses modality cell ordering)
-        cell_to_col_idx = {cell: idx for idx, cell in enumerate(gene_mod.cell_names)}
-
-        _is_sparse = sparse.issparse(counts_sub)
-
-        for gene in genes2permute:
-            # Resolve gene → row index in counts_sub
-            if feat_name_to_idx is not None and isinstance(gene, str):
-                if gene not in feat_name_to_idx:
-                    continue
-                gene_row = feat_name_to_idx[gene]
-            elif isinstance(gene, int):
-                if gene >= gene_mod.dims['n_features']:
-                    continue
-                gene_row = gene
-            else:
+        groups = self.meta.groupby(covariates) if covariates else [(None, self.meta)]
+        for _key, group in groups:
+            ntc_cells = group.loc[group['target'] == 'ntc', 'cell'].values
+            if len(ntc_cells) == 0:
                 continue
 
-            _gene_groups = meta_sub.groupby(covariates) if covariates else [(None, meta_sub)]
-            for _cov_values, group in _gene_groups:
-                mycells     = group.loc[group["target"] != "ntc", "cell"]
-                my_ntc_cells = group.loc[group["target"] == "ntc", "cell"]
+            ntc_col_idx = [cis_cell_to_col[c] for c in ntc_cells if c in cis_cell_to_col]
+            if not ntc_col_idx:
+                continue
 
-                if len(mycells) > 0 and len(my_ntc_cells) > 0:
-                    mycell_indices   = [cell_to_col_idx[c] for c in mycells   if c in cell_to_col_idx]
-                    my_ntc_indices   = [cell_to_col_idx[c] for c in my_ntc_cells if c in cell_to_col_idx]
+            sf_ntc = primary_mod.sum_factors.loc[ntc_cells, sum_factor_col].values
 
-                    if _is_sparse:
-                        gene_counts_ntc = np.asarray(counts_sub[gene_row, my_ntc_indices].todense()).flatten()
-                    else:
-                        gene_counts_ntc = counts_sub[gene_row, my_ntc_indices]
+            if cis_is_sparse:
+                ntc_expr = np.asarray(
+                    cis_counts_work[cis_row, ntc_col_idx].todense()
+                ).flatten().astype(float)
+            else:
+                ntc_expr = np.asarray(cis_counts_work)[cis_row, ntc_col_idx].astype(float)
 
-                    ntc_sum_factors    = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
-                    mycell_sum_factors = primary_mod.sum_factors.loc[mycells.values,      sum_factor_col].values
+            perm_idx = np.random.choice(len(ntc_cells), size=len(ntc_cells), replace=True)
+            new_cis = np.round((ntc_expr / np.maximum(sf_ntc, 1e-12))[perm_idx] * sf_ntc)
 
-                    sampled_values = np.random.choice(
-                        gene_counts_ntc / ntc_sum_factors,
-                        size=len(mycells),
-                        replace=True
-                    ) * mycell_sum_factors
+            if cis_is_sparse:
+                cis_counts_work = cis_counts_work.tolil()
+                for i, col in enumerate(ntc_col_idx):
+                    cis_counts_work[cis_row, col] = new_cis[i]
+                cis_counts_work = cis_counts_work.tocsr()
+            else:
+                cis_counts_work = np.asarray(cis_counts_work)
+                cis_counts_work[cis_row, ntc_col_idx] = new_cis
 
-                    if _is_sparse:
-                        counts_sub = counts_sub.tolil()
-                        for i, col_idx in enumerate(mycell_indices):
-                            counts_sub[gene_row, col_idx] = np.round(sampled_values[i])
-                        counts_sub = counts_sub.tocsr()
-                        _is_sparse = True  # still sparse
-                    else:
-                        counts_sub[gene_row, mycell_indices] = np.round(sampled_values)
+            meta_ntc_idx = self.meta.index[self.meta['cell'].isin(ntc_cells)].tolist()
+            x_true_np[meta_ntc_idx] = x_true_np[meta_ntc_idx][perm_idx]
 
-        if permute_ntc_x and cis_mod is not None:
-            cis_counts_sub = cis_mod.counts.copy()
-            cis_is_sparse  = sparse.issparse(cis_counts_sub)
-            cis_row = 0  # cis modality has exactly 1 feature row
-
-            cis_cell_to_col = {cell: idx for idx, cell in enumerate(cis_mod.cell_names)}
-
-            _ntc_groups = meta_sub.groupby(covariates) if covariates else [(None, meta_sub)]
-            for _cov_values, group in _ntc_groups:
-                my_ntc_cells = group.loc[group["target"] == "ntc", "cell"]
-
-                if len(my_ntc_cells) > 0:
-                    my_ntc_indices = [cis_cell_to_col[c] for c in my_ntc_cells if c in cis_cell_to_col]
-
-                    ntc_sum_factor = primary_mod.sum_factors.loc[my_ntc_cells.values, sum_factor_col].values
-
-                    if cis_is_sparse:
-                        ntc_expr = np.asarray(cis_counts_sub[cis_row, my_ntc_indices].todense()).flatten()
-                    else:
-                        ntc_expr = np.asarray(cis_counts_sub)[cis_row, my_ntc_indices]
-
-                    ntc_expr_norm    = ntc_expr / ntc_sum_factor
-                    permuted_indices = np.random.choice(len(my_ntc_cells), size=len(my_ntc_cells), replace=True)
-                    new_counts       = ntc_expr_norm[permuted_indices] * ntc_sum_factor
-
-                    if cis_is_sparse:
-                        cis_counts_sub = cis_counts_sub.tolil()
-                        for i, col_idx in enumerate(my_ntc_indices):
-                            cis_counts_sub[cis_row, col_idx] = np.round(new_counts[i])
-                        cis_counts_sub = cis_counts_sub.tocsr()
-                    else:
-                        cis_counts_sub = np.asarray(cis_counts_sub)
-                        cis_counts_sub[cis_row, my_ntc_indices] = np.round(new_counts)
-
-                    # Permute x_true for NTC cells in the same order
-                    ntc_idx = meta_sub.index[meta_sub["cell"].isin(my_ntc_cells)].tolist()
-                    assert len(ntc_idx) == len(my_ntc_cells)
-
-                    if isinstance(self.x_true, torch.Tensor):
-                        x_true_np = self.x_true.detach().cpu().numpy()
-                    else:
-                        x_true_np = np.array(self.x_true)
-
-                    x_true_ntc = x_true_np[ntc_idx]
-                    x_true_np[ntc_idx] = x_true_ntc[permuted_indices]
-                    self.x_true = torch.tensor(x_true_np, dtype=self.x_true.dtype, device=self.x_true.device)
-
-            cis_mod.counts = cis_counts_sub
-
-        # Write permuted counts back into the modality
-        gene_mod.counts = counts_sub
+        cis_mod.counts = cis_counts_work
+        self.x_true = torch.tensor(x_true_np, dtype=self.x_true.dtype, device=self.x_true.device)
 
     def subset_cells(
         self,
