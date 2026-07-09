@@ -250,7 +250,7 @@ class NTCFitter:
                 raise RuntimeError(
                     "Multinomial QC mismatch: feature(s) with ≤1 active category reached "
                     f"_model_ntc (indices in T_fit: {bad}). "
-                    "These should have been filtered out in fit_technical()."
+                    "These should have been filtered out in fit_ntc()."
                 )
         
             if C == 1:
@@ -325,8 +325,7 @@ class NTCFitter:
 
                     with f_plate:
                         with c_plate:  # [C-1, T]
-                            # Name kept as log2_alpha_y for backwards compatibility;
-                            # for Normal it is *literally* the additive shift in y-units.
+                            # For Normal, log2_alpha_y is *literally* the additive shift in y-units.
                             log2_alpha_y = pyro.sample(
                                 "log2_alpha_y",
                                 dist.StudentT(
@@ -336,8 +335,7 @@ class NTCFitter:
                                 ),
                             )
 
-                            # For Normal we don't *use* multiplicative effects at all:
-                            # keep alpha_y_mul around for API compatibility, but fix it to 1.
+                            # For Normal, multiplicative effects are not used; alpha_y_mul is fixed to 1.
                             alpha_y_mul = pyro.deterministic(
                                 "alpha_y_mul",
                                 torch.ones_like(log2_alpha_y)
@@ -622,6 +620,7 @@ class NTCFitter:
             raise ValueError(f"Missing columns in meta: {missing_cols}")
 
         self.model.meta["technical_group_code"] = self.model.meta.groupby(covariates).ngroup()
+        self.model._technical_group_covariates = list(covariates)
         print(f"[INFO] Set technical_group_code with {self.model.meta['technical_group_code'].nunique()} groups based on {covariates}")
     
         # ---- SAFEGUARD: ensure every technical group is represented among NTCs ----
@@ -852,7 +851,7 @@ class NTCFitter:
             raise ValueError(
                 f"Modality '{modality_name}' has distribution '{distribution}' but no sum_factors "
                 f"DataFrame has been set. Assign a cell-indexed DataFrame to "
-                f"modality.sum_factors before calling fit_technical()."
+                f"modality.sum_factors before calling fit_ntc()."
             )
 
         if requires_denominator(distribution) and denominator is None:
@@ -1765,7 +1764,7 @@ class NTCFitter:
             # Detect NaN/Inf loss early and give an actionable message
             if not math.isfinite(loss):
                 raise RuntimeError(
-                    f"fit_technical: loss became {loss} at step {step}. "
+                    f"fit_ntc: loss became {loss} at step {step}. "
                     "This usually indicates numerical instability. Try: "
                     "(1) lower learning rate (e.g. lr=1e-4), "
                     "(2) check for extreme values in sum_factor, "
@@ -1925,7 +1924,7 @@ class NTCFitter:
         # Reconstruct full α (all original T)
         # multiplicative baseline=1; additive baseline=0
         # ----------------------------------------
-        # Back-compat: some guides name the mult version "alpha_y_mul"
+        # alpha_y_mul is the Pyro site name; normalise to alpha_y
         if "alpha_y" not in posterior_samples and "alpha_y_mul" in posterior_samples:
             posterior_samples["alpha_y"] = posterior_samples["alpha_y_mul"]
 

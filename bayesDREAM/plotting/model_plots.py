@@ -63,7 +63,6 @@ class PlottingMixin:
         subset_features: Optional[List[str]] = None,
         plot_type: str = 'auto',
         metric: str = 'posterior_coverage',
-        cell_line_index: Optional[int] = None,  # Deprecated, backward compatibility
         **kwargs
     ) -> plt.Figure:
         """
@@ -108,14 +107,6 @@ class PlottingMixin:
         >>> # Plot alpha_y for specific genes
         >>> fig = model.plot_technical_fit('alpha_y', subset_features=['GFI1B', 'TET2'])
         """
-        # Handle backward compatibility for cell_line_index
-        if cell_line_index is not None:
-            if technical_group_index is not None:
-                raise ValueError("Cannot specify both technical_group_index and cell_line_index. "
-                               "Use technical_group_index (cell_line_index is deprecated).")
-            warnings.warn("cell_line_index is deprecated, use technical_group_index instead", DeprecationWarning)
-            technical_group_index = cell_line_index
-
         # Check for invalid technical_group_index
         if technical_group_index is not None and technical_group_index == 0:
             raise ValueError(
@@ -403,75 +394,61 @@ class PlottingMixin:
 
     def plot_cis_fit(
         self,
-        param: str = 'x_true',
         order_by: str = 'mean',
         metric: str = 'posterior_coverage',
         **kwargs
     ) -> plt.Figure:
         """
-        Plot prior vs posterior for cis fit parameters.
+        Plot prior vs posterior for x_true from the cis fit.
 
         Parameters
         ----------
-        param : str
-            Parameter to plot: 'x_true', 'mu_x', 'log2_x_eff'
-        order_by : str
-            Guide ordering: 'mean', 'difference', 'alphabetical', 'input'
-        metric : str
-            Prior/posterior comparison metric: 'overlap', 'kl_divergence', or 'posterior_coverage' (default)
+        order_by : str, default 'mean'
+            Guide ordering: ``'mean'``, ``'difference'``, ``'alphabetical'``, ``'input'``.
+        metric : str, default 'posterior_coverage'
+            Prior/posterior comparison metric: ``'overlap'``, ``'kl_divergence'``,
+            or ``'posterior_coverage'``.
         **kwargs
-            Additional plotting arguments
+            Additional arguments forwarded to ``plot_1d_parameter``.
 
         Returns
         -------
         plt.Figure
-            Matplotlib figure
-
-        Examples
-        --------
-        >>> # Plot x_true (cis gene expression per guide)
-        >>> fig = model.plot_cis_fit('x_true')
         """
         if not hasattr(self, 'posterior_samples_cis'):
             raise ValueError("No cis fit found. Run fit_cis() first.")
 
         posterior = self.posterior_samples_cis
 
-        # Sample priors
+        if 'x_true' not in posterior:
+            raise ValueError("x_true not found in posterior_samples_cis")
+
         prior_dict = get_prior_samples(
             self,
             fit_type='cis',
             nsamples=posterior[list(posterior.keys())[0]].shape[0]
         )
 
-        # Get guide names
         guide_names = self.meta_guides['guide'].tolist() if hasattr(self, 'meta_guides') else None
         if guide_names is None:
-            n_guides = posterior['x_true'].shape[1] if 'x_true' in posterior else posterior['mu_x'].shape[1]
+            n_guides = posterior['x_true'].shape[1]
             guide_names = [f'Guide_{i}' for i in range(n_guides)]
 
-        if param == 'x_true':
-            if 'x_true' not in posterior:
-                raise ValueError("x_true not found in posterior_samples_cis")
+        post_samples = posterior['x_true']
+        if hasattr(post_samples, 'numpy'):
+            post_samples = post_samples.numpy()
 
-            post_samples = posterior['x_true']
-            if hasattr(post_samples, 'numpy'):
-                post_samples = post_samples.numpy()
+        prior_samples = prior_dict['x_true']
+        if hasattr(prior_samples, 'numpy'):
+            prior_samples = prior_samples.numpy()
 
-            # Use sampled priors
-            prior_samples = prior_dict['x_true'].numpy() if hasattr(prior_dict['x_true'], 'numpy') else prior_dict['x_true']
-
-            return plot_1d_parameter(
-                prior_samples, post_samples, guide_names, 'x_true',
-                order_by, plot_type='violin', metric=metric, **kwargs
-            )
-
-        else:
-            raise ValueError(f"Unknown parameter: {param}. Must be 'x_true'")
+        return plot_1d_parameter(
+            prior_samples, post_samples, guide_names, 'x_true',
+            order_by, plot_type='violin', metric=metric, **kwargs
+        )
 
     def plot_trans_fit(
         self,
-        param: str = 'theta',
         modality_name: Optional[str] = None,
         subset_features: Optional[List[str]] = None,
         order_by: str = 'mean',
@@ -481,39 +458,31 @@ class PlottingMixin:
         **kwargs
     ) -> plt.Figure:
         """
-        Plot prior vs posterior for trans fit parameters.
+        Plot prior vs posterior for theta (trans function parameters).
 
         Parameters
         ----------
-        param : str
-            Parameter to plot: 'theta', 'gamma', 'mu_y'
         modality_name : str, optional
-            Modality name (default: primary modality)
+            Modality name. Defaults to ``model.primary_modality``.
         subset_features : List[str], optional
-            Subset to specific features
-        order_by : str
-            Feature ordering
-        plot_type : str
-            'auto', 'violin', or 'scatter'
-        function_type : str
-            Function type used in fit: 'additive_hill', 'single_hill', 'polynomial'
-        metric : str
-            Prior/posterior comparison metric: 'overlap', 'kl_divergence', or 'posterior_coverage' (default)
+            Subset to specific features by name.
+        order_by : str, default 'mean'
+            Feature ordering: ``'mean'``, ``'difference'``, ``'alphabetical'``, ``'input'``.
+        plot_type : str, default 'auto'
+            ``'auto'``, ``'violin'``, or ``'scatter'``.
+        function_type : str, default 'additive_hill'
+            Function type used in the trans fit: ``'additive_hill'``,
+            ``'single_hill'``, or ``'polynomial'``.
+        metric : str, default 'posterior_coverage'
+            Prior/posterior comparison metric: ``'overlap'``, ``'kl_divergence'``,
+            or ``'posterior_coverage'``.
         **kwargs
-            Additional plotting arguments
+            Additional arguments forwarded to ``plot_1d_parameter`` or
+            ``plot_2d_parameter``.
 
         Returns
         -------
         plt.Figure
-            Matplotlib figure
-
-        Examples
-        --------
-        >>> # Plot theta (Hill function parameters)
-        >>> fig = model.plot_trans_fit('theta', function_type='additive_hill')
-        >>>
-        >>> # Plot for specific genes
-        >>> fig = model.plot_trans_fit('theta', subset_features=['GFI1B', 'TET2'])
         """
         if not hasattr(self, 'posterior_samples_trans'):
             raise ValueError("No trans fit found. Run fit_trans() first.")
@@ -524,7 +493,9 @@ class PlottingMixin:
         modality = self.get_modality(modality_name)
         posterior = self.posterior_samples_trans
 
-        # Sample priors
+        if 'theta' not in posterior:
+            raise ValueError("theta not found in posterior_samples_trans")
+
         prior_dict = get_prior_samples(
             self,
             fit_type='trans',
@@ -534,7 +505,6 @@ class PlottingMixin:
             distribution=modality.distribution
         )
 
-        # Get feature names
         if 'gene' in modality.feature_meta.columns:
             feature_names = modality.feature_meta['gene'].tolist()
         elif 'gene_name' in modality.feature_meta.columns:
@@ -542,79 +512,34 @@ class PlottingMixin:
         else:
             feature_names = modality.feature_meta.index.tolist()
 
-        if param == 'theta':
-            if 'theta' not in posterior:
-                raise ValueError("theta not found in posterior_samples_trans")
+        post_samples = posterior['theta']
+        if hasattr(post_samples, 'numpy'):
+            post_samples = post_samples.numpy()
 
-            post_samples = posterior['theta']
-            if hasattr(post_samples, 'numpy'):
-                post_samples = post_samples.numpy()
+        prior_samples = prior_dict['theta']
+        if hasattr(prior_samples, 'numpy'):
+            prior_samples = prior_samples.numpy()
 
-            # Use sampled priors
-            prior_samples = prior_dict['theta'].numpy() if hasattr(prior_dict['theta'], 'numpy') else prior_dict['theta']
-
-            # theta is typically (samples, genes, n_params)
-            if post_samples.ndim == 3:
-                # Plot as 2D parameter with dimensions = parameter indices
-                param_names = [f'param_{i}' for i in range(post_samples.shape[2])]
-                return plot_2d_parameter(
-                    prior_samples, post_samples, feature_names, param_names, 'theta',
-                    order_by=order_by, subset_features=subset_features,
-                    plot_type=plot_type, metric=metric, **kwargs
-                )
-            elif post_samples.ndim == 2:
-                # Single parameter per gene
-                return plot_1d_parameter(
-                    prior_samples, post_samples, feature_names, 'theta',
-                    order_by, subset_features=subset_features, plot_type=plot_type,
-                    metric=metric, **kwargs
-                )
-
+        if post_samples.ndim == 3:
+            param_names = [f'param_{i}' for i in range(post_samples.shape[2])]
+            return plot_2d_parameter(
+                prior_samples, post_samples, feature_names, param_names, 'theta',
+                order_by=order_by, subset_features=subset_features,
+                plot_type=plot_type, metric=metric, **kwargs
+            )
         else:
-            raise ValueError(f"Unknown parameter: {param}. Must be 'theta', 'gamma', or 'mu_y'")
+            return plot_1d_parameter(
+                prior_samples, post_samples, feature_names, 'theta',
+                order_by, subset_features=subset_features, plot_type=plot_type,
+                metric=metric, **kwargs
+            )
 
     def plot_xy_data(self, *args, **kwargs):
         """
-        Plot raw x-y data showing relationship between cis gene expression and modality values.
+        Plot raw x-y data (cis expression vs modality values) with k-NN smoothing.
 
-        This method is delegated to xy_plots.plot_xy_data(). See that function for full documentation.
-
-        Parameters
-        ----------
-        feature : str
-            Feature name (gene, junction, donor, etc.)
-        modality_name : str, optional
-            Modality name (default: primary modality)
-        window : int
-            k-NN window size for smoothing (default: 100 cells)
-        show_correction : str
-            'uncorrected', 'corrected', or 'both' (default: 'corrected')
-        min_counts : int
-            Minimum denominator for binomial/minimum total for multinomial (default: 3)
-        color_palette : dict, optional
-            Custom colors for technical groups
-        show_hill_function : bool
-            Overlay Hill function if trans model fitted (default: True)
-        **kwargs
-            Additional plotting arguments
-
-        Returns
-        -------
-        plt.Figure or plt.Axes
-            Matplotlib figure or axes object
-
-        Examples
-        --------
-        >>> # Plot gene counts with Hill function overlay
-        >>> fig = model.plot_xy_data('TET2', window=100, show_hill_function=True)
-        >>>
-        >>> # Plot splice junction with filtering
-        >>> fig = model.plot_xy_data('chr1:12345:67890:+',
-        ...                          modality_name='splicing_sj',
-        ...                          min_counts=5)
-        >>>
-        >>> # Plot with both corrected and uncorrected
-        >>> fig = model.plot_xy_data('GFI1B', show_correction='both')
+        Delegates to ``xy_plots.plot_xy_data``; see that function for full
+        parameter documentation.
         """
         from .xy_plots import plot_xy_data
         return plot_xy_data(self, *args, **kwargs)
@@ -623,71 +548,13 @@ class PlottingMixin:
         """
         Plot fitted trans functions and/or their derivatives.
 
-        Simple plot showing just the fitted Hill functions (no smoothed data).
-        Useful for comparing multiple genes or viewing function shape with derivatives.
-
         Parameters
         ----------
         features : str or list of str
-            Single feature name or list of feature names to plot
-        modality_name : str, optional
-            Modality name (default: primary modality)
-        show_function : bool
-            Show the fitted function y(x) (default: True)
-        show_first_derivative : bool
-            Show first derivative dy/dx (default: False)
-        show_second_derivative : bool
-            Show second derivative d²y/dx² (default: False)
-        x_range : np.ndarray, optional
-            X values to plot at. If None, uses range from model's x_true.
-        n_points : int
-            Number of points for x_range if auto-generated (default: 200)
-        use_log2_x : bool
-            Use log2(x) for x-axis (default: True)
-        colors : str, list, or dict, optional
-            Colors for each feature
-        figsize : tuple, optional
-            Figure size (width, height)
-        title : str, optional
-            Plot title
-        legend : bool
-            Show legend (default: True)
-        overlay_roots : pd.DataFrame, pd.Series, dict, or None
-            Summary DataFrame (or single row) from ``save_trans_summary``.
-            When provided, draws dashed vertical lines at derivative roots on
-            each subplot.  See ``plot_trans_functions`` in ``xy_plots.py`` for
-            full documentation of the root overlay behaviour.
-        overlay_roots_lw : float
-            Line width for root vlines (default 1.0).
-        overlay_roots_alpha : float
-            Transparency for root vlines (default 0.8).
-        overlay_roots_also_on_function : bool
-            If True (default), also draw roots on the function subplot.
+            Feature name(s) to plot.
 
-        Returns
-        -------
-        plt.Figure
-            Matplotlib figure
-
-        Examples
-        --------
-        >>> # Plot function and derivatives for one gene
-        >>> model.plot_trans_functions('TET2', show_first_derivative=True,
-        ...                            show_second_derivative=True)
-
-        >>> # Overlay derivative roots from summary df
-        >>> df = model.save_trans_summary(compute_derivative_roots=True)
-        >>> model.plot_trans_functions('TET2', use_log2fc=True,
-        ...                            show_function=True,
-        ...                            show_first_derivative=True,
-        ...                            show_second_derivative=True,
-        ...                            show_third_derivative=True,
-        ...                            overlay_roots=df)
-
-        >>> # Plot first derivative of multiple genes
-        >>> model.plot_trans_functions(['TET2', 'MYB', 'GFI1B'],
-        ...                            show_function=False,
-        ...                            show_first_derivative=True)
+        Delegates to ``xy_plots.plot_trans_functions``; see that function for
+        full parameter documentation.
         """
         from .xy_plots import plot_trans_functions
         return plot_trans_functions(self, features, **kwargs)
@@ -696,70 +563,19 @@ class PlottingMixin:
         """
         Forest plot (dot + whisker CI) for posterior parameters across trans genes.
 
-        Creates a plot with genes on the x-axis and parameter values (median + CI) on
-        the y-axis. Multiple parameters are dodged side-by-side for comparison.
-
-        This method is delegated to basic.plot_parameter_ci_panel().
-        See that function for full documentation.
-
         Parameters
         ----------
         params : list of str
-            Parameter names to plot (e.g., ['n_a', 'n_b'] or ['alpha', 'beta']).
-            These must exist in posterior_samples_trans.
-        modality_name : str, optional
-            Modality name. If None, uses primary modality.
-        genes : list of str, optional
-            Specific genes to plot. If None, plots all genes (subject to max_genes).
-        ci_level : float
-            Credible interval level (default: 95.0 for 95% CI)
-        sort_by : str
-            How to sort genes: 'none', 'alphabetical', 'median', 'abs_median', 'effect'
-        filter_dependent : bool
-            If True, only show genes where CI excludes 0 (default: False)
-        max_genes : int
-            Maximum genes to plot (default: 100). Raises error if exceeded.
-            Set to None to disable limit.
-        ymin, ymax : float, optional
-            Y-axis limits. If None, auto-scaled.
-        title : str, optional
-            Plot title. If None, auto-generated.
-        color_palette : dict, optional
-            Custom colors for parameters.
-        show_gene_separators : bool
-            Draw vertical lines between genes (default: True)
-        **kwargs
-            Additional plotting arguments
+            Parameter names to plot (e.g., ``['n_a', 'n_b']`` or
+            ``['alpha', 'beta']``). Must exist in ``posterior_samples_trans``.
+
+        Delegates to ``basic.plot_parameter_ci_panel``; see that function for
+        full parameter documentation.
 
         Returns
         -------
         fig : matplotlib.Figure
         ax : matplotlib.Axes
-
-        Examples
-        --------
-        >>> # Plot n_a and n_b for all genes
-        >>> fig, ax = model.plot_parameter_ci_panel(['n_a', 'n_b'])
-
-        >>> # Plot only dependent genes, sorted by effect size
-        >>> fig, ax = model.plot_parameter_ci_panel(
-        ...     ['n_a', 'n_b'],
-        ...     filter_dependent=True,
-        ...     sort_by='effect'
-        ... )
-
-        >>> # Plot alpha and beta with custom colors
-        >>> fig, ax = model.plot_parameter_ci_panel(
-        ...     ['alpha', 'beta'],
-        ...     color_palette={'alpha': 'crimson', 'beta': 'dodgerblue'}
-        ... )
-
-        >>> # Plot specific genes, sorted alphabetically
-        >>> fig, ax = model.plot_parameter_ci_panel(
-        ...     ['n_a', 'n_b'],
-        ...     genes=['TET2', 'NFE2', 'MYB'],
-        ...     sort_by='alphabetical'
-        ... )
         """
         from .basic import plot_parameter_ci_panel
         return plot_parameter_ci_panel(self, params, **kwargs)
@@ -768,36 +584,13 @@ class PlottingMixin:
         """
         Extract posterior parameters into a long-format DataFrame.
 
-        This is useful for custom analysis or plotting with seaborn/plotnine.
-
-        This method is delegated to basic.extract_posterior_dataframe().
-        See that function for full documentation.
-
         Parameters
         ----------
         params : list of str
-            Parameter names to extract (e.g., ['n_a', 'n_b', 'K_a', 'K_b'])
-        modality_name : str, optional
-            Modality name. If None, uses primary modality.
-        include_samples : bool
-            If True, includes all posterior samples (can be large).
-            If False (default), only includes summary statistics.
+            Parameter names to extract (e.g., ``['n_a', 'n_b', 'K_a', 'K_b']``).
 
-        Returns
-        -------
-        pd.DataFrame
-            Long-format DataFrame with columns:
-            - gene, gene_idx, param, median, lo, hi, mean, std, ci_excludes_zero
-            If include_samples=True, also: sample_idx, value
-
-        Examples
-        --------
-        >>> # Get summary statistics
-        >>> df = model.extract_posterior_dataframe(['n_a', 'n_b', 'K_a', 'K_b'])
-        >>> df_dependent = df[df['ci_excludes_zero']]
-
-        >>> # Get all samples for custom analysis
-        >>> df_samples = model.extract_posterior_dataframe(['n_a'], include_samples=True)
+        Delegates to ``basic.extract_posterior_dataframe``; see that function for
+        full parameter documentation.
         """
         from .basic import extract_posterior_dataframe
         return extract_posterior_dataframe(self, params, **kwargs)

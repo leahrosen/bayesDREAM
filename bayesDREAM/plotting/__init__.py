@@ -22,8 +22,7 @@ from .prior_posterior import (
 from .colors import ColorScheme, build_guide_colors, lighten, darken
 
 # Helper utilities
-from .helpers import (to_np, per_cell_mean_std, resolve_guide_labels,
-                       _guide_ntc_mask, _xtrue_posterior)
+from .helpers import (to_np, per_cell_mean_std, resolve_guide_labels)
 from .utils import (
     hill_xinf_samples,
     dependency_mask_from_n,
@@ -62,7 +61,6 @@ from .de_comparison import (
     scatter_and_heatmap_edger_vs_bayes,
     plot_edger_vs_bayes_full_range,
     plot_edger_vs_bayes_observed_range,
-    dependency_mask_from_n
 )
 
 # Diagnostic plots

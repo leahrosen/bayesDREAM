@@ -22,20 +22,40 @@ def scatter_with_smooth_by_group(
     xlabel=None,
     ylabel=None,
     title=None,
+    ax=None,
+    show=True,
 ):
     """
     Scatter plot with per-group lowess smoothed lines, drawn on the current axes.
 
     Parameters
     ----------
-    x, y : array-like or torch.Tensor
+    x : array-like or torch.Tensor
+        X-axis values.
+    y : array-like or torch.Tensor
+        Y-axis values.
     group : array-like
-        Group labels; one line per unique value.
-    frac : float
+        Group labels; one smoothed line is drawn per unique value.
+    frac : float, default 0.2
         Lowess smoothing fraction.
-    s, alpha : float
-        Scatter marker size and transparency.
-    xlabel, ylabel, title : str, optional
+    s : float, default 1
+        Scatter marker size.
+    alpha : float, default 0.3
+        Scatter marker transparency.
+    xlabel : str, optional
+        X-axis label.
+    ylabel : str, optional
+        Y-axis label.
+    title : str, optional
+        Plot title.
+    ax : matplotlib axes, optional
+        Axes to plot on. If None, uses current axes.
+    show : bool, default True
+        Whether to call ``plt.show()``.
+
+    Returns
+    -------
+    ax : matplotlib axes
     """
     if hasattr(x, "detach"):
         x = x.detach().cpu().numpy()
@@ -58,6 +78,9 @@ def scatter_with_smooth_by_group(
     y = y[mask]
     group = group[mask]
 
+    if ax is None:
+        ax = plt.gca()
+
     for g in np.unique(group):
         idx = group == g
         x_g = x[idx]
@@ -67,35 +90,38 @@ def scatter_with_smooth_by_group(
         x_g = x_g[order]
         y_g = y_g[order]
 
-        plt.scatter(x_g, y_g, s=s, alpha=alpha, label=str(g))
+        ax.scatter(x_g, y_g, s=s, alpha=alpha, label=str(g))
         smoothed = lowess(y_g, x_g, frac=frac, return_sorted=True)
-        (line,) = plt.plot(smoothed[:, 0], smoothed[:, 1], linewidth=2.5, zorder=10)
+        (line,) = ax.plot(smoothed[:, 0], smoothed[:, 1], linewidth=2.5, zorder=10)
         line.set_path_effects([
             pe.Stroke(linewidth=4, foreground="white"),
             pe.Normal(),
         ])
 
     if xlabel is not None:
-        plt.xlabel(xlabel)
+        ax.set_xlabel(xlabel)
     if ylabel is not None:
-        plt.ylabel(ylabel)
+        ax.set_ylabel(ylabel)
     if title is not None:
-        plt.title(title)
+        ax.set_title(title)
 
-    plt.legend()
-    plt.show()
+    ax.legend()
+    if show:
+        plt.show()
+    return ax
 
 
 def plot_x_true_residuals_vs_sumfactor(
     model,
+    group_col,
+    facet_col,
     sum_factor_col="sum_factor",
-    group_col="lane",
-    facet_col="target",
     frac=0.2,
     s=1,
     alpha=0.3,
     figsize=(12, 5),
     min_cells_for_smooth=10,
+    show=True,
 ):
     """
     Diagnostic: log2(sum_factor) vs normalised log2_x_true, faceted by a
@@ -117,20 +143,26 @@ def plot_x_true_residuals_vs_sumfactor(
     ----------
     model : bayesDREAM
         A fitted model (fit_cis must have been called).
-    sum_factor_col : str
-        Column in the primary modality's sum_factors to use as y-axis.
     group_col : str
-        Column in model.meta to colour / smooth separately (e.g. 'lane').
+        Column in model.meta to colour and smooth separately (e.g. ``'lane'``,
+        ``'batch'``).
     facet_col : str
         Column in model.meta to facet by; one panel per unique value
-        (e.g. 'target', 'cell_line').
-    frac : float
+        (e.g. ``'target'``, ``'cell_line'``).
+    sum_factor_col : str, default ``'sum_factor'``
+        Column in the primary modality's sum_factors to use as y-axis.
+    frac : float, default 0.2
         Lowess smoothing fraction.
-    s, alpha : float
-        Scatter marker size and transparency.
-    figsize : tuple
-    min_cells_for_smooth : int
+    s : float, default 1
+        Scatter marker size.
+    alpha : float, default 0.3
+        Scatter marker transparency.
+    figsize : tuple, default (12, 5)
+        Figure size.
+    min_cells_for_smooth : int, default 10
         Minimum cells in a (facet × group) slice to draw a smoothed line.
+    show : bool, default True
+        Whether to call ``plt.show()``.
 
     Returns
     -------
@@ -244,29 +276,32 @@ def plot_x_true_residuals_vs_sumfactor(
         f"single-guide cells only  (n={n_single:,})"
     )
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
     return fig
 
 
-def plot_sum_factor_comparison(model, cis_gene=None, sf_col1='clustered.sum.factor',
-                               sf_col2='sum_factor_adj', color_scheme=None, show=True):
+def plot_sum_factor_comparison(model, sf_col1, sf_col2, cis_gene=None,
+                               color_scheme=None, show=True):
     """
     Plot pairwise comparison of sum factors (e.g., original vs adjusted).
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
-    cis_gene : str, optional
-        Cis gene name for title (defaults to model.cis_gene)
+        Fitted bayesDREAM model.
     sf_col1 : str
-        First sum factor column name
+        First sum factor column name (checked in model.meta then primary modality
+        sum_factors).
     sf_col2 : str
-        Second sum factor column name
+        Second sum factor column name (checked in model.meta then primary modality
+        sum_factors).
+    cis_gene : str, optional
+        Cis gene name for plot title. Defaults to ``model.cis_gene``.
     color_scheme : ColorScheme, optional
-        Custom color scheme
-    show : bool
-        Whether to display the plot
+        Custom color scheme. Defaults to a plain ``ColorScheme()``.
+    show : bool, default True
+        Whether to call ``plt.show()``.
 
     Returns
     -------
@@ -311,8 +346,6 @@ def plot_sum_factor_comparison(model, cis_gene=None, sf_col1='clustered.sum.fact
     df[sf_col2] = s2.loc[model.meta['cell'].values].values
 
     # Filter to positive values
-    df = df[(df[sf_col1] > 0) & (df[sf_col2] > 0)]
-
     df = df[(df[sf_col1] > 0) & (df[sf_col2] > 0)]
 
     # Plot by guide

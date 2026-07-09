@@ -4,6 +4,7 @@ Basic plotting functions for x_true distributions.
 Provides scatter, violin, and density plots colored by guide.
 """
 
+import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
@@ -1312,7 +1313,7 @@ def plot_parameter_ci_panel(
                 gene_mask = gene_mask | param_dep
 
         n_dep = gene_mask.sum()
-        print(f"[FILTER] {n_dep}/{T} genes pass dependency filter (CI excludes 0)")
+        print(f"{n_dep}/{T} genes pass dependency filter (CI excludes 0)")
 
     # Get indices of genes to plot
     gene_indices = np.where(gene_mask)[0]
@@ -1613,7 +1614,7 @@ def extract_posterior_dataframe(
 
     for param in params:
         if param not in posterior:
-            print(f"[WARNING] Parameter '{param}' not found in posterior, skipping.")
+            warnings.warn(f"Parameter '{param}' not found in posterior_samples_trans, skipping.")
             continue
 
         samps = to_np(posterior[param])

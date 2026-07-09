@@ -1,4 +1,4 @@
-"""Test backward compatibility of fit_technical with negbinom distribution."""
+"""Test fit_ntc with negbinom distribution."""
 
 import numpy as np
 
@@ -48,5 +48,5 @@ def test_alpha_y_prefit_set_in_modality(technical_compat_model):
 
 def test_alpha_y_prefit_correct_shape(technical_compat_model):
     gene_modality = technical_compat_model.get_modality('gene')
-    # Shape should be (n_samples, n_groups, n_genes)
-    assert len(gene_modality.alpha_y_prefit.shape) == 3
+    # Shape is (n_groups, n_genes) — point estimates, not posterior samples
+    assert len(gene_modality.alpha_y_prefit.shape) == 2

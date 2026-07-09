@@ -584,6 +584,34 @@ def _multinomial_correct_binned_probs(
 
 
 # ============================================================================
+# Posterior Extraction Utilities
+# ============================================================================
+
+def _extract_param_mean(param_samples, feature_idx: int):
+    """Extract the posterior-mean value for one feature from a parameter tensor."""
+    if hasattr(param_samples, 'mean'):
+        param_mean = param_samples.mean(dim=0)
+    else:
+        param_mean = param_samples.mean(axis=0)
+    if param_mean.ndim > 1:
+        param_mean = param_mean.squeeze(0)
+    val = param_mean[feature_idx]
+    return val.item() if hasattr(val, 'item') else val
+
+
+def _extract_param_samples(posterior, param_name: str, feature_idx: int) -> np.ndarray:
+    """Extract all posterior samples for one feature from a named parameter."""
+    samples = posterior[param_name]
+    if hasattr(samples, 'cpu'):
+        samples = samples.cpu().numpy()
+    else:
+        samples = np.array(samples)
+    if samples.ndim > 2:
+        samples = samples.squeeze(1)
+    return samples[:, feature_idx]
+
+
+# ============================================================================
 # Technical Group Utilities
 # ============================================================================
 
@@ -591,68 +619,35 @@ def get_technical_group_labels(model) -> List[str]:
     """
     Get informative labels for technical groups.
 
-    Returns human-readable labels like "K562", "TF1:lane1" instead of
-    generic "technical_group_0", "technical_group_1".
+    Returns human-readable labels like ``"K562"`` or ``"K562:lane1"`` built
+    from the covariates passed to ``set_technical_groups()``.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
 
     Returns
     -------
     List[str]
-        Informative labels for each technical group code
+        One label per unique ``technical_group_code`` value (sorted).
     """
     if 'technical_group_code' not in model.meta.columns:
-        return ['All']  # Single group when no technical groups
+        return ['All']
 
-    # Get unique technical groups
     group_codes = sorted(model.meta['technical_group_code'].unique())
 
-    # Determine which covariates were used
-    # We need to reverse engineer this from the grouping
-    # Try common covariate combinations
-    potential_covariates = ['cell_line', 'lane', 'batch', 'replicate']
-    available_covariates = [c for c in potential_covariates if c in model.meta.columns]
-
-    if not available_covariates:
-        # Fall back to generic labels
+    # Use stored covariates if available (set by set_technical_groups)
+    covariates = getattr(model, '_technical_group_covariates', None)
+    if not covariates:
         return [f'Group_{i}' for i in group_codes]
 
-    # Find which covariates were used by checking if they distinguish groups
-    used_covariates = []
-    for cov in available_covariates:
-        test_grouping = model.meta.groupby(used_covariates + [cov]).ngroup()
-        if test_grouping.nunique() == len(group_codes) and (test_grouping == model.meta['technical_group_code']).all():
-            # This covariate set matches
-            used_covariates.append(cov)
-            break
-        elif len(used_covariates) == 0:
-            # Try single covariate
-            test_grouping = model.meta.groupby([cov]).ngroup()
-            if test_grouping.nunique() == len(group_codes) and (test_grouping == model.meta['technical_group_code']).all():
-                used_covariates = [cov]
-                break
-
-    if not used_covariates:
-        # Couldn't determine covariates, use generic labels
-        return [f'Group_{i}' for i in group_codes]
-
-    # Create labels
     labels = []
     for code in group_codes:
         mask = model.meta['technical_group_code'] == code
-        group_data = model.meta.loc[mask, used_covariates].iloc[0]
-
-        if len(used_covariates) == 1:
-            # Single covariate: just use the value
-            labels.append(str(group_data[used_covariates[0]]))
-        else:
-            # Multiple covariates: join with ":"
-            parts = [str(group_data[cov]) for cov in used_covariates]
-            labels.append(':'.join(parts))
-
+        row = model.meta.loc[mask, covariates].iloc[0]
+        parts = [str(row[c]) for c in covariates]
+        labels.append(':'.join(parts))
     return labels
 
 
@@ -1111,29 +1106,18 @@ def predict_trans_derivatives(
 
     feature_idx = feature_list.index(feature)
 
-    # Helper function to extract parameter value
-    def _extract_param(param_samples, feature_idx):
-        if hasattr(param_samples, 'mean'):
-            param_mean = param_samples.mean(dim=0)
-        else:
-            param_mean = param_samples.mean(axis=0)
-        if param_mean.ndim > 1:
-            param_mean = param_mean.squeeze(0)
-        val = param_mean[feature_idx]
-        return val.item() if hasattr(val, 'item') else val
-
     # Check function type and compute derivatives
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
 
             # First derivatives
             dHill_a = Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1158,14 +1142,14 @@ def predict_trans_derivatives(
     elif 'upper_limit' in posterior and 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL (binomial/multinomial) =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
 
             # First derivatives
             dHill_a = Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1190,10 +1174,10 @@ def predict_trans_derivatives(
     elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
 
             # First derivative
             first_deriv = alpha * Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -2458,23 +2442,6 @@ def predict_trans_function(
     feature_idx = feature_list.index(feature)
     A = A_mean[feature_idx].item() if hasattr(A_mean, 'item') else A_mean[feature_idx]
 
-    # Helper function to extract parameter value for a specific feature
-    # Handles both primary modality (S, T) and non-primary modality (S, C, T) shapes
-    def _extract_param(param_samples, feature_idx):
-        """Extract mean parameter value for a specific feature, handling dimension squeezing."""
-        if hasattr(param_samples, 'mean'):
-            param_mean = param_samples.mean(dim=0)
-        else:
-            param_mean = param_samples.mean(axis=0)
-
-        # Squeeze out cis gene dimension if present
-        if param_mean.ndim > 1:
-            param_mean = param_mean.squeeze(0)
-
-        # Extract value for this feature
-        val = param_mean[feature_idx]
-        return val.item() if hasattr(val, 'item') else val
-
     # Determine function type from available parameters
     if debug:
         print(f"[predict_trans_function] A={A_mean[feature_idx]:.4g}, feature_idx={feature_idx}")
@@ -2484,14 +2451,14 @@ def predict_trans_function(
         # ===== ADDITIVE HILL (negbinom/normal/studentt) =====
         try:
             # Extract parameters using helper function
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
 
             if debug:
                 print(f"[predict_trans_function] additive_hill: A={A:.4g}, alpha={alpha:.4g}, beta={beta:.4g}, Vmax_a={Vmax_a:.4g}, Vmax_b={Vmax_b:.4g}, K_a={K_a:.4g}, K_b={K_b:.4g}, n_a={n_a:.4g}, n_b={n_b:.4g}")
@@ -2514,14 +2481,14 @@ def predict_trans_function(
         # ===== ADDITIVE HILL (binomial/multinomial with upper_limit and Vmax_a/b) =====
         try:
             # Extract parameters using helper function
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
 
             # IMPORTANT: Match the actual model computation in fit_trans!
             # Model uses: y = A + (alpha * Hill_a(Vmax=Vmax_a)) + (beta * Hill_b(Vmax=Vmax_b))
@@ -2540,10 +2507,10 @@ def predict_trans_function(
     elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
 
             # Compute Hill function: y = A + alpha * Hill(x, Vmax=Vmax_a, K=K_a, n=n_a)
             Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
@@ -2753,32 +2720,19 @@ def predict_trans_function_samples(
             return None
         feature_idx = feature_list.index(feature)
 
-    # Helper to extract all samples for a parameter
-    def _extract_samples(param_name, feature_idx):
-        """Extract all posterior samples for a specific feature."""
-        samples = posterior[param_name]
-        if hasattr(samples, 'cpu'):
-            samples = samples.cpu().numpy()
-        else:
-            samples = np.array(samples)
-        # Squeeze cis gene dimension if present
-        if samples.ndim > 2:
-            samples = samples.squeeze(1)
-        return samples[:, feature_idx]  # [n_samples]
-
     # Determine function type and compute predictions
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
             A = A_samples[:, feature_idx]  # [n_samples]
-            alpha = _extract_samples('alpha', feature_idx)
-            beta = _extract_samples('beta', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            Vmax_b = _extract_samples('Vmax_b', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            K_b = _extract_samples('K_b', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
-            n_b = _extract_samples('n_b', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            beta = _extract_param_samples(posterior, 'beta', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            Vmax_b = _extract_param_samples(posterior, 'Vmax_b', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            K_b = _extract_param_samples(posterior, 'K_b', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
+            n_b = _extract_param_samples(posterior, 'n_b', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -2814,10 +2768,10 @@ def predict_trans_function_samples(
         # ===== SINGLE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            alpha = _extract_samples('alpha', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -2938,29 +2892,19 @@ def predict_trans_derivatives_samples(
         feature_idx = feature_list.index(feature)
 
     # Helper to extract all samples for a parameter
-    def _extract_samples(param_name, feature_idx):
-        samples = posterior[param_name]
-        if hasattr(samples, 'cpu'):
-            samples = samples.cpu().numpy()
-        else:
-            samples = np.array(samples)
-        if samples.ndim > 2:
-            samples = samples.squeeze(1)
-        return samples[:, feature_idx]
-
     # Compute based on function type
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            alpha = _extract_samples('alpha', feature_idx)
-            beta = _extract_samples('beta', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            Vmax_b = _extract_samples('Vmax_b', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            K_b = _extract_samples('K_b', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
-            n_b = _extract_samples('n_b', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            beta = _extract_param_samples(posterior, 'beta', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            Vmax_b = _extract_param_samples(posterior, 'Vmax_b', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            K_b = _extract_param_samples(posterior, 'K_b', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
+            n_b = _extract_param_samples(posterior, 'n_b', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -3012,10 +2956,10 @@ def predict_trans_derivatives_samples(
         # ===== SINGLE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            alpha = _extract_samples('alpha', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -3344,7 +3288,7 @@ def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
     )
 
 
-def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=True, y_scale=1.0,
+def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0,
                           fdr_df=None, fdr_threshold=0.05):
     """
     Compute meaningful parameter markers for single_hill and additive_hill trans functions.
@@ -3358,9 +3302,10 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
         True for negbinom (y-axis is log2). False for binomial/normal (linear y-axis).
     y_scale : float
         Multiplicative scale applied to linear y-values before plotting (e.g. 100 for PSI%).
-    ci_level : float
-        Kept for API compatibility; no longer used internally (activity is now
-        always determined by Bayesian FDR, not a CI on n).
+    fdr_df : DataFrame, optional
+        FDR summary table. If provided, used to determine which Hill components are active.
+    fdr_threshold : float, default 0.05
+        FDR threshold for classifying components as active.
     """
     # ── Resolve posterior and feature list ─────────────────────────────────
     if modality.name == model.primary_modality:
@@ -4059,7 +4004,7 @@ def plot_negbinom_xy(
             if _show_fit_markers and (corrected or not has_technical_fit):
                 _markers = _compute_hill_markers(
                     model, feature, modality,
-                    ci_level=ci_level, log2_space=True, y_scale=1.0,
+                    log2_space=True, y_scale=1.0,
                     fdr_df=_effective_fdr_df, fdr_threshold=fdr_threshold,
                 )
                 # In log2FC mode the axes are shifted; pass the same offsets so
@@ -4443,7 +4388,7 @@ def plot_binomial_xy(
         if mark_params and (corrected or not has_technical_fit):
             _markers = _compute_hill_markers(
                 model, feature, modality,
-                ci_level=ci_level, log2_space=False, y_scale=100.0
+                log2_space=False, y_scale=100.0
             )
             _draw_hill_markers(ax_plot, _markers)
 
@@ -4984,7 +4929,7 @@ def plot_normal_xy(
         if mark_params and (corrected or not has_technical_fit):
             _markers = _compute_hill_markers(
                 model, feature, modality,
-                ci_level=ci_level, log2_space=False, y_scale=1.0
+                log2_space=False, y_scale=1.0
             )
             _draw_hill_markers(ax_plot, _markers)
 
