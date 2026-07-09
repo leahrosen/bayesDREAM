@@ -16,7 +16,7 @@ Technical group covariate handling:
 - negbinom: Multiplicative effects on mu via alpha_y
 - normal/studentt: Additive effects on mu
 - binomial: Effects on logit scale
-- multinomial: Not supported yet (complex - need to maintain probability simplex)
+- multinomial: Log-additive on log(probs), then masked softmax (alpha_y [C,T,K] per-category)
 """
 
 import torch
@@ -250,7 +250,12 @@ def sample_multinomial_trans(
 
     # Add α and compute probabilities
     if alpha_y_full is not None and groups_tensor is not None:
-        if alpha_y_full.dim() == 3:
+        if alpha_y_full.dim() == 2:
+            # [C, T] -> fallback only (multinomial alpha_y should be [C,T,K]);
+            # broadcast the same offset uniformly across all K categories
+            alpha_used = alpha_y_full[groups_tensor, :].unsqueeze(-1)  # [N, T, 1]
+            probs = _probs_from_logits(safe_log_mu, alpha_used)        # [N, T, K]
+        elif alpha_y_full.dim() == 3:
             # [C, T, K] -> index by group per observation -> [N, T, K]
             alpha_used = alpha_y_full[groups_tensor, :, :]
             probs = _probs_from_logits(safe_log_mu, alpha_used)        # [N, T, K]

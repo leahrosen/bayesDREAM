@@ -1055,9 +1055,16 @@ class ModelSummarizer:
         if isinstance(alpha_y, torch.Tensor):
             alpha_y = alpha_y.cpu().numpy()
 
-        # alpha_y is always 2D [C, T] — no samples dimension
-        if alpha_y.ndim == 3:
-            alpha_y = alpha_y.mean(axis=0)
+        # For multinomial, alpha_y is [C, T, K]; for all others, [C, T].
+        # If an old-format tensor with a leading samples dim (S) was stored, collapse it.
+        if modality.distribution == 'multinomial':
+            if alpha_y.ndim == 4:  # [S, C, T, K] — collapse S
+                alpha_y = alpha_y.mean(axis=0)
+            # alpha_y is now [C, T, K]
+        else:
+            if alpha_y.ndim == 3:  # [S, C, T] — collapse S
+                alpha_y = alpha_y.mean(axis=0)
+            # alpha_y is now [C, T]
 
         # Get feature names - prefer modality.feature_names (what users see)
         if modality.feature_names is not None:
@@ -1095,11 +1102,21 @@ class ModelSummarizer:
         data['modality'] = modality_name
         data['distribution'] = modality.distribution
 
-        # Add columns for each group
-        for g in range(n_groups):
-            data[f'group_{g}_alpha_y_median'] = alpha_median[g, :]
-            data[f'group_{g}_alpha_y_lower'] = alpha_lower[g, :]
-            data[f'group_{g}_alpha_y_upper'] = alpha_upper[g, :]
+        # Add columns for each group.
+        # For multinomial alpha_y is [C, T, K]: export one column per (group, category).
+        # For all others alpha_y is [C, T]: one column per group.
+        if modality.distribution == 'multinomial':
+            K_alpha = alpha_median.shape[2]
+            for g in range(n_groups):
+                for k in range(K_alpha):
+                    data[f'group_{g}_alpha_y_cat{k}_median'] = alpha_median[g, :, k]
+                    data[f'group_{g}_alpha_y_cat{k}_lower'] = alpha_lower[g, :, k]
+                    data[f'group_{g}_alpha_y_cat{k}_upper'] = alpha_upper[g, :, k]
+        else:
+            for g in range(n_groups):
+                data[f'group_{g}_alpha_y_median'] = alpha_median[g, :]
+                data[f'group_{g}_alpha_y_lower'] = alpha_lower[g, :]
+                data[f'group_{g}_alpha_y_upper'] = alpha_upper[g, :]
 
         if mu_ntc_vals is not None:
             data['mu_ntc'] = mu_ntc_vals
@@ -2550,6 +2567,8 @@ class ModelSummarizer:
             # Modality.__init__ ensures column K_max-1 is always a real category (by swapping
             # the last real category there for features with K_actual < K_max), so [:, :, -1]
             # is always the correct residual baseline.
+            # Also export all K per-category A values and per-category Hill params so that
+            # simulation can reconstruct the full per-category dose-response curves.
             if 'A' in posterior:
                 A_raw = posterior['A']
                 if isinstance(A_raw, torch.Tensor):
@@ -2561,6 +2580,24 @@ class ModelSummarizer:
                     data['A_K_median'] = np.median(AK, axis=0)
                     data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
                     data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)
+                    # Per-category A for k=0..K-2 (K-1 fitted, last is residual A_K above)
+                    K_dim = A_raw.shape[2]
+                    for k in range(K_dim - 1):
+                        ck = A_raw[:, :, k]  # [S, T]
+                        data[f'A_cat{k}_median'] = np.median(ck, axis=0)
+                        data[f'A_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'A_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
+
+            # Per-category Hill parameters for simulation (Vmax, K, n for a- and b-components)
+            for hill_param in ['Vmax_a', 'K_a', 'n_a', 'Vmax_b', 'K_b', 'n_b']:
+                cat_arr = _extract_cat_param(hill_param)
+                if cat_arr is not None:
+                    n_cats = cat_arr.shape[2]
+                    for k in range(n_cats):
+                        ck = cat_arr[:, :, k]  # [S, T]
+                        data[f'{hill_param}_cat{k}_median'] = np.median(ck, axis=0)
+                        data[f'{hill_param}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'{hill_param}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
         # Get full posterior samples (needed for FDR and per-sample CI computations)
         Vmax_a_full = extract_param_full('Vmax_a')
@@ -3554,6 +3591,47 @@ class ModelSummarizer:
         data['A_median'] = A_mean
         data['A_lower'] = A_lo
         data['A_upper'] = A_hi
+
+        # Multinomial: export per-category A, Vmax_a, K_a, n_a, alpha for simulation.
+        # These parallel the per-category alpha/beta columns already in _add_additive_hill_params.
+        if distribution == 'multinomial':
+            def _extract_single_cat_param(name):
+                """Return raw numpy [S, T, K-1] (or [S, T, K] for A) for a per-category parameter."""
+                if name not in posterior:
+                    return None
+                p = posterior[name]
+                if isinstance(p, torch.Tensor):
+                    p = p.cpu().numpy()
+                if p.ndim == 4 and p.shape[1] == 1:
+                    p = p.squeeze(1)
+                if p.ndim == 3 and p.shape[1] == n_features:
+                    return p
+                return None
+
+            # A: shape [S, T, K] — export K-1 fitted categories and residual
+            A_raw_sh = _extract_single_cat_param('A')
+            if A_raw_sh is not None:
+                K_dim = A_raw_sh.shape[2]
+                AK = A_raw_sh[:, :, -1]
+                data['A_K_median'] = np.median(AK, axis=0)
+                data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
+                data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)
+                for k in range(K_dim - 1):
+                    ck = A_raw_sh[:, :, k]
+                    data[f'A_cat{k}_median'] = np.median(ck, axis=0)
+                    data[f'A_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                    data[f'A_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
+
+            # Vmax_a, K_a, n_a, alpha: shape [S, T, K-1]
+            for hill_param in ['Vmax_a', 'K_a', 'n_a', 'alpha']:
+                cat_arr = _extract_single_cat_param(hill_param)
+                if cat_arr is not None:
+                    n_cats = cat_arr.shape[2]
+                    for k in range(n_cats):
+                        ck = cat_arr[:, :, k]
+                        data[f'{hill_param}_cat{k}_median'] = np.median(ck, axis=0)
+                        data[f'{hill_param}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'{hill_param}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
         # Compute product-based FDR for single_hill: P(alpha * Vmax / A > epsilon)
         _ACTIVITY_EPSILON = 0.01
