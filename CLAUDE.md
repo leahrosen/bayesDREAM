@@ -61,16 +61,18 @@ The main class in `bayesDREAM/model.py` implements multi-modal Bayesian modeling
   - Flexible identifier support: uses 'gene', 'gene_name', 'gene_id', or index
 - Creates guide-level metadata by grouping cells by guide and specified covariates
 - Supports both CPU and CUDA devices
+- `cis_gene` is **optional at init** (low-MOI only); omit it to run `fit_ntc()` once across all cis genes, then call `add_cis_gene()` before `fit_cis()`. When `cis_gene` is omitted, `label` must be provided explicitly (it normally defaults to the gene name).
 
 **Key Methods:**
 
-- `set_technical_groups(covariates)`: Sets technical_group_code based on covariates (must be called before fit_technical)
-- `fit_technical(sum_factor_col, modality_name, ...)`: Fits NTC-only model to estimate `alpha_y_prefit`
-- `set_alpha_x(alpha_x, is_posterior, covariates)`: Sets cis gene overdispersion parameters
-- `set_alpha_y(alpha_y, is_posterior, covariates)`: Sets trans gene overdispersion parameters
+- `set_technical_groups(covariates)`: Sets technical_group_code based on covariates (must be called before fit_ntc)
+- `fit_ntc(sum_factor_col, modality_name, ...)`: Fits NTC-only model to estimate `alpha_y_prefit`
+- `add_cis_gene(cis_gene)`: Specifies the cis gene after initialization (see **Deferred Cis-Gene Workflow** below). Can be called before or after `fit_ntc()`.
+- `set_alpha_x(alpha_x, covariates)`: Sets cis gene overdispersion parameters
+- `set_alpha_y(alpha_y, covariates)`: Sets trans gene overdispersion parameters
 - `adjust_ntc_sum_factor(covariates, ...)`: Adjusts NTC sum factors for covariates
 - `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`
-- `set_x_true(x_true, is_posterior)`: Sets true cis expression for trans modeling
+- `set_x_true(x_true)`: Sets true cis expression for trans modeling
 - `permute_genes(genes2permute, ...)`: Permutes guide-gene associations for null testing
 - `refit_sumfactor(covariates, ...)`: Re-estimates sum factors based on posterior cis expression
 - `fit_trans(sum_factor_col, function_type, modality_name, ...)`: Fits trans effects using `_model_y`
@@ -156,6 +158,46 @@ To add a new dose-response function:
 2. Add a conditional branch in `_model_y` to handle the new function type
 3. Update `fit_trans` to set appropriate priors and optimization settings
 
+### Deferred Cis-Gene Workflow (`add_cis_gene`)
+
+In the standard pipeline, `cis_gene` is provided at initialization and the model is subset to NTC + that gene's cells immediately. This means `fit_ntc()` must be re-run separately per cis gene.
+
+**`add_cis_gene(cis_gene)`** allows a single `fit_ntc()` call to serve all cis genes:
+
+```python
+# One model, one fit_ntc call — shared across all cis genes
+model = bayesDREAM(meta=meta, counts=gene_counts, label='run1')
+model.set_technical_groups(['cell_line'])
+model.fit_ntc(sum_factor_col='sum_factor')
+model.adjust_ntc_sum_factor(covariates=['cell_line'])  # optional, also shareable
+
+# Then for each cis gene, fork from the fitted model:
+import copy
+for gene in ['GFI1B', 'MYB', 'TET2']:
+    m = copy.deepcopy(model)
+    m.add_cis_gene(gene)
+    m.fit_cis(sum_factor_col='sum_factor')
+    m.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
+```
+
+**What `add_cis_gene()` does internally (`model.py`):**
+
+1. Finds the cis gene by name in the primary modality's `feature_meta`
+2. Extracts its counts into a new `'cis'` modality
+3. If `fit_ntc()` has already run: calls `_extract_cis_alpha_from_ntc_posteriors()` — pulls the gene's alpha from the primary modality posteriors into the cis modality and trims it from the primary posteriors; sets `self.alpha_x_prefit`
+4. Removes the cis gene from the primary modality (counts + feature_meta, index reset)
+5. Subsets `self.meta` and all modalities to NTC + cis cells
+6. Calls `_refilter_zero_count_features()` — drops features that became zero-count after cell subsetting; trims matching axes in stored NTC posteriors via `_trim_feature_axis_in_posteriors()`
+7. Recomputes `guide_code` as compact integers over the retained cells
+8. Reinitialises `sum_factors` on the final cell set
+
+**Constraints:**
+- Not supported in high-MOI mode (cell classification requires `cis_gene` at init)
+- `label` must be provided explicitly when `cis_gene` is omitted at init
+- `fit_cis()` and `fit_trans()` require `add_cis_gene()` to have been called first
+- `adjust_ntc_sum_factor()` and `fit_ntc()` can safely be called before `add_cis_gene()`
+- `guide_code` is computed over all cells at init (harmless), then recomputed compactly inside `add_cis_gene()`
+
 ### Testing Changes
 
 The `toydata/` directory contains small test datasets. Use these for quick validation before running on full data:
@@ -194,7 +236,7 @@ The `Modality` class (`bayesDREAM/modality.py`) provides a standardized containe
 
 The `bayesDREAM` class (`bayesDREAM/model.py`) provides full multi-modal support:
 
-**Initialization:**
+**Initialization (standard):**
 ```python
 from bayesDREAM import bayesDREAM
 
@@ -202,11 +244,25 @@ model = bayesDREAM(
     meta=cell_metadata,
     counts=gene_counts,              # Primary modality (genes)
     gene_meta=gene_metadata,         # Optional: gene annotations
-    cis_gene='GFI1B',
+    cis_gene='GFI1B',               # Optional — can be set later via add_cis_gene()
     primary_modality='gene',         # Which modality drives cis/trans effects
     output_dir='./output',
     label='multimodal_run'
 )
+```
+
+**Initialization (deferred cis gene — fit_ntc once for all genes):**
+```python
+model = bayesDREAM(
+    meta=cell_metadata,
+    counts=gene_counts,
+    label='run1',                   # Required when cis_gene is omitted
+)
+model.set_technical_groups(['cell_line'])
+model.fit_ntc(sum_factor_col='sum_factor')
+# model now has fit_ntc posteriors for ALL genes;
+# call add_cis_gene() to commit to one cis gene before fit_cis()
+model.add_cis_gene('GFI1B')
 ```
 
 **Adding Modalities:**
