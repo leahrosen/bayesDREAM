@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 bayesDREAM is a Bayesian framework for modeling perturbation effects across multiple molecular modalities. The model consists of three sequential steps:
 
-1. **Technical fit** (`fit_technical`): Models technical variation in non-targeting controls (NTC) to estimate gene-specific overdispersion parameters (`alpha_y`)
+1. **Technical fit** (`fit_ntc`): Models technical variation in non-targeting controls (NTC) to estimate gene-specific overdispersion parameters (`alpha_y`)
 2. **Cis fit** (`fit_cis`): Models direct effects on the targeted gene expression (`model_x`)
 3. **Trans fit** (`fit_trans`): Models downstream effects on other genes as a function of the cis gene expression (`model_y`)
 
@@ -18,30 +18,54 @@ The codebase uses PyTorch and Pyro for probabilistic programming and variational
 bayesDREAM_forClaude/
 ├── bayesDREAM/
 │   ├── __init__.py          # Package exports
-│   ├── model.py             # Main bayesDREAM class (~311 lines)
-│   ├── core.py              # _BayesDREAMCore base class (~909 lines)
+│   ├── __main__.py          # CLI entry point
+│   ├── cli.py               # Command-line interface
+│   ├── model.py             # Main bayesDREAM class
+│   ├── core.py              # _BayesDREAMCore base class
 │   ├── modality.py          # Modality class for multi-modal data
-│   ├── distributions.py     # Distribution-specific observation samplers
-│   ├── splicing.py          # Splicing data processing (pure Python)
+│   ├── diagnostics.py       # Diagnostic utilities
+│   ├── slurm_jobgen.py      # SLURM job generation
+│   ├── utils.py             # Shared utility functions
 │   ├── fitting/             # Fitting methods (modular)
 │   │   ├── __init__.py
-│   │   ├── helpers.py       # Shared helper functions
-│   │   ├── technical.py     # TechnicalFitter class
+│   │   ├── ntc.py           # NTCFitter class (overdispersion estimation)
 │   │   ├── cis.py           # CisFitter class
-│   │   └── trans.py         # TransFitter class
-│   ├── io/                  # Save/load functionality
+│   │   ├── trans.py         # TransFitter class
+│   │   └── distributions.py # Distribution-specific observation samplers
+│   ├── io/                  # Save/load/summary functionality
 │   │   ├── __init__.py
 │   │   ├── save.py          # ModelSaver class
-│   │   └── load.py          # ModelLoader class
-│   └── modalities/          # Modality-specific methods
+│   │   ├── load.py          # ModelLoader class
+│   │   └── summary.py       # Summary export
+│   ├── modalities/          # Modality-specific methods
+│   │   ├── __init__.py
+│   │   ├── transcript.py    # TranscriptModalityMixin
+│   │   ├── splicing_modality.py  # SplicingModalityMixin
+│   │   ├── atac.py          # ATACModalityMixin
+│   │   ├── custom.py        # CustomModalityMixin
+│   │   └── plotting_mixin.py # PlottingMixin
+│   ├── plotting/            # Visualization subpackage
+│   │   ├── __init__.py
+│   │   ├── basic.py         # Basic plots
+│   │   ├── model_plots.py   # Model-specific plots
+│   │   ├── posterior.py     # Posterior visualization
+│   │   ├── prior_posterior.py
+│   │   ├── prior_sampling.py
+│   │   ├── xy_plots.py      # x/y dose-response plots
+│   │   ├── de_comparison.py # DE comparison plots
+│   │   ├── diagnostics.py   # Diagnostic plots
+│   │   ├── colors.py        # Color palettes
+│   │   ├── helpers.py       # Plotting helpers
+│   │   └── utils.py         # Plotting utilities
+│   └── simulation/          # Simulation and permutation
 │       ├── __init__.py
-│       ├── transcript.py    # TranscriptModalityMixin
-│       ├── splicing_modality.py  # SplicingModalityMixin
-│       ├── atac.py          # ATACModalityMixin
-│       └── custom.py        # CustomModalityMixin
-├── tests/                   # Test suite
+│       ├── simulation.py    # Data simulation
+│       └── permutation.py   # Permutation testing utilities
+├── tests/                   # Test suite (19 test files)
 ├── toydata/                 # Test datasets (genes, splicing, metadata)
-└── docs/                    # Documentation
+├── examples/                # Example scripts
+├── docs/                    # Documentation
+└── visualisation/           # Visualization scripts
 ```
 
 **Note**: The codebase was recently refactored from a single 4,537-line `model.py` file into a modular structure. This improves maintainability while preserving backward compatibility. See `docs/archive/planning/REFACTORING_SUMMARY.md` for details.
@@ -107,10 +131,12 @@ Three Pyro models implement the statistical framework:
 
 ### Testing
 
-Run infrastructure tests (requires pyroenv conda environment):
+Run infrastructure tests (requires `bayesdream` conda environment at `/Users/leahrosen/miniconda3/envs/bayesdream/`):
 
 ```bash
-/opt/anaconda3/envs/pyroenv/bin/python test_multimodal_fitting.py
+cd "/Users/leahrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/Code/bayesDREAM code/bayesDREAM_forClaude"
+export PYTHONPATH="."
+/Users/leahrosen/miniconda3/envs/bayesdream/bin/python -m pytest tests/ -v
 ```
 
 ### Modifying the Model
@@ -118,10 +144,10 @@ Run infrastructure tests (requires pyroenv conda environment):
 The codebase uses a modular structure with delegation:
 
 1. **Core fitting logic**: Pyro models and fitting methods are in `fitting/` directory
-   - `fitting/technical.py`: TechnicalFitter class with `_model_technical` and `fit_technical`
+   - `fitting/ntc.py`: NTCFitter class with `_model_ntc` and `fit_ntc`
    - `fitting/cis.py`: CisFitter class with `_model_x` and `fit_cis`
    - `fitting/trans.py`: TransFitter class with `_model_y` and `fit_trans`
-   - `fitting/helpers.py`: Shared helper functions (Hill functions, etc.)
+   - `fitting/distributions.py`: Distribution-specific observation samplers (shared across fitters)
 
 2. **Base class**: `core.py` contains `_BayesDREAMCore` which:
    - Initializes fitter objects (`_technical_fitter`, `_cis_fitter`, `_trans_fitter`)
@@ -139,12 +165,13 @@ The codebase uses a modular structure with delegation:
    - `atac.py`: `add_atac_modality`
    - `custom.py`: `add_custom_modality`
 
-5. **I/O operations**: `io/` directory contains save/load functionality
+5. **I/O operations**: `io/` directory contains save/load/summary functionality
    - `save.py`: ModelSaver class
    - `load.py`: ModelLoader class
+   - `summary.py`: Summary export for downstream analysis
 
 **When adding new functionality**:
-- Helper functions → `fitting/helpers.py`
+- Distribution sampling logic → `fitting/distributions.py`
 - New Pyro models → appropriate fitter in `fitting/` (follow `_model_<name>` convention)
 - Modality-specific code → appropriate mixin in `modalities/`
 - Save/load methods → `io/save.py` or `io/load.py`
@@ -431,17 +458,38 @@ See `tests/` directory for complete examples including transcripts, custom modal
 
 ### Running Tests
 
-All tests are in the `tests/` directory. Run them with:
+All tests are in the `tests/` directory. The conda environment is `bayesdream` at `/Users/leahrosen/miniconda3/envs/bayesdream/bin/python`.
+
+Run the full suite with pytest:
 
 ```bash
-cd "/Users/lrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/bayesDREAM code/bayesDREAM_forClaude"
+cd "/Users/leahrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/Code/bayesDREAM code/bayesDREAM_forClaude"
 export PYTHONPATH="."
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_multimodal_fitting.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_negbinom_compat.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_technical_compat.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_per_modality_fitting.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_gene_meta.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_modality_save_load.py
+/Users/leahrosen/miniconda3/envs/bayesdream/bin/python -m pytest tests/ -v
+```
+
+Or run individual test files:
+
+```bash
+PYTHON=/Users/leahrosen/miniconda3/envs/bayesdream/bin/python
+$PYTHON tests/test_multimodal_fitting.py       # Full pipeline (slow, requires toydata)
+$PYTHON tests/test_negbinom_compat.py          # Negbinom backward compat
+$PYTHON tests/test_technical_compat.py         # Technical fitting compat
+$PYTHON tests/test_per_modality_fitting.py     # Multi-modality fitting
+$PYTHON tests/test_gene_meta.py                # Gene metadata handling
+$PYTHON tests/test_modality_save_load.py       # Save/load
+$PYTHON tests/test_summary_export.py           # Summary export (slow)
+$PYTHON tests/test_summary_export_simple.py    # Summary export (mocked, faster)
+$PYTHON tests/test_system_quick_pipeline.py    # Quick end-to-end pipeline
+$PYTHON tests/test_trans_all_distributions.py  # Trans fitting all distributions
+$PYTHON tests/test_high_moi.py                 # High-MOI mode
+$PYTHON tests/test_cli_system.py               # CLI tests
+$PYTHON tests/test_imports.py                  # Import smoke tests
+$PYTHON tests/test_filtering_simple.py         # Feature filtering
+$PYTHON tests/test_matrix_types.py             # Sparse/dense matrix support
+$PYTHON tests/test_modality_atac.py            # ATAC modality
+$PYTHON tests/test_cell_names_numpy.py         # Cell name handling
+$PYTHON tests/test_exon_skip_aggregation.py    # Exon skipping aggregation
 ```
 
 ### Documentation
@@ -453,12 +501,21 @@ All documentation is in the `docs/` directory:
 - `INITIALIZATION.md`: Technical fitting initialization strategies (empirical Bayes for negbinom, binomial, multinomial)
 - `OUTSTANDING_TASKS.md`: **Current outstanding tasks and known issues**
 - `SAVE_LOAD_GUIDE.md`: Guide to save/load functionality
+- `SUMMARY_EXPORT_GUIDE.md`: Exporting results for R/plotting
 - `QUICKSTART_MULTIMODAL.md`: Quick start for multi-modal analysis
 - `SLURM_JOB_GENERATOR.md`: HPC job generation guide
 - `MEMORY_REQUIREMENTS.md`: Memory estimation guide
-- `PLOTTING_GUIDE.md`: Comprehensive visualization guide
-- `SUMMARY_EXPORT_GUIDE.md`: Exporting results for R/plotting
-- Various specialized guides (ATAC, splicing, high MOI, etc.)
+- `FIT_TRANS_GUIDE.md`: Trans fitting guide
+- `FIT_TRANS_DESIGN_DECISIONS.md`: Design decisions for trans fitting
+- `HIGH_MOI_GUIDE.md`: High-MOI mode guide
+- `SPLICING_LOADER_GUIDE.md`: Splicing data loading guide
+- `CIS_MODEL_PARAMETERS.md`: Cis model parameter documentation
+- `HILL_FUNCTION_PRIORS.md`: Hill function prior specification
+- `BAYESIAN_FDR.md`: Bayesian FDR approach
+- `CELL_NAMES_GUIDE.md`: Cell name handling
+- `DATA_ACCESS.md`: Data access patterns
+- `FALSE_POSITIVES_GFI1B_DIAGNOSIS.md`: False positive diagnosis for GFI1B run
+- `OX_PRIOR_DIAGNOSIS.md`: o_x prior diagnosis and fix
 - Historical planning documents available in `docs/archive/`
 
 **Important**: Check `docs/OUTSTANDING_TASKS.md` for current development priorities, including the guide-prior infrastructure that needs to be integrated into `fit_cis()`.
