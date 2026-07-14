@@ -138,7 +138,10 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         if label is None and cis_gene is not None:
             label = cis_gene
         elif label is None:
-            label = ""
+            raise ValueError(
+                "label must be provided when cis_gene is not specified at initialization. "
+                "When cis_gene is provided, label defaults to the gene name."
+            )
 
         # Basic assignments
         self.meta = meta.copy()
@@ -173,6 +176,12 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
                         type(guide_assignment).__name__ if guide_assignment is not None else None,
                         type(guide_meta).__name__ if guide_meta is not None else None
                     )
+                )
+            if cis_gene is None:
+                raise ValueError(
+                    "cis_gene must be provided at initialization time in high-MOI mode. "
+                    "Deferred cis-gene specification via add_cis_gene() is not supported "
+                    "for high-MOI models."
                 )
             self.is_high_moi = True
 
@@ -440,18 +449,25 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
                 print(f"[INFO] Excluded {n_excluded} cells carrying guides in exclude_guides={exclude_guides}")
 
         # Subset meta and counts to relevant cells
-        valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
-        n_cells_before = len(self.meta["cell"].unique())
-        if len(valid_cells) < n_cells_before:
-            print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
-        self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
+        if self.cis_gene is not None:
+            valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
+            n_cells_before = len(self.meta["cell"].unique())
+            if len(valid_cells) < n_cells_before:
+                print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
+            self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
+        else:
+            # cis_gene not yet specified — keep all cells; add_cis_gene() will subset later
+            valid_cells = self.meta["cell"].unique()
+            print(f"[INFO] No cis_gene at init — keeping all {len(valid_cells)} cells. "
+                  "Call add_cis_gene() before fit_cis().")
 
         # Subset counts by cells - works for both DataFrame and sparse
         if isinstance(self.counts, pd.DataFrame):
             self.counts = self.counts[valid_cells].copy()
         else:
             # Sparse or dense array - subset by column indices
-            cell_indices = [i for i, cell in enumerate(self._cell_names) if cell in valid_cells]
+            valid_cells_set = set(valid_cells)
+            cell_indices = [i for i, cell in enumerate(self._cell_names) if cell in valid_cells_set]
             if self.is_sparse_counts:
                 self.counts = self.counts[:, cell_indices]
             else:

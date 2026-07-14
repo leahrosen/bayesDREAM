@@ -17,6 +17,7 @@ import warnings
 from typing import Dict, Optional
 import numpy as np
 import pandas as pd
+import torch
 
 from .core import _BayesDREAMCore
 from .modality import Modality
@@ -341,13 +342,13 @@ class bayesDREAM(
                               if c in valid_cells]
                 if len(cell_indices) < len(mod.cell_names):
                     self.modalities[mod_name] = mod.get_cell_subset(cell_indices)
-                else:
-                    # This shouldn't happen - means we have fewer cells in modality than in meta
-                    print(f"[WARNING] Modality '{mod_name}' has {len(mod.cell_names)} cells but filtered meta has {len(valid_cells)}")
 
         print(f"bayesDREAM: label={self.label}, device={self.device}, {len(self.modalities)} modalities")
         for name, mod in self.modalities.items():
             print(f"  - {name}: {mod}")
+
+        # Store sum_factor_col so add_cis_gene() can re-init sum_factors after cell subsetting.
+        self._sum_factor_col = sum_factor_col
 
         # Initialise sum_factors on all negbinom modalities from meta.
         # Must run AFTER super().__init__() and cell subsetting so self.meta is final.
@@ -370,6 +371,355 @@ class bayesDREAM(
             New color scheme to use for all visualizations.
         """
         self.color_scheme = color_scheme
+
+    # ------------------------------------------------------------------
+    # Deferred cis-gene specification
+    # ------------------------------------------------------------------
+
+    def add_cis_gene(self, cis_gene: str) -> None:
+        """
+        Specify the cis gene after initialization and prepare the model for cis/trans fitting.
+
+        Intended for workflows where fit_ntc() (and optionally adjust_ntc_sum_factor())
+        should be run once before the cis gene is committed, avoiding a separate technical-fit
+        run per gene.
+
+        The method:
+        1. Finds and extracts the cis gene from the primary modality, creating the 'cis' modality.
+        2. Subsets cells to NTC + cis-targeting cells only.
+        3. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
+           already been run, trims matching feature axes in the stored posteriors.
+        4. If fit_ntc() has already been run, extracts the cis gene's overdispersion parameters
+           from the primary modality posteriors into the 'cis' modality (equivalent to having
+           set cis_gene at init time).
+        5. Recomputes guide_code for compact indexing over the retained cells.
+        6. Reinitialises sum_factors on the (now-final) cell set.
+
+        Parameters
+        ----------
+        cis_gene : str
+            Name of the cis gene (must exist in the primary modality's feature_meta).
+
+        Raises
+        ------
+        ValueError
+            If cis_gene is already set, if called in high-MOI mode, if the gene is not
+            found, or if the gene has zero counts across NTC + cis cells.
+        """
+        if self.cis_gene is not None:
+            raise ValueError(
+                f"cis_gene is already set to '{self.cis_gene}'. Cannot call add_cis_gene() again."
+            )
+        if self.is_high_moi:
+            raise ValueError(
+                "add_cis_gene() is not supported in high-MOI mode. "
+                "Provide cis_gene at initialization time."
+            )
+        if 'cis' in self.modalities:
+            raise ValueError("'cis' modality already exists.")
+
+        primary_mod = self.modalities[self.primary_modality]
+        n_total_features = primary_mod.dims['n_features']
+
+        # ----------------------------------------------------------------
+        # Step 1: locate the cis gene in the primary modality feature_meta
+        # ----------------------------------------------------------------
+        gene_col = None
+        for col in ['gene_name', 'gene', 'gene_id', 'feature_id']:
+            if col in primary_mod.feature_meta.columns and cis_gene in primary_mod.feature_meta[col].values:
+                gene_col = col
+                break
+
+        if gene_col is None:
+            raise ValueError(
+                f"cis_gene '{cis_gene}' not found in primary modality feature_meta. "
+                f"Tried columns: gene_name, gene, gene_id, feature_id. "
+                f"Available columns: {list(primary_mod.feature_meta.columns)}"
+            )
+
+        match_mask = primary_mod.feature_meta[gene_col] == cis_gene
+        cis_feat_iloc = int(np.where(match_mask.values)[0][0])
+
+        print(f"[INFO] add_cis_gene: found '{cis_gene}' at feature iloc {cis_feat_iloc} "
+              f"in primary modality (of {n_total_features} features)")
+
+        # ----------------------------------------------------------------
+        # Step 2: extract cis gene counts from primary modality
+        # ----------------------------------------------------------------
+        if primary_mod.cells_axis == 1:
+            cis_counts = primary_mod.counts[[cis_feat_iloc], :]
+        else:
+            cis_counts = primary_mod.counts[:, [cis_feat_iloc]]
+
+        cis_feature_meta = primary_mod.feature_meta.iloc[[cis_feat_iloc]].copy()
+        cis_feature_meta.index = [0]
+        if 'gene' not in cis_feature_meta.columns:
+            cis_feature_meta['gene'] = cis_gene
+        if 'gene_name' not in cis_feature_meta.columns:
+            cis_feature_meta['gene_name'] = cis_gene
+
+        self.modalities['cis'] = Modality(
+            name='cis',
+            counts=cis_counts,
+            feature_meta=cis_feature_meta,
+            cell_names=primary_mod.cell_names,
+            distribution='negbinom',
+            cells_axis=primary_mod.cells_axis,
+            min_count=self.min_count,
+        )
+
+        # ----------------------------------------------------------------
+        # Step 3: if fit_ntc already ran, extract cis posteriors from primary
+        #         BEFORE we remove the cis feature row (while indices still align)
+        # ----------------------------------------------------------------
+        ntc_ran = primary_mod.posterior_samples_ntc is not None
+
+        if ntc_ran:
+            self._extract_cis_alpha_from_ntc_posteriors(cis_gene, cis_feat_iloc, n_total_features)
+
+        # ----------------------------------------------------------------
+        # Step 4: remove cis gene from primary modality
+        # ----------------------------------------------------------------
+        trans_idx = list(range(cis_feat_iloc)) + list(range(cis_feat_iloc + 1, n_total_features))
+
+        if primary_mod.cells_axis == 1:
+            trans_counts = primary_mod.counts[trans_idx, :]
+        else:
+            trans_counts = primary_mod.counts[:, trans_idx]
+
+        trans_feature_meta = primary_mod.feature_meta.iloc[trans_idx].copy()
+        trans_feature_meta.index = range(len(trans_idx))
+
+        trans_feature_names = (
+            [primary_mod.feature_names[i] for i in trans_idx]
+            if primary_mod.feature_names is not None else None
+        )
+
+        new_primary_mod = Modality(
+            name=self.primary_modality,
+            counts=trans_counts,
+            feature_meta=trans_feature_meta,
+            distribution=primary_mod.distribution,
+            cells_axis=primary_mod.cells_axis,
+            feature_names=trans_feature_names,
+            cell_names=primary_mod.cell_names,
+            min_count=primary_mod.min_count,
+        )
+
+        # Transfer already-trimmed fitting results to the new primary modality object
+        if ntc_ran:
+            new_primary_mod.posterior_samples_ntc = primary_mod.posterior_samples_ntc
+            new_primary_mod.alpha_y_prefit_mult = primary_mod.alpha_y_prefit_mult
+            new_primary_mod.alpha_y_prefit_add = primary_mod.alpha_y_prefit_add
+            if hasattr(primary_mod, 'loss_ntc'):
+                new_primary_mod.loss_ntc = primary_mod.loss_ntc
+
+        self.modalities[self.primary_modality] = new_primary_mod
+        self.cis_gene = cis_gene
+
+        # ----------------------------------------------------------------
+        # Step 5: subset cells to NTC + cis
+        # ----------------------------------------------------------------
+        valid_cells = set(self.meta[self.meta['target'].isin(['ntc', cis_gene])]['cell'].unique())
+        n_before = len(self.meta)
+        self.meta = self.meta[self.meta['cell'].isin(valid_cells)].copy()
+        n_after = len(self.meta)
+        if n_after < n_before:
+            print(f"[INFO] add_cis_gene: cells {n_before} → {n_after} (kept NTC + {cis_gene} only)")
+
+        for mod_name in list(self.modalities.keys()):
+            mod = self.modalities[mod_name]
+            if mod.cell_names is not None:
+                cell_idx = [i for i, c in enumerate(mod.cell_names) if c in valid_cells]
+                if len(cell_idx) < len(mod.cell_names):
+                    new_mod = mod.get_cell_subset(cell_idx)
+                    # Forward fitting results to cell-subsetted copy
+                    new_mod.posterior_samples_ntc = mod.posterior_samples_ntc
+                    new_mod.alpha_y_prefit_mult    = mod.alpha_y_prefit_mult
+                    new_mod.alpha_y_prefit_add     = mod.alpha_y_prefit_add
+                    if hasattr(mod, 'loss_ntc'):
+                        new_mod.loss_ntc = mod.loss_ntc
+                    self.modalities[mod_name] = new_mod
+
+        # ----------------------------------------------------------------
+        # Step 6: re-filter zero-count features after cell subsetting
+        # ----------------------------------------------------------------
+        self._refilter_zero_count_features(ntc_ran)
+
+        # ----------------------------------------------------------------
+        # Step 7: recompute guide_code for compact indices over retained cells
+        # ----------------------------------------------------------------
+        self.meta['guide_code'] = pd.Categorical(self.meta['guide_used']).codes
+
+        # ----------------------------------------------------------------
+        # Step 8: reinitialise sum_factors on the final cell set
+        # ----------------------------------------------------------------
+        self._init_sum_factors(self._sum_factor_col)
+
+        # ----------------------------------------------------------------
+        # Step 9: rebuild color scheme
+        # ----------------------------------------------------------------
+        self.color_scheme = ColorScheme.from_model(self)
+
+        print(f"[INFO] add_cis_gene('{cis_gene}') complete: {n_after} cells, "
+              f"{self.modalities[self.primary_modality].dims['n_features']} trans features, "
+              f"{'NTC posteriors transferred' if ntc_ran else 'fit_ntc() not yet run'}.")
+
+    def _extract_cis_alpha_from_ntc_posteriors(
+        self, cis_gene: str, cis_feat_iloc: int, n_total_features: int
+    ) -> None:
+        """
+        Extract cis gene overdispersion from primary modality NTC posteriors,
+        populate the 'cis' modality's posterior_samples_ntc, and trim the cis
+        gene's entry from the primary modality posteriors in-place.
+
+        Called by add_cis_gene() when fit_ntc() has already been run.
+        """
+        primary_mod = self.modalities[self.primary_modality]
+        ps = primary_mod.posterior_samples_ntc  # mutated in-place
+
+        T = n_total_features
+        trans_idx = list(range(cis_feat_iloc)) + list(range(cis_feat_iloc + 1, T))
+
+        full_alpha_y_mult = ps.get('alpha_y_mult')
+        full_alpha_y_add  = ps.get('alpha_y_add')
+
+        # alpha_x_prefit: median of the cis gene's alpha_y_mult samples → [C]
+        if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
+            self.alpha_x_prefit = full_alpha_y_mult[..., cis_feat_iloc].median(dim=0).values
+
+        # alpha_y_prefit for primary modality (trans genes only)
+        if primary_mod.distribution == 'negbinom':
+            if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
+                primary_mod.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].median(dim=0).values
+        else:
+            if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
+                primary_mod.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
+
+        # Build cis modality's posterior_samples_ntc (matching what ntc.py produces)
+        cis_modality = self.modalities['cis']
+        cis_posterior = {}
+        for src_key, dst_key in [
+            ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
+            ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
+            ('mu_ntc',      'mu_ntc'),
+        ]:
+            if src_key in ps and isinstance(ps[src_key], torch.Tensor):
+                v = ps[src_key]
+                if v.shape[-1] == T:
+                    cis_posterior[dst_key] = v[..., cis_feat_iloc:cis_feat_iloc + 1]
+
+        if 'alpha_x_mul' in cis_posterior:
+            raw = cis_posterior['alpha_x_mul']
+            if raw.dim() == 3:
+                S, Cminus1, _ = raw.shape
+                cis_posterior['alpha_x_mult'] = torch.cat(
+                    [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
+                cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
+
+        if 'delta_x_add' in cis_posterior:
+            raw = cis_posterior['delta_x_add']
+            if raw.dim() == 3:
+                S, Cminus1, _ = raw.shape
+                cis_posterior['alpha_x_add'] = torch.cat(
+                    [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
+
+        cis_modality.posterior_samples_ntc = cis_posterior
+        print(f"[INFO] Extracted '{cis_gene}' posteriors from primary modality NTC fit")
+
+        # Trim cis gene row from primary modality posteriors in-place
+        if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
+            ps['alpha_y_mult'] = full_alpha_y_mult[..., trans_idx]
+            ps['alpha_y']      = ps['alpha_y_mult']
+        if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
+            ps['alpha_y_add'] = full_alpha_y_add[..., trans_idx]
+            if full_alpha_y_mult is None:
+                ps['alpha_y'] = ps['alpha_y_add']
+
+        for key in ['log2_alpha_y', 'alpha_y_mul', 'delta_y_add', 'o_y', 'mu_ntc']:
+            if key in ps and isinstance(ps[key], torch.Tensor):
+                v = ps[key]
+                if v.shape[-1] == T:
+                    ps[key] = v[..., trans_idx]
+
+        print(f"[INFO] Trimmed '{cis_gene}' from primary modality posteriors "
+              f"(T {T} → {len(trans_idx)})")
+
+    def _refilter_zero_count_features(self, ntc_ran: bool) -> None:
+        """
+        After cell subsetting in add_cis_gene(), drop features that have become
+        zero-count across the retained NTC + cis cells.  If fit_ntc() has already
+        been run, trim the corresponding axes in the stored NTC posteriors so they
+        stay aligned with the surviving feature set.
+
+        Operates on every modality except 'cis' (which is a single feature and
+        cannot usefully be dropped here).
+        """
+        for mod_name, mod in list(self.modalities.items()):
+            if mod_name == 'cis':
+                continue
+
+            n_features = mod.dims['n_features']
+
+            # Compute per-feature total counts (works for dense, sparse, multinomial)
+            if mod.distribution == 'multinomial':
+                raw = mod.counts  # [F, N, K]
+                feature_sums = np.array(raw.sum(axis=(1, 2))).flatten()
+            elif mod.cells_axis == 1:
+                feature_sums = np.array(mod.counts.sum(axis=1)).flatten()
+            else:
+                feature_sums = np.array(mod.counts.sum(axis=0)).flatten()
+
+            keep_idx = np.where(feature_sums > 0)[0]
+            n_dropped = n_features - len(keep_idx)
+
+            if n_dropped == 0:
+                continue
+
+            print(f"[INFO] add_cis_gene: dropping {n_dropped} zero-count features "
+                  f"from modality '{mod_name}' after cell subsetting")
+
+            # Trim posteriors on the existing modality object BEFORE creating subset
+            if mod.posterior_samples_ntc is not None:
+                self._trim_feature_axis_in_posteriors(mod, keep_idx, n_features)
+
+            # Create feature-subsetted copy and re-attach fitting results
+            new_mod = mod.get_feature_subset(keep_idx.tolist())
+            new_mod.posterior_samples_ntc = mod.posterior_samples_ntc  # already trimmed
+            new_mod.alpha_y_prefit_mult   = mod.alpha_y_prefit_mult
+            new_mod.alpha_y_prefit_add    = mod.alpha_y_prefit_add
+            if hasattr(mod, 'loss_ntc'):
+                new_mod.loss_ntc = mod.loss_ntc
+
+            self.modalities[mod_name] = new_mod
+
+    @staticmethod
+    def _trim_feature_axis_in_posteriors(
+        mod: 'Modality', keep_idx: np.ndarray, T: int
+    ) -> None:
+        """
+        Trim the feature (last) axis of every tensor in mod.posterior_samples_ntc
+        and the alpha_y_prefit arrays to the surviving feature indices.
+
+        Mutates mod in-place; called before get_feature_subset() so the counts
+        array still has T columns.
+        """
+        ps = mod.posterior_samples_ntc
+        if ps is None:
+            return
+
+        for key in list(ps.keys()):
+            v = ps[key]
+            if not isinstance(v, torch.Tensor):
+                continue
+            if v.shape[-1] == T:
+                ps[key] = v[..., keep_idx]
+
+        if mod.alpha_y_prefit_mult is not None and mod.alpha_y_prefit_mult.shape[-1] == T:
+            mod.alpha_y_prefit_mult = mod.alpha_y_prefit_mult[..., keep_idx]
+
+        if mod.alpha_y_prefit_add is not None and mod.alpha_y_prefit_add.shape[-1] == T:
+            mod.alpha_y_prefit_add = mod.alpha_y_prefit_add[..., keep_idx]
 
     def _init_sum_factors(self, sum_factor_col: str = 'sum_factor'):
         """
