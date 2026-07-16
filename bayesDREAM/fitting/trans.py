@@ -398,7 +398,6 @@ class TransFitter:
         sum_factor_tensor,
         beta_o_alpha_tensor,
         beta_o_beta_tensor,
-        alpha_alpha_mu_tensor,
         K_max_tensor,
         K_alpha_tensor,
         Vmax_mean_tensor,
@@ -408,7 +407,6 @@ class TransFitter:
         p_n_logits_tensor,
         epsilon_tensor,
         x_true_sample,
-        log2_x_true_sample,
         nmin,
         nmax,
         alpha_y_sample=None,
@@ -422,11 +420,8 @@ class TransFitter:
         distribution='negbinom',
         denominator_tensor=None,
         K=None,
-        D=None,
-        mean_within_guide_var=None,
         x_true_CV=None,
         x_ntc_mean=None,
-        use_data_driven_priors=True,
         use_epsilon=True,
         vmax_log_sigma_floor_tensor=None,
         k_log_sigma_min_tensor=None,
@@ -434,6 +429,7 @@ class TransFitter:
         y_ntc_tensor=None,
         mean_y_corrected_tensor=None,
         o_y_ntc_tensor=None,
+        sigma_hat_tensor=None,
         alpha_n_coupling: float = 10.0,
         latents_only=False,
     ):
@@ -446,7 +442,6 @@ class TransFitter:
         ##########
         ## x_true (Now Fully Observed) ##
         ##########
-        #x_true = pyro.deterministic("x_true", x_true_sample)
         x_true = x_true_sample
     
         ####################
@@ -455,44 +450,44 @@ class TransFitter:
         alpha_y = None
         if alpha_y_sample is not None:
             alpha_y = alpha_y_sample
-        elif groups_tensor is not None:
-            with pyro.plate("technical_groups_plate", C-1, dim=-2):  # **Now correctly uses C-1**
-                with trans_plate:
-                    alpha_alpha = pyro.sample("alpha_alpha", dist.Exponential(1 / alpha_alpha_mu_tensor))  # shape = [C-1, T]
-                    alpha_mu = pyro.sample("alpha_mu", dist.Gamma(1, 1))  # shape = [C-1, T]
-                    alpha_y = pyro.sample("alpha_y", dist.Gamma(alpha_alpha, alpha_alpha / alpha_mu))  # shape = [C-1, T]
     
-        ####################
-        ## Overdispersion ##
-        ####################
-        beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
-        with trans_plate:
-            o_y = pyro.sample("o_y", dist.Exponential(beta_o))
-            phi_y = 1 / (o_y**2)
-        phi_y_used = phi_y.unsqueeze(-2)
+        ##############################################
+        ## Feature-level variance (distribution-specific)
+        ##############################################
+        phi_y_used = None  # NB dispersion; None for other distributions
+        sigma_y    = None  # noise scale for normal/studentt
 
-        # Per-gene overdispersion weight for the adaptive A prior.
-        # weight → 1 for noisier genes (o_y >> prior mean), → 0 for quieter genes.
-        # If o_y_ntc_tensor is provided (from fit_ntc), use it as a fixed pre-fit weight
-        # rather than the sampled o_y — this avoids the unidentifiability of o_y during
-        # fit_trans (posterior stays near prior mean for all genes, making the weight
-        # uninformative). The NTC-estimated o_y reflects true gene-level noisiness.
-        _prior_mean_o_y = (beta_o_beta_tensor / beta_o_alpha_tensor).clamp_min(epsilon_tensor)
-        if o_y_ntc_tensor is not None:
-            _o_y_weight = o_y_ntc_tensor / (o_y_ntc_tensor + _prior_mean_o_y)  # [T], fixed
-        else:
-            _o_y_weight = o_y / (o_y + _prior_mean_o_y)  # [T], sampled (fallback)
-
-        # Degrees of freedom for Student-t distribution (nu_y)
-        # Only needed if using studentt distribution
-        nu_y = None
-        if distribution == 'studentt':
-            # Two options (must match fit_ntc choice):
-            # Option 1: Fixed value (simpler, faster) - COMMENTED OUT FOR NOW
-            # nu_y = self._t(3.0)
-            # Option 2: Sample per-feature (more flexible, slower) - ACTIVE
+        if distribution == 'negbinom':
+            beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
             with trans_plate:
-                nu_y = pyro.sample("nu_y", dist.Gamma(self._t(10.0), self._t(2.0)))  # mean~5, ensures df>2
+                o_y = pyro.sample("o_y", dist.Exponential(beta_o))
+                phi_y = 1 / (o_y**2)
+            phi_y_used = phi_y.unsqueeze(-2)
+            # A-prior weight: noisier genes get stronger pull toward NTC anchor.
+            # Use NTC-estimated o_y when available (sampled o_y is near-unidentifiable
+            # in fit_trans, so its posterior stays close to the prior mean for all genes).
+            _prior_mean_o_y = (beta_o_beta_tensor / beta_o_alpha_tensor).clamp_min(epsilon_tensor)
+            if o_y_ntc_tensor is not None:
+                _o_y_weight = o_y_ntc_tensor / (o_y_ntc_tensor + _prior_mean_o_y)  # [T], fixed
+            else:
+                _o_y_weight = o_y / (o_y + _prior_mean_o_y)  # [T], sampled (fallback)
+
+        elif distribution in ('normal', 'studentt'):
+            with trans_plate:
+                if sigma_hat_tensor is not None:
+                    sigma_y = pyro.sample("sigma_y", dist.HalfNormal(2.0 * sigma_hat_tensor))
+                    # A-prior weight: features with larger NTC sigma pulled more toward NTC anchor.
+                    _sigma_ref = sigma_hat_tensor.mean().clamp_min(epsilon_tensor)
+                    _o_y_weight = sigma_hat_tensor / (sigma_hat_tensor + _sigma_ref)  # [T], fixed
+                else:
+                    sigma_y = pyro.sample("sigma_y", dist.HalfCauchy(self._t(10.0)))
+                    _o_y_weight = self._t(0.5)  # neutral without NTC data
+
+        else:  # binomial, multinomial — variance fully determined by count totals
+            _o_y_weight = self._t(0.5)  # neutral; no per-feature noise parameter
+
+        # Degrees of freedom: Student-t only, fixed at 3 to match fit_ntc
+        nu_y = self._t(3.0) if distribution == 'studentt' else None
     
         #################
         ## Hill-based: ##
@@ -574,13 +569,10 @@ class TransFitter:
                         obs_total = y_obs_tensor.sum(dim=0)  # [T, K]
                         phantom_conc_mask = (obs_total == 0)  # [T, K]
 
-                    # Logit-space prior mean (base: from Q05 or uniform)
-                    if use_data_driven_priors:
-                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
-                        A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
-                        A_logit_mean_base = torch.log(A_mean_normalized.clamp(min=1e-10))              # [T, K]
-                    else:
-                        A_logit_mean_base = torch.zeros(T, K_dim, device=self.model.device)
+                    # Logit-space prior mean (base: from Q05)
+                    A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                    A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
+                    A_logit_mean_base = torch.log(A_mean_normalized.clamp(min=1e-10))              # [T, K]
 
                     # A prior: w-interpolated LogisticNormal anchored between data-driven
                     # lower anchor and y_ntc. Mode at (1-w)*A_logit_mean_base + w*logit(y_ntc),
@@ -624,7 +616,7 @@ class TransFitter:
                     #   sigma = (logit(y_ntc) − logit(Amean/2)).clamp_min(1 logit unit)
                     #
                     # Fallback (no NTC posterior): Beta(1, β) with mean = 0.5×Q05.
-                    if y_ntc_tensor is not None and use_data_driven_priors:
+                    if y_ntc_tensor is not None:
                         # Lift upper anchor to mean(y_corrected) when y_ntc < mean.
                         if mean_y_corrected_tensor is not None:
                             effective_y_ntc = torch.maximum(y_ntc_tensor, mean_y_corrected_tensor)
@@ -637,12 +629,10 @@ class TransFitter:
                         mu_logit    = (1.0 - _o_y_weight) * logit_Amean_half + _o_y_weight * logit_y_ntc  # [T]
                         logit_A = pyro.sample("logit_A", dist.Normal(mu_logit, sigma_logit))            # [T]
                         A = pyro.deterministic("A", torch.sigmoid(logit_A))                             # [T]
-                    elif use_data_driven_priors:
+                    else:
                         A_mean_shifted = (0.5 * Amean_tensor).clamp_min(epsilon_tensor)
                         beta_A = (1.0 - A_mean_shifted) / A_mean_shifted                               # [T]
                         A = pyro.sample("A", dist.Beta(self._t(1.0), beta_A).expand([T]))              # [T]
-                    else:
-                        A = pyro.sample("A", dist.Beta(self._t(1.0), self._t(1.0)).expand([T]))        # [T]
 
             else:
                 # For negbinom: LogNormal A prior (Normal in log2 space) with noise-adaptive mean.
@@ -1279,8 +1269,6 @@ class TransFitter:
                 C=C
             )
         elif distribution == 'normal':
-            # For normal, we need sigma_y (standard deviation)
-            sigma_y = 1.0 / torch.sqrt(phi_y)  # Convert from precision to std dev
             observation_sampler(
                 y_obs_tensor=y_obs_tensor,
                 mu_y=mu_y,
@@ -1292,8 +1280,6 @@ class TransFitter:
                 C=C
             )
         elif distribution == 'studentt':
-            # For studentt, we need sigma_y (standard deviation) and nu_y (degrees of freedom)
-            sigma_y = 1.0 / torch.sqrt(phi_y)  # Convert from precision to std dev
             observation_sampler(
                 y_obs_tensor=y_obs_tensor,
                 mu_y=mu_y,
@@ -1320,10 +1306,8 @@ class TransFitter:
         niters: int = None,
         nsamples: int = 1000,
         alpha_ewma: float = 0.05,
-        tolerance: float = 1e-4, # recommended to keep based on cell2location
         beta_o_beta: float = 3, # recommended to keep based on cell2location
         beta_o_alpha: float = 9, # recommended to keep based on cell2location
-        alpha_alpha_mu: float = 5.8,
         K_alpha: float = 2,
         Vmax_alpha: float = 2,
         n_mu: float = 0,
@@ -1337,9 +1321,6 @@ class TransFitter:
         denominator: np.ndarray = None,
         modality_name: str = None,
         min_denominator: int = None,
-        use_data_driven_priors: bool = True,
-        correct_priors_for_technical: bool = True,
-        use_archive_prior_computation: bool = False,
         use_epsilon: bool = False,
         warmup: bool = True,
         warmup_T_min: float = 0.5,
@@ -1373,21 +1354,6 @@ class TransFitter:
             Minimum denominator value for binomial observations. Observations where
             denominator < min_denominator are masked (excluded from fitting).
             Useful for filtering low-coverage splicing junctions. Default: None (no filtering).
-        use_data_driven_priors : bool, optional
-            If True (default), use Beta priors for A and upper_limit based on data percentiles.
-            If False, use uniform priors (Beta(1, 1)). Useful for testing if data-driven
-            priors are too strong or causing issues. Default: True.
-        correct_priors_for_technical : bool, optional
-            If True (default), correct data for technical effects before computing priors (Amean, Vmax_mean).
-            If False (archive behavior), compute priors from raw sum_factor-normalized data.
-            Technical effects are still corrected during model fitting via alpha_y_sample.
-        use_archive_prior_computation : bool, optional
-            If True, compute Amean and Vmax_mean using archive method:
-            - Amean = min(guide_means) per feature
-            - Vmax_mean = max(guide_means) per feature
-            If False (default), use percentile-based method:
-            - Amean = 5th percentile of guide means
-            - Vmax_mean = 95th percentile - 5th percentile (range)
         use_epsilon : bool, optional
             If True, add 1e-8 epsilon for numerical stability in NegativeBinomial logits.
             If False (default), use log(mu) - log(phi) directly.
@@ -1486,10 +1452,6 @@ class TransFitter:
         --------
         >>> model.set_technical_groups(['cell_line'])  # Optional, for correction
         >>> model.fit_trans(sum_factor_col='sum_factor', function_type='additive_hill')
-
-        >>> # Test without data-driven priors
-        >>> model.fit_trans(sum_factor_col='sum_factor', function_type='additive_hill',
-        ...                 use_data_driven_priors=False)
         """
 
         if self.model.x_true is None:
@@ -1585,15 +1547,6 @@ class TransFitter:
             warmup_steps = 0
             total_steps = niters
         
-        #if lr is None:
-        #    # Default: 100,000 unless multinomial OR polynomial function, then 200,000
-        #    if distribution in ['binomial', 'multinomial']:
-        #        lr = 1e-4
-        #        print(f"[INFO] Using default niters=200,000 for distribution '{distribution}'")
-        #    else:
-        #        lr = 1e-3
-        #        print(f"[INFO] Using default lr=1e-3 for distribution '{distribution}'")
-
         if (modality.alpha_y_prefit is None
                 and 'technical_group_code' in self.model.meta.columns):
             raise ValueError(
@@ -1701,7 +1654,6 @@ class TransFitter:
         _cell_indices = [_cell_index_map[c] for c in modality_cells]
         _cell_idx_tensor = torch.tensor(_cell_indices, dtype=torch.long, device=self.model.device)
         x_true_subset = self.model.x_true[_cell_idx_tensor]
-        log2_x_true_subset = torch.log2(x_true_subset)
 
         N = len(modality_cells)
 
@@ -1784,7 +1736,6 @@ class TransFitter:
         # Detect data dimensions (for multinomial)
         from .distributions import is_3d_distribution
         K = None
-        D = None
         if is_3d_distribution(distribution):
             if y_obs.ndim == 3:
                 if distribution == 'multinomial':
@@ -1794,7 +1745,6 @@ class TransFitter:
         x_true_mean = x_true_subset
         beta_o_alpha_tensor = torch.tensor(beta_o_alpha, dtype=torch.float32, device=self.model.device)
         beta_o_beta_tensor = torch.tensor(beta_o_beta, dtype=torch.float32, device=self.model.device)
-        alpha_alpha_mu_tensor = torch.tensor(alpha_alpha_mu, dtype=torch.float32, device=self.model.device)
         K_alpha_tensor = torch.tensor(K_alpha, dtype=torch.float32, device=self.model.device)
         Vmax_alpha_tensor = torch.tensor(Vmax_alpha, dtype=torch.float32, device=self.model.device)
         n_mu_tensor = torch.tensor(n_mu, dtype=torch.float32, device=self.model.device)
@@ -1893,13 +1843,8 @@ class TransFitter:
         # ===================================================================
         # CORRECT FOR TECHNICAL EFFECTS BEFORE COMPUTING PRIORS
         # ===================================================================
-        # The observed data includes technical batch effects. To compute unbiased
-        # priors for A and Vmax (baseline parameters), we can optionally remove these effects
-        # using the inverse transformation.
-        # NOTE: Archive code does NOT correct priors - it uses raw sum_factor-normalized data.
-        # Technical effects are only applied during model fitting via alpha_y_sample.
-        # Setting correct_priors_for_technical=False (default) matches archive behavior.
-        if correct_priors_for_technical and alpha_y_prefit is not None and groups_tensor is not None:
+        # Remove technical batch effects from observed data before computing A and Vmax priors.
+        if alpha_y_prefit is not None and groups_tensor is not None:
             print(f"[INFO] Correcting for technical effects before computing priors (distribution: {distribution})")
 
             # alpha_y_prefit is always [C, T] (point estimate/mean), index groups dimension
@@ -2106,43 +2051,6 @@ class TransFitter:
             Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))   # [T, K]
             Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
 
-        # mean_within_guide_var: guide-level if guides available, else cell-level
-        if 'guide_code' in self.model.meta.columns and len(unique_guides) > 1:
-            G = len(unique_guides)
-            # Contiguous guide index 0..G-1 via scatter remap
-            g_max = int(unique_guides.max().item())
-            g_remap = torch.full((g_max + 1,), 0, dtype=torch.long, device=self.model.device)
-            g_remap[unique_guides] = torch.arange(G, device=self.model.device)
-            g_idx = g_remap[guides_tensor]  # [N]
-
-            # Flatten trailing dims for vectorized scatter: [N, T] → [N, F] or [N, T*K] → [N, F]
-            _trailing = y_obs_for_prior.shape[1:]
-            F = int(torch.tensor(list(_trailing)).prod().item())
-            _y_flat = torch.nan_to_num(y_obs_for_prior, nan=0.0).reshape(N, F)  # [N, F]
-            _v_flat = (~torch.isnan(y_obs_for_prior)).reshape(N, F).float()      # [N, F]
-            g_idx_F = g_idx.unsqueeze(1).expand(-1, F)                           # [N, F]
-
-            g_cnt = _y_flat.new_zeros(G, F).scatter_add_(0, g_idx_F, _v_flat)
-            g_sum = _y_flat.new_zeros(G, F).scatter_add_(0, g_idx_F, _y_flat)
-            g_mean = g_sum / g_cnt.clamp_min(1.0)  # [G, F]
-
-            # Squared deviations from guide mean; NaN cells contribute 0
-            _dev_sq = torch.nan_to_num(
-                (y_obs_for_prior.reshape(N, F) - g_mean[g_idx]) ** 2, nan=0.0
-            )  # [N, F]
-            g_ss  = _y_flat.new_zeros(G, F).scatter_add_(0, g_idx_F, _dev_sq)
-            g_var = torch.where(
-                g_cnt >= 2,
-                g_ss / (g_cnt - 1).clamp_min(1.0),
-                g_ss.new_full(g_ss.shape, float('nan'))
-            )  # [G, F]
-
-            mean_within_guide_var = torch.nanmean(g_var, dim=0).reshape(_trailing)  # [T] or [T, K]
-            print(f"[INFO] Cell-level Q05/Q95 priors ({T} features, {G} guides for within-guide variance)")
-        else:
-            mean_within_guide_var = cell_var
-            print(f"[INFO] Cell-level Q05/Q95 priors ({T} features, no guide stratification)")
-
         # For binomial/multinomial: clamp Vmax_mean to valid Beta range
         if distribution in ['binomial', 'multinomial']:
             Vmax_mean_tensor = Vmax_mean_tensor.clamp(min=self._t(1e-3), max=self._t(1.0 - 1e-6))
@@ -2186,8 +2094,6 @@ class TransFitter:
                 torch.isnan(Amean_tensor), torch.full_like(Amean_tensor, fallback_A), Amean_tensor)
             Vmax_mean_tensor = torch.where(
                 torch.isnan(Vmax_mean_tensor), torch.full_like(Vmax_mean_tensor, fallback_Vmax), Vmax_mean_tensor)
-            mean_within_guide_var = torch.where(
-                torch.isnan(mean_within_guide_var), torch.full_like(mean_within_guide_var, valid_var_val), mean_within_guide_var)
 
         # --- A prior: NTC anchor (all distributions) ---
         # Extract y_ntc_tensor (posterior mean of NTC expression per feature) to anchor the
@@ -2350,6 +2256,33 @@ class TransFitter:
                 print(f"[WARNING] Could not extract o_y from NTC posterior: {_e}; "
                       f"falling back to sampled o_y for A prior weight")
 
+        # For normal/studentt: extract sigma_y posterior median from fit_ntc as HalfNormal prior scale.
+        # Mirrors the negbinom o_y_ntc_tensor approach: the NTC-estimated sigma is feature-specific
+        # and data-driven, whereas a fixed prior would be uninformative across features.
+        sigma_hat_tensor = None
+        if distribution in ('normal', 'studentt') and _post_tech is not None and 'sigma_y' in _post_tech:
+            try:
+                _sigma_ntc = _post_tech['sigma_y']
+                if not torch.is_tensor(_sigma_ntc):
+                    _sigma_ntc = torch.tensor(_sigma_ntc, dtype=torch.float32, device=self.model.device)
+                else:
+                    _sigma_ntc = _sigma_ntc.float().to(self.model.device)
+                # Collapse leading sample dims → [T]
+                if _sigma_ntc.ndim > 1 and _sigma_ntc.shape[-1] == T:
+                    while _sigma_ntc.ndim > 1:
+                        _sigma_ntc = _sigma_ntc.median(dim=0).values
+                if _sigma_ntc.ndim == 1 and _sigma_ntc.shape[0] == T:
+                    _sigma_ntc = _sigma_ntc.clamp_min(self._t(1e-6))
+                    sigma_hat_tensor = _sigma_ntc
+                    print(f"[INFO] sigma_y NTC anchor: using pre-fit sigma_y as HalfNormal scale "
+                          f"(median={sigma_hat_tensor.median().item():.3f})")
+                else:
+                    print(f"[WARNING] sigma_y from NTC posterior has unexpected shape "
+                          f"{tuple(_sigma_ntc.shape)}; using fallback HalfCauchy prior")
+            except Exception as _e:
+                print(f"[WARNING] Could not extract sigma_y from NTC posterior: {_e}; "
+                      f"using fallback HalfCauchy prior")
+
         # For K: use CV (coefficient of variation) of x_true (works with or without guides)
         # CV = std(x_true) / mean(x_true) - scale-invariant measure of variability
         x_true_mean_global = x_true_mean.mean()
@@ -2358,7 +2291,11 @@ class TransFitter:
 
         # K_max: max of x_true (or max of guide means if guides exist)
         if 'guide_code' in self.model.meta.columns and len(unique_guides) > 1:
-            # Reuse g_idx/G from _guide_vars scatter above
+            G = len(unique_guides)
+            g_max = int(unique_guides.max().item())
+            g_remap = torch.full((g_max + 1,), 0, dtype=torch.long, device=self.model.device)
+            g_remap[unique_guides] = torch.arange(G, device=self.model.device)
+            g_idx = g_remap[guides_tensor]  # [N]
             g_sum_x = torch.zeros(G, device=self.model.device).scatter_add_(0, g_idx, x_true_mean)
             g_cnt_x = torch.zeros(G, device=self.model.device).scatter_add_(
                 0, g_idx, torch.ones(N, device=self.model.device))
@@ -2421,7 +2358,6 @@ class TransFitter:
                 sum_factor_tensor,
                 beta_o_alpha_tensor,
                 beta_o_beta_tensor,
-                alpha_alpha_mu_tensor,
                 K_max_tensor,
                 K_alpha_tensor,
                 Vmax_mean_tensor,
@@ -2431,7 +2367,6 @@ class TransFitter:
                 p_n_logits_tensor,
                 epsilon_tensor,
                 x_true_sample = x_true_subset,
-                log2_x_true_sample = log2_x_true_subset,
                 nmin = nmin,
                 nmax = nmax,
                 alpha_y_sample = alpha_y_prefit,
@@ -2445,11 +2380,9 @@ class TransFitter:
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
-                D=D,
-                mean_within_guide_var=mean_within_guide_var,
                 x_true_CV=x_true_CV,
                 x_ntc_mean=x_ntc_mean,
-                use_data_driven_priors=use_data_driven_priors,
+
                 use_epsilon=use_epsilon,
                 vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                 k_log_sigma_min_tensor=k_log_sigma_min_tensor,
@@ -2457,6 +2390,7 @@ class TransFitter:
                 y_ntc_tensor=y_ntc_tensor,
                 mean_y_corrected_tensor=mean_y_corrected_tensor,
                 o_y_ntc_tensor=o_y_ntc_tensor,
+                sigma_hat_tensor=sigma_hat_tensor,
                 alpha_n_coupling=alpha_n_coupling,
             )
             # OneCycleLR for polynomial only
@@ -2663,31 +2597,20 @@ class TransFitter:
                 else:
                     raise ValueError(f"Unknown function_type: {effective_function_type}")
                 
-            #if step < 0.7 * niters:
-            #    # First 70% of training: linearly decrease from 1.0 to 0.1
-            #    current_temp = 1.0 - (0.9 * (step / (0.7 * niters)))
-            #else:
-            #    # Last 30% of training: exponentially cool down to 0.0005
-            #    current_temp = 0.1 * (final_temp/0.1) ** ((step - 0.7 * niters) / (0.3 * niters))
-
-
             # Anneal coupling from 0 → target over first half of total training.
             # Lets alpha and n co-explore freely early on; identifiability constraint
             # ramps in gradually rather than blocking from step 0.
             _coupling_frac = min(1.0, 2.0 * step / total_steps) if total_steps > 0 else 1.0
             current_coupling = alpha_n_coupling * _coupling_frac
 
-            # x_true, log2_x_true, alpha_y_prefit are always point estimates (means)
+            # x_true and alpha_y_prefit are always point estimates (means)
             x_true_sample = x_true_subset
-            log2_x_true_sample = log2_x_true_subset
             alpha_y_sample = alpha_y_prefit  # [C, T] point estimate or None
 
-            #use_straight_through = step >= int(0.7 * niters)
             use_straight_through = False
 
             _svi_kwargs = dict(
                 x_true_sample=x_true_sample,
-                log2_x_true_sample=log2_x_true_sample,
                 nmin=nmin,
                 nmax=nmax,
                 alpha_y_sample=alpha_y_sample,
@@ -2701,11 +2624,9 @@ class TransFitter:
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
-                D=D,
-                mean_within_guide_var=mean_within_guide_var,
                 x_true_CV=x_true_CV,
                 x_ntc_mean=x_ntc_mean,
-                use_data_driven_priors=use_data_driven_priors,
+
                 use_epsilon=use_epsilon,
                 vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                 k_log_sigma_min_tensor=k_log_sigma_min_tensor,
@@ -2713,6 +2634,7 @@ class TransFitter:
                 y_ntc_tensor=y_ntc_tensor,
                 mean_y_corrected_tensor=mean_y_corrected_tensor,
                 o_y_ntc_tensor=o_y_ntc_tensor,
+                sigma_hat_tensor=sigma_hat_tensor,
                 alpha_n_coupling=current_coupling,
             )
             if debug:
@@ -2720,7 +2642,7 @@ class TransFitter:
                     loss, prev_finite = self._debug_svi_step(
                         svi, step, prev_finite,
                         N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
-                        alpha_alpha_mu_tensor, K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
+                        K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
                         n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor,
                         **_svi_kwargs,
                     )
@@ -2730,7 +2652,7 @@ class TransFitter:
             else:
                 loss = svi.step(
                     N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
-                    alpha_alpha_mu_tensor, K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
+                    K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
                     n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor,
                     **_svi_kwargs,
                 )
@@ -2774,9 +2696,6 @@ class TransFitter:
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
 
         # Save complete=True checkpoint so Predictive can be retried if it OOMs.
@@ -2814,7 +2733,6 @@ class TransFitter:
                 "sum_factor_tensor": self._to_cpu(sum_factor_tensor),
                 "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
                 "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
-                "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
                 "K_max_tensor": self._to_cpu(K_max_tensor),
                 "K_alpha_tensor": self._to_cpu(K_alpha_tensor),
                 "Vmax_mean_tensor": self._to_cpu(Vmax_mean_tensor),
@@ -2824,7 +2742,6 @@ class TransFitter:
                 "p_n_logits_tensor": self._to_cpu(p_n_logits_tensor),
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "x_true_sample": self._to_cpu(x_true_subset),
-                "log2_x_true_sample": self._to_cpu(log2_x_true_subset),
                 "nmin": self._to_cpu(nmin),
                 "nmax": self._to_cpu(nmax),
                 "alpha_y_sample": self._to_cpu(alpha_y_prefit) if alpha_y_prefit is not None else None,
@@ -2839,10 +2756,7 @@ class TransFitter:
                 "distribution": distribution,
                 "denominator_tensor": self._to_cpu(denominator_tensor) if denominator_tensor is not None else None,
                 "K": K,
-                "D": D,
-                "mean_within_guide_var": self._to_cpu(mean_within_guide_var) if mean_within_guide_var is not None else None,
                 "x_true_CV": self._to_cpu(x_true_CV) if x_true_CV is not None else None,
-                "use_data_driven_priors": use_data_driven_priors,
                 "use_epsilon": use_epsilon,
                 "vmax_log_sigma_floor_tensor": self._to_cpu(vmax_log_sigma_floor_tensor),
                 "k_log_sigma_min_tensor": self._to_cpu(k_log_sigma_min_tensor),
@@ -2850,6 +2764,7 @@ class TransFitter:
                 "y_ntc_tensor": self._to_cpu(y_ntc_tensor) if y_ntc_tensor is not None else None,
                 "x_ntc_mean": self._to_cpu(x_ntc_mean) if x_ntc_mean is not None else None,
                 "o_y_ntc_tensor": self._to_cpu(o_y_ntc_tensor) if o_y_ntc_tensor is not None else None,
+                "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor) if sigma_hat_tensor is not None else None,
                 "alpha_n_coupling": alpha_n_coupling,
             }
         else:
@@ -2860,7 +2775,6 @@ class TransFitter:
                 "sum_factor_tensor": sum_factor_tensor,
                 "beta_o_alpha_tensor": beta_o_alpha_tensor,
                 "beta_o_beta_tensor": beta_o_beta_tensor,
-                "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
                 "K_max_tensor": K_max_tensor,
                 "K_alpha_tensor": K_alpha_tensor,
                 "Vmax_mean_tensor": Vmax_mean_tensor,
@@ -2870,7 +2784,6 @@ class TransFitter:
                 "p_n_logits_tensor": p_n_logits_tensor,
                 "epsilon_tensor": epsilon_tensor,
                 "x_true_sample": x_true_subset,
-                "log2_x_true_sample": log2_x_true_subset,
                 "nmin": nmin,
                 "nmax": nmax,
                 "alpha_y_sample": alpha_y_prefit,
@@ -2884,16 +2797,14 @@ class TransFitter:
                 "distribution": distribution,
                 "denominator_tensor": denominator_tensor if denominator_tensor is not None else None,
                 "K": K,
-                "D": D,
-                "mean_within_guide_var": mean_within_guide_var,
                 "x_true_CV": x_true_CV,
-                "use_data_driven_priors": use_data_driven_priors,
                 "use_epsilon": use_epsilon,
                 "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
                 "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
                 "k_center_tensor": k_center_tensor,
                 "y_ntc_tensor": y_ntc_tensor,
                 "o_y_ntc_tensor": o_y_ntc_tensor,
+                "sigma_hat_tensor": sigma_hat_tensor,
                 "alpha_n_coupling": alpha_n_coupling,
             }
 
@@ -3108,10 +3019,6 @@ class TransFitter:
         modality.posterior_samples_trans = posterior_samples_y
         modality.trans_prior_params = trans_prior_params
         modality.losses_trans = self.losses_trans  # Store loss history
-
-        # Update alpha_y_prefit in modality if it was None and alpha_y was sampled
-        if modality.alpha_y_prefit is None and groups_tensor is not None and "alpha_y" in posterior_samples_y:
-            modality.alpha_y_prefit = posterior_samples_y["alpha_y"].median(dim=0).values
 
         # For primary modality, also store at model level for direct access via model.posterior_samples_trans
         if modality_name == self.model.primary_modality:

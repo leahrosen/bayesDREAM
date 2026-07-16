@@ -1,0 +1,1027 @@
+%% bayesDREAM Methods Section
+%% Draft for manuscript. Sections marked [TODO] need author review.
+%% Compile with pdflatex or a journal template; requires amsmath, amssymb.
+
+\documentclass[12pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newcommand{\NB}{\mathrm{NegBin}}
+\newcommand{\given}{\mid}
+\newcommand{\iid}{\overset{\mathrm{iid}}{\sim}}
+\newcommand{\ind}{\overset{\mathrm{ind}}{\sim}}
+
+\begin{document}
+
+\section*{Methods: bayesDREAM Probabilistic Framework}
+
+\subsection*{Overview}
+
+bayesDREAM (Bayesian Dose-Response Estimation Across Modalities) is a three-step hierarchical
+Bayesian model for characterising the downstream consequences of CRISPR perturbations across
+multiple molecular modalities.
+%
+The three steps are applied sequentially:
+\begin{enumerate}
+  \item \textbf{Technical fitting} (\texttt{fit\_ntc}): Estimates per-feature mean, overdispersion, and
+        batch-correction parameters from non-targeting control (NTC) cells.
+  \item \textbf{Cis fitting} (\texttt{fit\_cis}): Estimates the true expression level of the
+        targeted (cis) gene for every cell, accounting for guide-level and technical variation.
+  \item \textbf{Trans fitting} (\texttt{fit\_trans}): Models the dose-response relationship
+        between cis gene expression and each downstream (trans) feature.
+\end{enumerate}
+
+bayesDREAM supports two experimental designs: \textbf{low-MOI} (at most one guide per cell,
+the default) and \textbf{high-MOI} (cells may carry multiple guides simultaneously).
+The three-step pipeline is identical in both designs; the high-MOI mode modifies only
+the aggregation of guide effects to cells within Step~2
+(Section~\ref{sec:highmoi}).
+
+All three models are fitted by stochastic variational inference (SVI) using the Adam optimiser
+with mean-field Gaussian guides (AutoNormal or AutoIAFNormal), implemented in Pyro~\cite{bingham2019pyro}.
+%
+Training runs for a fixed number of iterations; an exponential moving average (EWMA) of the ELBO is tracked for monitoring but does not trigger early stopping.
+
+The framework supports five likelihood families, each applied to one or more molecular modalities:
+\begin{itemize}
+  \item \textbf{Negative binomial} (\texttt{negbinom}): gene expression counts,
+        transcript counts. Technical effects are \emph{multiplicative} on the mean.
+  \item \textbf{Binomial} (\texttt{binomial}): splice junction read fractions (PSI),
+        percent-spliced-in values. Technical effects are \emph{additive on the logit scale}.
+  \item \textbf{Multinomial} (\texttt{multinomial}): isoform usage, donor/acceptor site
+        usage. Technical effects are \emph{log-additive} (on the simplex log-probability).
+  \item \textbf{Normal} (\texttt{normal}): continuous scores. Technical
+        effects are \emph{additive on the mean}.
+  \item \textbf{Student-$t$} (\texttt{studentt}): heavy-tailed continuous scores (e.g.\ SpliZ).
+        Technical effects are additive on the mean; degrees of freedom are fixed at $\nu = 3$
+        during technical fitting (\texttt{fit\_ntc}) and sampled per feature from
+        $\nu_t \sim \mathrm{Gamma}(10, 2)$ during trans fitting (\texttt{fit\_trans}).
+\end{itemize}
+
+\medskip
+\noindent Table~\ref{tab:distributions} summarises the parameterisation choices for each
+distribution.
+
+\begin{table}[h]
+  \centering
+  \caption{Distribution-specific parameterisation across all three model steps.}
+  \label{tab:distributions}
+  \begin{tabular}{lllll}
+    \toprule
+    Distribution & Baseline prior & Technical effect & Effect scale & Denominator \\
+    \midrule
+    negbinom    & LogNormal        & Multiplicative   & $\log_2$-ratio  & sum factor \\
+    binomial    & Beta             & Additive (logit) & logit-difference & read depth \\
+    multinomial & Dirichlet        & Log-additive     & log-ratio       & category totals \\
+    normal      & Normal           & Additive         & raw-scale       & --- \\
+    studentt    & Normal           & Additive         & raw-scale       & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%%============================================================
+\section{Step 1: Technical Fitting (\texttt{fit\_ntc})}
+%%============================================================
+
+\subsection{Purpose and data}
+
+The goal of technical fitting is to learn three sets of parameters from NTC cells:
+(i) per-feature mean parameters that characterise the feature in NTC cells in the reference group,
+(ii) per-feature overdispersion (or variance) parameters that characterise how noisy
+each molecular feature is in the absence of perturbation, and (iii) multiplicative
+(or additive) cell-line / batch correction factors that account for systematic
+non-biological differences between experimental conditions.
+
+Let $\mathcal{S}_{\mathrm{NTC}}$ denote the set of NTC cells and let $c \in \{0, \ldots, C-1\}$
+index technical groups (e.g.\ cell lines or sequencing batches), where group $c=0$ is the
+reference. Note that sum factors typically suffice to batch effect correct 10X sequencing lanes.
+The number of features is $T$ (genes, junctions, etc.).
+
+\subsection{Negative-binomial model}
+
+For count-based modalities (gene expression, transcript counts, region-level ATAC-seq accessibility), the observation model for
+NTC cell $i$ belonging to group $c_i$ and feature $t$ is:
+
+\begin{equation}
+  y_{i,t} \given \mu_t, \phi_t, \alpha_{c_i,t}, s_i
+    \;\sim\; \NB\!\left(\phi_t,\;
+      \frac{\mu_t \,\alpha_{c_i,t}\, s_i}{\phi_t}\right),
+  \label{eq:ntc_negbinom_obs}
+\end{equation}
+%
+where $\mu_t > 0$ is the baseline (reference-group) mean expression of feature $t$ after
+size-factor normalisation, $s_i > 0$ is a pre-computed size factor for cell $i$
+(e.g.\ from \texttt{scran}), $\phi_t = 1/o_t^2$ is the NB total-count (shape) parameter,
+$o_t > 0$ is an inverse-overdispersion scale, and $\alpha_{c,t}$ is a multiplicative
+correction for technical group $c$ (with $\alpha_{0,t} = 1$).
+
+\paragraph{Negative-binomial parameterisation.}
+Throughout this paper we use the \emph{total-count} (NB2) parameterisation.
+For $Y \sim \NB(r,\, \mu)$ with total-count parameter $r > 0$ and mean $\mu > 0$:
+\begin{equation}
+  P(Y = k) = \binom{k + r - 1}{k}
+    \left(\frac{\mu}{\mu + r}\right)^{\!k}
+    \left(\frac{r}{\mu + r}\right)^{\!r},
+    \quad k \in \mathbb{Z}_{\ge 0},
+  \label{eq:nb_pmf}
+\end{equation}
+giving $\mathrm{E}[Y] = \mu$ and $\mathrm{Var}[Y] = \mu + \mu^2/r$.
+As $r \to \infty$ the distribution converges to Poisson$(\mu)$; smaller $r$ gives
+greater variance relative to the mean.
+
+The notation $\NB(\phi_t,\; \mu_{i,t}/\phi_t)$ in equation~\eqref{eq:ntc_negbinom_obs}
+passes the \emph{odds} $\mu/r = p/(1{-}p)$ as the second argument
+(where $p = \mu/(\mu+r)$ is the success probability), which corresponds to the
+PyTorch/Pyro \texttt{NegativeBinomial(total\_count,\;logits=}\,$\log(\mu/r)$\texttt{)} convention.
+Setting $r = \phi_t = 1/o_t^2$ gives
+$\mathrm{Var}[y_{i,t}] = \mu_{i,t}\!\left(1 + \mu_{i,t}\,o_t^2\right)$,
+so $o_t$ is a natural inverse-overdispersion scale ($o_t \to 0$ recovers Poisson noise).
+
+\paragraph{Priors.}
+
+\begin{align}
+  \beta_o &\sim \mathrm{Gamma}(9,\; 3)
+    \label{eq:ntc_beta_o} \\
+  o_t \given \beta_o &\iid \mathrm{Exponential}(\beta_o), \quad t = 1,\ldots,T
+    \label{eq:ntc_o_t} \\
+  \mu_t &\iid \mathrm{LogNormal}\!\left(\hat\mu_t^{\log},\; \hat\sigma_t^{\log}\right)
+    \label{eq:ntc_mu_t} \\
+  \log_2 \alpha_{c,t} &\iid \mathrm{StudentT}(3,\; 0,\; 20),
+    \quad c = 1,\ldots,C-1
+    \label{eq:ntc_alpha_t}
+\end{align}
+%
+where $\alpha_{0,t} = 1$ (reference group) and $\alpha_{c,t} = 2^{\log_2\alpha_{c,t}}$
+for $c \ge 1$ (heavy-tailed, zero-centred prior in log-ratio space).
+The prior on $o_t$ is a \emph{containment prior}~\cite{kleshchevnikov2022}: the
+Gamma$(9,3)$ hyperprior on $\beta_o$ encourages $\phi_t = 1/o_t^2$ to be large
+(near-Poisson), calibrated to scRNA-seq overdispersion levels in the literature.
+
+\paragraph{Empirical hyperparameters for $\mu_t$.}
+
+Let $\bar y_t^{(0)} = N_0^{-1}\!\sum_{i:\,c_i=0} y_{i,t}/s_i$ be the mean
+size-factor-corrected count across the $N_0$ reference-group NTC cells, and let
+$\hat\sigma_t^{\mathrm{rob}} = 1.4826\times\mathrm{MAD}(y_{i,t}/s_i)$ be the
+robust SD (falling back to the ordinary SD when MAD\,$= 0$).
+The standard error of the mean is
+$\hat\sigma_t^{\mathrm{SE}} = \hat\sigma_t^{\mathrm{rob}}/\sqrt{N_{\mathrm{NTC}}}$,
+floored at $0.1\,\bar y_t^{(0)}$.
+Setting $\mathrm{CV}_t = \hat\sigma_t^{\mathrm{SE}} / \bar y_t^{(0)}$:
+\begin{align}
+  \hat\sigma_t^{\log} &= \max\!\left(\sqrt{\log(1+\mathrm{CV}_t^2)},\; 0.1\right),
+    \label{eq:ntc_sigma_log} \\
+  \hat\mu_t^{\log}    &= \log\bar y_t^{(0)} - \tfrac{1}{2}(\hat\sigma_t^{\log})^2.
+    \label{eq:ntc_mu_log}
+\end{align}
+
+\subsection{Binomial model (splicing PSI)}
+
+For modalities with a denominator (total reads), the observation for NTC cell $i$,
+feature $t$ is:
+\begin{equation}
+  y_{i,t} \given \mu_t^{\mathrm{psi}}, \alpha_{c_i,t}^{\mathrm{add}}, n_{i,t}
+    \;\sim\; \mathrm{Binomial}\!\left(n_{i,t},\;
+      \sigma\!\left(\logit\!\mu_t^{\mathrm{psi}} + \alpha_{c_i,t}^{\mathrm{add}}\right)\right),
+  \label{eq:ntc_binom_obs}
+\end{equation}
+where $n_{i,t}$ is the total read count (denominator), $\mu_t^{\mathrm{psi}} \in (0,1)$ is
+the baseline PSI, $\sigma(\cdot)$ is the logistic function, and $\alpha_{c,t}^{\mathrm{add}}$
+is an additive correction on the logit scale ($\alpha_{0,t}^{\mathrm{add}} = 0$).
+
+\paragraph{Priors.}
+
+\begin{align}
+  \mu_t^{\mathrm{psi}} &\iid \mathrm{Beta}(a_t,\; b_t)
+    \label{eq:ntc_psi_prior} \\
+  \alpha_{c,t}^{\mathrm{add}} &\iid \mathrm{StudentT}(3,\; 0,\; 20),
+    \quad c = 1,\ldots,C-1
+    \label{eq:ntc_binom_alpha}
+\end{align}
+
+\paragraph{Empirical hyperparameters for $\mu_t^{\mathrm{psi}}$.}
+
+Let $y_t^{(0)}$ and $n_t^{(0)}$ be the total spliced-read and total-read counts
+summed over all reference-group NTC cells.
+The Laplace-smoothed empirical PSI is $\hat p_t = (y_t^{(0)} + 0.5)/(n_t^{(0)} + 1)$,
+and the effective concentration $\kappa_t = \min(\max(n_t^{(0)},\, 20),\, 200)$
+(clamped to prevent an overly sharp prior from deep-sequenced samples).
+The Beta parameters are then:
+\begin{equation}
+  a_t = \hat p_t\,\kappa_t + 10^{-3}, \qquad b_t = (1-\hat p_t)\,\kappa_t + 10^{-3}.
+\end{equation}
+
+\subsection{Multinomial model (isoform/donor/acceptor usage)}
+
+For categorical outcomes where each feature $t$ has $K_t$ mutually exclusive categories
+(e.g.\ $K$ alternative splice sites), the observation for NTC cell $i$ and feature $t$
+is a vector of category counts $\mathbf{y}_{i,t} \in \mathbb{Z}_{\ge 0}^K$.
+
+Let $\mathbf{p}_t \in \Delta^{K-1}$ be the baseline probability vector for feature $t$
+(the $K$-simplex), and let $\boldsymbol{\alpha}_{c,t}^{\mathrm{logit}} \in \mathbb{R}^K$
+be additive corrections in log-probability space (with the reference-group correction
+fixed to $\mathbf{0}$).
+
+\begin{equation}
+  \mathbf{y}_{i,t} \given \mathbf{p}_t, \boldsymbol{\alpha}_{c_i,t}^{\mathrm{logit}},
+      n_{i,t}
+    \;\sim\; \mathrm{Multinomial}\!\left(n_{i,t},\;
+      \mathrm{softmax}\!\left(\log \mathbf{p}_t +
+        \boldsymbol{\alpha}_{c_i,t}^{\mathrm{logit}}\right)\right),
+\end{equation}
+%
+where $n_{i,t} = \sum_k y_{i,t,k}$ is the total count.
+Structurally absent categories (zero counts across all NTC cells and groups) are identified
+via a mask $\mathbf{z}_t \in \{0,1\}^K$ and their probabilities are hard-set to zero before
+normalisation.
+
+\paragraph{Priors.}
+
+\begin{align}
+  \mathbf{p}_t &\iid \mathrm{Dirichlet}\!\left(\mathbf{c}_t^{(0)} + 1\right)
+    \label{eq:ntc_dirichlet} \\
+  \alpha_{c,t,k}^{\mathrm{logit}} &\iid \mathrm{StudentT}(3, 0, 20)
+    \label{eq:ntc_multi_alpha}
+\end{align}
+%
+where $\mathbf{c}_t^{(0)} \in \mathbb{Z}_{\ge 0}^K$ with
+$c_{t,k}^{(0)} = \sum_{i:\,c_i=0,\,i\in\mathcal{S}_{\mathrm{NTC}}} y_{i,t,k}$
+are the category counts summed across all reference-group NTC cells.
+Categories that are absent from at least one technical group (i.e.\ have zero total
+reads in that group) are flagged as \emph{structural zeros} via a boolean mask
+$\mathbf{z}_t \in \{0,1\}^K$.
+For structural-zero categories the Dirichlet concentration is set to 1
+(a flat, proper prior) rather than 0, which would make the Dirichlet improper at
+the boundary; the model subsequently hard-zeros and renormalises their probabilities
+so the prior value has no effect on the fitted proportions.
+After sampling, group-level corrections $\boldsymbol{\alpha}_{c,t}^{\mathrm{logit}}$
+are centred over the active (non-masked) categories so their sum over active $k$ is zero,
+removing the non-identified global-shift direction that arises from softmax's invariance to additive constants.
+
+\subsection{Normal and Student-$t$ models}
+
+For continuous-valued features (e.g.\ SpliZ scores), the observation model is:
+\begin{equation}
+  y_{i,t} \given \mu_t, \sigma_t, \alpha_{c_i,t}^{\mathrm{add}}
+    \;\sim\; \mathcal{D}\!\left(\mu_t + \alpha_{c_i,t}^{\mathrm{add}},\; \sigma_t\right),
+\end{equation}
+where $\mathcal{D}$ is either $\mathcal{N}$ (normal) or $t_\nu$ (Student-$t$, $\nu = 3$).
+
+\paragraph{Priors.}
+
+\begin{align}
+  \mu_t &\iid \mathcal{N}\!\left(\hat\mu_t^{(0)},\; \hat\sigma_t^{\mathrm{SE}}\right) \\
+  \sigma_t &\iid \mathrm{HalfNormal}\!\left(2\,\hat\sigma_t^{\mathrm{SD}}\right) \\
+  \alpha_{c,t}^{\mathrm{add}} &\iid \mathrm{StudentT}\!\left(3,\; 0,\; \hat\sigma_t^{\mathrm{SE}}\right),
+    \quad c = 1,\ldots,C-1
+\end{align}
+
+\paragraph{Empirical hyperparameters.}
+
+All quantities are estimated from reference-group ($c_i = 0$) NTC cells:
+\begin{align}
+  \hat\mu_t^{(0)}             &= N_0^{-1}\!\sum_{i:\,c_i=0} y_{i,t}, \\
+  \hat\sigma_t^{\mathrm{SD}}  &= \mathrm{nanstd}_{c_i=0}(y_{i,t}), \\
+  \hat\sigma_t^{\mathrm{rob}} &= 1.4826\times\mathrm{MAD}_{c_i=0}(y_{i,t})
+    \quad\text{(falls back to $\hat\sigma_t^{\mathrm{SD}}$ when MAD\,$= 0$)}, \\
+  \hat\sigma_t^{\mathrm{SE}}  &= \max\!\left(
+    \hat\sigma_t^{\mathrm{rob}}/\sqrt{N_{\mathrm{NTC}}},\;
+    \max\!\left(0.1\,|\hat\mu_t^{(0)}|,\; 0.1\right)\right).
+\end{align}
+$\hat\sigma_t^{\mathrm{SD}}$ scales both the $\sigma_t$ prior and the
+$\alpha_{c,t}^{\mathrm{add}}$ Student-$t$ scale to the observed feature variability;
+$\hat\sigma_t^{\mathrm{SE}}$ sets the $\mu_t$ prior width so the NTC mean is
+well-estimated even for low-variance features.
+
+\subsection{Number of features and joint fitting}
+\label{sec:ntc_nfeatures}
+
+The statistical behaviour of \texttt{fit\_ntc} depends on how many features $T$ are modelled
+and whether they are fitted jointly or independently.
+
+\paragraph{Non-negative-binomial distributions.}
+For binomial, multinomial, normal, and Student-$t$ modalities, every prior is specified
+per-feature via empirical Bayes hyperparameters: no parameter is shared across features.
+Fitting all $T$ features in a single joint call is therefore \emph{statistically equivalent}
+to fitting each feature separately and pooling the results; the only practical difference
+is computational (GPU vectorisation over the feature dimension).
+
+\paragraph{Negative-binomial modality.}
+For negative-binomial modalities the situation is fundamentally different because the
+overdispersion rate $\beta_o$ is a \emph{shared} hyperparameter
+(equation~\ref{eq:ntc_beta_o}).
+Every feature's $o_t$ contributes a likelihood term that jointly informs the posterior of
+$\beta_o$; with $T = 1$ the posterior on $\beta_o$ barely moves from the Gamma$(9,3)$
+prior, and the resulting $o_t$ estimate is driven almost entirely by the hyperprior rather
+than the data—the same failure mode described for the single-gene cis fit in
+Section~\ref{sec:cis_fitting}.
+Fitting all features simultaneously is therefore not merely a computational convenience
+but a statistical requirement for the containment prior to be data-driven.
+
+In practice the containment prior performs well when 90 features with
+detectable expression are included.
+Caution is warranted as the feature count decreases.
+The Gamma$(9,3)$ prior on $\beta_o$ (mean $9/3 = 3$) is calibrated to the realistic
+situation in which \emph{most} features are near-Poisson (high $\beta_o$ keeps
+$o_t = \mathrm{Exponential}(\beta_o)$ small) while a minority of genuinely overdispersed
+features are free to deviate upward.
+With many features this mixture is identifiable from data: the near-Poisson majority
+anchors $\beta_o$ near its prior, and the overdispersed minority can pull individual
+$o_t$ estimates above that baseline.
+With $T \ll 30$ there are too few features to characterise this mixture reliably, so
+$\beta_o$ and individual $o_t$ values both carry high posterior uncertainty.
+For modalities with very few features (e.g.\ a small panel of CITE-seq proteins), users
+should inspect the posterior credible intervals on individual $o_t$ estimates to assess
+whether they have contracted from the prior before treating the overdispersion estimates as reliable.
+The same reasoning applies to \texttt{fit\_trans} (Section~3), where $\beta_o$ plays the
+identical structural role for the negative-binomial likelihood.
+
+\subsection{Output}
+
+The technical fitting step produces the following outputs for downstream use:
+\begin{itemize}
+  \item $\alpha_{c,t}^{\text{mult}}$ or $\alpha_{c,t}^{\text{add}}$: batch correction
+        parameters, stored as matrices of shape $[C, T]$ on the relevant modality object.
+  \item $o_t$ (negbinom only): inverse-overdispersion estimates stored as
+        $\alpha_y^{\text{prefit}}$.
+  \item $o_{t_0}$ for the cis gene $t_0$ (negbinom primary modality): extracted as
+        $\alpha_x^{\text{prefit}}$ for use in \texttt{fit\_cis}.
+  \item $\mu_t$ (negbinom, normal, Student-$t$, binomial) or $\mathbf{p}_t$ (multinomial):
+        the per-feature baseline mean (or baseline probability vector) in NTC cells.
+        Stored as key \texttt{mu\_ntc} (or \texttt{probs\_baseline} for multinomial)
+        in the modality's posterior sample dictionary.
+        The posterior median is extracted by \texttt{fit\_trans} to anchor the prior on
+        $A_t$ (the baseline trans-feature level; see Section~3), preventing $A_t$ from
+        collapsing to near-zero for lowly expressed features.
+\end{itemize}
+
+%%============================================================
+\section{Step 2: Cis Effect Fitting (\texttt{fit\_cis})}
+\label{sec:cis_fitting}
+%%============================================================
+
+\subsection{Purpose}
+
+The cis fitting step estimates the latent \emph{true expression} $x_i$ of the CRISPR-targeted
+gene for every cell $i$, accounting for guide-level effects, within-guide cell-to-cell
+variation, technical batch effects, and sequencing depth.
+%
+The result is a posterior distribution over $x_i$, whose posterior median is passed as an
+observed quantity to the trans fitting step.
+%
+It is important to fit cis before fitting trans, as doing the two at once can lead to overfitting.
+
+\subsection{Data}
+
+\texttt{fit\_cis} models the targeted gene using a dedicated \emph{cis modality},
+which is always branched off from the \emph{primary modality}—the main data type
+that quantifies the perturbation target.
+%
+Most commonly the primary modality is gene expression (RNA-seq read counts), but it
+could equally be protein abundance (e.g.\ CITEseq antibody-derived tag counts) or
+chromatin accessibility at the gene's promoter region (e.g.\ ATAC-seq fragment counts
+in a promoter window).
+
+The key requirement is that the primary modality must be \emph{count-based}.
+This is because the cis modality serves as a proxy for gene \emph{dosage}—the
+continuous $x$-axis along which downstream effects are modelled in Step~3.
+Dosage must be measured on an absolute, count-based scale that reflects the
+\emph{quantity} of the cis gene product: proportional or continuous measurements
+(e.g.\ isoform usage fractions or SpliZ scores) are not suitable as the primary modality
+because they carry no information about the total amount of the molecule present, only
+its relative distribution.
+%
+Consequently, unlike trans fitting (Step~3), which supports multiple likelihood families,
+\texttt{fit\_cis} always uses a negative-binomial observation model, regardless of the
+distributions used by other modalities in the same analysis.
+
+Let $N$ denote the total number of cells (NTC + cis-gene-targeting cells), $G$ the number of
+distinct guides, and $x^{\mathrm{obs}}_i$ the observed read count for the cis gene in cell $i$.
+Each cell is assigned to exactly one guide $g_i \in \{0, \ldots, G-1\}$, and to one technical
+group $c_i \in \{0, \ldots, C-1\}$.
+
+\subsection{Hierarchical model}
+
+\paragraph{Population distribution of guide effects.}
+
+Guide-level effects are drawn from a population distribution parameterised in $\log_2$ expression
+space:
+\begin{align}
+  \mu &\sim \mathcal{N}\!\left(\hat\mu_{\log_2},\; \hat\sigma_{\log_2}\right)
+      \label{eq:cis_pop_mu} \\
+  \sigma &\sim \mathrm{HalfCauchy}(2)
+      \label{eq:cis_pop_sigma} \\
+  \varepsilon_g &\iid t_3(0, 1), \quad g = 0,\ldots,G-1
+      \label{eq:cis_eps} \\
+  \log_2 x_g^{\mathrm{eff}} &= \mu + \sigma \varepsilon_g
+      \label{eq:cis_log2_xeff}
+\end{align}
+%
+where $x_g^{\mathrm{eff}} = 2^{\log_2 x_g^{\mathrm{eff}}}$ is the guide-specific effective
+expression.  The hyperparameters $\hat\mu_{\log_2}$ and $\hat\sigma_{\log_2}$ are set
+empirically from size-factor-corrected guide means (Section~\ref{sec:cis_hyperparams}).
+Equations~\eqref{eq:cis_eps}--\eqref{eq:cis_log2_xeff} are a \emph{non-centred} reparameterisation
+of the centred form $\log_2 x_g^{\mathrm{eff}} \iid t_3(\mu, \sigma)$; the two are statistically
+equivalent. The non-centred form is preferred because, in the centred form, the posterior geometry
+over $(\mu, \sigma, {\log_2 x_g^{\mathrm{eff}}})$ contains a funnel: when $\sigma$ is small,
+every $\log_2 x_g^{\mathrm{eff}}$ must track $\mu$ closely, inducing strong posterior dependencies
+that a mean-field variational approximation cannot represent. Parameterising via the standardised
+noise $\varepsilon_g$ breaks this coupling—the posterior over each $\varepsilon_g$ remains
+approximately $t_3(0,1)$-shaped regardless of $\sigma$—and yields a better-conditioned
+optimisation landscape for SVI.
+
+Optionally, when the target type is known (e.g.\ NTC vs.\ targetting), separate populations
+$(\mu_{\mathrm{type}}, \sigma_{\mathrm{type}})$ can be fitted for each target class
+(\texttt{independent\_mu\_sigma=True}). This can be helpful when there are few targetting
+guides relative to the number of NTC guides (in this case the NTC guides would pull targetting
+$x_g^{\mathrm{eff}}$ towards the NTC mean.
+
+\paragraph{Within-guide cell-to-cell variation.}
+
+Each guide $g$ has a per-guide noise parameter $\sigma_{\mathrm{eff},g}$ governing
+variability among cells sharing the same guide.
+The prior on $\sigma_{\mathrm{eff},g}$ is hierarchical: its Gamma shape and rate are
+themselves drawn from Exponential priors with data-driven rates $r_\alpha$ and $r_\beta$
+(Section~\ref{sec:cis_hyperparams}).
+
+\begin{align}
+  \hat\alpha_\sigma &\sim \mathrm{Exponential}(r_\alpha)
+      \label{eq:cis_alpha_sigma} \\
+  \hat\beta_\sigma  &\sim \mathrm{Exponential}(r_\beta)
+      \label{eq:cis_beta_sigma} \\
+  \sigma_{\mathrm{eff},g} &\iid \mathrm{Gamma}(\hat\alpha_\sigma, \hat\beta_\sigma)
+      \label{eq:cis_sigma_eff} \\
+  \log_2 x_i &\sim \mathcal{N}\!\left(\log_2 x_{g_i}^{\mathrm{eff}},\;
+      \sigma_{\mathrm{eff}, g_i}\right)
+      \label{eq:cis_log2_xtrue} \\
+  x_i &= 2^{\log_2 x_i}
+      \label{eq:cis_xtrue}
+\end{align}
+
+\paragraph{Technical batch correction.}
+
+Batch-effect scale factors are transferred from \texttt{fit\_ntc}:
+\begin{equation}
+  \alpha_{c,t_0}^x = \hat\alpha_{c,t_0}^x
+      \quad \text{(fixed point estimate from Step 1)},
+\end{equation}
+where $t_0$ is the index of the cis gene.
+Running \texttt{fit\_ntc} before \texttt{fit\_cis} is always required and raises an error if
+no prior technical fit is found.
+
+\paragraph{Overdispersion prefit ($o_x$).}
+
+The NB dispersion parameter $o_x$ for the cis gene is \emph{not} estimated within
+\texttt{fit\_cis}; instead it is fixed to the posterior mean obtained in Step~1.
+Two complementary failure modes motivate this design.
+
+\textit{Containment prior collapse.}
+In Step~1 the containment prior (equations~\ref{eq:ntc_beta_o}--\ref{eq:ntc_o_t}) operates
+across all $T$ features simultaneously.
+The hierarchical rate $\beta_o$ is informed by the overdispersion of every feature, so the
+prior can exert meaningful regularisation even for a single gene within the batch.
+In Step~2, however, only the cis gene is modelled.
+With a single feature, the containment prior has no cross-gene information to borrow:
+it simply minimises $o_x$ toward zero (i.e.\ pushes the NB toward Poisson),
+and the posterior mean of $o_x$ is then driven almost entirely by the prior hyperparameters
+rather than by the data.
+
+\textit{Latent overfitting.}
+Even if $o_x$ were well-identified in a single-gene fit, a freely estimated overdispersion
+can be exploited by the latent $x_i$ variables to overfit discrete count structure.
+Because integer count data have a non-smooth marginal distribution (probability mass
+concentrated on $0, 1, 2, \ldots$), the model can increase its likelihood by
+simultaneously making $o_x$ small (Poisson-like, sharply peaked) and adjusting $x_i$
+to reproduce exact observed counts rather than the underlying biological dosage.
+Fixing $o_x$ breaks this feedback loop: the latent $x_i$ must explain count variability
+through within-guide biological noise rather than by tuning the NB shape.
+
+For both reasons, $o_x$ is treated as an empirical Bayes point estimate: the posterior
+mean from \texttt{fit\_ntc}—where the multi-gene containment prior is well-defined—is
+extracted for the cis gene and held fixed throughout Step~2.
+
+\paragraph{Observation model.}
+
+\begin{equation}
+  x_i^{\mathrm{obs}} \given x_i, \phi_x, \alpha_{c_i}^x, s_i
+    \;\sim\; \NB\!\left(\phi_x,\; \frac{\alpha_{c_i}^x \, x_i \, s_i}{\phi_x}\right),
+    \label{eq:cis_obs}
+\end{equation}
+%
+where $\phi_x = 1/o_x^2$ and $o_x$ is fixed to the posterior mean from \texttt{fit\_ntc}.
+
+\subsection{Empirical hyperparameter initialisation}
+\label{sec:cis_hyperparams}
+
+The hyperparameters for the population distribution (equation~\eqref{eq:cis_pop_mu}) are
+computed from size-factor-corrected counts.
+Let $\tilde x_i = x_i^{\mathrm{obs}}/s_i$ and $\bar{\tilde x}_g = n_g^{-1}\sum_{i:\,g_i=g} \tilde x_i$
+be the mean size-factor-corrected count for guide $g$.
+\begin{align}
+  \hat\mu_{\log_2} &= \mathrm{mean}_g\!\left[\log_2 \bar{\tilde x}_g\right], \\
+  \hat\sigma_{\log_2} &= \mathrm{std}_g\!\left[\log_2 \bar{\tilde x}_g\right].
+\end{align}
+These are computed as the mean and standard deviation (across all guides $g$) of the
+guide-specific mean $\log_2$-expression level.
+
+The within-guide noise hyperparameters (equations~\ref{eq:cis_alpha_sigma}--\ref{eq:cis_beta_sigma})
+use guide-level MADs of $\log_2\tilde x_i$:
+\begin{equation}
+  d_g = 1.4826\times\mathrm{MAD}_{i:\,g_i=g}\!\left(\log_2 \tilde x_i\right).
+\end{equation}
+Setting $m = \mathrm{mean}_g(d_g)$ and $v = \mathrm{Var}_g(d_g)$, the Exponential
+prior rates are:
+\begin{equation}
+  r_\alpha = v/m^2, \qquad r_\beta = v/m.
+  \label{eq:cis_r_alphabeta}
+\end{equation}
+These are the method-of-moments solutions such that the prior mean of
+$\sigma_{\mathrm{eff},g}$ equals $m$ and the prior variance equals $v$.
+When $m < 0.01$ or $v < 0.01$ (degenerate case, e.g.\ all guides have identical MADs),
+a broad $\mathrm{Gamma}(1, 0.01)$ prior is used instead.
+
+\subsection{High-MOI extension}
+\label{sec:highmoi}
+
+In high-MOI screens each cell $i$ may carry multiple guides simultaneously.
+The guide assignment is encoded in a binary matrix $W \in \{0,1\}^{N \times G}$,
+where $W_{ig} = 1$ if cell $i$ contains guide $g$.
+
+\paragraph{Cell classification.}
+
+Before fitting, cells are classified into one of three groups based on their guide set:
+\begin{itemize}
+  \item \textbf{Cis-targeting}: the cell carries at least one guide targeting the cis gene.
+  \item \textbf{NTC}: the cell carries only non-targeting control guides (possibly in
+        combination with guides targeting other genes; those non-NTC, non-cis assignments
+        are removed from $W$ before fitting).
+  \item \textbf{Excluded}: the cell carries only guides targeting genes other than the
+        cis gene; these cells provide no information about the cis effect and are dropped.
+\end{itemize}
+
+\paragraph{Additive guide effects.}
+
+Guide-level effects $x_g^{\mathrm{eff}}$ are still drawn from the same hierarchical prior
+as in equations~(\ref{eq:cis_pop_mu})--(\ref{eq:cis_log2_xeff}).
+%
+What changes is how per-cell expression is assembled from those guide effects.
+Let $k_i = \sum_g W_{ig}$ be the number of guides in cell $i$.
+The effects are combined additively on the $\log_2$ fold-change scale:
+\begin{equation}
+  \log_2 x_{\mathrm{mean},i}
+    = \sum_{g} W_{ig}\,\log_2 x_g^{\mathrm{eff}}
+      - (k_i - 1)\,\log_2 \bar x^{\mathrm{NTC}},
+  \label{eq:highmoi_xmean}
+\end{equation}
+%
+where $\bar x^{\mathrm{NTC}}$ is a precision-weighted mean of NTC guide effects
+(see below).
+Equation~(\ref{eq:highmoi_xmean}) is equivalent to
+\begin{equation*}
+  \log_2 x_{\mathrm{mean},i}
+    = \log_2 \bar x^{\mathrm{NTC}}
+      + \sum_g W_{ig}\!\left(\log_2 x_g^{\mathrm{eff}} - \log_2 \bar x^{\mathrm{NTC}}\right),
+\end{equation*}
+i.e.\ guide fold-changes add on the $\log_2$ scale regardless of how many guides a
+cell carries.
+In matrix form, letting $\mathbf{l} = \log_2 \mathbf{x}^{\mathrm{eff}} \in \mathbb{R}^G$
+and $\mathbf{k} = W\mathbf{1} \in \mathbb{N}^N$:
+\begin{equation}
+  \log_2 \mathbf{x}_{\mathrm{mean}} = W\mathbf{l} - (\mathbf{k} - \mathbf{1})\,\log_2 \bar x^{\mathrm{NTC}}.
+\end{equation}
+
+\paragraph{Weighted NTC reference.}
+
+To ensure that cells carrying only NTC guides remain at the NTC expression baseline
+regardless of how many NTC guides they carry, the reference $\bar x^{\mathrm{NTC}}$
+is a precision-weighted mean of the NTC guide effects:
+\begin{equation}
+  \bar x^{\mathrm{NTC}}
+    = \frac{\displaystyle\sum_{g \in \mathcal{G}_{\mathrm{NTC}}} w_g\, x_g^{\mathrm{eff}}}
+           {\displaystyle\sum_{g \in \mathcal{G}_{\mathrm{NTC}}} w_g},
+  \qquad
+  w_g = \frac{n_g}{\sigma_{\mathrm{eff},g}},
+\end{equation}
+where $n_g = \sum_i W_{ig}$ is the number of cells carrying guide $g$,
+$\mathcal{G}_{\mathrm{NTC}}$ is the set of NTC guide indices, and $\sigma_{\mathrm{eff},g}$
+is the per-guide within-guide noise (equation~\ref{eq:cis_sigma_eff}).
+Guides observed in more cells and with lower noise receive higher weight, making the
+reference robust to rare or variable NTC guides.
+
+\paragraph{Within-guide noise aggregation.}
+
+For multi-guide cells, the per-cell noise is the mean of the constituent guide-level
+noise parameters:
+\begin{equation}
+  \sigma_{\mathrm{eff},i}^{\mathrm{cell}} = \frac{\sum_g W_{ig}\,\sigma_{\mathrm{eff},g}}{k_i}.
+\end{equation}
+The cell-level latent expression then follows
+$\log_2 x_i \sim \mathcal{N}\!\left(\log_2 x_{\mathrm{mean},i},\;
+\sigma_{\mathrm{eff},i}^{\mathrm{cell}}\right)$,
+and the observation model (equation~\ref{eq:cis_obs}) is unchanged.
+
+\subsection{Output}
+
+The posterior median of $x_i$ over $S = 1000$ samples is stored as $\hat x_i$
+(\texttt{x\_true}) and treated as a fixed observation in Step~3.
+The posterior median of $\log_2 x_i$ is also stored as $\widehat{\log_2 x}_i$
+(\texttt{log2\_x\_true}) for downstream inspection; Step~3 takes only $\hat x_i$ as input
+and computes $\log_2 \hat x_i$ internally as needed.
+
+%%============================================================
+\section{Step 3: Trans Effect Fitting (\texttt{fit\_trans})}
+%%============================================================
+
+\subsection{Purpose}
+
+The trans fitting step models how the expression level $\hat x_i$ of the cis gene
+(estimated in Step~2) affects the molecular phenotype $y_{i,t}$ of each downstream
+(trans) feature $t$, for all $T$ features simultaneously.
+%
+The dose-response function $f_t(\hat x_i)$ captures the shape of this relationship
+(monotone increase, decrease, or non-monotone), while a sparsity gate controls which
+features actually respond.
+
+\subsection{Feature-level variance}
+\label{sec:trans_variance}
+
+Variance parameters are distribution-specific; only negative-binomial uses a shared
+cross-feature hyperprior.
+
+\paragraph{Negative binomial.}
+
+\begin{align}
+  \beta_o &\sim \mathrm{Gamma}(9,\; 3) \label{eq:trans_beta_o} \\
+  o_t \given \beta_o &\iid \mathrm{Exponential}(\beta_o), \quad t = 1,\ldots,T \label{eq:trans_o_t} \\
+  \phi_t &= 1/o_t^2
+\end{align}
+%
+This is the same containment prior as in Step~1
+(equations~\ref{eq:ntc_beta_o}--\ref{eq:ntc_o_t}),
+encouraging most features to have near-Poisson overdispersion by
+default~\cite{kleshchevnikov2022}.
+Because $\beta_o$ is shared across all $T$ trans features, fitting them jointly in a single
+call is a statistical requirement, not merely a computational convenience
+(Section~\ref{sec:ntc_nfeatures}).
+If \texttt{fit\_ntc} has been run, the NTC posterior mean of $o_t$ is used as a fixed
+weight to anchor the $A_t$ prior toward the NTC baseline (see Section~\ref{sec:trans_A}).
+
+\paragraph{Normal and Student-$t$.}
+
+Each feature has an independent per-feature noise scale with no shared hyperprior:
+\begin{equation}
+  \sigma_t \iid \mathrm{HalfNormal}\!\left(2\,\hat\sigma_t^{\mathrm{NTC}}\right),
+  \quad t = 1,\ldots,T,
+\end{equation}
+where $\hat\sigma_t^{\mathrm{NTC}}$ is the posterior median of $\sigma_t$ from
+\texttt{fit\_ntc} (providing an empirical Bayes scale).
+If \texttt{fit\_ntc} has not been run, a broad $\mathrm{HalfCauchy}(10)$ fallback is used.
+
+\paragraph{Degrees of freedom (Student-$t$ only).}
+
+$\nu_t = 3$, fixed to match the value used in \texttt{fit\_ntc}.
+
+\paragraph{Binomial and multinomial.}
+
+No variance parameter is estimated; the observation variance is fully determined by
+the per-cell count totals $n_{i,t}$.
+
+\subsection{Technical batch correction}
+
+Batch corrections are fixed to the posterior means from \texttt{fit\_ntc} (stored as
+$\hat\alpha_{c,t}^{\text{mult}}$ or $\hat\alpha_{c,t}^{\text{add}}$ depending on
+distribution).
+Running \texttt{fit\_ntc} before \texttt{fit\_trans} is required whenever technical covariates
+are specified; providing covariates without a prior technical fit raises an error.
+
+\subsection{Baseline parameter $A$}
+\label{sec:trans_A}
+
+The parameter $A_t$ represents the expected value of feature $t$ in the absence of
+any cis-gene effect (i.e.\ at the NTC expression level $\hat x^{\mathrm{NTC}}$).
+Its prior is distribution-specific and noise-adaptive.
+
+\paragraph{Noise-adaptive weighting.}
+
+Let $\omega_t = o_t^{\mathrm{NTC}} / (o_t^{\mathrm{NTC}} + \bar o)$ where
+$o_t^{\mathrm{NTC}}$ is the posterior mean of $o_t$ from \texttt{fit\_ntc} and
+$\bar o = \beta_o^{\mathrm{rate}} / \beta_o^{\mathrm{shape}}$ is the prior mean of $o_t$
+(i.e.\ $\bar o = 3/9 = 1/3$ for the default Gamma$(9,3)$ containment prior on $\beta_o$).
+Noisier features ($o_t^{\mathrm{NTC}} \gg \bar o$) get $\omega_t \to 1$, pulling the
+prior on $A_t$ toward the NTC empirical mean.
+
+\paragraph{Negative-binomial baseline.}
+
+The $A_t$ prior is a log-normal anchored between a data-driven lower bound $L_t$ and
+the NTC expression level $U_t$ (all quantities in log$_2$ units).
+Let $Q_{05,t}$ denote the 5th percentile of batch-corrected, size-factor-normalised
+counts $y_{i,t}/(s_i\,\hat\alpha_{c_i,t}^{\mathrm{mult}})$ across all cells, floored
+at $\min(Q_{01}(\hat\mu^{\mathrm{NTC}}),\, 2^{-10})$ when zero or negative.
+The upper and lower anchors are:
+\begin{align}
+  U_t &= \max\!\left(\log_2 \hat\mu_t^{\mathrm{NTC}},\; \log_2 \bar y_t^{\mathrm{corr}}\right), \\
+  L_t &= \max\!\left(\log_2(Q_{05,t}/2),\; U_t - 4\right),
+\end{align}
+where $\hat\mu_t^{\mathrm{NTC}}$ is the \texttt{fit\_ntc} posterior median of $\mu_t$ and
+$\bar y_t^{\mathrm{corr}}$ is the mean of batch-corrected counts across all cells
+(a floor for genes absent in NTC but expressed in perturbation cells);
+$L_t$ is capped to be at most 4\,$\log_2$ units below $U_t$.
+\begin{equation}
+  \log_2 A_t \sim \mathcal{N}\!\left(
+    (1 - \omega_t)\,L_t + \omega_t\,U_t,\;
+    \sigma_{A,t}^{\log_2}\right),
+  \quad \sigma_{A,t}^{\log_2} = \max(U_t - L_t,\; 1),
+  \label{eq:trans_A_nb}
+\end{equation}
+so the prior width spans the gap between anchors (at least 1 and at most 4\,$\log_2$
+units by construction of $L_t$).
+
+\paragraph{Normal and Student-$t$ baseline.}
+
+Let $Q_{05,t}^{\mathrm{lin}}$ be the 5th percentile of batch-corrected values
+$y_{i,t} - \hat\alpha_{c_i,t}^{\mathrm{add}}$ across all cells (the lower anchor in
+linear space).
+
+\begin{equation}
+  A_t \sim \mathcal{N}\!\left(
+    (1 - \omega_t)\,Q_{05,t}^{\mathrm{lin}}
+    + \omega_t\,\hat\mu_t^{\mathrm{NTC}},\;
+    \sigma_{A,t}\right),
+\end{equation}
+%
+where $\hat\mu_t^{\mathrm{NTC}}$ is the posterior median of $\mu_t$ from \texttt{fit\_ntc},
+$\sigma_{A,t} = |\hat\mu_t^{\mathrm{NTC}} - Q_{05,t}^{\mathrm{lin}}|$,
+floored at 10\% of the observed response amplitude $Q_{95,t}^{\mathrm{lin}} - Q_{05,t}^{\mathrm{lin}}$.
+
+\paragraph{Binomial baseline.}
+
+When NTC data are available (i.e.\ \texttt{fit\_ntc} has been run for this modality),
+the prior on $A_t$ is placed on the logit scale:
+\begin{equation}
+  \logit A_t \sim \mathcal{N}\!\left(
+    (1 - \omega_t)\,\logit\!\left(\tfrac12 Q_{05,t}^{\mathrm{PSI}}\right)
+    + \omega_t\,\logit \hat p_t^{\mathrm{NTC}},\;
+    \sigma_{\logit, t}\right),
+\end{equation}
+%
+where $Q_{05,t}^{\mathrm{PSI}}$ is the 5th percentile of batch-corrected PSI values across
+all cells (lower anchor), $\hat p_t^{\mathrm{NTC}}$ is the posterior median of $\mu_t^{\mathrm{psi}}$
+from \texttt{fit\_ntc} (optionally lifted to the overall mean corrected PSI if $\hat p_t^{\mathrm{NTC}}$
+falls below that mean), and
+$\sigma_{\logit, t} = \logit\hat p_t^{\mathrm{NTC}} - \logit\!\bigl(\tfrac12 Q_{05,t}^{\mathrm{PSI}}\bigr)$,
+floored at 1 logit unit (and the lower anchor is capped to be at most 4 logit units below
+the upper anchor).
+Without NTC data:
+$A_t \sim \mathrm{Beta}(1,\, (1 - \hat p_{t,0})/\hat p_{t,0})$
+where $\hat p_{t,0} = Q_{05,t}^{\mathrm{PSI}}/2$ is the shifted lower anchor.
+
+\paragraph{Multinomial baseline.}
+
+Let $\mathbf{p}_t^{\mathrm{low}} \in \Delta^{K-1}$ be the category probability vector
+obtained by normalising $0.5 \times Q_{05,t,k}^{\mathrm{prop}}$ across categories,
+where $Q_{05,t,k}^{\mathrm{prop}}$ is the 5th percentile of the batch-corrected usage
+proportion for category $k$ across all cells (the lower anchor).
+Let $\hat{\mathbf{p}}_t^{\mathrm{NTC}}$ be the posterior median of $\mathbf{p}_t$
+from \texttt{fit\_ntc} (the NTC category probability vector).
+
+\begin{equation}
+  [\log \mathbf{A}_t]_k \sim \mathcal{N}\!\left(
+    (1 - \omega_t)\,[\log \mathbf{p}_t^{\mathrm{low}}]_k
+    + \omega_t\,[\log \hat{\mathbf{p}}_t^{\mathrm{NTC}}]_k,\;
+    \sigma_{\log,t,k}\right),
+\end{equation}
+The lower anchor is itself floored at $[\log\hat{\mathbf{p}}_t^{\mathrm{NTC}}]_k - 4$ so that
+$\sigma_{\log,t,k} \in [1,\,4]$ log units:
+\begin{equation}
+  \tilde{\mathbf{p}}_t^{\mathrm{low}} = \max\!\bigl(\mathbf{p}_t^{\mathrm{low}},\;
+    e^{[\log\hat{\mathbf{p}}_t^{\mathrm{NTC}}]_k - 4}\bigr),\quad
+  \sigma_{\log,t,k} = \max\!\bigl(|[\log\hat{\mathbf{p}}_t^{\mathrm{NTC}}]_k
+    - [\log\tilde{\mathbf{p}}_t^{\mathrm{low}}]_k|,\;1.0\bigr).
+\end{equation}
+$\mathbf{A}_t = \mathrm{softmax}([\log \mathbf{A}_t])$ with phantom
+categories (absent from all cells) forced to $-\infty$ before the softmax so they
+receive zero probability.
+This LogisticNormal parameterisation avoids the numerical instabilities of the
+stick-breaking transformation for large $K$.
+
+\subsection{Sparsity gate $\alpha_t$}
+
+To encode the expectation that most features do not respond to the perturbation, a
+continuous Bernoulli gate is placed on the amplitude:
+\begin{equation}
+  \alpha_t \sim \mathrm{RelaxedBernoulli}\!\left(
+    \tau,\; \mathrm{logit}(p_0)\right),
+\end{equation}
+where $\tau > 0$ is the temperature and $p_0$ is the prior probability of a non-zero effect.
+In the default configuration $p_0 = 10^{-6}$ (strongly sparse prior) and $\tau$ is linearly
+annealed from $1.0$ down to $0.1$ over training.
+For \texttt{additive\_hill}, a warmup phase first fits a single-Hill model at temperatures
+$[1.0 \to 0.5]$, providing stable initialisation before the second sparsity gate is introduced.
+%
+An identifiability coupling penalty
+$-\lambda \alpha_t \exp(-|n_t|) \; (\lambda = 10)$
+discourages $\alpha_t$ from being active when the Hill coefficient $n_t \approx 0$
+(flat dose-response), preventing the amplitude from absorbing noise as a constant offset.
+
+\subsection{Dose-response functions}
+
+Two functional forms are available for $f_t(\hat x_i)$:
+
+\subsubsection{Single Hill equation (\texttt{single\_hill})}
+
+\begin{equation}
+  f_t(\hat x_i) = A_t + \alpha_t \, V_{a,t} \,
+    \sigma\!\left(n_{a,t}\,\bigl(\log \hat x_i - \log K_{a,t}\bigr)\right),
+  \label{eq:single_hill}
+\end{equation}
+where $V_{a,t} > 0$ is the maximum response amplitude, $K_{a,t} > 0$ is the
+half-effect concentration (EC$_{50}$), $n_{a,t}$ is the Hill coefficient
+(negative values model repression), and $\sigma(\cdot)$ is the logistic function.
+This is equivalent to $V_{a,t}\,x^{n_a}/(K_{a,t}^{n_a} + x^{n_a}) + A_t$ with
+a numerically stable sigmoid formulation that avoids overflow for extreme $n$.
+
+\subsubsection{Additive Hill equation (\texttt{additive\_hill})}
+
+\begin{equation}
+  f_t(\hat x_i) = A_t
+    + \alpha_t \, V_{a,t} \, \sigma\!\left(n_{a,t}\,(\log\hat x_i - \log K_{a,t})\right)
+    + \beta_t  \, V_{b,t} \, \sigma\!\left(n_{b,t}\,(\log\hat x_i - \log K_{b,t})\right),
+  \label{eq:additive_hill}
+\end{equation}
+%
+where a second relaxed-Bernoulli gate $\beta_t$ and a second Hill component $(V_b, K_b, n_b)$
+allow the model to capture biphasic dose-response curves (e.g.\ activation at low dose,
+repression at high dose, or two independent regulatory modes).
+
+\subsection{Priors on Hill parameters}
+
+\paragraph{Half-effect concentration $K$.}
+
+\begin{equation}
+  \log K_{a,t} \sim \mathcal{N}\!\left(\log \hat x^{\mathrm{NTC}},\;
+    \tfrac{5\ln 2}{2}\right),
+\end{equation}
+centred at the NTC mean cis expression so that the prior EC$_{50}$ is located at the
+NTC expression level (log$_2$FC $= 0$), with 95\% CI spanning $\pm 5$ log$_2$FC.
+When no NTC mean is available, the prior is centred at half the observed expression range.
+
+\paragraph{Amplitude $V$.}
+
+For count-based and continuous modalities (negbinom, normal, studentt):
+\begin{equation}
+  \log V_{a,t} \sim \mathcal{N}\!\left(\mu_{V,t}^{\log},\; \sigma_{V,t}^{\log}\right),
+\end{equation}
+where the prior is a log-normal centred on the empirical response range.
+Let $\bar V_t = Q_{95,t}^{\mathrm{corr}} - Q_{05,t}^{\mathrm{corr}}$ be the difference
+between the 95th and 5th percentiles of batch-corrected observations across all cells
+(a data-driven estimate of the maximum plausible amplitude).
+Setting $V_{\mathrm{alpha}} = 2$ (a fixed diffuseness parameter):
+\begin{align}
+  \sigma_{V,t}^{\log} &= \max\!\left(\sqrt{\log\!\left(1 + 1/V_{\mathrm{alpha}}\right)},\; v_{\mathrm{floor}}\right), \\
+  \mu_{V,t}^{\log}    &= \log\bar V_t - \tfrac12\,(\sigma_{V,t}^{\log})^2,
+\end{align}
+where the floor $v_{\mathrm{floor}} = 1.5$ (default) ensures the prior spans at least a
+$\sim\!20\times$ range even when the data-driven $\bar V_t$ is very small.
+(In practice, $\sqrt{\log(1 + 1/2)} = \sqrt{\log 1.5} \approx 0.64 < 1.5$, so the
+floor always binds and $\sigma_{V,t}^{\log} = 1.5$ for all features.)
+
+For bounded modalities (binomial, multinomial):
+\begin{equation}
+  V_{a,t} \sim \mathrm{Beta}\!\left(2\,Q_{95,t}^{\mathrm{PSI}},\; 2(1 - Q_{95,t}^{\mathrm{PSI}})\right),
+\end{equation}
+where $Q_{95,t}^{\mathrm{PSI}}$ is the 95th-percentile PSI or usage proportion across cells,
+with concentration 2, placing the Beta prior centre near the upper end of the
+observed range while remaining relatively diffuse.
+
+\paragraph{Hill coefficient $n$.}
+
+\begin{equation}
+  n_{a,t}^{\mathrm{raw}} \sim \mathcal{N}(\tilde n_\mu, \sigma_{n,t}),
+  \quad
+  n_{a,t} = h(n_{a,t}^{\mathrm{raw}};\; n_{\min}, n_{\max}),
+\end{equation}
+where $h(\cdot)$ is a differentiable soft-clamp (tanh-based) mapping to
+$(n_{\min}, n_{\max})$, default $[-100, 100]$, and $\sigma_{n,t} \sim \mathrm{Exponential}(1)$
+is sampled per feature to allow heterogeneous regularisation.
+%
+The desired constrained mode is $n_\mu = 0$; to achieve this, the unconstrained prior mean
+is set via the inverse soft-clamp:
+\begin{equation}
+  \tilde n_\mu^{\mathrm{raw}}
+    = \tfrac{n_{\max}-n_{\min}}{2}\,
+      \mathrm{atanh}\!\left(
+        \frac{n_\mu - \tfrac{n_{\min}+n_{\max}}{2}}{\tfrac{n_{\max}-n_{\min}}{2}}
+      \right).
+\end{equation}
+For symmetric bounds ($n_{\min} = -n_{\max}$) this gives $\tilde n_\mu^{\mathrm{raw}} = 0$;
+for the asymmetric bounds that arise when all cells have $x > 1$ the correction shifts
+the unconstrained mean away from zero to compensate.
+
+\subsection{Likelihood}
+
+\paragraph{Negative binomial.}
+
+\begin{equation}
+  y_{i,t} \given f_t(\hat x_i), \phi_t, \alpha_{c_i,t}^{\text{mult}}, s_i
+    \;\sim\; \NB\!\left(\phi_t,\;
+      \frac{f_t(\hat x_i)\,\alpha_{c_i,t}^{\text{mult}}\,s_i}{\phi_t}\right).
+  \label{eq:trans_nb_lik}
+\end{equation}
+
+\paragraph{Binomial.}
+
+\begin{equation}
+  y_{i,t} \given f_t(\hat x_i), \alpha_{c_i,t}^{\text{add}}, n_{i,t}
+    \;\sim\; \mathrm{Binomial}\!\left(n_{i,t},\;
+      \sigma\!\left(\logit f_t(\hat x_i) + \alpha_{c_i,t}^{\text{add}}\right)\right).
+  \label{eq:trans_binom_lik}
+\end{equation}
+
+\paragraph{Multinomial.}
+
+\begin{equation}
+  \mathbf{y}_{i,t} \given f_t(\hat x_i),
+      \boldsymbol\alpha_{c_i,t}^{\text{logit}}, n_{i,t}
+    \;\sim\; \mathrm{Multinomial}\!\left(n_{i,t},\;
+      \widetilde{\mathrm{softmax}}\!\left(\log \mathbf{f}_t(\hat x_i) +
+        \boldsymbol\alpha_{c_i,t}^{\text{logit}}\right)\right),
+  \label{eq:trans_multi_lik}
+\end{equation}
+where $\mathbf{f}_t(\hat x_i) \in \Delta^{K-1}$ is the vector of category probabilities
+from the dose-response model (residual-category construction, see above) and
+$\widetilde{\mathrm{softmax}}$ is a masked softmax that enforces zero probability at
+structurally absent categories.  Cells with zero total reads for a feature are
+automatically excluded from the likelihood.
+
+\paragraph{Normal.}
+
+\begin{equation}
+  y_{i,t} \given f_t(\hat x_i), \sigma_t, \alpha_{c_i,t}^{\text{add}}
+    \;\sim\; \mathcal{N}\!\left(f_t(\hat x_i) + \alpha_{c_i,t}^{\text{add}},\; \sigma_t\right),
+  \label{eq:trans_normal_lik}
+\end{equation}
+where $\sigma_t$ and its prior are defined in Section~\ref{sec:trans_variance}.
+Missing values (NaN) in $y_{i,t}$ are excluded from the likelihood.
+
+\paragraph{Student-$t$.}
+
+As Normal but with $t_{\nu_t}(\cdot, \sigma_t)$ in place of $\mathcal{N}$, providing
+robustness to outlier observations; $\sigma_t$ and $\nu_t = 3$ are defined in
+Section~\ref{sec:trans_variance}.
+
+\subsection{Inference and output}
+
+SVI with AutoNormal guides is run for the full $100{,}000$ steps per modality.
+%
+Afterwards, $S = 1000$ posterior samples are drawn for each latent parameter.
+%
+Key outputs are posterior medians of $(A_t, \alpha_t, V_{a,t}, K_{a,t}, n_{a,t})$
+and, for \texttt{additive\_hill}, the corresponding $b$-set parameters.
+
+%%============================================================
+\section*{Notation summary}
+
+\begin{tabular}{ll}
+\toprule
+Symbol & Meaning \\
+\midrule
+$N$ & Number of cells \\
+$T$ & Number of trans features \\
+$G$ & Number of distinct guides \\
+$C$ & Number of technical groups \\
+$K$ & Number of multinomial categories \\
+$s_i$ & Size factor for cell $i$ \\
+$c_i$ & Technical group of cell $i$ \\
+$g_i$ & Guide of cell $i$ \\
+$x_i$ & Latent true cis gene expression in cell $i$ \\
+$\hat x_i$ & Posterior median cis expression (fixed in Step 3) \\
+$\hat x^{\mathrm{NTC}}$ & Mean cis expression in NTC cells \\
+$\phi_t = 1/o_t^2$ & NB dispersion (total count) for feature $t$ \\
+$A_t$ & Baseline level of trans feature $t$ \\
+$V_{a,t}, K_{a,t}, n_{a,t}$ & Hill amplitude, EC$_{50}$, coefficient for component $a$ \\
+$\alpha_t$ & Sparsity gate (relaxed Bernoulli) \\
+$\sigma(\cdot)$ & Logistic function \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent [TODO: add references, journal-specific formatting, and supplementary model diagrams]
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+\bibitem{bingham2019pyro}
+  Bingham, E.\ et al.\ (2019).
+  Pyro: Deep Universal Probabilistic Programming.
+  \textit{J.\ Mach.\ Learn.\ Res.}, 20(28):1--6.
+
+\bibitem{kleshchevnikov2022}
+  Kleshchevnikov, V.\ et al.\ (2022).
+  Cell2location maps fine-grained cell types in spatial transcriptomics.
+  \textit{Nature Biotechnology}, 40, 661--671.
+
+%% [TODO: add SCRAN reference for size factors]
+%% [TODO: add any other relevant citations]
+\end{thebibliography}
+
+\end{document}
