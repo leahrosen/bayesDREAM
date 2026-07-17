@@ -17,6 +17,7 @@ import functools
 import warnings
 from typing import Dict, Optional
 import numpy as np
+from .plotting.model_plots import ModelPlottingMixin as _ModelPlottingMixin
 import pandas as pd
 import torch
 
@@ -1721,16 +1722,29 @@ class bayesDREAM(
         overwrite: bool = False
     ):
         """
-        Add a new modality.
+        Add a pre-constructed Modality object to the model.
 
         Parameters
         ----------
         name : str
-            Modality name
+            Modality name (e.g., ``'my_data'``). Must be unique unless
+            ``overwrite=True``.
         modality : Modality
-            Modality object
-        overwrite : bool
-            Whether to overwrite existing modality with same name
+            A fully constructed :class:`Modality` object.
+        overwrite : bool, default False
+            If True, replace an existing modality with the same name.
+
+        Warns
+        -----
+        UserWarning
+            If a ``negbinom`` modality is added without ``sum_factors`` set.
+            You must assign ``modality.sum_factors`` (a cell-indexed DataFrame)
+            before calling :meth:`fit_trans` on that modality.
+
+        Raises
+        ------
+        ValueError
+            If ``name`` already exists and ``overwrite=False``.
         """
         if name in self.modalities and not overwrite:
             raise ValueError(f"Modality '{name}' already exists. Use overwrite=True to replace it.")
@@ -1919,6 +1933,27 @@ class bayesDREAM(
     def classify_second_deriv_roots(self, *args, **kwargs):
         return super().classify_second_deriv_roots(*args, **kwargs)
 
+    def plot_technical_fit(self, *args, **kwargs):
+        return super().plot_technical_fit(*args, **kwargs)
+
+    def plot_cis_fit(self, *args, **kwargs):
+        return super().plot_cis_fit(*args, **kwargs)
+
+    def plot_trans_fit(self, *args, **kwargs):
+        return super().plot_trans_fit(*args, **kwargs)
+
+    def plot_xy_data(self, *args, **kwargs):
+        return super().plot_xy_data(*args, **kwargs)
+
+    def plot_trans_functions(self, *args, **kwargs):
+        return super().plot_trans_functions(*args, **kwargs)
+
+    def plot_parameter_ci_panel(self, *args, **kwargs):
+        return super().plot_parameter_ci_panel(*args, **kwargs)
+
+    def extract_posterior_dataframe(self, *args, **kwargs):
+        return super().extract_posterior_dataframe(*args, **kwargs)
+
     def __repr__(self) -> str:
         """String representation."""
         n_cells = len(self.meta)
@@ -1935,3 +1970,17 @@ class bayesDREAM(
             f"  device={self.device}\n"
             f")"
         )
+
+
+# Copy docstrings from ModelPlottingMixin to the forwarding stubs above.
+# We don't use functools.wraps because that copies __qualname__, which would
+# cause pdoc to attribute the methods to ModelPlottingMixin's page rather than
+# showing them on bayesDREAM.
+for _plot_method in [
+    "plot_technical_fit", "plot_cis_fit", "plot_trans_fit",
+    "plot_xy_data", "plot_trans_functions",
+    "plot_parameter_ci_panel", "extract_posterior_dataframe",
+]:
+    _src = getattr(_ModelPlottingMixin, _plot_method, None)
+    if _src and _src.__doc__:
+        bayesDREAM.__dict__[_plot_method].__doc__ = _src.__doc__

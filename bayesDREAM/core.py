@@ -37,13 +37,13 @@ from .fitting.distributions import get_observation_sampler, requires_denominator
 # Import fitters
 from .fitting import NTCFitter, CisFitter, TransFitter
 from .io import ModelSaver, ModelLoader, ModelSummarizer
-from .plotting.model_plots import PlottingMixin
+from .plotting.model_plots import ModelPlottingMixin
 from .diagnostics import DiagnosticsMixin
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
+class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
     """
     Internal core class for the three-step Bayesian Dosage Response Effects Across Modalities framework:
 

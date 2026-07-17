@@ -17,8 +17,9 @@ from .prior_posterior import (
 )
 from .prior_sampling import get_prior_samples
 
+__pdoc__ = {"ModelPlottingMixin": False}
 
-class PlottingMixin:
+class ModelPlottingMixin:
     """Mixin class providing plotting methods for bayesDREAM models."""
 
     def _get_technical_group_names(self) -> List[str]:
