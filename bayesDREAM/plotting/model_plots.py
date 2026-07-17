@@ -537,10 +537,205 @@ class ModelPlottingMixin:
 
     def plot_xy_data(self, *args, **kwargs):
         """
-        Plot raw x-y data (cis expression vs modality values) with k-NN smoothing.
+        Plot raw x-y data showing relationship between cis gene expression and modality values.
 
-        Delegates to ``xy_plots.plot_xy_data``; see that function for full
-        parameter documentation.
+        Requires x_true to be set (must run fit_cis() first).
+
+        Parameters
+        ----------
+        feature : str
+            Feature name (junction, donor, etc.) OR gene name.
+            - If a specific feature name (e.g., 'chr1:999788:999865'), plots that feature
+            - If a gene name (e.g., 'HES4'), plots all features for that gene in subplots
+            - Requires modality to have gene information ('gene', 'gene_name', or 'gene_id' columns)
+        modality_name : str, optional
+            Modality name (default: primary modality)
+        window : int
+            k-NN window size for smoothing (default: 100 cells)
+        show_correction : str
+            'uncorrected': no technical correction
+            'corrected': apply alpha_y technical correction
+            'both': show both side-by-side (default)
+        min_counts : int, optional
+            Minimum raw counts to include cells.
+            Default depends on distribution: 0 for negbinom, 3 for binomial/multinomial.
+            For negbinom: excludes cells with y_obs < min_counts
+            For binomial: minimum denominator
+            For multinomial: minimum total counts
+        color_palette : dict, optional
+            Custom colors for technical groups, keyed by the group label string.
+            Example: {'K562': 'crimson', 'TF1': 'dodgerblue'}
+        show_hill_function : bool
+            Overlay fitted trans function if trans model fitted (all distributions, default: True).
+            Works with all function types: additive_hill, single_hill, polynomial.
+            Automatically detects function type from posterior_samples_trans.
+        show_ntc_gradient : bool
+            Color lines by NTC proportion in k-NN window (default: False).
+            Lighter colors = more NTC cells, Darker colors = fewer NTC cells.
+            Only applies to uncorrected plots.
+            Fully implemented for: negbinom, binomial, normal, studentt.
+            Not yet implemented for: multinomial (will issue warning).
+        sum_factor_col : str
+            Column name in model.meta for sum factors (default: 'sum_factor').
+            Can be 'sum_factor', 'sum_factor_adj', or any other sum factor column.
+            Only used for negbinom distribution (gene expression).
+        xlabel : str
+            X-axis label (default: "log2(x_true)")
+        figsize : tuple, optional
+            Figure size as ``(width, height)`` in inches. When None (default) the
+            size is chosen automatically: 6 inches per column × 3 inches per row
+            for multi-panel plots, or (8, 5) / (14, 5) for single-panel plots.
+        src_barcodes : np.ndarray, optional
+            Source barcode order if x_true not in model.meta order
+        subset_meta : dict, optional
+            Subset cells by metadata columns. Dictionary of {column: value} pairs.
+            Example: {'target': 'ntc'} — plot only NTC cells.
+            Example: {'cell_line': 'K562'} — plot only K562 cells.
+            Multiple conditions are combined with AND logic.
+        only_dependent : bool
+            If True and plotting multiple features (gene name), filter to only "dependent" features
+            where the Hill coefficient (n_a or n_b) credible interval excludes 0 (default: False).
+            Requires fit_trans() to have been run with function_type='additive_hill'.
+            Ignored for single-feature plots.
+        ci_level : float
+            Credible interval level for dependency filtering and parameter marker
+            classification (default: 95.0).
+            Used by only_dependent=True and mark_params=True.
+        mark_params : bool or str
+            Overlay meaningful parameter markers on the Hill function (default: False).
+            Requires show_hill_function=True and fit_trans() completed with
+            function_type='single_hill' or 'additive_hill'.
+
+            - True or 'both': markers for both the fitted curve and the reference curve
+            - 'fit': markers for the fitted curve only
+            - 'reference': markers for the reference curve only (requires reference_df)
+            - False or None: no markers
+
+            Markers drawn depend on the fitted regime:
+
+            - **Single Hill / effectively single**: log2(A), log2(A+α·Vmax), log2(EC50)
+            - **Same-sign additive** (both Hills in same direction):
+              log2(A), log2(A+α·Vmax_a+β·Vmax_b), log2(EC50_lower), log2(EC50_upper)
+            - **Non-monotonic** (opposite-sign Hills):
+              log2(y: x→0), log2(y: x→∞), log2(EC50_lower), log2(EC50_upper);
+              additionally log2(A+α·Vmax_a+β·Vmax_b) [peak] if activation EC50 < inhibition EC50
+
+            For non-negbinom distributions, all y-axis markers are in linear space.
+            Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
+        log2fc : bool
+            If True, plot log2FC relative to NTC instead of raw log2 counts
+            (default: False). Only applies to negbinom modalities.
+            x-axis: log2(x_true) - log2(mean NTC x_true)
+            y-axis: log2(counts) - log2(mean NTC counts, reference group)
+            A grey dotted crosshair is drawn at (0, 0) to mark the NTC reference.
+        color_by : str or list of two str
+            What to color smoothed lines by (default: ``'technical_group'``).
+
+            - ``'technical_group'``: one line per cell-line / technical group (default)
+            - ``'targeting'``: two lines — NTC vs Targeting
+            - **Any column name in model.meta**: one line per unique value.
+              A warning is issued if the column looks continuous (float dtype with many
+              unique values) or has more than 30 unique values.
+            - **List of two** (e.g. ``['technical_group', 'targeting']``): cross-product of
+              two groupings — the first sets hue, the second sets shade. When the secondary
+              is ``'targeting'``, NTC lines are drawn as a light tint of the group colour
+              and targeting lines as the full colour (matching the classic "shades" style).
+              Override any auto-generated colour via ``color_palette`` using the combined
+              label ``"K562 / NTC"``, ``"K562 / Targeting"``, etc.
+
+            Alpha-y technical correction is always applied per technical group regardless
+            of this setting.
+        facet_by : str or list of str, optional
+            Column name(s) to facet by (default: None). Accepts either a single string or
+            a list of **at most two** strings. Each value may be a real column name in
+            model.meta **or** one of the same special keywords supported by ``color_by``:
+
+            - ``'targeting'`` — two panels: NTC / Targeting
+            - ``'technical_group'`` — one panel per technical group code
+
+            **1 column** (``facet_by='cell_line'``) — all unique values become
+            side-by-side column groups::
+
+                rows = n_features,  cols = n_facets × n_corrections
+
+            **2 columns** (``facet_by=['cell_line', 'perturbation']``) — first
+            column maps to grid *rows*, second column maps to grid *columns*::
+
+                rows = n_facet1_values × n_features
+                cols = n_facet2_values × n_corrections
+
+            ``subset_meta`` applies first; ``color_by`` works independently within
+            each panel. Use ``legend_outside=True`` for many panels.
+            Not yet supported for multinomial distributions (ignored with a warning).
+        expand_x_to_params : bool
+            When True, extend the x-axis (and the Hill curve) beyond the data range
+            so that all K/EC50 parameters are visible on the plot (default: False).
+            Requires ``show_hill_function=True`` and a fitted trans model.
+            Ignored for polynomial function types (which have no K parameters).
+        expand_y_to_params : bool
+            When True, extend the y-axis to show the full range of the fitted Hill
+            curve over the entire displayed x range (default: False). Normally the
+            Hill curve's y values are only used for y-axis scaling within the data
+            x range; this flag removes that restriction.
+        legend_outside : bool
+            Place the legend outside the panel to the right, shared across all panels
+            (default: False). Useful when many lines clutter the plot area.
+        filename : str, optional
+            If provided, save the figure to ``model.output_dir / filename``.
+            A ``.png`` extension is added automatically if none is given.
+            Use a full path to save elsewhere.
+        reference_df : pd.DataFrame, optional
+            A trans_summary DataFrame with fitted Hill parameters (columns ending in
+            ``_median``, e.g. ``A_median``, ``Vmax_a_median``). When provided, a
+            reference Hill curve is overlaid in red dashed on each negbinom panel.
+            Feature names are matched via a ``gene_name`` or ``gene`` column.
+            Only applied to negbinom modalities.
+        fdr_df : pd.DataFrame, optional
+            A trans_summary DataFrame with ``fdr_alpha`` and ``fdr_beta`` columns
+            (e.g. the output of ``save_trans_summary``). Used for greying out
+            FDR-inactive parameter markers (``mark_params`` mode) and for classifying
+            the Hill regime. Feature names are matched via ``gene_name`` or ``gene``.
+        fdr_threshold : float
+            FDR threshold for classifying components as active (default: 0.05).
+            Components with ``fdr_alpha`` or ``fdr_beta`` >= this threshold are
+            treated as inactive. Only used when ``fdr_df`` is provided.
+        **kwargs
+            Additional plotting arguments.
+
+        Returns
+        -------
+        plt.Figure or plt.Axes
+            Matplotlib figure or axes object.
+
+        Raises
+        ------
+        ValueError
+            If x_true not set (must run fit_cis first),
+            if feature not found in modality,
+            or if show_correction='corrected' but fit_technical not run.
+
+        Warnings
+        --------
+        If fit_technical not run for modality and show_correction='corrected',
+        warns and plots uncorrected only.
+
+        Examples
+        --------
+        >>> # Plot single gene with Hill function
+        >>> model.plot_xy_data('TET2', window=100, show_hill_function=True)
+        >>>
+        >>> # Plot specific splice junction with min_counts filter
+        >>> model.plot_xy_data('chr1:12345:67890:+', modality_name='splicing_sj',
+        ...                     min_counts=5)
+        >>>
+        >>> # Plot all splice junctions for a gene (creates multi-panel figure)
+        >>> model.plot_xy_data('HES4', modality_name='splicing_sj')
+        >>>
+        >>> # Plot with custom colors
+        >>> model.plot_xy_data('GFI1B', color_palette={'K562': 'red', 'TF1': 'blue'})
+        >>>
+        >>> # Show both corrected and uncorrected (default)
+        >>> model.plot_xy_data('TET2', show_correction='both')
         """
         from .xy_plots import plot_xy_data
         return plot_xy_data(self, *args, **kwargs)
