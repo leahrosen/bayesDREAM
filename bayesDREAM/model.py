@@ -13,6 +13,7 @@ The bayesDREAM class combines:
 - Modality mixins: Methods for adding different data types (transcripts, splicing, ATAC, custom)
 """
 
+import functools
 import warnings
 from typing import Dict, Optional
 import numpy as np
@@ -1827,6 +1828,96 @@ class bayesDREAM(
                 'fit_trans': has_trans
             })
         return pd.DataFrame(rows)
+
+    # -----------------------------------------------------------------------
+    # Re-expose core methods at class level so pdoc renders them here.
+    # Docstrings flow from the implementation classes via functools.wraps in
+    # _BayesDREAMCore; no documentation lives in this block.
+    # -----------------------------------------------------------------------
+
+    @functools.wraps(_BayesDREAMCore.set_technical_groups)
+    def set_technical_groups(self, *args, **kwargs):
+        return super().set_technical_groups(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.fit_ntc)
+    def fit_ntc(self, *args, **kwargs):
+        return super().fit_ntc(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.fit_cis)
+    def fit_cis(self, *args, **kwargs):
+        return super().fit_cis(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.fit_trans)
+    def fit_trans(self, *args, **kwargs):
+        return super().fit_trans(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.set_alpha_x)
+    def set_alpha_x(self, *args, **kwargs):
+        return super().set_alpha_x(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.set_alpha_y)
+    def set_alpha_y(self, *args, **kwargs):
+        return super().set_alpha_y(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.set_x_true)
+    def set_x_true(self, *args, **kwargs):
+        return super().set_x_true(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.adjust_ntc_sum_factor)
+    def adjust_ntc_sum_factor(self, *args, **kwargs):
+        return super().adjust_ntc_sum_factor(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.refit_sumfactor)
+    def refit_sumfactor(self, *args, **kwargs):
+        return super().refit_sumfactor(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.subset_cells)
+    def subset_cells(self, *args, **kwargs):
+        return super().subset_cells(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.permute_x_true)
+    def permute_x_true(self, *args, **kwargs):
+        return super().permute_x_true(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_ntc_fit)
+    def save_ntc_fit(self, *args, **kwargs):
+        return super().save_ntc_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_cis_fit)
+    def save_cis_fit(self, *args, **kwargs):
+        return super().save_cis_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_trans_fit)
+    def save_trans_fit(self, *args, **kwargs):
+        return super().save_trans_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.load_ntc_fit)
+    def load_ntc_fit(self, *args, **kwargs):
+        return super().load_ntc_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.load_cis_fit)
+    def load_cis_fit(self, *args, **kwargs):
+        return super().load_cis_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.load_trans_fit)
+    def load_trans_fit(self, *args, **kwargs):
+        return super().load_trans_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_ntc_summary)
+    def save_ntc_summary(self, *args, **kwargs):
+        return super().save_ntc_summary(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_cis_summary)
+    def save_cis_summary(self, *args, **kwargs):
+        return super().save_cis_summary(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_trans_summary)
+    def save_trans_summary(self, *args, **kwargs):
+        return super().save_trans_summary(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.classify_second_deriv_roots)
+    def classify_second_deriv_roots(self, *args, **kwargs):
+        return super().classify_second_deriv_roots(*args, **kwargs)
 
     def __repr__(self) -> str:
         """String representation."""

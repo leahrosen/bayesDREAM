@@ -6,6 +6,7 @@ specialized fitters for technical, cis, and trans modeling.
 """
 
 import os
+import functools
 import warnings
 from typing import Union
 import numpy as np
@@ -35,7 +36,7 @@ from .fitting.distributions import get_observation_sampler, requires_denominator
 
 # Import fitters
 from .fitting import NTCFitter, CisFitter, TransFitter
-from .io import ModelSaver, ModelLoader
+from .io import ModelSaver, ModelLoader, ModelSummarizer
 from .plotting.model_plots import PlottingMixin
 from .diagnostics import DiagnosticsMixin
 
@@ -612,8 +613,6 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         self._saver = ModelSaver(self)
         self._loader = ModelLoader(self)
 
-        # Import here to avoid circular dependency
-        from .io.summary import ModelSummarizer
         self._summarizer = ModelSummarizer(self)
 
         # Free the raw counts matrix – data now lives in modalities.
@@ -1660,12 +1659,12 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         """Delegate to NTCFitter."""
         return self._ntc_fitter._model_ntc(*args, **kwargs)
 
+    @functools.wraps(NTCFitter.set_technical_groups)
     def set_technical_groups(self, *args, **kwargs):
-        """Delegate to NTCFitter."""
         return self._ntc_fitter.set_technical_groups(*args, **kwargs)
 
+    @functools.wraps(NTCFitter.fit_ntc)
     def fit_ntc(self, *args, **kwargs):
-        """Delegate to NTCFitter."""
         return self._ntc_fitter.fit_ntc(*args, **kwargs)
 
     def _model_x(self, *args, **kwargs):
@@ -1673,22 +1672,7 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         return self._cis_fitter._model_x(*args, **kwargs)
 
     def fit_cis(self, *args, force: bool = False, **kwargs):
-        """
-        Delegate to CisFitter, after checking the cis gene is expressed in NTC cells.
-
-        Raises ValueError if the cis gene's log2 NTC mean expression (from
-        fit_ntc() posteriors) is below -1, because overdispersion estimation is
-        unreliable at near-zero counts.  Pass force=True to skip this check.
-
-        Parameters
-        ----------
-        force : bool, default False
-            If True, skip the low-expression check and proceed regardless.
-            Use plot_ntc_expression() to inspect the expression distribution
-            before overriding.
-        *args, **kwargs
-            All other arguments are forwarded directly to CisFitter.fit_cis().
-        """
+        # Docstring built programmatically below the class to stay DRY.
         if not force and hasattr(self, '_compute_ntc_log2_exprs_from_fit'):
             data = self._compute_ntc_log2_exprs_from_fit()
             if data is not None:
@@ -1706,47 +1690,64 @@ class _BayesDREAMCore(PlottingMixin, DiagnosticsMixin):
         """Delegate to TransFitter."""
         return self._trans_fitter._model_y(*args, **kwargs)
 
+    @functools.wraps(TransFitter.fit_trans)
     def fit_trans(self, *args, **kwargs):
-        """Delegate to TransFitter."""
         return self._trans_fitter.fit_trans(*args, **kwargs)
 
+    @functools.wraps(ModelSaver.save_ntc_fit)
     def save_ntc_fit(self, *args, **kwargs):
-        """Delegate to ModelSaver."""
         return self._saver.save_ntc_fit(*args, **kwargs)
 
+    @functools.wraps(ModelSaver.save_cis_fit)
     def save_cis_fit(self, *args, **kwargs):
-        """Delegate to ModelSaver."""
         return self._saver.save_cis_fit(*args, **kwargs)
 
+    @functools.wraps(ModelSaver.save_trans_fit)
     def save_trans_fit(self, *args, **kwargs):
-        """Delegate to ModelSaver."""
         return self._saver.save_trans_fit(*args, **kwargs)
 
+    @functools.wraps(ModelLoader.load_ntc_fit)
     def load_ntc_fit(self, *args, **kwargs):
-        """Delegate to ModelLoader."""
         return self._loader.load_ntc_fit(*args, **kwargs)
 
+    @functools.wraps(ModelLoader.load_cis_fit)
     def load_cis_fit(self, *args, **kwargs):
-        """Delegate to ModelLoader."""
         return self._loader.load_cis_fit(*args, **kwargs)
 
+    @functools.wraps(ModelLoader.load_trans_fit)
     def load_trans_fit(self, *args, **kwargs):
-        """Delegate to ModelLoader."""
         return self._loader.load_trans_fit(*args, **kwargs)
 
-    # Summary export methods
+    @functools.wraps(ModelSummarizer.save_ntc_summary)
     def save_ntc_summary(self, *args, **kwargs):
-        """Delegate to ModelSummarizer."""
         return self._summarizer.save_ntc_summary(*args, **kwargs)
 
+    @functools.wraps(ModelSummarizer.save_cis_summary)
     def save_cis_summary(self, *args, **kwargs):
-        """Delegate to ModelSummarizer."""
         return self._summarizer.save_cis_summary(*args, **kwargs)
 
+    @functools.wraps(ModelSummarizer.save_trans_summary)
     def save_trans_summary(self, *args, **kwargs):
-        """Delegate to ModelSummarizer."""
         return self._summarizer.save_trans_summary(*args, **kwargs)
 
+    @functools.wraps(ModelSummarizer.classify_second_deriv_roots)
     def classify_second_deriv_roots(self, *args, **kwargs):
-        """Delegate to ModelSummarizer.classify_second_deriv_roots."""
         return self._summarizer.classify_second_deriv_roots(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Build fit_cis docstring from CisFitter, injecting the wrapper-level `force`
+# parameter so the single source of truth stays in CisFitter.fit_cis.
+# ---------------------------------------------------------------------------
+_force_doc = """\
+    force : bool, default False
+        If True, skip the low-expression check and proceed regardless.
+        Use plot_ntc_expression() to inspect the expression distribution
+        before overriding.
+"""
+_base = CisFitter.fit_cis.__doc__ or ""
+_BayesDREAMCore.fit_cis.__doc__ = _base.replace(
+    "Parameters\n        ----------",
+    "Parameters\n        ----------\n" + _force_doc,
+    1,
+)
