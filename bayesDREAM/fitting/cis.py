@@ -47,20 +47,16 @@ class CisFitter:
         self,
         N,
         G,
-        alpha_dirichlet_tensor,
         guides_tensor,
         x_obs_tensor,
         sum_factor_tensor,
-        alpha_alpha_mu_tensor,
         mu_x_mean_tensor,
         mu_x_sd_tensor,
         sigma_eff_mean_tensor,
         sigma_eff_sd_tensor,
-        epsilon_tensor,
         C=None,
         groups_tensor=None,
         alpha_x_sample=None,
-        o_x_sample=None,
         target_per_guide_tensor=None,
         independent_mu_sigma=False,
         phi_x_precomputed=None,
@@ -74,26 +70,18 @@ class CisFitter:
         ###################################
         if alpha_x_sample is not None:
             alpha_x = alpha_x_sample
-        elif groups_tensor is not None:
-            with pyro.plate("c_plate", C - 1):
-                alpha_alpha = pyro.sample("alpha_alpha", dist.Exponential(1 / alpha_alpha_mu_tensor)) # shape = [C-1]
-                alpha_mu = pyro.sample("alpha_mu", dist.Gamma(1, 1))
-                alpha_x = pyro.sample("alpha_x", dist.Gamma(alpha_alpha, alpha_alpha/alpha_mu)) # shape = [C-1]
         else:
             alpha_x = None
         
         ####################
         ## Overdispersion ##
         ####################
-        if phi_x_precomputed is not None:
-            phi_x_used = phi_x_precomputed
-        else:
-            if o_x_sample is None:
-                raise ValueError(
-                    "o_x_sample is required for fit_cis. "
-                    "Run fit_ntc() before fit_cis() to estimate cis gene overdispersion from NTC cells."
-                )
-            phi_x_used = 1.0 / (o_x_sample ** 2)
+        if phi_x_precomputed is None:
+            raise ValueError(
+                "phi_x_precomputed is required. "
+                "Run fit_ntc() before fit_cis() to estimate cis gene overdispersion from NTC cells."
+            )
+        phi_x_used = phi_x_precomputed
 
         ###############################
         ## Mixture model for x_eff_g ##
@@ -213,10 +201,7 @@ class CisFitter:
         niters: int = 100_000,
         nsamples: int = 1000,
         alpha_ewma: float = 0.05,
-        tolerance: float = 1e-4,
-        alpha_alpha_mu: float = 5.8,
         epsilon: float = 1e-6,
-        alpha_dirichlet: float = 0.1,
         minibatch_size: int = None,
         predictive_on_cpu: bool = True,
         independent_mu_sigma: bool = False,
@@ -256,8 +241,6 @@ class CisFitter:
             to reduce GPU memory pressure. Set False to keep Predictive on GPU.
         alpha_ewma : float
             Exponential weight for smoothing the ELBO
-        tolerance : float
-            Convergence tolerance
         independent_mu_sigma : bool
             Whether to use independent mu/sigma per target type
         kwargs :
@@ -342,13 +325,12 @@ class CisFitter:
             C = self.model.meta['technical_group_code'].nunique()
             groups_tensor = torch.tensor(self.model.meta['technical_group_code'].values, dtype=torch.long, device=self.model.device)
 
-            # Check if alpha_x_prefit should exist but doesn't
+            # alpha_x_prefit is required when technical_covariates are specified
             if self.model.alpha_x_prefit is None:
-                warnings.warn(
+                raise ValueError(
                     f"Technical covariates provided but alpha_x_prefit not set. "
-                    f"You should run fit_ntc() on the primary modality ('{self.model.primary_modality}') first "
-                    f"to estimate technical effects for the cis gene. "
-                    f"Proceeding without technical correction for cis gene (alpha_x will be fitted fresh)."
+                    f"Run fit_ntc() on the primary modality ('{self.model.primary_modality}') before fit_cis() "
+                    f"to estimate technical effects for the cis gene."
                 )
 
         elif self.model.alpha_x_prefit is None:
@@ -399,63 +381,10 @@ class CisFitter:
         manual_guide_mask_tensor = None
 
         if manual_guide_effects is not None:
-            # Validate format
-            required_cols = ['guide', 'log2FC']
-            missing_cols = set(required_cols) - set(manual_guide_effects.columns)
-            if missing_cols:
-                raise ValueError(f"manual_guide_effects must have columns {required_cols}, missing: {missing_cols}")
-
-            # Create mapping from guide name → log2FC
-            manual_dict = dict(zip(manual_guide_effects['guide'], manual_guide_effects['log2FC']))
-
-            # Map to guide_code indices
-            # self.model.meta has 'guide' (name) and 'guide_code' (integer)
-            guide_code_to_name = self.model.meta[['guide_code', 'guide']].drop_duplicates().set_index('guide_code')['guide'].to_dict()
-
-            # Create tensor of shape (G,) with log2FC for each guide_code
-            # Use NaN for guides without manual effects
-            manual_log2fc_list = []
-            manual_mask_list = []
-            for g in range(G):
-                guide_name = guide_code_to_name.get(g, None)
-                if guide_name in manual_dict:
-                    manual_log2fc_list.append(manual_dict[guide_name])
-                    manual_mask_list.append(1.0)  # This guide has a manual prior
-                else:
-                    manual_log2fc_list.append(0.0)  # Placeholder
-                    manual_mask_list.append(0.0)  # No prior for this guide
-
-            manual_guide_log2fc_tensor = torch.tensor(manual_log2fc_list, dtype=torch.float32, device=self.model.device)
-            manual_guide_mask_tensor = torch.tensor(manual_mask_list, dtype=torch.float32, device=self.model.device)
-
-            print(f"[INFO] Manual guide effects provided for {int(manual_guide_mask_tensor.sum())} / {G} guides")
-            print(f"[INFO] Prior strength: {prior_strength}")
-
-            # PSEUDOCODE: How these tensors would be used in _model_x:
-            # ------------------------------------------------------------------
-            # In _model_x, when sampling mu_x (guide-level mean log2 expression):
-            #
-            # for g in range(G):
-            #     if manual_guide_mask_tensor[g] == 1.0:
-            #         # This guide has a manual prior
-            #         # Sample from a Gaussian centered on the manual log2FC
-            #         # with width controlled by prior_strength
-            #         prior_mean = manual_guide_log2fc_tensor[g]
-            #         prior_sd = 1.0 / prior_strength  # Higher strength → narrower prior
-            #         mu_x[g] = pyro.sample(f"mu_x_{g}",
-            #                               dist.Normal(prior_mean, prior_sd))
-            #     else:
-            #         # No manual prior - use standard hierarchical prior
-            #         mu_x[g] = pyro.sample(f"mu_x_{g}",
-            #                               dist.Normal(mu, sigma))
-            #
-            # DECISIONS TO MAKE:
-            # 1. Should prior_sd = 1.0 / prior_strength, or some other function?
-            # 2. Should manual effects override hierarchical priors completely,
-            #    or combine them (e.g., weighted average)?
-            # 3. Should NTC guide always have log2FC=0 enforced, or learned?
-            # 4. How to handle cell-line-specific effects with manual priors?
-            # ------------------------------------------------------------------
+            raise NotImplementedError(
+                "manual_guide_effects is not yet implemented. "
+                "The infrastructure for guide-level priors is planned but not yet integrated into _model_x."
+            )
         # ========================================================================
         if independent_mu_sigma:
             if ('target' not in self.model.meta.columns):
@@ -537,12 +466,7 @@ class CisFitter:
                 "to set a data-driven overdispersion prior instead of the generic Gamma(9,3)."
             )
         o_x_ntc = float(cis_modality.posterior_samples_ntc['o_x'].mean().item())
-        o_x_sample = torch.tensor(o_x_ntc, dtype=torch.float32, device=self.model.device)
         print(f"[INFO] fit_cis: using technical o_x = {o_x_ntc:.4f} (phi = {1/o_x_ntc**2:.2f})")
-
-        alpha_alpha_mu_tensor = torch.tensor(alpha_alpha_mu, dtype=torch.float32, device=self.model.device)
-        alpha_dirichlet_tensor = torch.tensor(alpha_dirichlet, dtype=torch.float32, device=self.model.device)
-        epsilon_tensor = torch.tensor(epsilon, dtype=torch.float32, device=self.model.device)
 
         # Compute guide-level means and MADs.
         # Uses numpy on CPU for per-guide median computation (faster than G GPU boolean masks).
@@ -595,9 +519,7 @@ class CisFitter:
 
         guide_mads_tensor = guide_mads_tensor * 1.4826  # Gaussian-equivalent spread
         sigma_eff_mean_tensor = torch.mean(guide_mads_tensor)#.to(self.model.device)
-        sigma_eff_sd_tensor = torch.std(guide_mads_tensor)#.to(self.model.device)        
-        mu_x_alpha_tensor = mu_x_mean_tensor ** 2 / (mu_x_sd_tensor ** 2)
-        mu_x_beta_tensor = mu_x_mean_tensor / (mu_x_sd_tensor ** 2)
+        sigma_eff_sd_tensor = torch.std(guide_mads_tensor)#.to(self.model.device)
 
         def init_loc_fn(site):
             name = site["name"]
@@ -664,26 +586,22 @@ class CisFitter:
         original_device = self.model.device
         losses = []
         smoothed_loss = None
-        alpha_x_sample_loop = self.model.alpha_x_prefit if self.model.alpha_x_prefit is not None else None
+        alpha_x_sample_loop = self.model.alpha_x_prefit
 
         for step in range(niters):
             loss = svi.step(
                 N,
                 G,
-                alpha_dirichlet_tensor,
                 guides_tensor,
                 x_obs_tensor,
                 sum_factor_tensor,
-                alpha_alpha_mu_tensor,
                 mu_x_mean_tensor,
                 mu_x_sd_tensor,
                 _seff_mean,
                 _seff_sd,
-                epsilon_tensor,
                 C=C,
                 groups_tensor=groups_tensor,
                 alpha_x_sample=alpha_x_sample_loop,
-                o_x_sample=o_x_sample,
                 target_per_guide_tensor=target_per_guide_tensor,
                 independent_mu_sigma=independent_mu_sigma,
                 phi_x_precomputed=phi_x_precomputed,
@@ -697,11 +615,7 @@ class CisFitter:
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
-            
 
         # Move to CPU if using too much GPU memory for Predictive
         run_on_cpu = predictive_on_cpu and self.model.device.type != "cpu"
@@ -718,20 +632,16 @@ class CisFitter:
             model_inputs = {
                 "N": N,
                 "G": G,
-                "alpha_dirichlet_tensor": self._to_cpu(alpha_dirichlet_tensor),
                 "guides_tensor": self._to_cpu(guides_tensor),
                 "x_obs_tensor": self._to_cpu(x_obs_tensor),
                 "sum_factor_tensor": self._to_cpu(sum_factor_tensor),
-                "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
                 "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
                 "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
                 "sigma_eff_mean_tensor": self._to_cpu(_seff_mean),
                 "sigma_eff_sd_tensor": self._to_cpu(_seff_sd),
-                "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "C": C,
                 "groups_tensor": self._to_cpu(groups_tensor),
                 "alpha_x_sample": self._to_cpu(self.model.alpha_x_prefit),
-                "o_x_sample": self._to_cpu(o_x_sample),
                 "target_per_guide_tensor": self._to_cpu(target_per_guide_tensor),
                 "independent_mu_sigma": independent_mu_sigma,
                 "phi_x_precomputed": self._to_cpu(phi_x_precomputed),
@@ -743,20 +653,16 @@ class CisFitter:
             model_inputs = {
                 "N": N,
                 "G": G,
-                "alpha_dirichlet_tensor": alpha_dirichlet_tensor,
                 "guides_tensor": guides_tensor,
                 "x_obs_tensor": x_obs_tensor,
                 "sum_factor_tensor": sum_factor_tensor,
-                "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
                 "mu_x_mean_tensor": mu_x_mean_tensor,
                 "mu_x_sd_tensor": mu_x_sd_tensor,
                 "sigma_eff_mean_tensor": _seff_mean,
                 "sigma_eff_sd_tensor": _seff_sd,
-                "epsilon_tensor": epsilon_tensor,
                 "C": C,
                 "groups_tensor": groups_tensor,
                 "alpha_x_sample": self.model.alpha_x_prefit,
-                "o_x_sample": o_x_sample,
                 "target_per_guide_tensor": target_per_guide_tensor,
                 "independent_mu_sigma": independent_mu_sigma,
                 "phi_x_precomputed": phi_x_precomputed,
@@ -819,10 +725,6 @@ class CisFitter:
         self.model.posterior_samples_cis = posterior_samples_x
         self.model.x_true = posterior_samples_x['x_true'].median(dim=0).values
         self.model.log2_x_true = posterior_samples_x['log_x_true'].median(dim=0).values
-        if self.model.alpha_x_prefit is None and technical_covariates:
-            alpha_x_mean = posterior_samples_x["alpha_x"].median(dim=0).values  # [C-1]
-            ones_ = torch.ones(1, device=alpha_x_mean.device)
-            self.model.alpha_x_prefit = torch.cat([ones_, alpha_x_mean])  # [C] with reference prepended
 
         if self.model.device.type == "cuda":
             torch.cuda.empty_cache()

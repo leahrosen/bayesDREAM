@@ -188,7 +188,6 @@ class NTCFitter:
         distribution='negbinom',
         denominator_ntc_tensor=None,
         K=None,
-        D=None,
         sigma_hat_tensor=None,
         skip_obs_sampling=False,
         log_mu_ntc=None,
@@ -303,8 +302,6 @@ class NTCFitter:
                 alpha_full_mul = None
                 alpha_full_add = alpha_full_add_logits
 
-            #print(f'[DEBUG], alpha_logits_y shape = {alpha_logits_y.shape}, expect [C-1={C-1}, T={T}, K={K}')
-            #print(f'[DEBUG], alpha_full_add shape = {alpha_full_add.shape}')
         else:
             # ----------------------------
             # Shared cell-line effects for non-multinomial dists
@@ -388,14 +385,11 @@ class NTCFitter:
                 else:
                     raise ValueError(f"Unexpected alpha/log2 shapes: {alpha_y_mul.shape}, {delta_y_add.shape}")
 
-        #print(f'[DEBUG], alpha_full_add shape = {alpha_full_add.shape}')
-    
         # --------------------------------
         # Dispersion / variance priors
         # --------------------------------
-        phi_y       = None  # NB overdispersion (as total_count)
-        sigma_y     = None  # Normal per-feature std
-        sigma_y_mv  = None  # MVN per-(feature,dim) std
+        phi_y   = None  # NB overdispersion (as total_count)
+        sigma_y = None  # Normal per-feature std
     
         if distribution == 'negbinom':
             beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
@@ -511,9 +505,6 @@ class NTCFitter:
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
     
-        # --------------------------------
-        # Call distribution-specific sampler
-        # --------------------------------
         # --------------------------------
         # Call distribution-specific sampler
         # --------------------------------
@@ -652,7 +643,6 @@ class NTCFitter:
         niters: int = None,
         nsamples: int = 1_000,
         alpha_ewma: float = 0.05,
-        tolerance: float = 1e-4,   # recommended to keep based on cell2location
         beta_o_beta: float = 3,    # recommended to keep based on cell2location
         beta_o_alpha: float = 9,   # recommended to keep based on cell2location
         epsilon: float = 1e-6,
@@ -691,9 +681,6 @@ class NTCFitter:
             Smoothing weight for the exponential moving average of the ELBO loss used
             in convergence checking.  Smaller values give a smoother (but slower-
             reacting) estimate.
-        tolerance : float, default 1e-4
-            Convergence threshold on the smoothed ELBO.  Training stops early when the
-            relative change in the moving average falls below this value.
         beta_o_beta : float, default 3
             Beta parameter of the Gamma prior on the overdispersion ``o_y``.
             Matches the cell2location prior; change with care.
@@ -1182,9 +1169,8 @@ class NTCFitter:
         C = meta_ntc['technical_group_code'].nunique()
         groups_ntc = meta_ntc['technical_group_code'].values
     
-        # Detect K/D
+        # Detect K (multinomial categories)
         K = None
-        D = None
         if is_3d_distribution(distribution):
             if distribution == 'multinomial':
                 K = y_obs_ntc.shape[2]
@@ -1686,7 +1672,7 @@ class NTCFitter:
                         epsilon_tensor,
                         distribution,
                         denominator_ntc_tensor,
-                        K, D,
+                        K,
                         sigma_hat_tensor,
                         **_model_precomp,
                     )
@@ -1704,7 +1690,7 @@ class NTCFitter:
 
         # Use OneCycleLR scheduler for stable convergence
         from torch.optim.lr_scheduler import OneCycleLR
-        base_lr = 1e-3 if lr is None else lr
+        base_lr = lr
 
         # OneCycleLR requires pct_start * total_steps > 1 to avoid ZeroDivisionError.
         # With pct_start=0.1, minimum total_steps is 11 (0.1*11-1=0.1>0).
@@ -1754,7 +1740,7 @@ class NTCFitter:
                 epsilon_tensor,
                 distribution,
                 denominator_ntc_tensor,
-                K, D,
+                K,
                 sigma_hat_tensor,
                 **_model_precomp,
             )
@@ -1773,11 +1759,8 @@ class NTCFitter:
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
-    
+
         # ---------------------------
         # Predictive (optionally on CPU)
         # ---------------------------
@@ -1800,7 +1783,7 @@ class NTCFitter:
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "distribution": distribution,
                 "denominator_ntc_tensor": self._to_cpu(denominator_ntc_tensor),
-                "K": K, "D": D,
+                "K": K,
                 "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor),
                 **{k: self._to_cpu(v) for k, v in _model_precomp.items()},
             }
@@ -1817,7 +1800,7 @@ class NTCFitter:
                 "epsilon_tensor": epsilon_tensor,
                 "distribution": distribution,
                 "denominator_ntc_tensor": denominator_ntc_tensor,
-                "K": K, "D": D,
+                "K": K,
                 "sigma_hat_tensor": sigma_hat_tensor,
                 **_model_precomp,
             }

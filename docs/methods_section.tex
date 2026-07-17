@@ -7,17 +7,27 @@
 \usepackage{booktabs}
 \usepackage{geometry}
 \geometry{margin=1in}
+\usepackage[hidelinks]{hyperref}
+\usepackage{graphicx}
+%% Plate-notation figures live in the paper's Figures directory (path relative to this .tex).
+%% Filenames contain spaces; a TeXLive >= 2019 kernel handles these directly.
+\graphicspath{{../../../../bayesDREAM_paper/Figures/Plate Notation/}}
 
 \newcommand{\NB}{\mathrm{NegBin}}
 \newcommand{\given}{\mid}
 \newcommand{\iid}{\overset{\mathrm{iid}}{\sim}}
 \newcommand{\ind}{\overset{\mathrm{ind}}{\sim}}
+\DeclareMathOperator{\logit}{logit}
 
 \begin{document}
 
-\section*{Methods: bayesDREAM Probabilistic Framework}
+\section{Methods: bayesDREAM Probabilistic Framework}
 
-\subsection*{Overview}
+\tableofcontents
+
+\listoffigures
+
+\subsection{Overview}
 
 bayesDREAM (Bayesian Dose-Response Estimation Across Modalities) is a three-step hierarchical
 Bayesian model for characterising the downstream consequences of CRISPR perturbations across
@@ -64,7 +74,7 @@ The framework supports five likelihood families, each applied to one or more mol
 \noindent Table~\ref{tab:distributions} summarises the parameterisation choices for each
 distribution.
 
-\begin{table}[h]
+\begin{table}[htbp]
   \centering
   \caption{Distribution-specific parameterisation across all three model steps.}
   \label{tab:distributions}
@@ -175,6 +185,22 @@ Setting $\mathrm{CV}_t = \hat\sigma_t^{\mathrm{SE}} / \bar y_t^{(0)}$:
   \hat\mu_t^{\log}    &= \log\bar y_t^{(0)} - \tfrac{1}{2}(\hat\sigma_t^{\log})^2.
     \label{eq:ntc_mu_log}
 \end{align}
+The full generative model is shown in Figure~\ref{fig:plate_ntc_negbinom}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.33\textwidth]{plate diagrams/fit_ntc NegBin.pdf}
+  \caption[NTC model: negative binomial]{Plate diagram for the negative-binomial technical model
+    (Equations~\ref{eq:ntc_negbinom_obs}--\ref{eq:ntc_mu_log}).
+    Throughout, shaded nodes are observed data or fixed inputs, unshaded circles are
+    latent random variables, and squares denote deterministic transforms.
+    The baseline mean $\mu_t$ and inverse-overdispersion $o_t$ (with $\phi_t = 1/o_t^2$)
+    are per-feature; the multiplicative technical correction $\alpha_{c,t}$ is per
+    feature and technical group; $s_i$ is the size factor.
+    The containment-prior rate $\beta_o$ is a single hyperparameter shared across all
+    $T$ features and therefore lies outside the $T$ plate.}
+  \label{fig:plate_ntc_negbinom}
+\end{figure}
 
 \subsection{Binomial model (splicing PSI)}
 
@@ -204,13 +230,25 @@ is an additive correction on the logit scale ($\alpha_{0,t}^{\mathrm{add}} = 0$)
 
 Let $y_t^{(0)}$ and $n_t^{(0)}$ be the total spliced-read and total-read counts
 summed over all reference-group NTC cells.
-The Laplace-smoothed empirical PSI is $\hat p_t = (y_t^{(0)} + 0.5)/(n_t^{(0)} + 1)$,
-and the effective concentration $\kappa_t = \min(\max(n_t^{(0)},\, 20),\, 200)$
+The Laplace-smoothed empirical PSI is $\hat p_t = (y_t^{(0)} + 0.5)/(n_t^{(0)} + 1)$;
+the effective concentration $\kappa_t = \min(\max(n_t^{(0)},\, 20),\, 200)$
 (clamped to prevent an overly sharp prior from deep-sequenced samples).
 The Beta parameters are then:
 \begin{equation}
   a_t = \hat p_t\,\kappa_t + 10^{-3}, \qquad b_t = (1-\hat p_t)\,\kappa_t + 10^{-3}.
 \end{equation}
+The plate diagram for the binomial technical model is shown in Figure~\ref{fig:plate_ntc_binom}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.20\textwidth]{plate diagrams/fit_ntc Binom.pdf}
+  \caption[NTC model: binomial]{Plate diagram for the binomial technical model
+    (Equations~\ref{eq:ntc_binom_obs}--\ref{eq:ntc_binom_alpha}).
+    The baseline PSI $\mu_t$ (here $\mu_t^{\mathrm{psi}}$) and the additive logit-scale
+    correction $\alpha_{c,t}$ (here $\alpha_{c,t}^{\mathrm{add}}$) generate the observed
+    counts $y_{i,t}^{\mathrm{obs}}$ given the observed read-depth denominator $n_{i,t}$.}
+  \label{fig:plate_ntc_binom}
+\end{figure}
 
 \subsection{Multinomial model (isoform/donor/acceptor usage)}
 
@@ -258,8 +296,21 @@ so the prior value has no effect on the fitted proportions.
 After sampling, group-level corrections $\boldsymbol{\alpha}_{c,t}^{\mathrm{logit}}$
 are centred over the active (non-masked) categories so their sum over active $k$ is zero,
 removing the non-identified global-shift direction that arises from softmax's invariance to additive constants.
+The plate diagram for the multinomial technical model is shown in Figure~\ref{fig:plate_ntc_multinomial}.
 
-\subsection{Normal and Student-$t$ models}
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.20\textwidth]{plate diagrams/fit_ntc Multinomial.pdf}
+  \caption[NTC model: multinomial]{Plate diagram for the multinomial technical model
+    (Equations~\ref{eq:ntc_dirichlet}--\ref{eq:ntc_multi_alpha}).
+    The baseline category-probability vector $\mathbf{p}_t$ and the per-category additive
+    logit corrections $\alpha_{c,t,k}^{\mathrm{logit}}$ (inner $K$ plate) generate the
+    observed category-count vector $\mathbf{y}_{i,t}^{\mathrm{obs}}$ given the total count
+    $n_{i,t}$.}
+  \label{fig:plate_ntc_multinomial}
+\end{figure}
+
+\subsection{Normal and Student-\texorpdfstring{$t$}{t} models}
 
 For continuous-valued features (e.g.\ SpliZ scores), the observation model is:
 \begin{equation}
@@ -293,6 +344,18 @@ $\hat\sigma_t^{\mathrm{SD}}$ scales both the $\sigma_t$ prior and the
 $\alpha_{c,t}^{\mathrm{add}}$ Student-$t$ scale to the observed feature variability;
 $\hat\sigma_t^{\mathrm{SE}}$ sets the $\mu_t$ prior width so the NTC mean is
 well-estimated even for low-variance features.
+The plate diagram for the normal and Student-$t$ technical models is shown in Figure~\ref{fig:plate_ntc_normal}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.20\textwidth]{plate diagrams/fit_ntc Normal StudentT.pdf}
+  \caption[NTC model: normal and Student-$t$]{Plate diagram for the normal and Student-$t$ technical models (Section~2.5).
+    The per-feature mean $\mu_t$, additive technical correction $\alpha_{c,t}$
+    (here $\alpha_{c,t}^{\mathrm{add}}$), and noise scale $\sigma_t$ generate the observed
+    continuous value $y_{i,t}^{\mathrm{obs}}$. The Student-$t$ model is identical with
+    fixed degrees of freedom $\nu = 3$.}
+  \label{fig:plate_ntc_normal}
+\end{figure}
 
 \subsection{Number of features and joint fitting}
 \label{sec:ntc_nfeatures}
@@ -301,11 +364,13 @@ The statistical behaviour of \texttt{fit\_ntc} depends on how many features $T$ 
 and whether they are fitted jointly or independently.
 
 \paragraph{Non-negative-binomial distributions.}
+\begin{sloppypar}
 For binomial, multinomial, normal, and Student-$t$ modalities, every prior is specified
 per-feature via empirical Bayes hyperparameters: no parameter is shared across features.
 Fitting all $T$ features in a single joint call is therefore \emph{statistically equivalent}
 to fitting each feature separately and pooling the results; the only practical difference
 is computational (GPU vectorisation over the feature dimension).
+\end{sloppypar}
 
 \paragraph{Negative-binomial modality.}
 For negative-binomial modalities the situation is fundamentally different because the
@@ -446,11 +511,11 @@ themselves drawn from Exponential priors with data-driven rates $r_\alpha$ and $
 (Section~\ref{sec:cis_hyperparams}).
 
 \begin{align}
-  \hat\alpha_\sigma &\sim \mathrm{Exponential}(r_\alpha)
+  \alpha_\sigma &\sim \mathrm{Exponential}(r_\alpha)
       \label{eq:cis_alpha_sigma} \\
-  \hat\beta_\sigma  &\sim \mathrm{Exponential}(r_\beta)
+  \beta_\sigma  &\sim \mathrm{Exponential}(r_\beta)
       \label{eq:cis_beta_sigma} \\
-  \sigma_{\mathrm{eff},g} &\iid \mathrm{Gamma}(\hat\alpha_\sigma, \hat\beta_\sigma)
+  \sigma_{\mathrm{eff},g} &\iid \mathrm{Gamma}(\alpha_\sigma, \beta_\sigma)
       \label{eq:cis_sigma_eff} \\
   \log_2 x_i &\sim \mathcal{N}\!\left(\log_2 x_{g_i}^{\mathrm{eff}},\;
       \sigma_{\mathrm{eff}, g_i}\right)
@@ -510,6 +575,31 @@ extracted for the cis gene and held fixed throughout Step~2.
 \end{equation}
 %
 where $\phi_x = 1/o_x^2$ and $o_x$ is fixed to the posterior mean from \texttt{fit\_ntc}.
+The full generative model for the low-MOI cis fit is shown in Figure~\ref{fig:plate_cis_lowmoi}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.21\textwidth]{plate diagrams/fit_cis lowMOI.pdf}
+  \caption[Cis model (low-MOI)]{Plate diagram for the cis model in the default low-MOI setting
+    (Equations~\ref{eq:cis_pop_mu}--\ref{eq:cis_obs}).
+    The population parameters $\mu,\sigma$ and per-guide standardised noise
+    $\varepsilon_g$ deterministically define the guide-effect $x_g^{\mathrm{eff}}$
+    (square); the hierarchical within-guide noise $\sigma_g^{\mathrm{eff}}$
+    (with hyperparameters $\alpha_\sigma,\beta_\sigma$) then generates the per-cell latent
+    expression $x_i$. Observed counts $x_i^{\mathrm{obs}}$ follow a negative binomial with
+    fixed inputs $\alpha_c^x$ (transferred from \texttt{fit\_ntc}), size factor $s_i$, and
+    dispersion $\phi_x$ (shaded, held fixed at the \texttt{fit\_ntc} estimate).
+    \textit{In the high-MOI extension} (Section~\ref{sec:highmoi}), the single guide
+    index $g_i$ is replaced by a binary membership row $W_{i\cdot}$ from the
+    guide-assignment matrix $W\in\{0,1\}^{N\times G}$. The edge from the guide plate to
+    the cell plate becomes a sum: $\log_2 x_{\mathrm{mean},i} = \sum_g W_{ig}\log_2
+    x_g^{\mathrm{eff}} - (k_i-1)\log_2\bar x^{\mathrm{NTC}}$, where $k_i = \sum_g W_{ig}$
+    is the number of guides in cell $i$ and $\bar x^{\mathrm{NTC}}$ is a
+    precision-weighted mean of NTC guide effects. The per-cell noise $\sigma_{\mathrm{eff},g_i}$
+    likewise becomes a precision-weighted combination over all $k_i$ active guides. The
+    observation model and all other nodes are unchanged.}
+  \label{fig:plate_cis_lowmoi}
+\end{figure}
 
 \subsection{Empirical hyperparameter initialisation}
 \label{sec:cis_hyperparams}
@@ -695,12 +785,20 @@ distribution).
 Running \texttt{fit\_ntc} before \texttt{fit\_trans} is required whenever technical covariates
 are specified; providing covariates without a prior technical fit raises an error.
 
-\subsection{Baseline parameter $A$}
+\subsection{Baseline parameter \texorpdfstring{$A$}{A}}
 \label{sec:trans_A}
 
-The parameter $A_t$ represents the expected value of feature $t$ in the absence of
-any cis-gene effect (i.e.\ at the NTC expression level $\hat x^{\mathrm{NTC}}$).
-Its prior is distribution-specific and noise-adaptive.
+The parameter $A_t$ is the asymptotic intercept of the dose-response curve: the value
+$f_t$ approaches when all Hill terms contribute zero.
+For a single activating component ($n_{t} > 0$) this limit is reached as
+$\hat x_i \to 0$; for a repressing component ($n_{t} < 0$) as $\hat x_i \to \infty$.
+In the additive Hill model, where the two components may have opposite signs, neither
+limit recovers $A_t$ exactly, and $A_t$ is best understood as the shared intercept
+of the sum.
+When the Hill curve is flat (the model fits no dependence), $A_t$ is the sole active parameter
+and equals the feature level across all cis-expression values.
+Its prior is distribution-specific, noise-adaptive, and anchored near the NTC expression
+level, which is the prior if the feature is a null gene (i.e. no dependence).
 
 \paragraph{Noise-adaptive weighting.}
 
@@ -805,7 +903,8 @@ receive zero probability.
 This LogisticNormal parameterisation avoids the numerical instabilities of the
 stick-breaking transformation for large $K$.
 
-\subsection{Sparsity gate $\alpha_t$}
+\subsection{Sparsity gate \texorpdfstring{$\alpha_t$}{alpha\_t}}
+\label{sec:sparsity}
 
 To encode the expectation that most features do not respond to the perturbation, a
 continuous Bernoulli gate is placed on the amplitude:
@@ -851,10 +950,21 @@ a numerically stable sigmoid formulation that avoids overflow for extreme $n$.
 \end{equation}
 %
 where a second relaxed-Bernoulli gate $\beta_t$ and a second Hill component $(V_b, K_b, n_b)$
-allow the model to capture biphasic dose-response curves (e.g.\ activation at low dose,
-repression at high dose, or two independent regulatory modes).
+allow the model to capture biphasic dose-response curves (e.g.\ step-wise monotonic curves,
+non-monotonic curves, and other more complex curvature shapes).
 
 \subsection{Priors on Hill parameters}
+
+Because the cis gene is always modelled with a negative-binomial observation model
+(Section~\ref{sec:cis_fitting}), the cis expression $\hat x_i$ is always on the same
+absolute count scale regardless of which likelihood is used for trans features.
+Consequently, the EC$_{50}$ parameter $K$ and the Hill coefficient $n$ are
+\emph{distribution-agnostic}: $K$ sets a threshold on the $x$-axis (cis expression),
+and $n$ controls the steepness of the sigmoid on that axis, neither of which depends on
+the scale of the trans observations.
+Only the amplitude $V$ is distribution-specific, because it is measured on the $y$-axis
+(trans feature scale) and must be expressed in units appropriate to each likelihood family
+(counts for negbinom, probability for binomial/multinomial, natural units for normal/studentt).
 
 \paragraph{Half-effect concentration $K$.}
 
@@ -864,7 +974,8 @@ repression at high dose, or two independent regulatory modes).
 \end{equation}
 centred at the NTC mean cis expression so that the prior EC$_{50}$ is located at the
 NTC expression level (log$_2$FC $= 0$), with 95\% CI spanning $\pm 5$ log$_2$FC.
-When no NTC mean is available, the prior is centred at half the observed expression range.
+When no NTC mean is available, the prior is centred at half the observed expression range
+(though the user can choose this to be upper, 95th percentile of per-guide $x_true$ means, or lower, 5th percentile of per-guide $x_true$ means, end of the expression range instead).
 
 \paragraph{Amplitude $V$.}
 
@@ -897,13 +1008,22 @@ observed range while remaining relatively diffuse.
 \paragraph{Hill coefficient $n$.}
 
 \begin{equation}
-  n_{a,t}^{\mathrm{raw}} \sim \mathcal{N}(\tilde n_\mu, \sigma_{n,t}),
+  n_{a,t}^{\mathrm{raw}} \sim \mathcal{N}(\tilde n_\mu^{\mathrm{raw}}, \sigma_{n_a,t}),
   \quad
   n_{a,t} = h(n_{a,t}^{\mathrm{raw}};\; n_{\min}, n_{\max}),
 \end{equation}
-where $h(\cdot)$ is a differentiable soft-clamp (tanh-based) mapping to
-$(n_{\min}, n_{\max})$, default $[-100, 100]$, and $\sigma_{n,t} \sim \mathrm{Exponential}(1)$
-is sampled per feature to allow heterogeneous regularisation.
+where $h(\cdot)$ is a differentiable soft-clamp (tanh-based) mapping to $(n_{\min}, n_{\max})$.
+The scale $\sigma_{n_a,t} \sim \mathrm{Exponential}(1)$ is sampled per feature to allow
+heterogeneous regularisation, and $\tilde n_\mu^{\mathrm{raw}}$ is the \emph{prior mean of}
+$n_{a,t}^{\mathrm{raw}}$ (not the same as $n_{a,t}^{\mathrm{raw}}$ itself, which varies
+across features and samples).
+For the additive Hill model, the Hill b component uses an independent prior with the same
+structure:
+\begin{equation*}
+  n_{b,t}^{\mathrm{raw}} \sim \mathcal{N}(\tilde n_\mu^{\mathrm{raw}},\, \sigma_{n_b,t}),
+  \quad \sigma_{n_b,t} \sim \mathrm{Exponential}(1),
+\end{equation*}
+with the same soft-clamp and bounds applied.
 %
 The desired constrained mode is $n_\mu = 0$; to achieve this, the unconstrained prior mean
 is set via the inverse soft-clamp:
@@ -915,8 +1035,22 @@ is set via the inverse soft-clamp:
       \right).
 \end{equation}
 For symmetric bounds ($n_{\min} = -n_{\max}$) this gives $\tilde n_\mu^{\mathrm{raw}} = 0$;
-for the asymmetric bounds that arise when all cells have $x > 1$ the correction shifts
-the unconstrained mean away from zero to compensate.
+for asymmetric bounds the correction shifts the unconstrained mean to compensate so the
+constrained mode remains at $n_\mu = 0$.
+
+The bounds $n_{\min}$ and $n_{\max}$ are computed from the observed range of $\hat x_i$
+to prevent float32 overflow in $\hat x^n$:
+\begin{align}
+  n_{\min} &= -\log(\texttt{float32\_max})\,/\,|\log \hat x_{\min}|
+    \quad \text{if } \hat x_{\min} < 1, \text{ else } -100, \\
+  n_{\max} &= \phantom{-}\log(\texttt{float32\_max})\,/\,|\log \hat x_{\max}|
+    \quad \text{if } \hat x_{\max} > 1, \text{ else } +100,
+\end{align}
+where $\hat x_{\min}$ and $\hat x_{\max}$ are the minimum and maximum observed cis
+expression values.
+The fallback values $\pm 100$ apply when the observed expression range does not cross
+the value 1 on the relevant side (e.g.\ $n_{\min} = -100$ when all cells have
+$\hat x_i \ge 1$, making large negative $n$ safe from overflow).
 
 \subsection{Likelihood}
 
@@ -928,6 +1062,23 @@ the unconstrained mean away from zero to compensate.
       \frac{f_t(\hat x_i)\,\alpha_{c_i,t}^{\text{mult}}\,s_i}{\phi_t}\right).
   \label{eq:trans_nb_lik}
 \end{equation}
+The plate diagram for the negative-binomial trans model is shown in Figure~\ref{fig:plate_trans_negbinom}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[height=0.35\textheight]{plate diagrams/fit_trans NegBin.pdf}
+  \caption[Trans model: negative binomial]{Plate diagram for the negative-binomial trans model
+    (Equation~\ref{eq:trans_nb_lik}).
+    The dose-response value $f_t(\hat x_i)$ (square) is assembled from the baseline $A_t$,
+    the two sparsity gates $\alpha_t,\beta_t$, and the two Hill components
+    $(V_{a,t},K_{a,t},n_{a,t})$ and $(V_{b,t},K_{b,t},n_{b,t})$, with each Hill coefficient
+    the soft-clamp of a raw draw $n_{\cdot,t}^{\mathrm{raw}}\!\sim\!\mathcal{N}(\cdot,
+    \sigma_{n_\cdot,t})$. The cis expression $\hat x_i$, technical correction
+    $\hat\alpha_{c,t}$, size factor $s_i$, and NTC overdispersion $\hat o_t^{\mathrm{NTC}}$
+    (anchoring the $A_t$ prior) are fixed inputs. As in \texttt{fit\_ntc}, $\beta_o$ is
+    shared across all $T$ features.}
+  \label{fig:plate_trans_negbinom}
+\end{figure}
 
 \paragraph{Binomial.}
 
@@ -937,6 +1088,20 @@ the unconstrained mean away from zero to compensate.
       \sigma\!\left(\logit f_t(\hat x_i) + \alpha_{c_i,t}^{\text{add}}\right)\right).
   \label{eq:trans_binom_lik}
 \end{equation}
+The plate diagram for the binomial trans model is shown in Figure~\ref{fig:plate_trans_binom}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[height=0.35\textheight]{plate diagrams/fit_trans Binomial.pdf}
+  \caption[Trans model: binomial]{Plate diagram for the binomial trans model
+    (Equation~\ref{eq:trans_binom_lik}).
+    As in Figure~\ref{fig:plate_trans_negbinom}, $f_t(\hat x_i)$ is built from $A_t$, the
+    gates $\alpha_t,\beta_t$, and the two Hill components. No variance parameter is
+    estimated: the observation is fully determined by the read-depth denominator $n_{i,t}$,
+    together with the fixed cis expression $\hat x_i$ and additive technical correction
+    $\hat\alpha_{c,t}$.}
+  \label{fig:plate_trans_binom}
+\end{figure}
 
 \paragraph{Multinomial.}
 
@@ -953,6 +1118,21 @@ from the dose-response model (residual-category construction, see above) and
 $\widetilde{\mathrm{softmax}}$ is a masked softmax that enforces zero probability at
 structurally absent categories.  Cells with zero total reads for a feature are
 automatically excluded from the likelihood.
+The plate diagram for the multinomial trans model is shown in Figure~\ref{fig:plate_trans_multinomial}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[height=0.36\textheight]{plate diagrams/fit_trans Multinomial.pdf}
+  \caption[Trans model: multinomial]{Plate diagram for the multinomial trans model
+    (Equation~\ref{eq:trans_multi_lik}).
+    The dose-response vector $\mathbf{f}_t(\hat x_i)$ (square) is constructed per category:
+    the baseline $\mathbf{A}_{t,k}$ spans all $K$ categories (inner $K$ plate), while the
+    two Hill components and their gates $\alpha_{t,k},\beta_{t,k}$ act on the $K-1$ free
+    categories (residual-category construction; outer $K{-}1$ plate).
+    Fixed inputs are the cis expression $\hat x_i$, per-category logit corrections
+    $\hat\alpha_{c,t,k}^{\mathrm{logit}}$, and the total count $n_{i,t}$.}
+  \label{fig:plate_trans_multinomial}
+\end{figure}
 
 \paragraph{Normal.}
 
@@ -969,6 +1149,20 @@ Missing values (NaN) in $y_{i,t}$ are excluded from the likelihood.
 As Normal but with $t_{\nu_t}(\cdot, \sigma_t)$ in place of $\mathcal{N}$, providing
 robustness to outlier observations; $\sigma_t$ and $\nu_t = 3$ are defined in
 Section~\ref{sec:trans_variance}.
+The plate diagram for the normal and Student-$t$ trans models is shown in Figure~\ref{fig:plate_trans_normal}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[height=0.39\textheight]{plate diagrams/fit_trans Normal StudentT.pdf}
+  \caption[Trans model: normal and Student-$t$]{Plate diagram for the normal and Student-$t$ trans models
+    (Equations~\ref{eq:trans_normal_lik} and the Student-$t$ variant).
+    As in Figure~\ref{fig:plate_trans_negbinom}, $f_t(\hat x_i)$ is assembled from $A_t$,
+    the gates $\alpha_t,\beta_t$, and the two Hill components; the per-feature noise scale
+    $\sigma_t$ enters the likelihood directly. The NTC noise scale
+    $\hat\sigma_t^{\mathrm{NTC}}$ anchors the $A_t$ prior. The Student-$t$ model is
+    identical with fixed $\nu_t = 3$.}
+  \label{fig:plate_trans_normal}
+\end{figure}
 
 \subsection{Inference and output}
 
@@ -979,8 +1173,33 @@ Afterwards, $S = 1000$ posterior samples are drawn for each latent parameter.
 Key outputs are posterior medians of $(A_t, \alpha_t, V_{a,t}, K_{a,t}, n_{a,t})$
 and, for \texttt{additive\_hill}, the corresponding $b$-set parameters.
 
+\paragraph{Two-stage inference for \texttt{additive\_hill}.}
+
+Fitting the additive Hill model directly from random initialisation risks the two
+Hill components converging to redundant solutions (e.g.\ both capturing the same
+inflection) or the second component absorbing noise.
+To avoid this, inference for \texttt{additive\_hill} proceeds in two phases.
+
+\textit{Phase 1 (single-Hill warmup).}
+A single-Hill model (Equation~\ref{eq:single_hill}) is fit for
+$\sim\!44\%$ of the total training budget (temperatures cooling from $1.0$ to $0.5$;
+see Section~\ref{sec:sparsity} for the temperature schedule).
+At the high temperatures used in this phase the relaxed-Bernoulli sparsity gate $\alpha_t$
+is relatively soft, providing only limited regularisation: the goal is to find the
+best single-Hill explanation of the data, not to suppress weak effects.
+
+\textit{Phase 2 (additive fit).}
+The second component $(V_{b,t}, K_{b,t}, n_{b,t})$ and its sparsity gate $\beta_t$ are
+introduced, initialised from the Phase~1 parameter store.
+Because the first Hill component already captures the dominant dose-response shape,
+the second component starts near zero and must earn its place against the strong
+sparsity prior ($p_0 = 10^{-6}$, $\tau$ annealed from $1.0$ to $0.1$).
+Genes for which a single Hill provides an adequate fit will have $\beta_t \approx 0$
+in the posterior; the second Hill is retained only when it substantially improves
+the fit (e.g.\ biphasic or non-monotonic dose-response curves).
+
 %%============================================================
-\section*{Notation summary}
+\section{Notation summary}
 
 \begin{tabular}{ll}
 \toprule
@@ -1004,9 +1223,6 @@ $\alpha_t$ & Sparsity gate (relaxed Bernoulli) \\
 $\sigma(\cdot)$ & Logistic function \\
 \bottomrule
 \end{tabular}
-
-\medskip
-\noindent [TODO: add references, journal-specific formatting, and supplementary model diagrams]
 
 \bibliographystyle{plain}
 \begin{thebibliography}{9}
