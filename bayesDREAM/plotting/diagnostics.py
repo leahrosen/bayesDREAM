@@ -390,6 +390,13 @@ _SHIFT_RESULT_COLS = frozenset({
     'shift_p_adj', 'shift_fc', 'lrt_stat', 'lrt_df', 'n_categories_tested',
 })
 
+# Display labels for the two standard corrected-p-value columns; falls back
+# to the raw column name for anything else (e.g. a user-supplied p_col).
+_P_COL_LABELS = {
+    'p_adj': r'$p_{adj}$',
+    'shift_p_adj': r'$p_{adj}^{\mathrm{shift}}$',
+}
+
 
 def _detect_group_col(res, group_col):
     """
@@ -543,6 +550,13 @@ def plot_systematic_shift_volcano(
     -------
     fig : matplotlib.figure.Figure
 
+    Raises
+    ------
+    ValueError
+        If ``group_col`` is None and cannot be unambiguously auto-detected
+        (see ``group_col`` above), or if no rows have ``ok == True`` with
+        finite ``effect_col``/``p_col`` values to plot.
+
     Notes
     -----
     Only rows with ``ok == True`` and finite ``effect_col``/``p_col`` are
@@ -590,7 +604,7 @@ def plot_systematic_shift_volcano(
         ax.scatter(
             sig[effect_col], sig["_neg_log10_p"],
             s=14, alpha=0.8, color=sig_color,
-            label=f"$p_{{adj}}$ < {fdr_threshold}", zorder=3,
+            label=f"{_P_COL_LABELS.get(p_col, p_col)} < {fdr_threshold}", zorder=3,
         )
 
         top_hits = sig.nsmallest(top_n, p_col)
@@ -697,6 +711,15 @@ def plot_shift_est_group_correlation(
     -------
     fig : matplotlib.figure.Figure
 
+    Raises
+    ------
+    ValueError
+        If ``groups`` is None and ``group_col`` doesn't have exactly 2
+        unique values among ``ok == True`` rows; if the inner join on
+        ``label_col`` between the two groups produces no shared, valid
+        features; or if ``highlight`` isn't one of ``'either'``, ``'both'``,
+        ``'none'``.
+
     Notes
     -----
     Only features with ``ok == True`` and finite ``effect_col``/``p_col`` in
@@ -756,7 +779,7 @@ def plot_shift_est_group_correlation(
         ax.scatter(
             x[sig_mask], y[sig_mask],
             s=14, alpha=0.8, color=sig_color,
-            label=f"$p_{{adj}}$ < {fdr_threshold} ({highlight})", zorder=3,
+            label=f"{_P_COL_LABELS.get(p_col, p_col)} < {fdr_threshold} ({highlight})", zorder=3,
         )
 
     lo, hi = min(x.min(), y.min()), max(x.max(), y.max())
@@ -887,6 +910,18 @@ def plot_systematic_shift_hits_xy(
     -------
     dict[str, plt.Figure or plt.Axes]
         ``feature -> plot_xy_data()`` return value, in plotting order.
+
+    Raises
+    ------
+    ValueError
+        If there are no features to plot (``features=[]``, or no rows in
+        ``res`` pass the ``ok``/``p_col < fdr_threshold`` filter), or if no
+        cells fall within any group's matched window (a strong sign
+        ``tech_col``/``target_col``/``ntc_label``/``targeted_label`` don't
+        match what ``check_systematic_shift()`` was actually called with).
+    RuntimeError, ValueError
+        Propagated from ``model.get_shift_window_cells()`` if ``x_true``
+        isn't set or ``targeted_label``/``self.cis_gene`` are both None.
     """
     group_col = _detect_group_col(res, group_col)
     if tech_col is None:

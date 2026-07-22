@@ -1015,6 +1015,16 @@ class DiagnosticsMixin:
             keyed by ``tech_col`` group value. Groups with fewer than 2 NTC
             cells (can't compute an SD) or an invalid NTC SD are omitted,
             matching ``check_systematic_shift()``'s own skip conditions.
+
+        Raises
+        ------
+        RuntimeError
+            If ``self.x_true`` is not set (``fit_cis()`` hasn't been run).
+        ValueError
+            If ``targeted_label`` is None and ``self.cis_gene`` is also None;
+            or (via ``_build_shift_base``) if ``target_col``/``tech_col`` are
+            missing from ``self.meta``, or ``exclude_cells`` was given but
+            ``self.meta`` has no ``'cell'`` column.
         """
         if not hasattr(self, "x_true") or self.x_true is None:
             raise RuntimeError(

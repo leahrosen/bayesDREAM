@@ -6278,6 +6278,12 @@ def restyle_targeting_lines(
     Only ``Line2D`` artists (the smoothed trend lines) are restyled --
     linestyle has no meaning for scatter points, and plot_xy_data's raw
     per-cell scatter points are unlabeled and left untouched.
+
+    This function does not raise: if ``result`` isn't a ``plt.Axes``,
+    ``plt.Figure``, or an array/list containing ``plt.Axes`` instances, it
+    resolves to zero axes and silently does nothing. Likewise, any axes
+    found with no lines matching ``ntc_label_fragment``/
+    ``targeting_label_fragment`` are left untouched.
     """
     if isinstance(result, plt.Axes):
         axes = [result]
