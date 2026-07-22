@@ -614,6 +614,9 @@ def _compute_nll_per_cell(y_obs, mu_final, distribution, o_y, nu_y, denom):
 # Mixin class
 # ---------------------------------------------------------------------------
 
+__pdoc__ = {"DiagnosticsMixin": False}
+
+
 class DiagnosticsMixin:
     """
     Mixin providing post-fitting diagnostic tests for bayesDREAM models.

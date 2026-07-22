@@ -18,6 +18,7 @@ import warnings
 from typing import Dict, Optional
 import numpy as np
 from .plotting.model_plots import ModelPlottingMixin as _ModelPlottingMixin
+from .diagnostics import DiagnosticsMixin as _DiagnosticsMixin
 import pandas as pd
 import torch
 
@@ -1954,6 +1955,12 @@ class bayesDREAM(
     def extract_posterior_dataframe(self, *args, **kwargs):
         return super().extract_posterior_dataframe(*args, **kwargs)
 
+    def check_systematic_shift(self, *args, **kwargs):
+        return super().check_systematic_shift(*args, **kwargs)
+
+    def get_shift_window_cells(self, *args, **kwargs):
+        return super().get_shift_window_cells(*args, **kwargs)
+
     def __repr__(self) -> str:
         """String representation."""
         n_cells = len(self.meta)
@@ -1972,10 +1979,10 @@ class bayesDREAM(
         )
 
 
-# Copy docstrings from ModelPlottingMixin to the forwarding stubs above.
-# We don't use functools.wraps because that copies __qualname__, which would
-# cause pdoc to attribute the methods to ModelPlottingMixin's page rather than
-# showing them on bayesDREAM.
+# Copy docstrings from ModelPlottingMixin / DiagnosticsMixin to the forwarding
+# stubs above. We don't use functools.wraps because that copies __qualname__,
+# which would cause pdoc to attribute the methods to the mixin's own (hidden
+# via __pdoc__) page rather than showing them on bayesDREAM.
 for _plot_method in [
     "plot_technical_fit", "plot_cis_fit", "plot_trans_fit",
     "plot_xy_data", "plot_trans_functions",
@@ -1984,3 +1991,8 @@ for _plot_method in [
     _src = getattr(_ModelPlottingMixin, _plot_method, None)
     if _src and _src.__doc__:
         bayesDREAM.__dict__[_plot_method].__doc__ = _src.__doc__
+
+for _diag_method in ["check_systematic_shift", "get_shift_window_cells"]:
+    _src = getattr(_DiagnosticsMixin, _diag_method, None)
+    if _src and _src.__doc__:
+        bayesDREAM.__dict__[_diag_method].__doc__ = _src.__doc__
