@@ -1423,6 +1423,7 @@ class ModelSummarizer:
         y_ntc=None,
         verbose: bool = True,
         max_features: Optional[int] = None,
+        fdr_threshold: float = 0.05,
     ):
         """
         Save trans fit parameters as feature-wise CSV.
@@ -1456,6 +1457,13 @@ class ModelSummarizer:
         - fdr_beta:  Bayesian q-value for component B (negative Hill).  NaN for
                      single_hill and polynomial.  Computed in the same pooled family as
                      fdr_alpha for additive_hill.
+        - is_dependent: True if the gene has a genuine (non-degenerate) dose-response:
+                     (fdr_alpha < fdr_threshold AND n_a's 95% CI excludes 0) OR
+                     (fdr_beta < fdr_threshold AND n_b's 95% CI excludes 0).
+                     Guards against the case where a component is FDR-significant purely
+                     because alpha/beta absorbed a constant offset while n_a/n_b ≈ 0
+                     (flat Hill, unidentified K) — see FIT_TRANS_DESIGN_DECISIONS.md §12.
+                     NaN for polynomial (no sparsity indicator to threshold).
 
         For additive_hill (all parameters needed to recreate: y = A + alpha*Vmax_a*Hill(x;K_a,n_a) + beta*Vmax_b*Hill(x;K_b,n_b)):
         - A_median, A_lower, A_upper: Baseline (intercept)
@@ -1562,6 +1570,10 @@ class ModelSummarizer:
             Set to False to skip the CI loops and use the posterior mean for lower/upper
             bounds instead. EC50_log2fc, inflection_log2fc, and all parameter CIs are
             unaffected — they remain fast vectorised computations.
+        fdr_threshold : float
+            Threshold on fdr_alpha/fdr_beta used to compute the `is_dependent` column
+            (default: 0.05). Does not affect the `classification` column, which uses
+            its own internal default independently.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -1829,6 +1841,26 @@ class ModelSummarizer:
         data.update(fdr_cols)
         if verbose:
             print(f"  _compute_bayesian_fdr:      {time.time() - _t0:.1f}s")
+
+        # is_dependent: FDR-significant AND the corresponding Hill exponent's CI
+        # excludes 0, guarding against alpha/beta being "significant" purely from a
+        # constant offset while n_a/n_b ≈ 0 (flat Hill, unidentified K).
+        if function_type == 'polynomial':
+            data['is_dependent'] = np.full(n_features, np.nan)
+        else:
+            fdr_alpha_arr = np.asarray(data['fdr_alpha'], dtype=float)
+            fdr_beta_arr = np.asarray(data['fdr_beta'], dtype=float)
+            n_a_lower_arr = np.asarray(data.get('n_a_lower', np.full(n_features, np.nan)), dtype=float)
+            n_a_upper_arr = np.asarray(data.get('n_a_upper', np.full(n_features, np.nan)), dtype=float)
+            n_b_lower_arr = np.asarray(data.get('n_b_lower', np.full(n_features, np.nan)), dtype=float)
+            n_b_upper_arr = np.asarray(data.get('n_b_upper', np.full(n_features, np.nan)), dtype=float)
+
+            n_a_excludes_zero = ~((n_a_lower_arr <= 0) & (0 <= n_a_upper_arr))
+            n_b_excludes_zero = ~((n_b_lower_arr <= 0) & (0 <= n_b_upper_arr))
+
+            active_a = (fdr_alpha_arr < fdr_threshold) & n_a_excludes_zero
+            active_b = (fdr_beta_arr < fdr_threshold) & n_b_excludes_zero
+            data['is_dependent'] = active_a | active_b
 
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
         # Also add o_y directly.
@@ -3594,6 +3626,7 @@ class ModelSummarizer:
 
         # Multinomial: export per-category A, Vmax_a, K_a, n_a, alpha for simulation.
         # These parallel the per-category alpha/beta columns already in _add_additive_hill_params.
+        distribution = data.get('distribution', 'negbinom')
         if distribution == 'multinomial':
             def _extract_single_cat_param(name):
                 """Return raw numpy [S, T, K-1] (or [S, T, K] for A) for a per-category parameter."""
