@@ -744,13 +744,119 @@ class ModelPlottingMixin:
         """
         Plot fitted trans functions and/or their derivatives.
 
+        Simple plot showing just the fitted Hill functions (no smoothed data).
+        Useful for comparing multiple genes or viewing function shape with derivatives.
+
         Parameters
         ----------
         features : str or list of str
-            Feature name(s) to plot.
+            Single feature name or list of feature names to plot
+        modality_name : str, optional
+            Modality name (default: primary modality)
+        show_function : bool
+            Show the fitted function y(x) (default: True)
+        show_first_derivative : bool
+            Show first derivative dy/dx (default: False)
+        show_second_derivative : bool
+            Show second derivative d²y/dx² (default: False)
+        show_third_derivative : bool
+            Show second derivative d3y/dx3 (default: False)
+        x_range : np.ndarray, optional
+            X values to plot at. If None, generates evenly spaced points in log2 space
+            from model's x_true range.
+        n_points : int
+            Number of points for x_range if auto-generated (default: 2000).
+            Points are evenly spaced in log2 space for smooth curves on log-log plots.
+        use_log2_x : bool
+            Use log2(x) for x-axis (default: True). Ignored if use_log2fc=True.
+        use_log2fc : bool
+            If True, plot in log2 fold-change space relative to NTC (default: False).
+            - x-axis: log2FC = log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
+            - y-axis: log2FC = log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
+            - Derivatives: dg/du and d²g/du² (chain rule transformed)
+            Requires posterior_samples_ntc to be available for both cis and trans modalities.
+            Not recommended for binomial modalities (use use_delta_p instead).
+        use_delta_p : bool
+            If True, plot in probability difference space relative to NTC (default: False).
+            Designed for binomial modalities (e.g., splicing_sj).
+            - x-axis: log2FC = log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
+            - y-axis: Δp = p - p_ntc where p is probability and p_ntc is NTC probability
+            - Derivatives: dp/du and d²p/du² (chain rule transformed)
+            Requires posterior_samples_ntc to be available for both cis and trans modalities.
+            Mutually exclusive with use_log2fc.
+        show_posterior_samples : bool
+            If True, plot individual posterior fits behind the mean line (default: False).
+            Each posterior sample is plotted with transparency set by `posterior_alpha`.
+        show_ci : bool
+            If True, show 95% credible interval band around the mean line (default: False).
+            The CI is computed at each x point and shown as a shaded region.
+        posterior_alpha : float
+            Transparency for individual posterior sample lines (default: 0.1).
+            Only used when show_posterior_samples=True.
+        ci_alpha : float
+            Transparency for the 95% CI shaded region (default: 0.3).
+            Only used when show_ci=True.
+        max_posterior_samples : int
+            Maximum number of posterior samples to plot (default: 1000).
+            Only used when show_posterior_samples=True.
+        colors : str, list, or dict, optional
+            Colors for each feature. Can be:
+            - Single color string (all features same color)
+            - List of colors (one per feature)
+            - Dict mapping feature names to colors
+            If None, uses default color cycle.
+        alpha : float
+            Line transparency (default: 0.8)
+        linewidth : float
+            Line width (default: 1.5)
+        figsize : tuple, optional
+            Figure size (width, height). Auto-sized if None.
+        title : str, optional
+            Plot title. If None, auto-generated.
+        legend : bool
+            Show legend (default: True)
+        ax : plt.Axes, optional
+            Existing axes to plot on. If None, creates new figure.
+        overlay_roots : pd.DataFrame, pd.Series, dict, or None
+            If provided, draws dashed vertical lines at derivative roots on each
+            subplot.  Accepted forms:
 
-        Delegates to ``xy_plots.plot_trans_functions``; see that function for
-        full parameter documentation.
+            - **pd.DataFrame** (full summary from ``save_trans_summary``): for each
+              feature being plotted, the matching row is looked up by the ``feature``
+              column.
+            - **pd.Series / dict** (a single row): used as-is for every feature.
+            - **None** (default): no overlay.
+
+            Root columns are selected automatically to match the plot's x-axis space:
+            ``*_log2fc_mean`` when ``use_log2fc=True``, ``*_delta_p_mean`` when
+            ``use_delta_p=True``, and ``*_mean`` (x-space, converted to log2 if
+            ``use_log2_x=True``) otherwise.
+        overlay_roots_lw : float
+            Line width for root vlines (default 1.0).
+        overlay_roots_alpha : float
+            Transparency for root vlines (default 0.8).
+        overlay_roots_also_on_function : bool
+            If True (default), draw all root sets also on the function subplot.
+
+        Returns
+        -------
+        plt.Figure
+            Matplotlib figure
+
+        Raises
+        ------
+        ValueError
+            If function type is polynomial (derivatives not supported)
+            If no features could be plotted
+            If use_log2fc=True but NTC means not available
+            If use_delta_p=True but NTC means not available
+            If both use_log2fc and use_delta_p are True (mutually exclusive)
+
+        Examples
+        --------
+        >>> # Plot function and derivatives for one gene
+        >>> model.plot_trans_functions('TET2', show_first_derivative=True,
+        ...                            show_second_derivative=True)
         """
         from .xy_plots import plot_trans_functions
         return plot_trans_functions(self, features, **kwargs)
@@ -759,19 +865,118 @@ class ModelPlottingMixin:
         """
         Forest plot (dot + whisker CI) for posterior parameters across trans genes.
 
+        Creates a plot with genes on the x-axis and parameter values (median + CI) on
+        the y-axis. Multiple parameters are dodged side-by-side for comparison.
+
         Parameters
         ----------
         params : list of str
-            Parameter names to plot (e.g., ``['n_a', 'n_b']`` or
-            ``['alpha', 'beta']``). Must exist in ``posterior_samples_trans``.
-
-        Delegates to ``basic.plot_parameter_ci_panel``; see that function for
-        full parameter documentation.
+            Parameter names to plot (e.g., ['n_a', 'n_b'] or ['alpha', 'beta']).
+            These must exist in posterior_samples_trans.
+        modality_name : str, optional
+            Modality name. If None, uses primary modality.
+        genes : list of str, optional
+            Specific genes to plot. If None, plots all genes (subject to max_genes).
+            Gene names must match feature names in the modality.
+        ci_level : float
+            Credible interval level (default: 95.0 for 95% CI)
+        sort_by : str
+            How to sort genes on x-axis:
+            - 'none': Keep original order
+            - 'alphabetical': Sort alphabetically by gene name
+            - 'median': Sort by median of first parameter (ascending)
+            - 'abs_median': Sort by absolute median of first parameter (descending)
+            - 'effect': Sort by max absolute effect across all params (descending)
+        filter_dependent : bool
+            If True, only show genes where CI excludes 0 for any param in
+            dependency_params (default: False)
+        dependency_params : list, optional
+            Parameters to use for dependency filtering. If None, uses all params.
+            Common: ['n_a', 'n_b'] for Hill coefficients.
+        max_genes : int
+            Maximum number of genes to plot (default: 100). If more genes would be
+            plotted, raises ValueError with suggestions. Set to None to disable limit.
+        ymin, ymax : float, optional
+            Y-axis limits. If None, auto-scaled.
+        title : str, optional
+            Plot title. If None, auto-generated.
+        ylabel : str
+            Y-axis label (default: 'value')
+        figsize : tuple, optional
+            Figure size. If None, auto-scaled based on number of genes.
+        color_palette : dict, optional
+            Custom colors for parameters. Keys are param names, values are colors.
+            If None, uses seaborn color palette.
+        marker_size : int
+            Size of median markers (default: 18)
+        capsize : int
+            Size of error bar caps (default: 3)
+        show_zero_line : bool
+            Whether to draw horizontal line at y=0 (default: True)
+        show_gene_separators : bool
+            Whether to draw vertical lines between genes (default: True).
+            Helps visually distinguish which parameters belong to which gene.
+        ax : matplotlib axes, optional
+            Axes to plot on. If None, creates new figure.
+        show : bool
+            Whether to display the plot (default: True)
+        fdr_df : pd.DataFrame, optional
+            trans_summary DataFrame (output of ``save_trans_summary()``).  The
+            DataFrame must contain a gene name column (``gene_name`` or ``gene``)
+            and the FDR columns ``fdr_alpha`` and ``fdr_beta``.  When provided,
+            parameters belonging to FDR-inactive components (fdr_alpha or fdr_beta
+            >= fdr_threshold) are either rendered in light grey (default) or
+            omitted entirely (when ``hide_inactive=True``).
+            Component mapping: alpha/n_a/K_a/Vmax_a → fdr_alpha;
+            beta/n_b/K_b/Vmax_b → fdr_beta.
+        fdr_threshold : float
+            FDR threshold for inactivity (default: 0.05). Used with fdr_df.
+        hide_inactive : bool
+            If True and fdr_df is provided, FDR-inactive parameters are completely
+            hidden (not plotted at all) rather than shown in grey (default: False).
+            Useful to avoid visual clutter from wandering posteriors of "off"
+            components.
+        show_prior : bool
+            If True, underlay each posterior CI with a light-grey violin drawn from
+            the analytic prior distribution (default: False).  Requires
+            ``model.trans_prior_params`` to be set (automatically set by
+            ``fit_trans()``).  Useful for assessing how much the posterior has moved
+            away from the prior.
+        technical_group : int
+            Which technical group to display for technical parameters (``alpha_y``,
+            ``log2_alpha_y``, ``mu_ntc``, ``o_y``). Index 0 is the reference group
+            (always 0 in log2 space), so typically use 1 for the first non-reference
+            group (default: 1). For ``log2_alpha_y`` specifically, this is 1-based
+            into the C-1 non-reference groups.
 
         Returns
         -------
-        fig : matplotlib.Figure
-        ax : matplotlib.Axes
+        fig : matplotlib Figure (if ax was None)
+        ax : matplotlib Axes
+
+        Examples
+        --------
+        >>> # Plot n_a and n_b for all genes
+        >>> fig, ax = model.plot_parameter_ci_panel(['n_a', 'n_b'])
+
+        >>> # Plot only dependent genes, sorted by effect size
+        >>> fig, ax = model.plot_parameter_ci_panel(
+        ...     ['n_a', 'n_b'],
+        ...     filter_dependent=True,
+        ...     sort_by='effect'
+        ... )
+
+        >>> # Plot alpha and beta with custom colors
+        >>> fig, ax = model.plot_parameter_ci_panel(
+        ...     ['alpha', 'beta'],
+        ...     color_palette={'alpha': 'crimson', 'beta': 'dodgerblue'}
+        ... )
+
+        >>> # Plot for a specific modality
+        >>> fig, ax = model.plot_parameter_ci_panel(
+        ...     ['n_a', 'n_b'],
+        ...     modality_name='splicing_sj'
+        ... )
         """
         from .basic import plot_parameter_ci_panel
         return plot_parameter_ci_panel(self, params, **kwargs)
@@ -780,13 +985,44 @@ class ModelPlottingMixin:
         """
         Extract posterior parameters into a long-format DataFrame.
 
+        This is useful for custom analysis or plotting with seaborn/plotnine.
+
         Parameters
         ----------
         params : list of str
-            Parameter names to extract (e.g., ``['n_a', 'n_b', 'K_a', 'K_b']``).
+            Parameter names to extract (e.g., ['n_a', 'n_b', 'K_a', 'K_b'])
+        modality_name : str, optional
+            Modality name. If None, uses primary modality.
+        include_samples : bool
+            If True, includes all posterior samples (can be large).
+            If False (default), only includes summary statistics.
 
-        Delegates to ``basic.extract_posterior_dataframe``; see that function for
-        full parameter documentation.
+        Returns
+        -------
+        pd.DataFrame
+            Long-format DataFrame with columns:
+            - gene: Gene name
+            - gene_idx: Gene index
+            - param: Parameter name
+            - median: Median value
+            - lo: Lower CI bound (2.5%)
+            - hi: Upper CI bound (97.5%)
+            - mean: Mean value
+            - std: Standard deviation
+            - ci_excludes_zero: Boolean, True if CI excludes 0
+            If include_samples=True, also includes:
+            - sample_idx: Sample index
+            - value: Sample value
+
+        Examples
+        --------
+        >>> # Get summary statistics
+        >>> df = model.extract_posterior_dataframe(['n_a', 'n_b', 'K_a', 'K_b'])
+        >>> df_dependent = df[df['ci_excludes_zero']]
+
+        >>> # Get all samples for custom analysis
+        >>> df_samples = model.extract_posterior_dataframe(['n_a'], include_samples=True)
+        >>> sns.violinplot(data=df_samples, x='gene', y='value')
         """
         from .basic import extract_posterior_dataframe
         return extract_posterior_dataframe(self, params, **kwargs)

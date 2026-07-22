@@ -1740,10 +1740,10 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 # parameter so the single source of truth stays in CisFitter.fit_cis.
 # ---------------------------------------------------------------------------
 _force_doc = """\
-    force : bool, default False
-        If True, skip the low-expression check and proceed regardless.
-        Use plot_ntc_expression() to inspect the expression distribution
-        before overriding.
+        force : bool, default False
+            If True, skip the low-expression check and proceed regardless.
+            Use plot_ntc_expression() to inspect the expression distribution
+            before overriding.
 """
 _base = CisFitter.fit_cis.__doc__ or ""
 _BayesDREAMCore.fit_cis.__doc__ = _base.replace(
