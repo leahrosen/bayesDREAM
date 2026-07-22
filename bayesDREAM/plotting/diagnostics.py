@@ -418,9 +418,12 @@ def plot_systematic_shift_volcano(
     res : pd.DataFrame
         Output of ``model.check_systematic_shift()``.
     group_col : str, optional
-        Column to facet by. If None, auto-detected as the single column in
-        ``res`` that isn't one of the standard result columns (raises
-        ``ValueError`` if that's ambiguous -- pass it explicitly in that case).
+        Column to facet by. If None: uses ``'technical_group_code'`` if present
+        (``check_systematic_shift``'s default ``tech_col`` name), otherwise
+        auto-detected as the single non-boolean column in ``res`` that isn't
+        one of the standard result columns (raises ``ValueError`` if that's
+        ambiguous, e.g. if you added your own derived columns to ``res`` --
+        pass it explicitly in that case).
     p_col : str, default ``'p_adj'``
         Which BH-corrected p-value column to plot: ``'p_adj'`` (likelihood-ratio
         test) or ``'shift_p_adj'`` (Wald test on the ``targeted`` coefficient).
@@ -457,13 +460,19 @@ def plot_systematic_shift_volcano(
     placed with a small fixed offset and may overlap for dense panels.
     """
     if group_col is None:
-        extra = [c for c in res.columns if c not in _SHIFT_RESULT_COLS]
-        if len(extra) != 1:
-            raise ValueError(
-                f"Could not auto-detect group_col (candidates: {extra}). "
-                "Pass group_col explicitly."
-            )
-        group_col = extra[0]
+        if "technical_group_code" in res.columns:
+            group_col = "technical_group_code"
+        else:
+            extra = [
+                c for c in res.columns
+                if c not in _SHIFT_RESULT_COLS and res[c].dtype != bool
+            ]
+            if len(extra) != 1:
+                raise ValueError(
+                    f"Could not auto-detect group_col (candidates: {extra}). "
+                    "Pass group_col explicitly."
+                )
+            group_col = extra[0]
 
     df = res[res["ok"] & np.isfinite(res[effect_col]) & np.isfinite(res[p_col])].copy()
     if df.empty:
