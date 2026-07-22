@@ -422,6 +422,13 @@ class Modality:
                 raise ValueError("binomial distribution requires denominator")
             if self.denominator.shape != self.counts.shape:
                 raise ValueError(f"denominator shape {self.denominator.shape} must match counts shape {self.counts.shape}")
+            counts_dense = self.counts.toarray() if sparse.issparse(self.counts) else self.counts
+            denom_dense = self.denominator.toarray() if sparse.issparse(self.denominator) else self.denominator
+            if np.any(counts_dense > denom_dense):
+                raise ValueError(
+                    f"[Modality '{self.name}'] counts exceed denominator for binomial distribution "
+                    f"(found {int(np.sum(counts_dense > denom_dense))} violating entries)"
+                )
 
         # Validate exon skipping data if provided
         if self.inc1 is not None or self.inc2 is not None or self.skip is not None:
