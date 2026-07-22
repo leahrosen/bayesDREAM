@@ -389,6 +389,71 @@ _SHIFT_RESULT_COLS = frozenset({
 })
 
 
+def _declutter_texts(fig, ax, texts, iterations=200, pad_px=1.5):
+    """
+    Iteratively nudge overlapping ``Text`` labels apart in display-pixel
+    space, converting shifts back to data coordinates for repositioning.
+
+    Lightweight fallback for when ``adjustText`` isn't installed: not as
+    good, but resolves direct overlaps within a panel.
+    """
+    if len(texts) < 2:
+        return
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    bbox = ax.get_window_extent(renderer=renderer)
+    px_per_xdata = bbox.width / (x1 - x0)
+    px_per_ydata = bbox.height / (y1 - y0)
+    if px_per_xdata <= 0 or px_per_ydata <= 0:
+        return
+
+    for _ in range(iterations):
+        boxes = [t.get_window_extent(renderer=renderer) for t in texts]
+        moved = False
+        for i in range(len(texts)):
+            for j in range(i + 1, len(texts)):
+                bi, bj = boxes[i], boxes[j]
+                if not bi.overlaps(bj):
+                    continue
+                moved = True
+                overlap_x = min(bi.x1, bj.x1) - max(bi.x0, bj.x0)
+                overlap_y = min(bi.y1, bj.y1) - max(bi.y0, bj.y0)
+                cix, cjx = (bi.x0 + bi.x1) / 2, (bj.x0 + bj.x1) / 2
+                ciy, cjy = (bi.y0 + bi.y1) / 2, (bj.y0 + bj.y1) / 2
+                xi, yi = texts[i].get_position()
+                xj, yj = texts[j].get_position()
+                if overlap_x < overlap_y:
+                    shift = (overlap_x / 2 + pad_px) * (1.0 if cix >= cjx else -1.0)
+                    dx = shift / px_per_xdata
+                    texts[i].set_position((xi + dx, yi))
+                    texts[j].set_position((xj - dx, yj))
+                else:
+                    shift = (overlap_y / 2 + pad_px) * (1.0 if ciy >= cjy else -1.0)
+                    dy = shift / px_per_ydata
+                    texts[i].set_position((xi, yi + dy))
+                    texts[j].set_position((xj, yj - dy))
+        if not moved:
+            break
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+
+
+def _draw_leader_lines(ax, texts, orig_xy, min_px=3.0, color="gray", lw=0.5):
+    """Draw a thin line from each label's original point to its (possibly
+    decluttered) final position, when it moved more than ``min_px`` pixels."""
+    fig = ax.figure
+    fig.canvas.draw()
+    for txt, (x0, y0) in zip(texts, orig_xy):
+        x1, y1 = txt.get_position()
+        d0 = ax.transData.transform((x0, y0))
+        d1 = ax.transData.transform((x1, y1))
+        if np.hypot(*(d1 - d0)) > min_px:
+            ax.plot([x0, x1], [y0, y1], color=color, lw=lw, zorder=3.5)
+
+
 def plot_systematic_shift_volcano(
     res,
     group_col=None,
@@ -456,8 +521,9 @@ def plot_systematic_shift_volcano(
     plotted; skipped (``ok == False``) rows are silently dropped.
 
     If the `adjustText <https://github.com/Phlya/adjustText>`_ package is
-    installed, labels are auto-repelled to reduce overlap; otherwise they're
-    placed with a small fixed offset and may overlap for dense panels.
+    installed, labels are auto-repelled using it (best quality). Otherwise a
+    built-in pixel-space decluttering pass nudges overlapping labels apart
+    and draws thin leader lines back to their points.
     """
     if group_col is None:
         if "technical_group_code" in res.columns:
@@ -514,15 +580,20 @@ def plot_systematic_shift_volcano(
 
         top_hits = sig.nsmallest(top_n, p_col)
         texts = []
+        orig_xy = []
+        x_span = sub[effect_col].max() - sub[effect_col].min()
+        y_span = sub["_neg_log10_p"].max() - sub["_neg_log10_p"].min()
+        dx0 = 0.01 * x_span if x_span > 0 else 0.01
+        dy0 = 0.02 * y_span if y_span > 0 else 0.02
         for _, row in top_hits.iterrows():
-            txt = ax.annotate(
-                str(row[label_col]),
-                (row[effect_col], row["_neg_log10_p"]),
-                xytext=(4, 4), textcoords="offset points",
+            x, y = row[effect_col], row["_neg_log10_p"]
+            txt = ax.text(
+                x + dx0, y + dy0, str(row[label_col]),
                 fontsize=label_fontsize, zorder=4,
             )
             txt.set_path_effects([pe.Stroke(linewidth=2, foreground="white"), pe.Normal()])
             texts.append(txt)
+            orig_xy.append((x, y))
 
         if texts:
             try:
@@ -532,7 +603,10 @@ def plot_systematic_shift_volcano(
                     arrowprops=dict(arrowstyle="-", color="gray", lw=0.5),
                 )
             except ImportError:
-                pass  # pip install adjustText for automatic label repulsion
+                # Built-in fallback: nudge overlapping labels apart, then
+                # draw thin leader lines back to their points.
+                _declutter_texts(fig, ax, texts)
+                _draw_leader_lines(ax, texts, orig_xy)
 
         ax.set_xlabel(effect_col)
         ax.set_title(f"{group_col}={gval}  (n={len(sub):,}, sig={len(sig):,})")
