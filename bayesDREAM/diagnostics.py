@@ -670,6 +670,12 @@ class DiagnosticsMixin:
             Name of the modality to test (default: primary modality, usually 'gene').
         sum_factor_col : str
             Column in ``self.meta`` to use as normalisation offset (negbinom only).
+            Defaults to the raw ``'sum_factor'`` column set at init -- this will
+            usually NOT match what ``fit_cis()``/``fit_trans()`` actually used if
+            you ran ``adjust_ntc_sum_factor()``/``refit_sumfactor()`` (which create
+            ``'sum_factor_adj'``/``'sum_factor_refit'``). Pass the same
+            ``sum_factor_col`` you used for ``fit_trans()`` so the offset here is
+            consistent with the model whose residuals you're testing.
         target_col : str
             Column in ``self.meta`` with perturbation labels. Cells are first
             filtered to ``target_col`` in ``{ntc_label, targeted_label}``.
@@ -720,6 +726,24 @@ class DiagnosticsMixin:
             ``lrt_df``.
             For multinomial data an additional ``n_categories_tested`` column
             is included.
+
+            ``pval``/``p_lrt``/``p_adj`` and ``shift_p``/``shift_p_adj`` are two
+            different tests of the same null hypothesis, not duplicates:
+
+            * ``pval`` == ``p_lrt`` -- likelihood-ratio test comparing the null
+              (``s(x)``) and alt (``s(x) + targeted``) model fits:
+              ``2*(llf_alt - llf_null) ~ chi2(1 df)``. Tests whether adding the
+              ``targeted`` term improves the fit at all.
+            * ``shift_p`` -- Wald test on the fitted ``targeted`` coefficient
+              itself (estimate / ``shift_se``, from the alt model only).
+              For multinomial, both are combined across categories via Fisher's
+              method rather than being a single coefficient's Wald test.
+
+            They usually agree, but the Wald SE underlying ``shift_p`` can be
+            unstable when the coefficient is large or near a boundary; prefer
+            ``p_adj`` (LRT) if they disagree. ``shift_est``/``shift_fc`` (the
+            effect size) come from the same Wald-tested coefficient regardless
+            of which p-value you use for significance.
 
             When ``ok`` is False, most other columns are absent/NaN for that
             row and ``reason`` is one of: ``"missing_theta"`` (negbinom only,

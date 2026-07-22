@@ -68,6 +68,7 @@ from .diagnostics import (
     scatter_with_smooth_by_group,
     plot_x_true_residuals_vs_sumfactor,
     plot_sum_factor_comparison,
+    plot_systematic_shift_volcano,
 )
 
 __all__ = [
@@ -116,4 +117,5 @@ __all__ = [
     'scatter_with_smooth_by_group',
     'plot_x_true_residuals_vs_sumfactor',
     'plot_sum_factor_comparison',
+    'plot_systematic_shift_volcano',
 ]

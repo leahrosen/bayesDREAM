@@ -377,3 +377,160 @@ def plot_sum_factor_comparison(model, sf_col1, sf_col2, cis_gene=None,
         plt.show()
 
     return fig
+
+
+# Columns produced by check_systematic_shift() that are never the group/facet
+# column -- used to auto-detect the group column (named after whatever
+# tech_col was passed to check_systematic_shift).
+_SHIFT_RESULT_COLS = frozenset({
+    'feature', 'ok', 'reason', 'n_ntc', 'n_targeted', 'theta',
+    'pval', 'p_lrt', 'p_adj', 'shift_est', 'shift_se', 'shift_p',
+    'shift_p_adj', 'shift_fc', 'lrt_stat', 'lrt_df', 'n_categories_tested',
+})
+
+
+def plot_systematic_shift_volcano(
+    res,
+    group_col=None,
+    p_col="p_adj",
+    effect_col="shift_est",
+    label_col="feature",
+    fdr_threshold=0.1,
+    top_n=20,
+    sig_color="firebrick",
+    nonsig_color="#999999",
+    label_fontsize=7,
+    figsize=None,
+    show=True,
+):
+    """
+    Volcano plot of ``check_systematic_shift()`` results, faceted by group.
+
+    One panel per unique value of ``group_col`` (the grouping column produced
+    by ``check_systematic_shift(tech_col=...)`` -- named after whatever
+    ``tech_col`` was passed, e.g. ``'technical_group_code'`` by default).
+    Each panel plots ``effect_col`` (x) against ``-log10(p_col)`` (y),
+    highlights points below ``fdr_threshold``, and labels the ``top_n`` most
+    significant features per panel.
+
+    Parameters
+    ----------
+    res : pd.DataFrame
+        Output of ``model.check_systematic_shift()``.
+    group_col : str, optional
+        Column to facet by. If None, auto-detected as the single column in
+        ``res`` that isn't one of the standard result columns (raises
+        ``ValueError`` if that's ambiguous -- pass it explicitly in that case).
+    p_col : str, default ``'p_adj'``
+        Which BH-corrected p-value column to plot: ``'p_adj'`` (likelihood-ratio
+        test) or ``'shift_p_adj'`` (Wald test on the ``targeted`` coefficient).
+        See ``check_systematic_shift``'s docstring for the difference.
+    effect_col : str, default ``'shift_est'``
+        Column for the x-axis (effect size).
+    label_col : str, default ``'feature'``
+        Column supplying the text used to label top hits.
+    fdr_threshold : float, default 0.1
+        Significance cutoff; also drawn as a horizontal dashed line.
+    top_n : int, default 20
+        Number of most-significant (lowest ``p_col``) features to label,
+        per panel, among rows below ``fdr_threshold``.
+    sig_color, nonsig_color : str
+        Colors for significant / non-significant points.
+    label_fontsize : int, default 7
+        Font size for point labels.
+    figsize : tuple, optional
+        Figure size. Defaults to ``(5 * n_panels, 5)``.
+    show : bool, default True
+        Whether to call ``plt.show()``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    Notes
+    -----
+    Only rows with ``ok == True`` and finite ``effect_col``/``p_col`` are
+    plotted; skipped (``ok == False``) rows are silently dropped.
+
+    If the `adjustText <https://github.com/Phlya/adjustText>`_ package is
+    installed, labels are auto-repelled to reduce overlap; otherwise they're
+    placed with a small fixed offset and may overlap for dense panels.
+    """
+    if group_col is None:
+        extra = [c for c in res.columns if c not in _SHIFT_RESULT_COLS]
+        if len(extra) != 1:
+            raise ValueError(
+                f"Could not auto-detect group_col (candidates: {extra}). "
+                "Pass group_col explicitly."
+            )
+        group_col = extra[0]
+
+    df = res[res["ok"] & np.isfinite(res[effect_col]) & np.isfinite(res[p_col])].copy()
+    if df.empty:
+        raise ValueError("No rows with ok=True and finite values to plot.")
+
+    # Avoid -log10(0) = inf for exact-zero p-values
+    tiny = np.finfo(float).tiny
+    df["_neg_log10_p"] = -np.log10(df[p_col].clip(lower=tiny))
+    df["_sig"] = df[p_col] < fdr_threshold
+
+    group_values = sorted(df[group_col].unique())
+    n_panels = len(group_values)
+    if figsize is None:
+        figsize = (5 * n_panels, 5)
+
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize, sharex=True, sharey=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    hline_y = -np.log10(fdr_threshold)
+
+    for ax, gval in zip(axes, group_values):
+        sub = df[df[group_col] == gval]
+        nonsig = sub[~sub["_sig"]]
+        sig = sub[sub["_sig"]]
+
+        ax.axvline(0, linestyle="--", color="gray", linewidth=1, zorder=1)
+        ax.axhline(hline_y, linestyle="--", color=sig_color, linewidth=1, zorder=1)
+
+        ax.scatter(
+            nonsig[effect_col], nonsig["_neg_log10_p"],
+            s=10, alpha=0.4, color=nonsig_color, label="Not significant", zorder=2,
+        )
+        ax.scatter(
+            sig[effect_col], sig["_neg_log10_p"],
+            s=14, alpha=0.8, color=sig_color,
+            label=f"$p_{{adj}}$ < {fdr_threshold}", zorder=3,
+        )
+
+        top_hits = sig.nsmallest(top_n, p_col)
+        texts = []
+        for _, row in top_hits.iterrows():
+            txt = ax.annotate(
+                str(row[label_col]),
+                (row[effect_col], row["_neg_log10_p"]),
+                xytext=(4, 4), textcoords="offset points",
+                fontsize=label_fontsize, zorder=4,
+            )
+            txt.set_path_effects([pe.Stroke(linewidth=2, foreground="white"), pe.Normal()])
+            texts.append(txt)
+
+        if texts:
+            try:
+                from adjustText import adjust_text
+                adjust_text(
+                    texts, ax=ax,
+                    arrowprops=dict(arrowstyle="-", color="gray", lw=0.5),
+                )
+            except ImportError:
+                pass  # pip install adjustText for automatic label repulsion
+
+        ax.set_xlabel(effect_col)
+        ax.set_title(f"{group_col}={gval}  (n={len(sub):,}, sig={len(sig):,})")
+        ax.legend(fontsize=7, frameon=False, markerscale=1.5)
+
+    axes[0].set_ylabel(f"$-\\log_{{10}}$({p_col})")
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return fig
