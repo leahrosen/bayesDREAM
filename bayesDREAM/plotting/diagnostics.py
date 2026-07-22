@@ -5,9 +5,11 @@ Provides quality control and diagnostic plots for bayesDREAM fits.
 """
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from statsmodels.nonparametric.smoothers_lowess import lowess
+from scipy.stats import pearsonr, spearmanr
 
 from .colors import ColorScheme
 
@@ -389,6 +391,32 @@ _SHIFT_RESULT_COLS = frozenset({
 })
 
 
+def _detect_group_col(res, group_col):
+    """
+    Resolve the grouping column for check_systematic_shift() results.
+
+    If ``group_col`` is given, returns it unchanged. Otherwise prefers
+    ``'technical_group_code'`` (check_systematic_shift's default ``tech_col``
+    name) if present; else falls back to the single non-boolean column in
+    ``res`` that isn't one of the standard result columns, raising
+    ``ValueError`` if that's ambiguous (e.g. user-added derived columns).
+    """
+    if group_col is not None:
+        return group_col
+    if "technical_group_code" in res.columns:
+        return "technical_group_code"
+    extra = [
+        c for c in res.columns
+        if c not in _SHIFT_RESULT_COLS and res[c].dtype != bool
+    ]
+    if len(extra) != 1:
+        raise ValueError(
+            f"Could not auto-detect group_col (candidates: {extra}). "
+            "Pass group_col explicitly."
+        )
+    return extra[0]
+
+
 def _declutter_texts(fig, ax, texts, iterations=200, pad_px=1.5):
     """
     Iteratively nudge overlapping ``Text`` labels apart in display-pixel
@@ -525,20 +553,7 @@ def plot_systematic_shift_volcano(
     built-in pixel-space decluttering pass nudges overlapping labels apart
     and draws thin leader lines back to their points.
     """
-    if group_col is None:
-        if "technical_group_code" in res.columns:
-            group_col = "technical_group_code"
-        else:
-            extra = [
-                c for c in res.columns
-                if c not in _SHIFT_RESULT_COLS and res[c].dtype != bool
-            ]
-            if len(extra) != 1:
-                raise ValueError(
-                    f"Could not auto-detect group_col (candidates: {extra}). "
-                    "Pass group_col explicitly."
-                )
-            group_col = extra[0]
+    group_col = _detect_group_col(res, group_col)
 
     df = res[res["ok"] & np.isfinite(res[effect_col]) & np.isfinite(res[p_col])].copy()
     if df.empty:
@@ -613,6 +628,181 @@ def plot_systematic_shift_volcano(
         ax.legend(fontsize=7, frameon=False, markerscale=1.5)
 
     axes[0].set_ylabel(f"$-\\log_{{10}}$({p_col})")
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_shift_est_group_correlation(
+    res,
+    group_col=None,
+    groups=None,
+    effect_col="shift_est",
+    p_col="p_adj",
+    label_col="feature",
+    fdr_threshold=0.1,
+    highlight="either",
+    top_n=0,
+    sig_color="firebrick",
+    nonsig_color="#999999",
+    label_fontsize=7,
+    figsize=(5, 5),
+    show=True,
+):
+    """
+    Scatter ``effect_col`` for one group against another, matched by feature.
+
+    Checks whether the residual shift detected by ``check_systematic_shift()``
+    is consistent across groups (e.g. two technical groups, or CRISPRi vs
+    CRISPRa) rather than being an artefact of one group's fit -- a real
+    off-target/guide effect should show up with a similar ``shift_est`` in
+    both groups; a group-specific artefact will not.
+
+    Parameters
+    ----------
+    res : pd.DataFrame
+        Output of ``model.check_systematic_shift()``.
+    group_col : str, optional
+        Column identifying groups. See ``plot_systematic_shift_volcano`` for
+        auto-detection rules (same logic, shared via ``_detect_group_col``).
+    groups : tuple of 2, optional
+        Which two group values to compare. Defaults to the two (sorted)
+        unique values in ``group_col`` if exactly two are present; raises
+        ``ValueError`` if there are more than 2 and this isn't specified.
+    effect_col : str, default ``'shift_est'``
+        Column to correlate between the two groups.
+    p_col : str, default ``'p_adj'``
+        Column used for significance highlighting/labeling.
+    label_col : str, default ``'feature'``
+        Column used to match rows across groups (inner join), and to label
+        points.
+    fdr_threshold : float, default 0.1
+        Significance cutoff for highlighting.
+    highlight : {'either', 'both', 'none'}, default ``'either'``
+        Highlight points significant in either group, in both groups, or
+        skip highlighting.
+    top_n : int, default 0
+        Label the top N highlighted points by ``min(p_col)`` across the two
+        groups. 0 = no labels.
+    sig_color, nonsig_color : str
+        Colors for significant / non-significant points.
+    label_fontsize : int, default 7
+        Font size for point labels.
+    figsize : tuple, default (5, 5)
+    show : bool, default True
+        Whether to call ``plt.show()``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    Notes
+    -----
+    Only features with ``ok == True`` and finite ``effect_col``/``p_col`` in
+    *both* groups are plotted (inner join on ``label_col``) -- features that
+    were skipped or untested in one group are silently dropped. Pearson r
+    and Spearman rho (computed on the matched pairs) are annotated on the
+    plot. Labels use the same adjustText-or-built-in decluttering as
+    ``plot_systematic_shift_volcano``.
+    """
+    group_col = _detect_group_col(res, group_col)
+
+    ok = res[res["ok"] & np.isfinite(res[effect_col]) & np.isfinite(res[p_col])]
+    unique_groups = sorted(ok[group_col].unique())
+
+    if groups is None:
+        if len(unique_groups) != 2:
+            raise ValueError(
+                f"Expected exactly 2 groups, found {unique_groups}. "
+                "Pass groups=(a, b) explicitly."
+            )
+        groups = tuple(unique_groups)
+    ga, gb = groups
+
+    da = ok[ok[group_col] == ga][[label_col, effect_col, p_col]]
+    db = ok[ok[group_col] == gb][[label_col, effect_col, p_col]]
+    merged = pd.merge(da, db, on=label_col, suffixes=("_a", "_b"))
+    if merged.empty:
+        raise ValueError(
+            f"No shared features with ok=True between groups {ga!r} and {gb!r}."
+        )
+
+    x = merged[f"{effect_col}_a"].to_numpy()
+    y = merged[f"{effect_col}_b"].to_numpy()
+    pa = merged[f"{p_col}_a"].to_numpy()
+    pb = merged[f"{p_col}_b"].to_numpy()
+
+    if highlight == "either":
+        sig_mask = (pa < fdr_threshold) | (pb < fdr_threshold)
+    elif highlight == "both":
+        sig_mask = (pa < fdr_threshold) & (pb < fdr_threshold)
+    elif highlight == "none":
+        sig_mask = np.zeros(len(merged), dtype=bool)
+    else:
+        raise ValueError("highlight must be 'either', 'both', or 'none'.")
+
+    r, r_p = pearsonr(x, y)
+    rho, _ = spearmanr(x, y)
+    n = len(merged)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.scatter(
+        x[~sig_mask], y[~sig_mask],
+        s=10, alpha=0.4, color=nonsig_color, label="Not significant", zorder=2,
+    )
+    if sig_mask.any():
+        ax.scatter(
+            x[sig_mask], y[sig_mask],
+            s=14, alpha=0.8, color=sig_color,
+            label=f"$p_{{adj}}$ < {fdr_threshold} ({highlight})", zorder=3,
+        )
+
+    lo, hi = min(x.min(), y.min()), max(x.max(), y.max())
+    pad = 0.05 * (hi - lo) if hi > lo else 1.0
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad],
+            linestyle="--", color="gray", linewidth=1, zorder=1)
+    ax.axhline(0, linestyle=":", color="gray", linewidth=0.7, zorder=1)
+    ax.axvline(0, linestyle=":", color="gray", linewidth=0.7, zorder=1)
+
+    ax.text(
+        0.03, 0.97,
+        f"Pearson r = {r:.2f} (p={r_p:.1e})\nSpearman ρ = {rho:.2f}\nn = {n:,}",
+        transform=ax.transAxes, va="top", ha="left", fontsize=8,
+    )
+
+    if top_n > 0 and sig_mask.any():
+        min_p = np.minimum(pa, pb)
+        sig_idx = np.flatnonzero(sig_mask)
+        top_idx = sig_idx[np.argsort(min_p[sig_idx])][:top_n]
+
+        texts, orig_xy = [], []
+        x_span, y_span = x.max() - x.min(), y.max() - y.min()
+        dx0 = 0.01 * x_span if x_span > 0 else 0.01
+        dy0 = 0.02 * y_span if y_span > 0 else 0.02
+        for i in top_idx:
+            xi, yi = x[i], y[i]
+            txt = ax.text(
+                xi + dx0, yi + dy0, str(merged[label_col].iloc[i]),
+                fontsize=label_fontsize, zorder=4,
+            )
+            txt.set_path_effects([pe.Stroke(linewidth=2, foreground="white"), pe.Normal()])
+            texts.append(txt)
+            orig_xy.append((xi, yi))
+
+        try:
+            from adjustText import adjust_text
+            adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color="gray", lw=0.5))
+        except ImportError:
+            _declutter_texts(fig, ax, texts)
+            _draw_leader_lines(ax, texts, orig_xy)
+
+    ax.set_xlabel(f"{effect_col} ({group_col}={ga})")
+    ax.set_ylabel(f"{effect_col} ({group_col}={gb})")
+    ax.set_title(f"{effect_col} correlation across {group_col}")
+    ax.legend(fontsize=7, frameon=False, markerscale=1.5, loc="lower right")
+
     plt.tight_layout()
     if show:
         plt.show()

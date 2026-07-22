@@ -69,6 +69,7 @@ from .diagnostics import (
     plot_x_true_residuals_vs_sumfactor,
     plot_sum_factor_comparison,
     plot_systematic_shift_volcano,
+    plot_shift_est_group_correlation,
 )
 
 __all__ = [
@@ -118,4 +119,5 @@ __all__ = [
     'plot_x_true_residuals_vs_sumfactor',
     'plot_sum_factor_comparison',
     'plot_systematic_shift_volcano',
+    'plot_shift_est_group_correlation',
 ]
