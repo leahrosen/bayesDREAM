@@ -807,3 +807,129 @@ def plot_shift_est_group_correlation(
     if show:
         plt.show()
     return fig
+
+
+def plot_systematic_shift_hits_xy(
+    model,
+    res,
+    p_col="p_adj",
+    fdr_threshold=0.1,
+    group_col=None,
+    label_col="feature",
+    features=None,
+    tech_col=None,
+    target_col="target",
+    ntc_label="ntc",
+    targeted_label=None,
+    exclude_cells=None,
+    window_col="_shift_window",
+    **plot_xy_kwargs,
+):
+    """
+    Call ``model.plot_xy_data()`` for each significant ``check_systematic_shift()``
+    hit, restricted to the cells the test actually used.
+
+    ``check_systematic_shift()`` matches NTC and targeted cells to a ±1 SD
+    window around the NTC mean of ``log2(x_true)`` before testing (see its
+    "Matching window" docstring section) -- a much narrower slice than the
+    full dose-response range ``plot_xy_data()`` shows by default. This
+    reconstructs that same window (via ``model.get_shift_window_cells()``)
+    and applies it as a ``subset_meta`` filter, so the plot shows exactly
+    the cells that drove the test's result.
+
+    Loops over the significant features in ``res`` (``ok`` and
+    ``p_col < fdr_threshold``, unless ``features`` is given explicitly) and
+    calls::
+
+        model.plot_xy_data(feature, subset_meta={window_col: True, **your_subset_meta}, **plot_xy_kwargs)
+
+    for each, after temporarily adding a boolean ``window_col`` column to
+    ``model.meta`` marking cells within *their own group's* matched window
+    (each cell only belongs to one ``tech_col`` group, so a single combined
+    column is enough even when ``plot_xy_kwargs['facet_by']`` differs from
+    ``tech_col``). The column is removed again afterwards, even on error.
+
+    Parameters
+    ----------
+    model : bayesDREAM
+        The fitted model ``res`` was produced from.
+    res : pd.DataFrame
+        Output of ``model.check_systematic_shift()``.
+    p_col : str, default ``'p_adj'``
+        Which corrected p-value column selects significant hits.
+    fdr_threshold : float, default 0.1
+        Significance cutoff for selecting hits (ignored if ``features`` is given).
+    group_col : str, optional
+        Grouping column in ``res`` (auto-detected as in
+        ``plot_systematic_shift_volcano`` if None).
+    label_col : str, default ``'feature'``
+        Column in ``res`` naming features.
+    features : list of str, optional
+        Explicit feature list to plot, bypassing the significance filter.
+    tech_col, target_col, ntc_label, targeted_label, exclude_cells
+        Passed to ``model.get_shift_window_cells()`` to reconstruct the same
+        matched window ``check_systematic_shift()`` used -- pass the same
+        values you used there, or the window won't match what the test
+        actually saw. ``tech_col`` defaults to ``group_col`` (the results
+        column is named after whatever ``tech_col`` was used, so this is
+        usually correct without passing it explicitly).
+    window_col : str, default ``'_shift_window'``
+        Name of the temporary boolean column added to ``model.meta``.
+        Restored to its previous value (or removed) when done.
+    **plot_xy_kwargs
+        Forwarded to ``model.plot_xy_data()`` (e.g. ``facet_by``, ``color_by``,
+        ``color_palette``, ``log2fc``, ``show_correction``, ``legend_outside``,
+        ``figsize``, ``mark_params``, ``show_hill_function``, ``sum_factor_col``).
+        A ``subset_meta`` dict, if given, is merged with the window filter
+        rather than overridden by it.
+
+    Returns
+    -------
+    dict[str, plt.Figure or plt.Axes]
+        ``feature -> plot_xy_data()`` return value, in plotting order.
+    """
+    group_col = _detect_group_col(res, group_col)
+    if tech_col is None:
+        tech_col = group_col
+
+    if features is None:
+        hits = res[res["ok"] & (res[p_col] < fdr_threshold)]
+        features = list(pd.unique(hits[label_col]))
+    if not features:
+        raise ValueError("No features to plot (empty `features` / no rows passed the significance filter).")
+
+    windows = model.get_shift_window_cells(
+        tech_col=tech_col,
+        target_col=target_col,
+        ntc_label=ntc_label,
+        targeted_label=targeted_label,
+        exclude_cells=exclude_cells,
+    )
+    all_window_cells = set()
+    for cells in windows.values():
+        all_window_cells.update(cells)
+    if not all_window_cells:
+        raise ValueError(
+            "No cells fall within any group's matched window; check tech_col/"
+            "target_col/ntc_label/targeted_label match what check_systematic_shift() used."
+        )
+
+    user_subset_meta = dict(plot_xy_kwargs.pop("subset_meta", {}) or {})
+
+    had_col = window_col in model.meta.columns
+    prev_values = model.meta[window_col].copy() if had_col else None
+    model.meta[window_col] = model.meta["cell"].isin(all_window_cells)
+
+    figs = {}
+    try:
+        for feature in features:
+            subset_meta = dict(user_subset_meta)
+            subset_meta[window_col] = True
+            figs[feature] = model.plot_xy_data(feature, subset_meta=subset_meta, **plot_xy_kwargs)
+    finally:
+        if had_col:
+            model.meta[window_col] = prev_values
+        else:
+            del model.meta[window_col]
+
+    return figs

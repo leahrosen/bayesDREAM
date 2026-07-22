@@ -964,6 +964,93 @@ class DiagnosticsMixin:
 
         return res
 
+    def get_shift_window_cells(
+        self,
+        tech_col: str = "technical_group_code",
+        target_col: str = "target",
+        ntc_label: str = "ntc",
+        targeted_label: Optional[str] = None,
+        exclude_cells: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        Return the cells within the matched NTC window ``check_systematic_shift()``
+        actually used to test each ``tech_col`` group.
+
+        ``check_systematic_shift()`` restricts NTC and targeted cells to a
+        fixed ±1 SD window around the NTC mean of ``log2(x_true)`` before
+        fitting (see its docstring's "Matching window" section). That window
+        depends only on ``x_true``, ``target_col``, ``tech_col``, and
+        ``exclude_cells`` -- not on the feature being tested -- so it is the
+        *same* set of cells for every feature within a given ``tech_col``
+        group. This method reconstructs that set directly (reusing
+        ``_build_shift_base``, so it's guaranteed consistent with
+        ``check_systematic_shift()``), for use in follow-up plots that
+        should show exactly the cells the test actually saw rather than all
+        NTC/targeted cells across the full ``x_true`` range.
+
+        Pass the same ``tech_col``/``target_col``/``ntc_label``/
+        ``targeted_label``/``exclude_cells`` you used for
+        ``check_systematic_shift()`` -- this does not read them back from a
+        results DataFrame, so a mismatch will silently give the wrong window.
+
+        Parameters
+        ----------
+        tech_col : str, default ``'technical_group_code'``
+            Column in ``self.meta`` to group by.
+        target_col : str, default ``'target'``
+            Column in ``self.meta`` with perturbation labels.
+        ntc_label : str, default ``'ntc'``
+            Value in ``target_col`` identifying NTC cells.
+        targeted_label : str or None
+            Value in ``target_col`` identifying targeted cells. Defaults to
+            ``self.cis_gene``.
+        exclude_cells : list of str, optional
+            Cell names to drop before computing the window, matching
+            ``check_systematic_shift(exclude_cells=...)``.
+
+        Returns
+        -------
+        dict[group_value, list[str]]
+            Cell names (``self.meta['cell']``) within the matched window,
+            keyed by ``tech_col`` group value. Groups with fewer than 2 NTC
+            cells (can't compute an SD) or an invalid NTC SD are omitted,
+            matching ``check_systematic_shift()``'s own skip conditions.
+        """
+        if not hasattr(self, "x_true") or self.x_true is None:
+            raise RuntimeError(
+                "x_true is not set. Run fit_cis() before get_shift_window_cells()."
+            )
+        if targeted_label is None:
+            targeted_label = self.cis_gene
+        if targeted_label is None:
+            raise ValueError("targeted_label must be specified (or set self.cis_gene).")
+
+        base = self._build_shift_base(
+            modality=None,
+            sum_factor_col=None,
+            target_col=target_col,
+            tech_col=tech_col,
+            ntc_label=ntc_label,
+            targeted_label=targeted_label,
+            distribution="normal",  # skips the negbinom-only sum_factor/offset requirement
+            exclude_cells=exclude_cells,
+        )
+
+        windows = {}
+        for tech, dt_sub in base.groupby(tech_col, sort=True):
+            x_ntc = dt_sub.loc[dt_sub[target_col] == ntc_label, "x"]
+            if len(x_ntc) < 2:
+                continue
+            ntc_mean, ntc_sd = x_ntc.mean(), x_ntc.std(ddof=1)
+            if not (np.isfinite(ntc_sd) and ntc_sd > 0):
+                continue
+            dt_win = dt_sub[
+                (dt_sub["x"] > ntc_mean - ntc_sd) & (dt_sub["x"] < ntc_mean + ntc_sd)
+            ]
+            windows[tech] = dt_win["cell"].tolist()
+
+        return windows
+
     # ------------------------------------------------------------------
     # Private helper methods
     # ------------------------------------------------------------------
