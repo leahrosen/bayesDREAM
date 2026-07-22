@@ -6196,3 +6196,133 @@ def plot_xy_data(
         ax_result = result if isinstance(result, plt.Axes) else result[0]
         _save_figure(ax_result.get_figure(), model, filename)
     return result
+
+
+def restyle_targeting_lines(
+    result,
+    color_palette=None,
+    ntc_alpha=0.35,
+    ntc_linestyle="dashed",
+    targeting_alpha=1.0,
+    targeting_linestyle="solid",
+    ntc_label_fragment="NTC",
+    targeting_label_fragment="Targeting",
+    rebuild_legend=True,
+    legend_outside=False,
+    legend_kwargs=None,
+):
+    """
+    Restyle a ``plot_xy_data()`` result to use alpha + linestyle for NTC vs
+    targeting, ggplot ``scale_alpha_manual``/``scale_linetype_manual`` style,
+    instead of plot_xy_data's built-in color-tint shading.
+
+    Meant for plotting everything on one shared axes with a single flat hue
+    per primary group (e.g. cell_line) rather than faceting: call
+    ``plot_xy_data`` with ``facet_by=None`` and
+    ``color_by=['<primary>', 'targeting']`` (which labels lines
+    ``"<primary> / NTC"`` / ``"<primary> / Targeting"`` and tints NTC as a
+    lighter shade of the primary color), then pass the result here to flatten
+    each line back to its primary group's solid color and encode NTC vs
+    targeting as alpha/linestyle instead::
+
+        palette = {'CRISPRi': 'steelblue', 'CRISPRa': 'tomato'}
+        result = model.plot_xy_data(
+            'GFI1B',
+            facet_by=None,
+            color_by=['cell_line', 'targeting'],
+            color_palette=palette,
+            legend_outside=True,
+        )
+        restyle_targeting_lines(result, color_palette=palette, legend_outside=True)
+
+    Also works with plain ``color_by='targeting'`` (labels are bare
+    ``"NTC"``/``"Targeting"``, no primary-color reset needed --
+    ``color_palette=None`` in that case).
+
+    Parameters
+    ----------
+    result : matplotlib Figure, Axes, or array of Axes
+        Return value of ``model.plot_xy_data(...)``.
+    color_palette : dict, optional
+        ``{primary_label: color}`` -- the same dict passed to
+        ``plot_xy_data(color_palette=...)``. Used to reset each line to its
+        primary group's flat color, undoing plot_xy_data's NTC tint. If
+        None, colors are left as plot_xy_data drew them (tinted).
+    ntc_alpha, targeting_alpha : float
+        Alpha for lines whose label contains ``ntc_label_fragment`` /
+        ``targeting_label_fragment`` respectively.
+    ntc_linestyle, targeting_linestyle : str
+        Matplotlib linestyle for the same two groups (e.g. ``'dashed'``,
+        ``'solid'``).
+    ntc_label_fragment, targeting_label_fragment : str
+        Substrings identifying NTC vs targeting lines in their legend label.
+        Lines whose label matches neither are left untouched.
+    rebuild_legend : bool, default True
+        Regenerate each axes' legend from the restyled lines. Matplotlib
+        legends snapshot line style at creation time, so the original
+        legend won't reflect the restyle otherwise.
+    legend_outside : bool, default False
+        Match whatever you passed to ``plot_xy_data(legend_outside=...)``,
+        so the rebuilt legend is placed the same way.
+    legend_kwargs : dict, optional
+        Extra kwargs forwarded to the rebuilt ``legend()`` call, overriding
+        the defaults (``frameon=False``, plus ``bbox_to_anchor=(1.02, 0.5),
+        loc='center left'`` when ``legend_outside=True``).
+
+    Returns
+    -------
+    The same ``result`` object, restyled in place.
+
+    Notes
+    -----
+    Only ``Line2D`` artists (the smoothed trend lines) are restyled --
+    linestyle has no meaning for scatter points, and plot_xy_data's raw
+    per-cell scatter points are unlabeled and left untouched.
+    """
+    if isinstance(result, plt.Axes):
+        axes = [result]
+    elif isinstance(result, plt.Figure):
+        axes = result.axes
+    else:
+        axes = [a for a in np.ravel(result) if isinstance(a, plt.Axes)]
+
+    legend_kwargs = dict(legend_kwargs or {})
+
+    for ax in axes:
+        handles, labels = [], []
+        for line in ax.get_lines():
+            label = line.get_label()
+            if not label or label.startswith("_"):
+                continue
+
+            if ntc_label_fragment in label:
+                alpha, linestyle = ntc_alpha, ntc_linestyle
+            elif targeting_label_fragment in label:
+                alpha, linestyle = targeting_alpha, targeting_linestyle
+            else:
+                handles.append(line)
+                labels.append(label)
+                continue
+
+            if color_palette is not None:
+                primary = label.split(" / ")[0].strip()
+                if primary in color_palette:
+                    line.set_color(color_palette[primary])
+
+            line.set_alpha(alpha)
+            line.set_linestyle(linestyle)
+            handles.append(line)
+            labels.append(label)
+
+        if rebuild_legend and handles:
+            existing = ax.get_legend()
+            if existing is not None:
+                existing.remove()
+            if legend_outside:
+                kw = dict(bbox_to_anchor=(1.02, 0.5), loc="center left", frameon=False)
+            else:
+                kw = dict(frameon=False)
+            kw.update(legend_kwargs)
+            ax.legend(handles, labels, **kw)
+
+    return result

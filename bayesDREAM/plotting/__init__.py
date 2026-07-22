@@ -63,6 +63,9 @@ from .de_comparison import (
     plot_edger_vs_bayes_observed_range,
 )
 
+# X-Y plot post-processing
+from .xy_plots import restyle_targeting_lines
+
 # Diagnostic plots
 from .diagnostics import (
     scatter_with_smooth_by_group,
@@ -122,4 +125,5 @@ __all__ = [
     'plot_systematic_shift_volcano',
     'plot_shift_est_group_correlation',
     'plot_systematic_shift_hits_xy',
+    'restyle_targeting_lines',
 ]
