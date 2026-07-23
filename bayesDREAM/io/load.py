@@ -7,6 +7,8 @@ import pickle
 import torch
 import pandas as pd
 
+from ..utils import make_names_unique
+
 
 # ---------------------------------------------------------------------------
 # Alignment helpers
@@ -36,8 +38,19 @@ def _align_tensor(tensor, saved_names, target_names, dim):
     if dim < 0:
         dim = tensor.ndim + dim
 
-    saved_idx = {n: i for i, n in enumerate(saved_names)}
     n_target = len(target_names)
+
+    # Legacy fit saved before feature-name deduplication was introduced:
+    # saved_names may still contain raw duplicate names (e.g. Ensembl gene_name
+    # collisions), which the current modality now disambiguates
+    # (name, name-1, name-2, ...). If re-running the same dedup transform on
+    # saved_names reproduces target_names exactly, the underlying feature
+    # order/identity is unchanged -- only the strings were disambiguated --
+    # so positions correspond 1:1 and no reindexing is needed.
+    if list(saved_names) != list(target_names) and make_names_unique(saved_names) == list(target_names):
+        return tensor, torch.ones(n_target, dtype=torch.bool)
+
+    saved_idx = {n: i for i, n in enumerate(saved_names)}
     mapping = [saved_idx.get(n, -1) for n in target_names]
     mask = torch.tensor([i >= 0 for i in mapping], dtype=torch.bool)
 
