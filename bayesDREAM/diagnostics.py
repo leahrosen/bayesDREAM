@@ -47,6 +47,7 @@ import pandas as pd
 from typing import Optional, Union, List
 from scipy.stats import chi2, combine_pvalues, t as t_dist
 from scipy.optimize import minimize
+from tqdm import tqdm
 
 try:
     from statsmodels.gam.api import GLMGam, BSplines
@@ -636,6 +637,7 @@ class DiagnosticsMixin:
         degree: int = 3,
         theta: Optional[Union[dict, np.ndarray, pd.Series]] = None,
         exclude_cells: Optional[List[str]] = None,
+        verbose: bool = True,
     ) -> pd.DataFrame:
         """
         Test for systematic expression shifts between NTC and targeted cells,
@@ -716,6 +718,8 @@ class DiagnosticsMixin:
             from the comparison. Applied globally, before the per-group NTC
             mean/SD window is computed, so excluded cells also don't
             contribute to that window.
+        verbose : bool, default True
+            Show a ``tqdm`` progress bar over features while fitting.
 
         Returns
         -------
@@ -762,7 +766,16 @@ class DiagnosticsMixin:
             window -- no shift is fittable), ``"zero_counts_in_window"`` /
             ``"single_category_in_window"`` (multinomial: no counts, or only
             one category observed, within the window), ``"zero_denom_in_window"``
-            (binomial: denominator is zero for every cell in the window), or
+            (binomial: denominator is zero for every cell in the window),
+            ``"quasi_separation_one_arm_all_zero"`` (negbinom: all counts are
+            zero within the NTC or targeted arm specifically, even though the
+            pooled window has nonzero variance -- the arm coefficient has no
+            finite MLE and any returned ``shift_est`` is a numerical-underflow
+            artifact, not a real effect size),
+            ``"quasi_separation_one_arm_boundary"`` (binomial: the NTC or
+            targeted arm's ratio is pinned at 0 or 1 for every cell),
+            ``"quasi_separation_category_absent_in_one_arm"`` (multinomial: an
+            observed category has zero counts within one arm), or
             ``"fit_failed: <ExceptionType>: <message>"``.
 
         Raises
@@ -843,6 +856,17 @@ class DiagnosticsMixin:
         # ---- Extract counts array ----------------------------------------------
         counts_arr = self._get_counts_array(modality)  # [T, N] or [T, N, K]
 
+        # Densify the denominator once up front (was previously redone inside
+        # the per-feature loop, i.e. once per feature instead of once total).
+        denom_arr = None
+        if distribution == "binomial":
+            if modality.denominator is None:
+                raise ValueError(
+                    "modality.denominator is None but distribution is 'binomial'. "
+                    "Denominator is required for binomial shift test."
+                )
+            denom_arr = self._get_dense_array(modality.denominator)
+
         # ---- Feature names / indices -------------------------------------------
         feature_names = modality.feature_names
         if feature_names is None:
@@ -855,71 +879,91 @@ class DiagnosticsMixin:
                 f"counts first dimension ({T})"
             )
 
+        # ---- Precompute the matched NTC window once per tech_col group --------
+        # The window (and every check leading up to it) depends only on `x`,
+        # `target_col`, and `tech_col` -- none of which vary by feature -- so
+        # computing it here instead of inside the feature loop turns an O(T)
+        # repeat of the same pandas filtering into a single O(1) pass per group.
+        group_windows = self._compute_shift_group_windows(
+            base=base,
+            tech_col=tech_col,
+            target_col=target_col,
+            targeted_label=targeted_label,
+            min_cells_per_group=min_cells_per_group,
+        )
+
         # ---- Loop over features × technical groups -----------------------------
         results = []
-        for g_idx, feature in enumerate(feature_names):
+        _iter = tqdm(
+            enumerate(feature_names), total=T,
+            desc="check_systematic_shift", disable=not verbose,
+        )
+        for g_idx, feature in _iter:
             # Get per-feature dispersion (sigma for studentt; phi for negbinom)
             t_val = self._lookup_theta(theta_array, feature, g_idx, distribution)
             # For studentt: also get per-feature degrees of freedom
             nu_val = self._lookup_theta(nu_array, feature, g_idx, "studentt") \
                 if nu_array is not None else float("nan")
 
-            # Attach feature-specific counts to base
-            dt_feature = self._attach_feature_counts(
-                base=base,
-                counts_arr=counts_arr,
-                g_idx=g_idx,
-                modality=modality,
-                distribution=distribution,
-            )
+            if distribution == "negbinom" and not (np.isfinite(t_val) and t_val > 0):
+                for tech in group_windows:
+                    results.append({
+                        "feature": feature, tech_col: tech, "theta": t_val,
+                        "ok": False, "reason": "missing_theta",
+                    })
+                continue
 
-            for tech, dt_sub in dt_feature.groupby(tech_col, sort=True):
+            for tech, gw in group_windows.items():
                 row_base = {
                     "feature": feature,
                     tech_col: tech,
                     "theta": t_val,
                 }
 
-                # --- Skip checks ---
-                skip_reason = self._shift_skip_reason(
-                    dt_sub=dt_sub,
-                    target_col=target_col,
-                    ntc_label=ntc_label,
-                    targeted_label=targeted_label,
-                    min_cells_per_group=min_cells_per_group,
-                    t_val=t_val,
-                    distribution=distribution,
-                )
-                if skip_reason is not None:
-                    results.append({**row_base, "ok": False, "reason": skip_reason})
+                # --- Skip checks that don't depend on this feature ---
+                if gw["early_skip_reason"] is not None:
+                    results.append({**row_base, "ok": False, "reason": gw["early_skip_reason"]})
                     continue
 
-                # --- Subset to matched x window ---
-                x_ntc = dt_sub.loc[dt_sub[target_col] == ntc_label, "x"]
-                if len(x_ntc) < 2:
-                    results.append({**row_base, "ok": False,
-                                    "reason": "too_few_ntc_for_sd_window"})
-                    continue
-                ntc_mean, ntc_sd = x_ntc.mean(), x_ntc.std(ddof=1)
-                if not (np.isfinite(ntc_sd) and ntc_sd > 0):
-                    results.append({**row_base, "ok": False, "reason": "invalid_ntc_sd"})
+                # --- Binomial-only: this feature's denominator within the ---
+                # --- pre-window group (still feature-specific) -------------
+                if distribution == "binomial":
+                    denom_pre = denom_arr[g_idx, gw["cell_pos_pre"]]
+                    if not np.any(denom_pre > 0):
+                        results.append({**row_base, "ok": False, "reason": "all_denominators_zero"})
+                        continue
+
+                if gw["late_skip_reason"] is not None:
+                    row = {**row_base, "ok": False, "reason": gw["late_skip_reason"]}
+                    if gw["late_skip_reason"] == "too_few_cells_after_subsetting":
+                        row["n_ntc"] = gw["n_ntc_after"]
+                        row["n_targeted"] = gw["n_tgt_after"]
+                    results.append(row)
                     continue
 
-                dt_win = dt_sub[
-                    (dt_sub["x"] > ntc_mean - ntc_sd) &
-                    (dt_sub["x"] < ntc_mean + ntc_sd)
-                ].copy()
+                n_ntc = gw["n_ntc_after"]
+                n_tgt = gw["n_tgt_after"]
 
-                n_ntc = int((dt_win[target_col] == ntc_label).sum())
-                n_tgt = int((dt_win[target_col] == targeted_label).sum())
+                # --- Attach this feature's response for the (already ---
+                # --- computed) matched window only, not the full base ---
+                cell_pos_win = gw["cell_pos_win"]
+                dt_win = pd.DataFrame({
+                    "x": gw["x_win"],
+                    "targeted": gw["targeted_win"],
+                })
+                if gw["offset_win"] is not None:
+                    dt_win["offset"] = gw["offset_win"]
 
-                if n_ntc < min_cells_per_group or n_tgt < min_cells_per_group:
-                    results.append({
-                        **row_base, "ok": False,
-                        "reason": "too_few_cells_after_subsetting",
-                        "n_ntc": n_ntc, "n_targeted": n_tgt,
-                    })
-                    continue
+                if distribution == "multinomial":
+                    feat_counts = counts_arr[g_idx, cell_pos_win, :]
+                    dt_win["y_total"] = feat_counts.sum(axis=1)
+                    for k in range(feat_counts.shape[1]):
+                        dt_win[f"y_{k}"] = feat_counts[:, k]
+                elif distribution == "binomial":
+                    dt_win["y"] = counts_arr[g_idx, cell_pos_win]
+                    dt_win["denom"] = denom_arr[g_idx, cell_pos_win]
+                else:
+                    dt_win["y"] = counts_arr[g_idx, cell_pos_win]
 
                 # --- Skip windows with no usable response signal (avoids ---
                 # --- GLM divergence, which is slow and warning-heavy) -----
@@ -1272,88 +1316,112 @@ class DiagnosticsMixin:
         base["targeted"] = (base[target_col] == targeted_label).astype(int)
         return base
 
+    def _get_dense_array(self, arr) -> np.ndarray:
+        """Densify a (possibly sparse) array once. Used for counts/denominator."""
+        from scipy import sparse
+        if sparse.issparse(arr):
+            arr = arr.toarray()
+        return np.asarray(arr, dtype=float)
+
     def _get_counts_array(self, modality) -> np.ndarray:
         """Return counts as a dense numpy array [T, N] or [T, N, K]."""
-        from scipy import sparse
-        counts = modality.counts
-        if sparse.issparse(counts):
-            counts = counts.toarray()
-        return np.asarray(counts, dtype=float)
+        return self._get_dense_array(modality.counts)
 
-    def _attach_feature_counts(
+    def _compute_shift_group_windows(
         self,
         base: pd.DataFrame,
-        counts_arr: np.ndarray,
-        g_idx: int,
-        modality,
-        distribution: str,
-    ) -> pd.DataFrame:
-        """
-        Add count column(s) for feature g_idx to a copy of base.
-
-        The base DataFrame has integer RangeIndex 0..N-1 matching the cell
-        axis of counts_arr.
-        """
-        dt = base.copy()
-        cell_pos = dt.index.to_numpy()  # integer positions into counts
-
-        if distribution == "multinomial":
-            # counts_arr shape: [T, N, K]
-            feat_counts = counts_arr[g_idx, cell_pos, :]  # [n_cells, K]
-            dt["y_total"] = feat_counts.sum(axis=1)
-            K = feat_counts.shape[1]
-            for k in range(K):
-                dt[f"y_{k}"] = feat_counts[:, k]
-        elif distribution == "binomial":
-            dt["y"] = counts_arr[g_idx, cell_pos]
-            # Denominator
-            denom = modality.denominator
-            if denom is None:
-                raise ValueError(
-                    "modality.denominator is None but distribution is 'binomial'. "
-                    "Denominator is required for binomial shift test."
-                )
-            from scipy import sparse as sp
-            if sp.issparse(denom):
-                denom = denom.toarray()
-            denom_arr = np.asarray(denom, dtype=float)
-            dt["denom"] = denom_arr[g_idx, cell_pos]
-        else:
-            dt["y"] = counts_arr[g_idx, cell_pos]
-
-        return dt
-
-    def _shift_skip_reason(
-        self,
-        dt_sub,
-        target_col,
-        ntc_label,
+        tech_col: str,
+        target_col: str,
         targeted_label,
-        min_cells_per_group,
-        t_val,
-        distribution,
-    ):
-        """Return a reason string if this (feature, tech_group) should be skipped, else None."""
-        # Check theta for distributions that need it
-        if distribution == "negbinom":
-            if not (np.isfinite(t_val) and t_val > 0):
-                return "missing_theta"
+        min_cells_per_group: int,
+    ) -> dict:
+        """
+        Precompute, once per ``tech_col`` group, everything about the matched
+        NTC window that does not depend on which feature is being tested.
 
-        # Minimum cell counts (before window subsetting)
-        n_ntc = int((dt_sub[target_col] == ntc_label).sum())
-        n_tgt = int((dt_sub[target_col] == targeted_label).sum())
-        if n_ntc < 2:
-            return "too_few_ntc_for_sd_window"
-        if n_ntc < min_cells_per_group or n_tgt < min_cells_per_group:
-            return "too_few_cells_before_subsetting"
+        The window (``ntc_mean``/``ntc_sd``/the resulting boolean mask) is a
+        function of ``x`` (shared across every feature) and ``target_col``
+        only -- see ``check_systematic_shift``'s "Matching window" docstring
+        section -- so this replaces what used to be an O(features) repeat of
+        the same pandas filtering with a single O(1)-per-group pass. Only the
+        checks that genuinely depend on the feature (``missing_theta``,
+        binomial's ``all_denominators_zero``) are left to the caller's
+        per-feature loop.
 
-        # Distribution-specific checks
-        if distribution == "binomial":
-            if "denom" in dt_sub.columns:
-                if (dt_sub["denom"] <= 0).all():
-                    return "all_denominators_zero"
+        Returns
+        -------
+        dict[group_value, dict]
+            Per-group dict with keys:
+            - ``early_skip_reason``: ``"too_few_ntc_for_sd_window"`` /
+              ``"too_few_cells_before_subsetting"`` / None. Mirrors the
+              checks that used to run before the binomial denominator check.
+            - ``n_ntc_before``/``n_tgt_before``: counts prior to windowing.
+            - ``cell_pos_pre``: integer positions (into the counts array's
+              cell axis) of all NTC+targeted cells in this group, before
+              windowing -- used for the per-feature binomial denominator check.
+            - ``late_skip_reason``: ``"invalid_ntc_sd"`` /
+              ``"too_few_cells_after_subsetting"`` / None. Only meaningful
+              when ``early_skip_reason`` is None.
+            - ``n_ntc_after``/``n_tgt_after``: counts after windowing (only
+              when ``late_skip_reason`` is not ``"invalid_ntc_sd"``).
+            - ``cell_pos_win``/``x_win``/``targeted_win``/``offset_win``:
+              arrays for cells inside the matched window (only when
+              ``late_skip_reason`` is None). ``offset_win`` is None unless
+              ``"offset"`` is a column in ``base`` (negbinom only).
+        """
+        has_offset = "offset" in base.columns
+        out = {}
+        for tech, dt_sub in base.groupby(tech_col, sort=True):
+            cell_pos_pre = dt_sub.index.to_numpy()
+            is_tgt_pre = (dt_sub[target_col].to_numpy() == targeted_label)
+            n_ntc_before = int((~is_tgt_pre).sum())
+            n_tgt_before = int(is_tgt_pre.sum())
 
-        return None
+            entry = {
+                "n_ntc_before": n_ntc_before,
+                "n_tgt_before": n_tgt_before,
+                "cell_pos_pre": cell_pos_pre,
+                "early_skip_reason": None,
+                "late_skip_reason": None,
+            }
+
+            if n_ntc_before < 2:
+                entry["early_skip_reason"] = "too_few_ntc_for_sd_window"
+                out[tech] = entry
+                continue
+            if n_ntc_before < min_cells_per_group or n_tgt_before < min_cells_per_group:
+                entry["early_skip_reason"] = "too_few_cells_before_subsetting"
+                out[tech] = entry
+                continue
+
+            x_pre = dt_sub["x"].to_numpy(dtype=float)
+            ntc_mean = x_pre[~is_tgt_pre].mean()
+            ntc_sd = x_pre[~is_tgt_pre].std(ddof=1)
+            if not (np.isfinite(ntc_sd) and ntc_sd > 0):
+                entry["late_skip_reason"] = "invalid_ntc_sd"
+                out[tech] = entry
+                continue
+
+            win_mask = (x_pre > ntc_mean - ntc_sd) & (x_pre < ntc_mean + ntc_sd)
+            is_tgt_win = is_tgt_pre[win_mask]
+            n_ntc_after = int((~is_tgt_win).sum())
+            n_tgt_after = int(is_tgt_win.sum())
+            entry["n_ntc_after"] = n_ntc_after
+            entry["n_tgt_after"] = n_tgt_after
+
+            if n_ntc_after < min_cells_per_group or n_tgt_after < min_cells_per_group:
+                entry["late_skip_reason"] = "too_few_cells_after_subsetting"
+                out[tech] = entry
+                continue
+
+            entry["cell_pos_win"] = cell_pos_pre[win_mask]
+            entry["x_win"] = x_pre[win_mask]
+            entry["targeted_win"] = is_tgt_win.astype(int)
+            entry["offset_win"] = (
+                dt_sub["offset"].to_numpy(dtype=float)[win_mask] if has_offset else None
+            )
+            out[tech] = entry
+        return out
 
     def _shift_window_degenerate_reason(
         self,
@@ -1368,14 +1436,34 @@ class DiagnosticsMixin:
         (mu -> 0 or inf), which is expensive and floods the console with
         RuntimeWarnings without ever producing a usable fit -- cheaper to
         catch them here before calling GLMGam at all.
+
+        Beyond the pooled (both arms combined) checks, this also catches
+        *per-arm* quasi-complete separation: cases where the pooled response
+        has some variance (so the pooled check above passes) but one arm
+        (``targeted == 0`` or ``targeted == 1``) sits entirely on a link-scale
+        boundary (all-zero counts for negbinom's log link; ratio pinned at
+        0 or 1 for binomial's logit link; a category entirely absent from one
+        arm for multinomial). In these cases the "alt" model's arm coefficient
+        has no finite MLE -- IRLS still returns a number, but it's an
+        artifact of where the optimizer's numerical underflow happens to
+        stop (e.g. log-scale estimates clustering near -20), not a real
+        effect size.
         """
+        targeted = dt_win["targeted"].to_numpy(dtype=float)
+
         if distribution == "multinomial":
             y_cols = [c for c in dt_win.columns if c.startswith("y_") and c != "y_total"]
-            totals = dt_win[y_cols].to_numpy(dtype=float).sum(axis=0)
+            counts = dt_win[y_cols].to_numpy(dtype=float)
+            totals = counts.sum(axis=0)
             if totals.sum() == 0:
                 return "zero_counts_in_window"
             if (totals > 0).sum() < 2:
                 return "single_category_in_window"
+            present = totals > 0
+            totals_ntc = counts[targeted == 0].sum(axis=0)
+            totals_tgt = counts[targeted == 1].sum(axis=0)
+            if np.any(present & ((totals_ntc == 0) | (totals_tgt == 0))):
+                return "quasi_separation_category_absent_in_one_arm"
             return None
 
         if distribution == "binomial":
@@ -1383,15 +1471,27 @@ class DiagnosticsMixin:
             if not np.any(denom > 0):
                 return "zero_denom_in_window"
             ratio = dt_win["y"].to_numpy(dtype=float) / np.where(denom > 0, denom, np.nan)
-            ratio = ratio[np.isfinite(ratio)]
-            if ratio.size == 0 or np.ptp(ratio) == 0:
+            valid = np.isfinite(ratio)
+            if not valid.any() or np.ptp(ratio[valid]) == 0:
                 return "zero_variance_window"
+            for arm_val in (0.0, 1.0):
+                arm_mask = valid & (targeted == arm_val)
+                if not arm_mask.any():
+                    continue
+                arm_ratio = ratio[arm_mask]
+                if np.all(arm_ratio == 0) or np.all(arm_ratio == 1):
+                    return "quasi_separation_one_arm_boundary"
             return None
 
         # negbinom / normal / studentt
         y = dt_win["y"].to_numpy(dtype=float)
         if np.ptp(y) == 0:
             return "zero_variance_window"
+        if distribution == "negbinom":
+            for arm_val in (0.0, 1.0):
+                arm_y = y[targeted == arm_val]
+                if arm_y.size > 0 and np.all(arm_y == 0):
+                    return "quasi_separation_one_arm_all_zero"
         return None
 
     def _run_shift_gam(
