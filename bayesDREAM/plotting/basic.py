@@ -863,11 +863,21 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     -------------------
     n_a, n_b  : marginal over sigma_n ~ Exp(rate) of Normal(n_mu_raw, sigma_n),
                 then soft-clamped to [nmin, nmax]
-    Vmax_a/b  : LogNormal(Vmax_log_mu[gene], Vmax_log_sigma)
+    Vmax_a/b  : LogNormal(Vmax_log_mu[gene], Vmax_log_sigma) for negbinom/normal/studentt;
+                Beta(Vmax_beta_alpha[gene], Vmax_beta_beta[gene]) for binomial
+                (multinomial not yet supported — Vmax_mean is per-category [T, K])
     K_a/b     : LogNormal(K_log_mu, K_log_sigma)
     A (negbinom): 2^Normal(A_log2_mu[gene], A_log2_sigma[gene])
                   lower anchor = log2(Amean/2), sigma = 1-4 octaves (NTC-anchored)
+    A (binomial): sigmoid(Normal(A_logit_mu[gene], A_logit_sigma[gene])) when y_ntc
+                  available (NTC-anchored, logit-space analogue of the negbinom case);
+                  falls back to Beta(1, A_beta_beta[gene]) without NTC data
+    A (normal/studentt): Normal(A_mean[gene], A_sigma[gene]) in natural (unbounded)
+                  value space — NTC-anchored when y_ntc is available, else a fixed
+                  shift from Amean scaled by the response amplitude
     alpha/beta: RelaxedBernoulli(logits=p_n_logits, temperature=1)
+    (multinomial 'A' has no analytic prior here yet — it's a per-category
+    LogisticNormal over the K-simplex; not currently reconstructed for plotting.)
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -888,11 +898,21 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     elif param in ('Vmax_a', 'Vmax_b'):
         Vmax_log_mu    = prior_params.get('Vmax_log_mu')
         Vmax_log_sigma = prior_params.get('Vmax_log_sigma')
-        if Vmax_log_mu is None or Vmax_log_sigma is None:
-            return None
-        mu = (float(Vmax_log_mu[gene_idx])
-              if hasattr(Vmax_log_mu, '__len__') else float(Vmax_log_mu))
-        return np.exp(rng.normal(mu, float(Vmax_log_sigma), n_samples))
+        if Vmax_log_mu is not None and Vmax_log_sigma is not None:
+            mu = (float(Vmax_log_mu[gene_idx])
+                  if hasattr(Vmax_log_mu, '__len__') else float(Vmax_log_mu))
+            return np.exp(rng.normal(mu, float(Vmax_log_sigma), n_samples))
+
+        Vmax_beta_alpha = prior_params.get('Vmax_beta_alpha')
+        Vmax_beta_beta  = prior_params.get('Vmax_beta_beta')
+        if Vmax_beta_alpha is not None and Vmax_beta_beta is not None:
+            a = (float(Vmax_beta_alpha[gene_idx])
+                 if hasattr(Vmax_beta_alpha, '__len__') else float(Vmax_beta_alpha))
+            b = (float(Vmax_beta_beta[gene_idx])
+                 if hasattr(Vmax_beta_beta, '__len__') else float(Vmax_beta_beta))
+            return rng.beta(a, b, n_samples)
+
+        return None
 
     elif param in ('K_a', 'K_b'):
         K_log_mu    = prior_params.get('K_log_mu')
@@ -906,13 +926,39 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     elif param == 'A':
         A_log2_mu    = prior_params.get('A_log2_mu')
         A_log2_sigma = prior_params.get('A_log2_sigma')
-        if A_log2_mu is None or A_log2_sigma is None:
-            return None
-        mu    = (float(A_log2_mu[gene_idx])
-                 if hasattr(A_log2_mu, '__len__') else float(A_log2_mu))
-        sigma = (float(A_log2_sigma[gene_idx])
-                 if hasattr(A_log2_sigma, '__len__') else float(A_log2_sigma))
-        return np.power(2.0, rng.normal(mu, sigma, n_samples))
+        if A_log2_mu is not None and A_log2_sigma is not None:
+            mu    = (float(A_log2_mu[gene_idx])
+                     if hasattr(A_log2_mu, '__len__') else float(A_log2_mu))
+            sigma = (float(A_log2_sigma[gene_idx])
+                     if hasattr(A_log2_sigma, '__len__') else float(A_log2_sigma))
+            return np.power(2.0, rng.normal(mu, sigma, n_samples))
+
+        A_logit_mu    = prior_params.get('A_logit_mu')
+        A_logit_sigma = prior_params.get('A_logit_sigma')
+        if A_logit_mu is not None and A_logit_sigma is not None:
+            mu    = (float(A_logit_mu[gene_idx])
+                     if hasattr(A_logit_mu, '__len__') else float(A_logit_mu))
+            sigma = (float(A_logit_sigma[gene_idx])
+                     if hasattr(A_logit_sigma, '__len__') else float(A_logit_sigma))
+            logit_samps = rng.normal(mu, sigma, n_samples)
+            return 1.0 / (1.0 + np.exp(-logit_samps))
+
+        A_beta_beta = prior_params.get('A_beta_beta')
+        if A_beta_beta is not None:
+            beta = (float(A_beta_beta[gene_idx])
+                    if hasattr(A_beta_beta, '__len__') else float(A_beta_beta))
+            return rng.beta(1.0, beta, n_samples)
+
+        A_mean  = prior_params.get('A_mean')
+        A_sigma = prior_params.get('A_sigma')
+        if A_mean is not None and A_sigma is not None:
+            mu    = (float(A_mean[gene_idx])
+                     if hasattr(A_mean, '__len__') else float(A_mean))
+            sigma = (float(A_sigma[gene_idx])
+                     if hasattr(A_sigma, '__len__') else float(A_sigma))
+            return rng.normal(mu, sigma, n_samples)
+
+        return None
 
     elif param in ('alpha', 'beta'):
         logits = prior_params.get('p_n_logits', -13.8)
@@ -1033,12 +1079,12 @@ def plot_parameter_ci_panel(
     model,
     params: list,
     modality_name: str = None,
-    genes: list = None,
+    features: list = None,
     ci_level: float = 95.0,
     sort_by: str = 'none',
     filter_dependent: bool = False,
     dependency_params: list = None,
-    max_genes: int = 100,
+    max_features: int = 100,
     ymin: float = None,
     ymax: float = None,
     title: str = None,
@@ -1048,7 +1094,7 @@ def plot_parameter_ci_panel(
     marker_size: int = 18,
     capsize: int = 3,
     show_zero_line: bool = True,
-    show_gene_separators: bool = True,
+    show_feature_separators: bool = True,
     ax=None,
     show: bool = True,
     fdr_df=None,
@@ -1058,9 +1104,9 @@ def plot_parameter_ci_panel(
     technical_group: int = 1,
 ):
     """
-    Forest plot (dot + whisker CI) for posterior parameters across trans genes.
+    Forest plot (dot + whisker CI) for posterior parameters across trans features.
 
-    Creates a plot with genes on the x-axis and parameter values (median + CI) on
+    Creates a plot with features on the x-axis and parameter values (median + CI) on
     the y-axis. Multiple parameters are dodged side-by-side for comparison.
 
     Parameters
@@ -1072,27 +1118,27 @@ def plot_parameter_ci_panel(
         These must exist in posterior_samples_trans.
     modality_name : str, optional
         Modality name. If None, uses primary modality.
-    genes : list of str, optional
-        Specific genes to plot. If None, plots all genes (subject to max_genes).
-        Gene names must match feature names in the modality.
+    features : list of str, optional
+        Specific features to plot. If None, plots all features (subject to
+        max_features). Names must match feature names in the modality.
     ci_level : float
         Credible interval level (default: 95.0 for 95% CI)
     sort_by : str
-        How to sort genes on x-axis:
+        How to sort features on x-axis:
         - 'none': Keep original order
-        - 'alphabetical': Sort alphabetically by gene name
+        - 'alphabetical': Sort alphabetically by feature name
         - 'median': Sort by median of first parameter (ascending)
         - 'abs_median': Sort by absolute median of first parameter (descending)
         - 'effect': Sort by max absolute effect across all params (descending)
     filter_dependent : bool
-        If True, only show genes where CI excludes 0 for any param in
+        If True, only show features where CI excludes 0 for any param in
         dependency_params (default: False)
     dependency_params : list, optional
         Parameters to use for dependency filtering. If None, uses all params.
         Common: ['n_a', 'n_b'] for Hill coefficients.
-    max_genes : int
-        Maximum number of genes to plot (default: 100). If more genes would be
-        plotted, raises ValueError with suggestions. Set to None to disable limit.
+    max_features : int
+        Maximum number of features to plot (default: 100). If more features would
+        be plotted, raises ValueError with suggestions. Set to None to disable limit.
     ymin, ymax : float, optional
         Y-axis limits. If None, auto-scaled.
     title : str, optional
@@ -1100,7 +1146,7 @@ def plot_parameter_ci_panel(
     ylabel : str
         Y-axis label (default: 'value')
     figsize : tuple, optional
-        Figure size. If None, auto-scaled based on number of genes.
+        Figure size. If None, auto-scaled based on number of features.
     color_palette : dict, optional
         Custom colors for parameters. Keys are param names, values are colors.
         If None, uses seaborn color palette.
@@ -1110,9 +1156,9 @@ def plot_parameter_ci_panel(
         Size of error bar caps (default: 3)
     show_zero_line : bool
         Whether to draw horizontal line at y=0 (default: True)
-    show_gene_separators : bool
-        Whether to draw vertical lines between genes (default: True).
-        Helps visually distinguish which parameters belong to which gene.
+    show_feature_separators : bool
+        Whether to draw vertical lines between features (default: True).
+        Helps visually distinguish which parameters belong to which feature.
     ax : matplotlib axes, optional
         Axes to plot on. If None, creates new figure.
     show : bool
@@ -1153,10 +1199,10 @@ def plot_parameter_ci_panel(
 
     Examples
     --------
-    >>> # Plot n_a and n_b for all genes
+    >>> # Plot n_a and n_b for all features
     >>> fig, ax = model.plot_parameter_ci_panel(['n_a', 'n_b'])
 
-    >>> # Plot only dependent genes, sorted by effect size
+    >>> # Plot only dependent features, sorted by effect size
     >>> fig, ax = model.plot_parameter_ci_panel(
     ...     ['n_a', 'n_b'],
     ...     filter_dependent=True,
@@ -1235,16 +1281,16 @@ def plot_parameter_ci_panel(
                 f"Available: {list(tech_posterior.keys())}"
             )
 
-    # Get gene names from modality
-    gene_names = modality.feature_names
-    if gene_names is None:
+    # Get feature names from modality
+    feature_names = modality.feature_names
+    if feature_names is None:
         # Fallback to feature_meta
         for col in ['gene_name', 'gene', 'feature_id', 'feature']:
             if col in modality.feature_meta.columns:
-                gene_names = modality.feature_meta[col].tolist()
+                feature_names = modality.feature_meta[col].tolist()
                 break
-    if gene_names is None:
-        gene_names = [str(i) for i in range(modality.dims['n_features'])]
+    if feature_names is None:
+        feature_names = [str(i) for i in range(modality.dims['n_features'])]
 
     # Extract samples for each parameter
     # Trans params: posterior[param] is typically (S, n_cis, T) where n_cis=1
@@ -1263,9 +1309,9 @@ def plot_parameter_ci_panel(
 
     T = samples_dict[params[0]].shape[1]
 
-    # Ensure gene_names matches T
-    if len(gene_names) != T:
-        gene_names = gene_names[:T]
+    # Ensure feature_names matches T
+    if len(feature_names) != T:
+        feature_names = feature_names[:T]
 
     # Build per-param FDR inactive masks from fdr_df (if provided)
     _PARAM_TO_FDR_COL = {
@@ -1274,16 +1320,16 @@ def plot_parameter_ci_panel(
     }
     inactive_masks = {}  # {param: bool array of length T}
     if fdr_df is not None:
-        _gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+        _feature_to_idx = {f: i for i, f in enumerate(feature_names)}
         _name_col = next((c for c in ['gene_name', 'gene', 'feature'] if c in fdr_df.columns), None)
         for param in params:
             fdr_col = _PARAM_TO_FDR_COL.get(param)
             if fdr_col and fdr_col in fdr_df.columns and _name_col:
                 mask = np.zeros(T, dtype=bool)
                 for _, row in fdr_df.iterrows():
-                    gname = row[_name_col]
-                    if gname in _gene_to_idx and np.isfinite(row[fdr_col]):
-                        mask[_gene_to_idx[gname]] = row[fdr_col] >= fdr_threshold
+                    fname = row[_name_col]
+                    if fname in _feature_to_idx and np.isfinite(row[fdr_col]):
+                        mask[_feature_to_idx[fname]] = row[fdr_col] >= fdr_threshold
                 inactive_masks[param] = mask
 
     # Compute CI bounds
@@ -1298,95 +1344,95 @@ def plot_parameter_ci_panel(
             'hi': np.nanpercentile(samps, hi_q, axis=0),
         }
 
-    # Filter to dependent genes if requested
-    gene_mask = np.ones(T, dtype=bool)
+    # Filter to dependent features if requested
+    feature_mask = np.ones(T, dtype=bool)
     if filter_dependent:
         dep_params = dependency_params if dependency_params else params
         # Start with all False, then OR with each param's dependency
-        gene_mask = np.zeros(T, dtype=bool)
+        feature_mask = np.zeros(T, dtype=bool)
         for param in dep_params:
             if param in samples_dict:
                 samps = samples_dict[param]
                 lo = np.nanpercentile(samps, lo_q, axis=0)
                 hi = np.nanpercentile(samps, hi_q, axis=0)
                 param_dep = (lo > 0) | (hi < 0)
-                gene_mask = gene_mask | param_dep
+                feature_mask = feature_mask | param_dep
 
-        n_dep = gene_mask.sum()
-        print(f"{n_dep}/{T} genes pass dependency filter (CI excludes 0)")
+        n_dep = feature_mask.sum()
+        print(f"{n_dep}/{T} features pass dependency filter (CI excludes 0)")
 
-    # Get indices of genes to plot
-    gene_indices = np.where(gene_mask)[0]
+    # Get indices of features to plot
+    feature_indices = np.where(feature_mask)[0]
 
-    # Filter to user-specified genes if provided
-    if genes is not None:
-        # Map gene names to indices
-        name_to_idx = {name: i for i, name in enumerate(gene_names)}
+    # Filter to user-specified features if provided
+    if features is not None:
+        # Map feature names to indices
+        name_to_idx = {name: i for i, name in enumerate(feature_names)}
         user_indices = []
-        missing_genes = []
-        for g in genes:
-            if g in name_to_idx:
-                idx = name_to_idx[g]
-                if idx in gene_indices:  # Respect dependency filter
+        missing_features = []
+        for f in features:
+            if f in name_to_idx:
+                idx = name_to_idx[f]
+                if idx in feature_indices:  # Respect dependency filter
                     user_indices.append(idx)
             else:
-                missing_genes.append(g)
-        if missing_genes:
+                missing_features.append(f)
+        if missing_features:
             import warnings
-            warnings.warn(f"Genes not found in modality: {missing_genes[:5]}{'...' if len(missing_genes) > 5 else ''}")
-        gene_indices = np.array(user_indices)
+            warnings.warn(f"Features not found in modality: {missing_features[:5]}{'...' if len(missing_features) > 5 else ''}")
+        feature_indices = np.array(user_indices)
 
-    n_genes = len(gene_indices)
+    n_features = len(feature_indices)
 
-    if n_genes == 0:
-        print("No genes to plot after filtering.")
+    if n_features == 0:
+        print("No features to plot after filtering.")
         return None, None
 
-    # Check max_genes limit
-    if max_genes is not None and n_genes > max_genes:
+    # Check max_features limit
+    if max_features is not None and n_features > max_features:
         raise ValueError(
-            f"Too many genes to plot ({n_genes} > {max_genes}). Options:\n"
-            f"  1. Use filter_dependent=True to show only dependent genes\n"
-            f"  2. Use genes=['gene1', 'gene2', ...] to specify specific genes\n"
+            f"Too many features to plot ({n_features} > {max_features}). Options:\n"
+            f"  1. Use filter_dependent=True to show only dependent features\n"
+            f"  2. Use features=['feature1', 'feature2', ...] to specify specific features\n"
             f"  3. Use sort_by='effect' with filter_dependent=True for top effects\n"
-            f"  4. Set max_genes=None to disable this limit (not recommended)"
+            f"  4. Set max_features=None to disable this limit (not recommended)"
         )
-    elif n_genes > 100:
+    elif n_features > 100:
         import warnings
         warnings.warn(
-            f"Plotting {n_genes} genes. Consider using filter_dependent=True "
-            f"or genes=[...] to reduce the number of genes."
+            f"Plotting {n_features} features. Consider using filter_dependent=True "
+            f"or features=[...] to reduce the number of features."
         )
 
-    # Sort genes
+    # Sort features
     if sort_by == 'alphabetical':
-        # Get gene names for current indices, then sort alphabetically
-        names_for_sort = [gene_names[i] for i in gene_indices]
+        # Get feature names for current indices, then sort alphabetically
+        names_for_sort = [feature_names[i] for i in feature_indices]
         order = np.argsort(names_for_sort)
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
     elif sort_by == 'median':
-        sort_vals = stats[params[0]]['median'][gene_indices]
+        sort_vals = stats[params[0]]['median'][feature_indices]
         order = np.argsort(sort_vals)
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
     elif sort_by == 'abs_median':
-        sort_vals = np.abs(stats[params[0]]['median'][gene_indices])
+        sort_vals = np.abs(stats[params[0]]['median'][feature_indices])
         order = np.argsort(sort_vals)[::-1]  # Descending
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
     elif sort_by == 'effect':
         # Max absolute median across all params
-        max_effect = np.zeros(n_genes)
+        max_effect = np.zeros(n_features)
         for param in params:
-            max_effect = np.maximum(max_effect, np.abs(stats[param]['median'][gene_indices]))
+            max_effect = np.maximum(max_effect, np.abs(stats[param]['median'][feature_indices]))
         order = np.argsort(max_effect)[::-1]  # Descending
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
 
-    # Get sorted gene names
-    sorted_gene_names = [gene_names[i] for i in gene_indices]
+    # Get sorted feature names
+    sorted_feature_names = [feature_names[i] for i in feature_indices]
 
     # Create figure
     if ax is None:
         if figsize is None:
-            fig_w = min(max(0.5 * n_genes, 12), 28)
+            fig_w = min(max(0.5 * n_features, 12), 28)
             fig_h = 5.5
             figsize = (fig_w, fig_h)
         fig, ax = plt.subplots(figsize=figsize)
@@ -1399,10 +1445,10 @@ def plot_parameter_ci_panel(
         color_palette = dict(zip(params, colors))
 
     # Set up x positions with dodging
-    # Use smaller width to keep params for same gene close together
-    x_base = np.arange(n_genes)
+    # Use smaller width to keep params for same feature close together
+    x_base = np.arange(n_features)
     n_params = len(params)
-    width = 0.3  # Reduced from 0.7 to keep params closer within gene
+    width = 0.3  # Reduced from 0.7 to keep params closer within feature
     if n_params > 1:
         offsets = np.linspace(-width/2, width/2, n_params)
     else:
@@ -1428,9 +1474,9 @@ def plot_parameter_ci_panel(
             for j, param in enumerate(params):
                 violin_data = []
                 violin_positions = []
-                for k, gene_idx in enumerate(gene_indices):
+                for k, feature_idx in enumerate(feature_indices):
                     samps_prior = _sample_prior_for_param(
-                        param, int(gene_idx), prior_params, n_samples=400, rng=_rng)
+                        param, int(feature_idx), prior_params, n_samples=400, rng=_rng)
                     if samps_prior is not None and np.isfinite(samps_prior).any():
                         violin_data.append(samps_prior[np.isfinite(samps_prior)])
                         violin_positions.append(x_base[k] + offsets[j])
@@ -1454,19 +1500,19 @@ def plot_parameter_ci_panel(
 
     # Plot each parameter
     for j, param in enumerate(params):
-        medians = stats[param]['median'][gene_indices]
-        los = stats[param]['lo'][gene_indices]
-        his = stats[param]['hi'][gene_indices]
+        medians = stats[param]['median'][feature_indices]
+        los = stats[param]['lo'][feature_indices]
+        his = stats[param]['hi'][feature_indices]
 
         x = x_base + offsets[j]
         color = color_palette.get(param, 'blue')
 
         # Determine FDR inactive subset (greyed out)
         raw_inactive = inactive_masks.get(param)
-        inactive_plot = raw_inactive[gene_indices] if raw_inactive is not None else np.zeros(len(gene_indices), dtype=bool)
+        inactive_plot = raw_inactive[feature_indices] if raw_inactive is not None else np.zeros(len(feature_indices), dtype=bool)
         active_plot = ~inactive_plot
 
-        # Plot active genes with full color
+        # Plot active features with full color
         if active_plot.any():
             ax.scatter(x[active_plot], medians[active_plot], label=param,
                        s=marker_size, zorder=3, color=color)
@@ -1475,10 +1521,10 @@ def plot_parameter_ci_panel(
             ax.errorbar(x[active_plot], medians[active_plot], yerr=yerr_act,
                         fmt='none', elinewidth=1.5, capsize=capsize, color=color, zorder=2)
         else:
-            # No active genes — add phantom entry for legend
+            # No active features — add phantom entry for legend
             ax.scatter([], [], label=param, s=marker_size, color=color)
 
-        # Plot inactive genes: grey (default) or hidden (hide_inactive=True)
+        # Plot inactive features: grey (default) or hidden (hide_inactive=True)
         if inactive_plot.any() and not hide_inactive:
             ax.scatter(x[inactive_plot], medians[inactive_plot],
                        s=marker_size, zorder=3, color='lightgray', alpha=0.5)
@@ -1491,15 +1537,15 @@ def plot_parameter_ci_panel(
     # Styling
     if title is None:
         param_str = ', '.join(params)
-        title = f"{model.cis_gene} → trans genes: {param_str}"
+        title = f"{model.cis_gene} → trans features: {param_str}"
         if filter_dependent:
-            title += f" (n={n_genes} dependent)"
+            title += f" (n={n_features} dependent)"
 
     ax.set_title(title)
-    ax.set_xlabel("Trans gene")
+    ax.set_xlabel("Trans feature")
     ax.set_ylabel(ylabel)
     ax.set_xticks(x_base)
-    ax.set_xticklabels(sorted_gene_names, rotation=90, ha="center")
+    ax.set_xticklabels(sorted_feature_names, rotation=90, ha="center")
 
     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
     ax.xaxis.grid(False)
@@ -1507,13 +1553,13 @@ def plot_parameter_ci_panel(
     if show_zero_line:
         ax.axhline(0, color='black', linestyle=':', linewidth=1, alpha=0.7)
 
-    # Draw vertical separators between genes
-    if show_gene_separators and n_genes > 1:
-        for i in range(1, n_genes):
+    # Draw vertical separators between features
+    if show_feature_separators and n_features > 1:
+        for i in range(1, n_features):
             ax.axvline(i - 0.5, color='lightgray', linestyle='-', linewidth=0.5, alpha=0.7, zorder=1)
 
     # Tighten x-axis margins
-    ax.set_xlim(-0.5, n_genes - 0.5)
+    ax.set_xlim(-0.5, n_features - 0.5)
 
     if ymin is not None or ymax is not None:
         cur = ax.get_ylim()

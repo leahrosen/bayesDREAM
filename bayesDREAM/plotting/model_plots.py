@@ -863,9 +863,9 @@ class ModelPlottingMixin:
 
     def plot_parameter_ci_panel(self, params: list, **kwargs):
         """
-        Forest plot (dot + whisker CI) for posterior parameters across trans genes.
+        Forest plot (dot + whisker CI) for posterior parameters across trans features.
 
-        Creates a plot with genes on the x-axis and parameter values (median + CI) on
+        Creates a plot with features on the x-axis and parameter values (median + CI) on
         the y-axis. Multiple parameters are dodged side-by-side for comparison.
 
         Parameters
@@ -875,27 +875,28 @@ class ModelPlottingMixin:
             These must exist in posterior_samples_trans.
         modality_name : str, optional
             Modality name. If None, uses primary modality.
-        genes : list of str, optional
-            Specific genes to plot. If None, plots all genes (subject to max_genes).
-            Gene names must match feature names in the modality.
+        features : list of str, optional
+            Specific features to plot. If None, plots all features (subject to
+            max_features). Names must match feature names in the modality.
         ci_level : float
             Credible interval level (default: 95.0 for 95% CI)
         sort_by : str
-            How to sort genes on x-axis:
+            How to sort features on x-axis:
             - 'none': Keep original order
-            - 'alphabetical': Sort alphabetically by gene name
+            - 'alphabetical': Sort alphabetically by feature name
             - 'median': Sort by median of first parameter (ascending)
             - 'abs_median': Sort by absolute median of first parameter (descending)
             - 'effect': Sort by max absolute effect across all params (descending)
         filter_dependent : bool
-            If True, only show genes where CI excludes 0 for any param in
+            If True, only show features where CI excludes 0 for any param in
             dependency_params (default: False)
         dependency_params : list, optional
             Parameters to use for dependency filtering. If None, uses all params.
             Common: ['n_a', 'n_b'] for Hill coefficients.
-        max_genes : int
-            Maximum number of genes to plot (default: 100). If more genes would be
-            plotted, raises ValueError with suggestions. Set to None to disable limit.
+        max_features : int
+            Maximum number of features to plot (default: 100). If more features
+            would be plotted, raises ValueError with suggestions. Set to None to
+            disable limit.
         ymin, ymax : float, optional
             Y-axis limits. If None, auto-scaled.
         title : str, optional
@@ -903,7 +904,7 @@ class ModelPlottingMixin:
         ylabel : str
             Y-axis label (default: 'value')
         figsize : tuple, optional
-            Figure size. If None, auto-scaled based on number of genes.
+            Figure size. If None, auto-scaled based on number of features.
         color_palette : dict, optional
             Custom colors for parameters. Keys are param names, values are colors.
             If None, uses seaborn color palette.
@@ -913,9 +914,9 @@ class ModelPlottingMixin:
             Size of error bar caps (default: 3)
         show_zero_line : bool
             Whether to draw horizontal line at y=0 (default: True)
-        show_gene_separators : bool
-            Whether to draw vertical lines between genes (default: True).
-            Helps visually distinguish which parameters belong to which gene.
+        show_feature_separators : bool
+            Whether to draw vertical lines between features (default: True).
+            Helps visually distinguish which parameters belong to which feature.
         ax : matplotlib axes, optional
             Axes to plot on. If None, creates new figure.
         show : bool
@@ -956,10 +957,10 @@ class ModelPlottingMixin:
 
         Examples
         --------
-        >>> # Plot n_a and n_b for all genes
+        >>> # Plot n_a and n_b for all features
         >>> fig, ax = model.plot_parameter_ci_panel(['n_a', 'n_b'])
 
-        >>> # Plot only dependent genes, sorted by effect size
+        >>> # Plot only dependent features, sorted by effect size
         >>> fig, ax = model.plot_parameter_ci_panel(
         ...     ['n_a', 'n_b'],
         ...     filter_dependent=True,

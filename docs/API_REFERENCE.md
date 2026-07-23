@@ -1706,24 +1706,24 @@ Plot raw x-y data showing relationship between cis gene expression and feature v
 model.plot_parameter_ci_panel(
     params,
     modality_name=None,
-    genes=None,
+    features=None,
     ci_level=95.0,
     sort_by='none',
     filter_dependent=False,
-    max_genes=100
+    max_features=100
 )
 ```
 
-Forest plot (dot + whisker CI) for posterior parameters across trans genes.
+Forest plot (dot + whisker CI) for posterior parameters across trans features.
 
 **Parameters:**
 - `params` (list): Parameter names to plot (e.g., `['n_a', 'n_b']`)
 - `modality_name` (str, optional): Modality name
-- `genes` (list, optional): Specific genes to plot
+- `features` (list, optional): Specific features to plot
 - `ci_level` (float): Credible interval level. Default: 95.0
 - `sort_by` (str): How to sort: `'none'`, `'alphabetical'`, `'median'`, `'abs_median'`, `'effect'`
-- `filter_dependent` (bool): Only show genes where CI excludes 0. Default: False
-- `max_genes` (int): Maximum genes to plot. Default: 100
+- `filter_dependent` (bool): Only show features where CI excludes 0. Default: False
+- `max_features` (int): Maximum features to plot. Default: 100
 
 **Returns:** Tuple of (matplotlib Figure, matplotlib Axes)
 

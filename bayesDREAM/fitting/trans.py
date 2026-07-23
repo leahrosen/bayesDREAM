@@ -2103,6 +2103,67 @@ class TransFitter:
         #   negbinom/normal/studentt/binomial: posterior_samples_ntc['mu_ntc']  → [S, T]
         #   multinomial:                       posterior_samples_ntc['probs_baseline'] → [S, T, K]
         y_ntc_tensor = None
+
+        # --- Pooled-NTC fallback for y_ntc when mu_ntc / probs_baseline is NaN ---
+        # For binomial/normal/studentt/multinomial, "missing" NTC data does NOT imply
+        # "low" the way it does for negbinom counts (no reads ⇒ probably low expression
+        # is a defensible RNA-seq assumption; no read *coverage*, a NaN continuous score,
+        # or a category missing in one technical group says nothing about the true rate
+        # or value). So instead of borrowing an unrelated feature's low percentile
+        # (q01_ntc_global, kept below as negbinom's fallback), pool this feature's own
+        # NTC data across all technical groups (ignoring which group individually caused
+        # the fitting exclusion — see fitting/ntc.py's zero_std_mask/only_one_category_mask
+        # logic) and shrink toward the dataset's typical value with a single
+        # pseudo-observation. This reduces to the raw pooled estimate when the feature has
+        # plenty of its own NTC data, and to the dataset median only when it truly has none.
+        _ntc_mask_pool = None
+        if 'target' in meta_subset.columns:
+            _ntc_mask_pool = torch.tensor(
+                (meta_subset['target'].str.lower() == 'ntc').values,
+                dtype=torch.bool, device=self.model.device
+            )
+
+        # Binomial: (y_sum_ntc + median_pooled_proportion) / (denom_sum_ntc + 1.0)
+        # Normal/studentt: (y_sum_ntc + median_pooled_mean) / (n_valid_ntc + 1.0)
+        _y_ntc_pooled_fallback = None  # [T]
+        if _ntc_mask_pool is not None and _ntc_mask_pool.any():
+            if distribution == 'binomial':
+                _y_sum_ntc = y_obs_tensor[_ntc_mask_pool, :].sum(dim=0)            # [T]
+                _denom_sum_ntc = denominator_tensor[_ntc_mask_pool, :].sum(dim=0)  # [T]
+                _valid_pool = _denom_sum_ntc > 0
+                _median_pooled = (_y_sum_ntc[_valid_pool] / _denom_sum_ntc[_valid_pool]).median() \
+                    if _valid_pool.any() else self._t(0.5)
+                _y_ntc_pooled_fallback = (_y_sum_ntc + _median_pooled) / (_denom_sum_ntc + 1.0)  # [T]
+
+            elif distribution in ('normal', 'studentt'):
+                _y_ntc_cells = y_obs_tensor[_ntc_mask_pool, :]                    # [N_ntc, T]
+                _finite_mask = torch.isfinite(_y_ntc_cells)                       # [N_ntc, T]
+                _n_valid_ntc = _finite_mask.sum(dim=0).float()                    # [T]
+                _y_sum_ntc = torch.where(
+                    _finite_mask, _y_ntc_cells, torch.zeros_like(_y_ntc_cells)
+                ).sum(dim=0)                                                      # [T]
+                _valid_pool = _n_valid_ntc > 0
+                _median_pooled = (_y_sum_ntc[_valid_pool] / _n_valid_ntc[_valid_pool]).median() \
+                    if _valid_pool.any() else self._t(0.0)
+                _y_ntc_pooled_fallback = (_y_sum_ntc + _median_pooled) / (_n_valid_ntc + 1.0)  # [T]
+
+        # Multinomial: (cat_sum_ntc + median_pooled_probs) / (total_sum_ntc + 1.0), a
+        # Dirichlet-style pseudocount split according to the typical category-usage
+        # pattern across features rather than a single scalar median.
+        _y_ntc_multinomial_pooled_fallback = None  # [T, K]
+        if (distribution == 'multinomial' and _ntc_mask_pool is not None
+                and _ntc_mask_pool.any() and y_obs_tensor.ndim == 3):
+            _cat_sum_ntc = y_obs_tensor[_ntc_mask_pool, :, :].sum(dim=0)          # [T, K]
+            _total_ntc = _cat_sum_ntc.sum(dim=-1, keepdim=True)                  # [T, 1]
+            _valid_pool = (_total_ntc.squeeze(-1) > 0)
+            if _valid_pool.any():
+                _median_probs = (_cat_sum_ntc[_valid_pool] / _total_ntc[_valid_pool]).median(dim=0).values  # [K]
+                _median_probs = _median_probs / _median_probs.sum().clamp_min(1e-10)
+            else:
+                _K_dim = _cat_sum_ntc.shape[-1]
+                _median_probs = torch.ones(_K_dim, device=self.model.device) / _K_dim
+            _y_ntc_multinomial_pooled_fallback = (_cat_sum_ntc + _median_probs.unsqueeze(0)) / (_total_ntc + 1.0)  # [T, K]
+
         _post_tech = getattr(modality, 'posterior_samples_ntc', None)
         if _post_tech is not None:
             try:
@@ -2134,7 +2195,12 @@ class TransFitter:
                         _ntc_nan_mask = torch.isnan(y_ntc_tensor)
                         if _ntc_nan_mask.any():
                             n_ntc_nan = _ntc_nan_mask.sum().item()
-                            if q01_ntc_global is not None:
+                            if distribution in ('binomial', 'normal', 'studentt') and _y_ntc_pooled_fallback is not None:
+                                print(f"[INFO] {n_ntc_nan}/{T} {distribution} features have NaN mu_ntc; "
+                                      f"using pooled-NTC fallback (shrunk toward a dataset-median "
+                                      f"pseudo-observation) as y_ntc anchor")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, _y_ntc_pooled_fallback, y_ntc_tensor)
+                            elif q01_ntc_global is not None:
                                 print(f"[WARNING] {n_ntc_nan}/{T} genes have NaN mu_ntc (fit_ntc not run); "
                                       f"using q01_ntc_global={q01_ntc_global.item():.3e} as y_ntc anchor")
                                 y_ntc_tensor = torch.where(_ntc_nan_mask, q01_ntc_global.expand_as(y_ntc_tensor), y_ntc_tensor)
@@ -2156,7 +2222,12 @@ class TransFitter:
                         _ntc_nan_mask = torch.isnan(y_ntc_tensor)
                         if _ntc_nan_mask.any():
                             n_ntc_nan = _ntc_nan_mask.sum().item()
-                            if q01_ntc_global is not None:
+                            if distribution in ('binomial', 'normal', 'studentt') and _y_ntc_pooled_fallback is not None:
+                                print(f"[INFO] {n_ntc_nan}/{T} {distribution} features have NaN mu_ntc; "
+                                      f"using pooled-NTC fallback (shrunk toward a dataset-median "
+                                      f"pseudo-observation) as y_ntc anchor")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, _y_ntc_pooled_fallback, y_ntc_tensor)
+                            elif q01_ntc_global is not None:
                                 print(f"[WARNING] {n_ntc_nan}/{T} genes have NaN mu_ntc (fit_ntc not run); "
                                       f"using q01_ntc_global={q01_ntc_global.item():.3e} as y_ntc anchor")
                                 y_ntc_tensor = torch.where(_ntc_nan_mask, q01_ntc_global.expand_as(y_ntc_tensor), y_ntc_tensor)
@@ -2179,6 +2250,14 @@ class TransFitter:
                         _probs = torch.tensor(_probs, dtype=torch.float32, device=self.model.device)
                     else:
                         _probs = _probs.float().to(self.model.device)
+                    # Predictive can introduce extra singleton broadcast dims beyond the
+                    # expected [S, T, K] (e.g. from nested plates), such as [S, 1, 1, 1, T, K].
+                    # Squeeze out singleton dims between the leading sample dim and the
+                    # trailing [T, K] pair so the ndim checks below can match.
+                    if _probs.ndim > 3:
+                        _squeeze_dims = [d for d in range(1, _probs.ndim - 2) if _probs.shape[d] == 1]
+                        for d in reversed(_squeeze_dims):
+                            _probs = _probs.squeeze(d)
                     _probs_flat = None
                     if _probs.ndim == 3 and _probs.shape[1] == T:
                         _probs_flat = _probs.median(dim=0).values  # [T, K]
@@ -2196,13 +2275,25 @@ class TransFitter:
                         else:
                             _K_dim = _probs_flat.shape[1]
                             q01_ntc_global_probs = torch.ones(_K_dim, device=self.model.device) / _K_dim
-                        # NaN fill: features where fit_ntc not run get q01_ntc_global_probs as y_ntc anchor
+                        # NaN fill: features where fit_ntc excluded this feature (a category
+                        # missing in one technical group, etc.) get the pooled-NTC Dirichlet-
+                        # style fallback (this feature's own category counts pooled across all
+                        # NTC cells, shrunk toward the dataset's typical category-usage pattern)
+                        # rather than a cross-feature q01 percentile, which assumes unrelated
+                        # features' category structures are comparable.
                         _ntc_nan_mask = torch.isnan(_probs_flat).all(dim=-1)  # [T]
                         if _ntc_nan_mask.any():
                             n_ntc_nan = _ntc_nan_mask.sum().item()
-                            print(f"[WARNING] {n_ntc_nan}/{T} features have NaN probs_baseline (fit_ntc not run); "
-                                  f"using q01_ntc_global probability vector as y_ntc anchor")
-                            fill = q01_ntc_global_probs.unsqueeze(0).expand_as(_probs_flat)
+                            if (_y_ntc_multinomial_pooled_fallback is not None
+                                    and _y_ntc_multinomial_pooled_fallback.shape == _probs_flat.shape):
+                                print(f"[INFO] {n_ntc_nan}/{T} multinomial features have NaN probs_baseline; "
+                                      f"using pooled-NTC category-count fallback (Dirichlet-style, "
+                                      f"dataset-median pseudo-observation) as y_ntc anchor")
+                                fill = _y_ntc_multinomial_pooled_fallback
+                            else:
+                                print(f"[WARNING] {n_ntc_nan}/{T} features have NaN probs_baseline (fit_ntc not run); "
+                                      f"using q01_ntc_global probability vector as y_ntc anchor")
+                                fill = q01_ntc_global_probs.unsqueeze(0).expand_as(_probs_flat)
                             mask = _ntc_nan_mask.unsqueeze(-1).expand_as(_probs_flat)
                             _probs_flat = torch.where(mask, fill, _probs_flat)
                         y_ntc_tensor = _probs_flat  # [T, K]
@@ -2272,10 +2363,32 @@ class TransFitter:
                     while _sigma_ntc.ndim > 1:
                         _sigma_ntc = _sigma_ntc.median(dim=0).values
                 if _sigma_ntc.ndim == 1 and _sigma_ntc.shape[0] == T:
-                    _sigma_ntc = _sigma_ntc.clamp_min(self._t(1e-6))
+                    # NaN fill: features excluded from fit_ntc (same mask that leaves
+                    # mu_ntc NaN) also have NaN sigma_y here. Unlike y_ntc's location
+                    # anchor, a noise/dispersion scale is reasonably shared across
+                    # features (same logic as o_y_ntc_tensor's fallback above), so
+                    # median-of-other-features is well-justified — and required, since
+                    # dist.HalfNormal(2.0 * sigma_hat_tensor) needs every entry finite.
+                    _sigma_nan_mask = torch.isnan(_sigma_ntc)
+                    if _sigma_nan_mask.any():
+                        _finite_sigma = _sigma_ntc[~_sigma_nan_mask]
+                        n_sigma_nan = _sigma_nan_mask.sum().item()
+                        if _finite_sigma.numel() > 0:
+                            _median_sigma = _finite_sigma.median()
+                            print(f"[INFO] {n_sigma_nan}/{T} {distribution} features have NaN sigma_y "
+                                  f"(excluded from fit_ntc); using median sigma_y across other features "
+                                  f"({_median_sigma.item():.3f}) as HalfNormal scale")
+                            _sigma_ntc = torch.where(_sigma_nan_mask, _median_sigma.expand_as(_sigma_ntc), _sigma_ntc)
+                        else:
+                            print(f"[WARNING] All {T} {distribution} features have NaN sigma_y; "
+                                  f"falling back to HalfCauchy prior")
+                            _sigma_ntc = None
+                    if _sigma_ntc is not None:
+                        _sigma_ntc = _sigma_ntc.clamp_min(self._t(1e-6))
                     sigma_hat_tensor = _sigma_ntc
-                    print(f"[INFO] sigma_y NTC anchor: using pre-fit sigma_y as HalfNormal scale "
-                          f"(median={sigma_hat_tensor.median().item():.3f})")
+                    if sigma_hat_tensor is not None:
+                        print(f"[INFO] sigma_y NTC anchor: using pre-fit sigma_y as HalfNormal scale "
+                              f"(median={sigma_hat_tensor.median().item():.3f})")
                 else:
                     print(f"[WARNING] sigma_y from NTC posterior has unexpected shape "
                           f"{tuple(_sigma_ntc.shape)}; using fallback HalfCauchy prior")
@@ -2926,6 +3039,14 @@ class TransFitter:
             # Vmax prior (log-normal): Vmax_log_sigma is the same for all genes
             # because sigma/mean = 1/sqrt(Vmax_alpha) regardless of Vmax_mean.
             # Apply the same floor that _model_y uses (parameterized via vmax_log_sigma_floor).
+            #
+            # Binomial/multinomial use a different family (Beta, matches _model_y lines
+            # 789-816: Vmax_a/Vmax_b ~ Beta(Vmax_mean*conc, (1-Vmax_mean)*conc), conc=2.0,
+            # Vmax_mean clamped to [0.01, 0.99]). Multinomial's Vmax_mean_tensor is [T, K]
+            # (per-category), which doesn't reduce to the plotting panel's per-feature
+            # scalar violins, so it's left unset here (same limitation as the 'A' prior).
+            Vmax_beta_alpha_p = None
+            Vmax_beta_beta_p  = None
             if distribution not in ['binomial', 'multinomial']:
                 Vmax_alpha_val   = float(Vmax_alpha_tensor.item())
                 _Vmax_log_sigma_floor_p = float(vmax_log_sigma_floor_tensor.item())
@@ -2938,6 +3059,11 @@ class TransFitter:
             else:
                 Vmax_log_sigma_p = None
                 Vmax_log_mu_p    = None
+                if distribution == 'binomial':
+                    _Vmax_mean_clamped_p = Vmax_mean_tensor.clamp(min=0.01, max=0.99)
+                    _concentration_vmax_p = 2.0
+                    Vmax_beta_alpha_p = (_Vmax_mean_clamped_p * _concentration_vmax_p).cpu().numpy()        # [T]
+                    Vmax_beta_beta_p  = ((1.0 - _Vmax_mean_clamped_p) * _concentration_vmax_p).cpu().numpy()  # [T]
 
             # K prior (log-normal): median centred at x_ntc_mean or k_center fallback.
             # K_log_mu = log(centre) with no -0.5*sigma² correction, so the MEDIAN of
@@ -2962,22 +3088,30 @@ class TransFitter:
                 'nmax':             float(nmax.item()),
                 'n_mu_raw':         n_mu_raw_prior,
                 'sigma_n_prior_rate': 1.0,           # Exp(1) prior per gene → mean sigma = 1
-                # Vmax_a / Vmax_b (log-normal)
+                # Vmax_a / Vmax_b (log-normal for negbinom/normal/studentt)
                 'Vmax_log_mu':      Vmax_log_mu_p,   # [T] numpy array or None
                 'Vmax_log_sigma':   Vmax_log_sigma_p, # scalar or None
+                # Vmax_a / Vmax_b (Beta, for binomial; multinomial not yet supported here)
+                'Vmax_beta_alpha':  Vmax_beta_alpha_p,  # [T] numpy array or None
+                'Vmax_beta_beta':   Vmax_beta_beta_p,   # [T] numpy array or None
                 # K_a / K_b (log-normal)
                 'K_log_mu':         K_log_mu_p,      # scalar
                 'K_log_sigma':      K_log_sigma_p,   # scalar
-                # A prior (negbinom: log2-Normal; others: None)
+                # A prior (negbinom: log2-Normal; binomial: logit-Normal or Beta fallback; multinomial: None)
                 # A_log2_mu / A_log2_sigma: per-gene anchors in log2 space, matching _model_y.
                 # mu = lower anchor (log2(Amean/2), capped so sigma ≤ 4 octaves).
                 # sigma = log2(y_ntc) - lower_anchor, clamped to [1, 4] octaves.
                 # Without y_ntc: sigma = 4 (flat fallback), mu = log2(Amean/2).
                 'Amean':            (Amean_tensor.cpu().numpy()
-                                     if distribution not in ['binomial', 'multinomial']
-                                     else None),      # [T] or None (binomial/multinomial: not applicable)
+                                     if distribution != 'multinomial'
+                                     else None),      # [T] or None (multinomial: not applicable)
                 'A_log2_mu':        None,             # [T] or None — set below for negbinom
                 'A_log2_sigma':     None,             # [T] or None — set below for negbinom
+                'A_logit_mu':       None,             # [T] or None — set below for binomial (with y_ntc)
+                'A_logit_sigma':    None,             # [T] or None — set below for binomial (with y_ntc)
+                'A_beta_beta':      None,             # [T] or None — set below for binomial (no y_ntc; Beta(1, beta) fallback)
+                'A_mean':           None,             # [T] or None — set below for normal/studentt
+                'A_sigma':          None,             # [T] or None — set below for normal/studentt
                 # alpha / beta (RelaxedBernoulli)
                 'p_n_logits':       float(p_n_logits_tensor.item()),
                 'temperature_prior': 1.0,
@@ -3013,6 +3147,56 @@ class TransFitter:
                     _sigma_log2_A = np.full_like(_mu_log2_A, 4.0)
                 trans_prior_params['A_log2_mu']    = _mu_log2_A    # [T]
                 trans_prior_params['A_log2_sigma'] = _sigma_log2_A  # [T]
+
+            # Fill A_logit_mu / A_logit_sigma (or A_beta_beta fallback) for binomial
+            # (matches _model_y lines 609-635). _o_y_weight is fixed at 0.5 for binomial
+            # (no per-feature o_y noise parameter), matching the model.
+            elif distribution == 'binomial':
+                _Amean_np = Amean_tensor.cpu().numpy()
+                if y_ntc_tensor is not None:
+                    _y_ntc_np = y_ntc_tensor.cpu().numpy()
+                    if mean_y_corrected_tensor is not None:
+                        _mean_ycorr_np = mean_y_corrected_tensor.cpu().numpy()
+                        _effective_y_ntc_np = np.maximum(_y_ntc_np, _mean_ycorr_np)
+                    else:
+                        _effective_y_ntc_np = _y_ntc_np
+                    _clip_Amean_half = np.clip(0.5 * _Amean_np, 1e-6, 1.0 - 1e-6)
+                    _clip_y_ntc = np.clip(_effective_y_ntc_np, 1e-6, 1.0 - 1e-6)
+                    _logit_Amean_half = np.log(_clip_Amean_half / (1.0 - _clip_Amean_half))
+                    _logit_y_ntc = np.log(_clip_y_ntc / (1.0 - _clip_y_ntc))
+                    _logit_Amean_half = np.maximum(_logit_Amean_half, _logit_y_ntc - 4.0)
+                    _sigma_logit = np.maximum(_logit_y_ntc - _logit_Amean_half, 1.0)
+                    _mu_logit = 0.5 * _logit_Amean_half + 0.5 * _logit_y_ntc  # _o_y_weight = 0.5
+                    trans_prior_params['A_logit_mu']    = _mu_logit     # [T]
+                    trans_prior_params['A_logit_sigma'] = _sigma_logit  # [T]
+                else:
+                    _A_mean_shifted = np.maximum(0.5 * _Amean_np, 1e-12)
+                    trans_prior_params['A_beta_beta'] = (1.0 - _A_mean_shifted) / _A_mean_shifted  # [T]
+
+            # Fill A_mean / A_sigma for normal/studentt (matches _model_y lines 510-528).
+            # A lives in natural (possibly negative) value space, so the prior is a plain
+            # Normal rather than log/logit-transformed. _o_y_weight mirrors the model:
+            # NTC-estimated sigma_hat_tensor when available, else neutral 0.5.
+            elif distribution in ('normal', 'studentt'):
+                _Amean_np = Amean_tensor.cpu().numpy()
+                _Vmax_mean_np = Vmax_mean_tensor.cpu().numpy()
+                _delta_A_np = np.maximum(_Vmax_mean_np - _Amean_np, epsilon)
+                if sigma_hat_tensor is not None:
+                    _sigma_hat_np = sigma_hat_tensor.cpu().numpy()
+                    _sigma_ref = max(float(_sigma_hat_np.mean()), epsilon)
+                    _w = _sigma_hat_np / (_sigma_hat_np + _sigma_ref)
+                else:
+                    _w = np.full_like(_Amean_np, 0.5)
+                if y_ntc_tensor is not None:
+                    _y_ntc_np = y_ntc_tensor.cpu().numpy()
+                    _sigma_A = np.maximum(np.abs(_y_ntc_np - _Amean_np), _delta_A_np * 0.1)
+                    _mean_A  = (1.0 - _w) * _Amean_np + _w * _y_ntc_np
+                else:
+                    _sigma_A = _delta_A_np
+                    _shift_A = (1.0 - _w) * 0.55
+                    _mean_A  = _Amean_np - _shift_A * _delta_A_np
+                trans_prior_params['A_mean']  = _mean_A   # [T]
+                trans_prior_params['A_sigma'] = _sigma_A  # [T]
 
         # Store results
         # Store in modality
