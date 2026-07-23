@@ -5,11 +5,14 @@ This module defines the Modality class for storing and validating
 different types of molecular measurements (genes, transcripts, splicing, etc.)
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 import torch
 from typing import Literal, Optional, Union, Dict, Any
 from scipy import sparse
+
+from .utils import make_names_unique
 
 
 class Modality:
@@ -117,6 +120,22 @@ class Modality:
             self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
 
+        # Disambiguate duplicate feature names (e.g. Ensembl gene_name collisions
+        # from pseudogenes/readthrough transcripts). Name-based lookups throughout
+        # the codebase (feature_names.index(), pd.Series indexed by feature_names,
+        # get_feature_subset(), plotting by gene name, etc.) all assume uniqueness.
+        if self.feature_names is not None:
+            deduped = make_names_unique(self.feature_names)
+            if deduped != self.feature_names:
+                n_dup = sum(1 for a, b in zip(deduped, self.feature_names) if a != b)
+                warnings.warn(
+                    f"Modality '{name}' had {n_dup} duplicate feature name(s); "
+                    "disambiguated by appending -1, -2, ... to repeats (scanpy-style). "
+                    "Original identifiers are still available in feature_meta.",
+                    UserWarning
+                )
+            self.feature_names = deduped
+
         self.feature_meta = feature_meta.copy()
 
         # For multinomial: ensure the implicit Kth residual slot (position K_max-1) is
@@ -188,7 +207,6 @@ class Modality:
 
                 n_dropped = int((~keep).sum())
                 if n_dropped > 0:
-                    import warnings
                     n_le1_cat = int((n_cats <= 1).sum())
                     n_zero_var = n_dropped - n_le1_cat
                     warnings.warn(

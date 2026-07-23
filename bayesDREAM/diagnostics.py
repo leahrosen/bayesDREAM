@@ -757,7 +757,13 @@ class DiagnosticsMixin:
             only), ``"invalid_ntc_sd"`` (NTC SD is zero/non-finite),
             ``"too_few_cells_after_subsetting"`` (fewer than
             ``min_cells_per_group`` NTC or targeted cells remain *after*
-            windowing), or ``"fit_failed: <ExceptionType>: <message>"``.
+            windowing), ``"zero_variance_window"`` (negbinom/normal/studentt:
+            response is constant, e.g. all-zero counts, within the matched
+            window -- no shift is fittable), ``"zero_counts_in_window"`` /
+            ``"single_category_in_window"`` (multinomial: no counts, or only
+            one category observed, within the window), ``"zero_denom_in_window"``
+            (binomial: denominator is zero for every cell in the window), or
+            ``"fit_failed: <ExceptionType>: <message>"``.
 
         Raises
         ------
@@ -915,16 +921,32 @@ class DiagnosticsMixin:
                     })
                     continue
 
+                # --- Skip windows with no usable response signal (avoids ---
+                # --- GLM divergence, which is slow and warning-heavy) -----
+                degenerate_reason = self._shift_window_degenerate_reason(dt_win, distribution)
+                if degenerate_reason is not None:
+                    results.append({
+                        **row_base, "ok": False,
+                        "reason": degenerate_reason,
+                        "n_ntc": n_ntc, "n_targeted": n_tgt,
+                    })
+                    continue
+
                 # --- Fit GAM ---
                 try:
-                    out = self._run_shift_gam(
-                        dt=dt_win,
-                        distribution=distribution,
-                        t_val=t_val,
-                        nu_val=nu_val,
-                        df_spline=df_spline,
-                        degree=degree,
-                    )
+                    with warnings.catch_warnings():
+                        # statsmodels' IRLS internals emit RuntimeWarnings for
+                        # numerically marginal (but not fully degenerate) fits;
+                        # genuine failures still raise and are caught below.
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        out = self._run_shift_gam(
+                            dt=dt_win,
+                            distribution=distribution,
+                            t_val=t_val,
+                            nu_val=nu_val,
+                            df_spline=df_spline,
+                            degree=degree,
+                        )
                     results.append({
                         **row_base,
                         "ok": True,
@@ -1331,6 +1353,45 @@ class DiagnosticsMixin:
                 if (dt_sub["denom"] <= 0).all():
                     return "all_denominators_zero"
 
+        return None
+
+    def _shift_window_degenerate_reason(
+        self,
+        dt_win: pd.DataFrame,
+        distribution: str,
+    ) -> Optional[str]:
+        """
+        Return a skip reason if the matched x-window has no usable response
+        signal for a GAM fit (e.g. all-zero/constant counts), else None.
+
+        These are exactly the windows that make statsmodels' IRLS diverge
+        (mu -> 0 or inf), which is expensive and floods the console with
+        RuntimeWarnings without ever producing a usable fit -- cheaper to
+        catch them here before calling GLMGam at all.
+        """
+        if distribution == "multinomial":
+            y_cols = [c for c in dt_win.columns if c.startswith("y_") and c != "y_total"]
+            totals = dt_win[y_cols].to_numpy(dtype=float).sum(axis=0)
+            if totals.sum() == 0:
+                return "zero_counts_in_window"
+            if (totals > 0).sum() < 2:
+                return "single_category_in_window"
+            return None
+
+        if distribution == "binomial":
+            denom = dt_win["denom"].to_numpy(dtype=float)
+            if not np.any(denom > 0):
+                return "zero_denom_in_window"
+            ratio = dt_win["y"].to_numpy(dtype=float) / np.where(denom > 0, denom, np.nan)
+            ratio = ratio[np.isfinite(ratio)]
+            if ratio.size == 0 or np.ptp(ratio) == 0:
+                return "zero_variance_window"
+            return None
+
+        # negbinom / normal / studentt
+        y = dt_win["y"].to_numpy(dtype=float)
+        if np.ptp(y) == 0:
+            return "zero_variance_window"
         return None
 
     def _run_shift_gam(

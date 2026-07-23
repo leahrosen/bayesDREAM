@@ -36,6 +36,50 @@ def set_max_threads(cores: int):
 
 
 ########################################
+# Name Handling
+########################################
+
+def make_names_unique(names, join: str = "-"):
+    """
+    Disambiguate duplicate names, AnnData/scanpy style.
+
+    The first occurrence of a name is kept unchanged; each subsequent
+    occurrence gets ``{join}{n}`` appended (n = 1, 2, ...). Used to make
+    modality ``feature_names`` safe for name-based lookup (e.g. gene
+    symbols that are not unique in Ensembl annotation, such as some
+    pseudogenes/readthrough transcripts).
+
+    Parameters
+    ----------
+    names : list of str
+    join : str, default="-"
+        Separator between the original name and the disambiguating suffix.
+
+    Returns
+    -------
+    list of str
+        Same length and order as `names`, with all entries unique.
+    """
+    names = [str(n) for n in names]
+    existing = set(names)
+    seen_counts = {}
+    out = []
+    for name in names:
+        if name not in seen_counts:
+            seen_counts[name] = 0
+            out.append(name)
+        else:
+            seen_counts[name] += 1
+            candidate = f"{name}{join}{seen_counts[name]}"
+            while candidate in existing:
+                seen_counts[name] += 1
+                candidate = f"{name}{join}{seen_counts[name]}"
+            existing.add(candidate)
+            out.append(candidate)
+    return out
+
+
+########################################
 # Numerical Solvers
 ########################################
 
