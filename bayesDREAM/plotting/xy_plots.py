@@ -6006,6 +6006,8 @@ def plot_xy_data(
         facet_col_iter = facet_col_groups if facet_col_groups else [(None, None)]
         facet_row_iter = facet_row_groups if facet_row_groups else [(None, None)]
 
+        _axes_by_feat = {feat_i: [] for feat_i in range(n_features)}
+
         for feat_i, feat_name in enumerate(feature_names_resolved):
             # Pre-compute global NTC log2FC offsets for this feature (negbinom only).
             if log2fc and distribution == 'negbinom':
@@ -6030,6 +6032,7 @@ def plot_xy_data(
                         ax = axes[grid_row, grid_col]
                         _plot_one_grid(feat_name, ax, correction, combined_mask,
                                        ntc_x_offset=_ntc_x_off, ntc_y_offset=_ntc_y_off)
+                        _axes_by_feat[feat_i].append(ax)
                         # Strip the per-panel legend — one shared legend is drawn below
                         if ax.get_legend() is not None:
                             ax.get_legend().remove()
@@ -6045,26 +6048,35 @@ def plot_xy_data(
                             current_title = ax.get_title()
                             ax.set_title("  ".join(title_parts) + "\n" + current_title)
 
-        # ── Uniform axis limits across all panels ────────────────────────────
+        # ── Uniform axis limits across panels ────────────────────────────────
         # Each panel has already set its own limits via set_xlim / set_ylim.
-        # Now compute the union across all panels so every facet shares the
-        # same range (the maximum that covers all of them).
+        # The x-axis (cis gene expression) is shared across all panels so
+        # dose-response curves line up. The y-axis is only shared *within*
+        # a feature (across its facet-row/col/correction panels), not across
+        # different features — different features (e.g. different SJs) can
+        # have very different effect magnitudes, and forcing a common y-axis
+        # hides subtle effects in the smaller-magnitude ones.
         _all_xlims = []
-        _all_ylims = []
         for _ax in axes.ravel():
             # Skip axes that have no plotted lines (empty panels)
             if not _ax.lines and not _ax.collections:
                 continue
             _all_xlims.append(_ax.get_xlim())
-            _all_ylims.append(_ax.get_ylim())
         if _all_xlims:
             _shared_x = (min(lo for lo, hi in _all_xlims),
                          max(hi for lo, hi in _all_xlims))
-            _shared_y = (min(lo for lo, hi in _all_ylims),
-                         max(hi for lo, hi in _all_ylims))
             for _ax in axes.ravel():
                 _ax.set_xlim(_shared_x)
-                _ax.set_ylim(_shared_y)
+
+        for _feat_axes in _axes_by_feat.values():
+            _feat_ylims = [_ax.get_ylim() for _ax in _feat_axes
+                           if _ax.lines or _ax.collections]
+            if not _feat_ylims:
+                continue
+            _feat_shared_y = (min(lo for lo, hi in _feat_ylims),
+                               max(hi for lo, hi in _feat_ylims))
+            for _ax in _feat_axes:
+                _ax.set_ylim(_feat_shared_y)
 
         # Overall suptitle for multi-feature plots
         if is_gene and len(feature_indices) > 1:
