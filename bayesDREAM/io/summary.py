@@ -1464,6 +1464,18 @@ class ModelSummarizer:
                      because alpha/beta absorbed a constant offset while n_a/n_b ≈ 0
                      (flat Hill, unidentified K) — see FIT_TRANS_DESIGN_DECISIONS.md §12.
                      NaN for polynomial (no sparsity indicator to threshold).
+        - fit_type:  Per-feature functional form actually supported by the data, using
+                     the same per-component (fdr < fdr_threshold) AND (n's 95% CI
+                     excludes 0) criterion as is_dependent:
+                     - 'additive_hill': both component A and component B are active
+                     - 'single_hill':   exactly one of component A / component B is active
+                     - 'not_dependent': neither component is active
+                     NaN for polynomial (no Hill components to test).
+        - which_active: Which component(s) are active, using the same criterion as
+                     fit_type: 'a', 'b', 'both', or NaN if neither is active (or
+                     polynomial). Mainly informative when fit_type == 'single_hill',
+                     to distinguish which of the two Hill components (A vs B) is the
+                     one supported by the data.
 
         For additive_hill (all parameters needed to recreate: y = A + alpha*Vmax_a*Hill(x;K_a,n_a) + beta*Vmax_b*Hill(x;K_b,n_b)):
         - A_median, A_lower, A_upper: Baseline (intercept)
@@ -1861,6 +1873,41 @@ class ModelSummarizer:
             active_a = (fdr_alpha_arr < fdr_threshold) & n_a_excludes_zero
             active_b = (fdr_beta_arr < fdr_threshold) & n_b_excludes_zero
             data['is_dependent'] = active_a | active_b
+
+        # fit_type: per-feature functional form actually supported by the data, based
+        # on the same (fdr < threshold) AND (n CI excludes 0) criterion used for
+        # is_dependent, applied per-component:
+        #   - 'additive_hill': both component A and component B are active
+        #   - 'single_hill':   exactly one of component A / component B is active
+        #   - 'not_dependent': neither component is active
+        # NaN for polynomial (no Hill components to test).
+        if function_type == 'polynomial':
+            data['fit_type'] = np.full(n_features, np.nan, dtype=object)
+            data['which_active'] = np.full(n_features, np.nan, dtype=object)
+        else:
+            fit_type = np.full(n_features, 'not_dependent', dtype=object)
+            fit_type[active_a & active_b] = 'additive_hill'
+            fit_type[active_a ^ active_b] = 'single_hill'
+            data['fit_type'] = fit_type
+
+            # which_active: which component(s) drove fit_type — 'a', 'b', 'both', or
+            # NaN when neither is active. Kept separate from fit_type so fit_type
+            # stays a plain equality-filterable field.
+            which_active = np.full(n_features, np.nan, dtype=object)
+            which_active[active_a & ~active_b] = 'a'
+            which_active[active_b & ~active_a] = 'b'
+            which_active[active_a & active_b] = 'both'
+            data['which_active'] = which_active
+
+            if verbose:
+                n_add = int(np.sum(fit_type == 'additive_hill'))
+                n_single = int(np.sum(fit_type == 'single_hill'))
+                n_flat = int(np.sum(fit_type == 'not_dependent'))
+                n_single_a = int(np.sum(which_active == 'a'))
+                n_single_b = int(np.sum(which_active == 'b'))
+                print(f"  fit_type: additive_hill={n_add}  single_hill={n_single}  "
+                      f"not_dependent={n_flat}  (fdr_threshold={fdr_threshold})")
+                print(f"  which_active (of single_hill): a={n_single_a}  b={n_single_b}")
 
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
         # Also add o_y directly.
