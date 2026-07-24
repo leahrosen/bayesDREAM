@@ -366,7 +366,7 @@ class ModelLoader:
             # Load alpha_x_prefit
             alpha_x_path = os.path.join(input_dir, 'alpha_x_prefit.pt')
             if os.path.exists(alpha_x_path):
-                alpha_x = _torch_load(alpha_x_path)
+                alpha_x = _torch_load(alpha_x_path, map_location=self.model.device)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_x, torch.Tensor) and alpha_x.ndim >= 2 and alpha_x.shape[0] > 1:
                     alpha_x = alpha_x.mean(dim=0)
@@ -379,7 +379,7 @@ class ModelLoader:
             # Load alpha_y_prefit (legacy model-level file → primary modality)
             alpha_y_path = os.path.join(input_dir, 'alpha_y_prefit.pt')
             if os.path.exists(alpha_y_path):
-                alpha_y = _torch_load(alpha_y_path)
+                alpha_y = _torch_load(alpha_y_path, map_location=self.model.device)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_y, torch.Tensor) and alpha_y.ndim >= 3:
                     alpha_y = alpha_y.mean(dim=0)
@@ -411,7 +411,7 @@ class ModelLoader:
                 if os.path.exists(legacy_path):
                     posterior_path = legacy_path
             if os.path.exists(posterior_path):
-                loaded_data = _torch_load(posterior_path)
+                loaded_data = _torch_load(posterior_path, map_location=self.model.device)
                 n_features = None
 
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
@@ -499,7 +499,7 @@ class ModelLoader:
             # ── alpha_y_prefit standalone file (align using names from posterior file) ──
             mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
             if os.path.exists(mod_path):
-                alpha_y_to_set = _torch_load(mod_path)
+                alpha_y_to_set = _torch_load(mod_path, map_location=self.model.device)
                 if isinstance(alpha_y_to_set, torch.Tensor):
                     collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
                     if alpha_y_to_set.ndim >= collapse_threshold:
@@ -601,7 +601,7 @@ class ModelLoader:
 
         posterior_path = os.path.join(input_dir, 'posterior_samples_cis.pt')
         if os.path.exists(posterior_path):
-            loaded_data = _torch_load(posterior_path)
+            loaded_data = _torch_load(posterior_path, map_location=self.model.device)
 
             if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                 posterior_raw = loaded_data['posterior_samples']
@@ -672,7 +672,7 @@ class ModelLoader:
         # Note: if subset_cells=True was applied above, current_cell_names is already reduced
         x_true_path = os.path.join(input_dir, 'x_true.pt')
         if os.path.exists(x_true_path):
-            x_true = _torch_load(x_true_path)
+            x_true = _torch_load(x_true_path, map_location=self.model.device)
             if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
                 x_true = x_true.mean(dim=0)
             if (current_cell_names is not None and saved_cell_names is not None
@@ -695,7 +695,7 @@ class ModelLoader:
         # Load log2_x_true (standalone file — align by cell if names available)
         log2_x_true_path = os.path.join(input_dir, 'log2_x_true.pt')
         if os.path.exists(log2_x_true_path):
-            log2_x_true = _torch_load(log2_x_true_path)
+            log2_x_true = _torch_load(log2_x_true_path, map_location=self.model.device)
             if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
                 log2_x_true = log2_x_true.mean(dim=0)
             if (current_cell_names is not None and saved_cell_names is not None
@@ -886,7 +886,7 @@ class ModelLoader:
                 posterior_path = os.path.join(input_dir, 'posterior_samples_trans.pt')
 
             if os.path.exists(posterior_path):
-                loaded_data = _torch_load(posterior_path)
+                loaded_data = _torch_load(posterior_path, map_location=self.model.device)
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                     posterior_dict, n_features, _, extra = _load_trans_posterior(
                         loaded_data, f"trans {self.model.primary_modality}")
@@ -910,7 +910,7 @@ class ModelLoader:
         for mod_name in modalities_to_load:
             mod_path = os.path.join(input_dir, f'posterior_samples_trans_{mod_name}.pt')
             if os.path.exists(mod_path):
-                loaded_data = _torch_load(mod_path)
+                loaded_data = _torch_load(mod_path, map_location=self.model.device)
                 mod_loaded = []
                 n_features = None
 
