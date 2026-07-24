@@ -73,6 +73,7 @@ from .diagnostics import (
     plot_sum_factor_comparison,
     plot_systematic_shift_volcano,
     plot_shift_est_group_correlation,
+    plot_cross_dataset_correlation,
     plot_systematic_shift_hits_xy,
 )
 
@@ -124,6 +125,7 @@ __all__ = [
     'plot_sum_factor_comparison',
     'plot_systematic_shift_volcano',
     'plot_shift_est_group_correlation',
+    'plot_cross_dataset_correlation',
     'plot_systematic_shift_hits_xy',
     'restyle_targeting_lines',
 ]

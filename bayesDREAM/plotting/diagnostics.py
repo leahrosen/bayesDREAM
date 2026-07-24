@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+import matplotlib.lines as mlines
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from scipy.stats import pearsonr, spearmanr
 
@@ -497,6 +498,9 @@ def plot_systematic_shift_volcano(
     label_col="feature",
     fdr_threshold=0.1,
     top_n=20,
+    highlight_features=None,
+    highlight_color="tab:blue",
+    highlight_label_all=False,
     sig_color="firebrick",
     nonsig_color="#999999",
     label_fontsize=7,
@@ -535,8 +539,26 @@ def plot_systematic_shift_volcano(
     fdr_threshold : float, default 0.1
         Significance cutoff; also drawn as a horizontal dashed line.
     top_n : int, default 20
-        Number of most-significant (lowest ``p_col``) features to label,
-        per panel, among rows below ``fdr_threshold``.
+        Number of most-significant (lowest ``p_col``) features to label per
+        panel. Without ``highlight_features``, this is the top_n among rows
+        below ``fdr_threshold``. With ``highlight_features``, this is instead
+        the top_n most significant *of the highlighted matches* (regardless
+        of ``fdr_threshold``) -- e.g. ``top_n=5`` labels only the 5 most
+        significant heat shock proteins. Ignored if ``highlight_label_all=True``.
+    highlight_features : list of str, optional
+        Feature names (matched against ``label_col``) to highlight, e.g. a
+        curated gene set such as heat shock proteins. When given, every
+        matching row in each panel is drawn with an open ``highlight_color``
+        ring (regardless of significance, so you can see the whole set), and
+        the ``top_n`` most significant of them are text-labeled (see
+        ``top_n`` and ``highlight_label_all``).
+    highlight_color : str, default ``'tab:blue'``
+        Ring color used to mark ``highlight_features`` points.
+    highlight_label_all : bool, default ``False``
+        If True, text-label every ``highlight_features`` match instead of
+        just the ``top_n`` most significant. Only meaningful when
+        ``highlight_features`` is given -- expect heavy overlap if the set
+        is large and clustered.
     sig_color, nonsig_color : str
         Colors for significant / non-significant points.
     label_fontsize : int, default 7
@@ -607,14 +629,30 @@ def plot_systematic_shift_volcano(
             label=f"{_P_COL_LABELS.get(p_col, p_col)} < {fdr_threshold}", zorder=3,
         )
 
-        top_hits = sig.nsmallest(top_n, p_col)
+        if highlight_features is not None:
+            highlighted = sub[sub[label_col].isin(set(highlight_features))]
+            if not highlighted.empty:
+                ax.scatter(
+                    highlighted[effect_col], highlighted["_neg_log10_p"],
+                    s=50, facecolors="none", edgecolors=highlight_color,
+                    linewidths=1.5, zorder=5, label="Highlighted",
+                )
+            # By default, only text-label the top_n most significant (lowest
+            # p_col) of the highlighted matches -- labeling all of them
+            # (often dozens clustered near p_adj~1) produces an unreadable
+            # pile of overlapping text. Set highlight_label_all=True to
+            # label every match regardless of significance.
+            to_label = highlighted if highlight_label_all else highlighted.nsmallest(top_n, p_col)
+        else:
+            to_label = sig.nsmallest(top_n, p_col)
+
         texts = []
         orig_xy = []
         x_span = sub[effect_col].max() - sub[effect_col].min()
         y_span = sub["_neg_log10_p"].max() - sub["_neg_log10_p"].min()
         dx0 = 0.01 * x_span if x_span > 0 else 0.01
         dy0 = 0.02 * y_span if y_span > 0 else 0.02
-        for _, row in top_hits.iterrows():
+        for _, row in to_label.iterrows():
             x, y = row[effect_col], row["_neg_log10_p"]
             txt = ax.text(
                 x + dx0, y + dy0, str(row[label_col]),
@@ -715,10 +753,13 @@ def plot_shift_est_group_correlation(
     ------
     ValueError
         If ``groups`` is None and ``group_col`` doesn't have exactly 2
-        unique values among ``ok == True`` rows; if the inner join on
-        ``label_col`` between the two groups produces no shared, valid
-        features; or if ``highlight`` isn't one of ``'either'``, ``'both'``,
-        ``'none'``.
+        unique values among ``ok == True`` rows -- if this is because one or
+        more groups have zero usable rows (e.g. every feature was skipped
+        for ``too_few_cells_after_subsetting``), the error message includes
+        a breakdown of skip reasons for the empty group(s); if the inner
+        join on ``label_col`` between the two groups produces no shared,
+        valid features; or if ``highlight`` isn't one of ``'either'``,
+        ``'both'``, ``'none'``.
 
     Notes
     -----
@@ -736,6 +777,26 @@ def plot_shift_est_group_correlation(
 
     if groups is None:
         if len(unique_groups) != 2:
+            all_groups = sorted(res[group_col].unique())
+            empty_groups = sorted(set(all_groups) - set(unique_groups))
+            if empty_groups:
+                lines = [
+                    f"Group(s) {empty_groups} have zero rows with ok=True in `res` -- "
+                    f"nothing to correlate for {'it' if len(empty_groups) == 1 else 'them'}. "
+                    f"Groups with usable rows: {unique_groups}."
+                ]
+                for g in empty_groups:
+                    reason_counts = res.loc[res[group_col] == g, "reason"].value_counts()
+                    if not reason_counts.empty:
+                        lines.append(f"  Skip reasons for group {g!r}:")
+                        lines.extend(f"    {r}: {c}" for r, c in reason_counts.items())
+                lines.append(
+                    "This usually means min_cells_per_group (in check_systematic_shift()) "
+                    "was too high for this group's cell counts after x_true-window matching. "
+                    "Consider lowering min_cells_per_group and re-running, or pass "
+                    f"groups={tuple(unique_groups)} explicitly if you only meant to plot those."
+                )
+                raise ValueError("\n".join(lines))
             raise ValueError(
                 f"Expected exactly 2 groups, found {unique_groups}. "
                 "Pass groups=(a, b) explicitly."
@@ -827,6 +888,321 @@ def plot_shift_est_group_correlation(
     ax.legend(fontsize=7, frameon=False, markerscale=1.5, loc="lower right")
 
     plt.tight_layout()
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_cross_dataset_correlation(
+    res_a,
+    res_b,
+    value_col="shift_est",
+    group_col_a=None,
+    group_col_b=None,
+    label_col="feature",
+    p_col="p_adj",
+    transform=None,
+    fdr_threshold=0.1,
+    highlight="either",
+    top_n=0,
+    dataset_names=("Dataset A", "Dataset B"),
+    sig_color="firebrick",
+    sig_color_a="tab:blue",
+    sig_color_b="tab:orange",
+    nonsig_color="#999999",
+    label_fontsize=7,
+    figsize=None,
+    show=True,
+):
+    """
+    Grid of scatter plots correlating ``value_col`` between two independently
+    produced ``check_systematic_shift()`` result tables (e.g. from different
+    datasets/experiments), matched by feature.
+
+    Columns = technical groups in ``res_a``; rows = technical groups in
+    ``res_b`` -- i.e. every (group_a, group_b) combination gets its own
+    panel (a full cross-tabulation, not a 1:1 group match, since group codes
+    from two independently fit models aren't assumed to correspond). Each
+    panel inner-joins ``res_a`` and ``res_b`` on ``label_col`` for that pair
+    of groups and scatters ``res_a[value_col]`` (x) against
+    ``res_b[value_col]`` (y).
+
+    Call this once with ``value_col='shift_est'`` and once with
+    ``value_col='p_adj'`` (or ``'shift_p_adj'``) to get the shift-estimate
+    and p-value correlation grids.
+
+    Parameters
+    ----------
+    res_a, res_b : pd.DataFrame
+        Two ``check_systematic_shift()`` outputs to compare. Must share at
+        least some ``label_col`` values within a given (group_a, group_b)
+        pair for that panel to be non-empty.
+    value_col : str, default ``'shift_est'``
+        Column to correlate. Known p-value columns (``'p_adj'``,
+        ``'shift_p_adj'``, ``'pval'``, ``'p_lrt'``, ``'shift_p'``) are
+        ``-log10``-transformed automatically unless ``transform`` overrides
+        this.
+    group_col_a, group_col_b : str, optional
+        Grouping column in ``res_a`` / ``res_b`` respectively. Auto-detected
+        independently for each dataframe (same logic as
+        ``plot_systematic_shift_volcano``), so they need not share a name.
+    label_col : str, default ``'feature'``
+        Column used to match rows across the two dataframes within a panel.
+    p_col : str, default ``'p_adj'``
+        Column name (assumed shared by both dataframes) used for
+        significance highlighting, regardless of what ``value_col`` is.
+    transform : {None, '-log10'}, optional
+        Force the axis transform. If None (default), auto-detected from
+        ``value_col`` (see above).
+    fdr_threshold : float, default 0.1
+        Significance cutoff applied to ``p_col`` in both dataframes.
+    highlight : {'either', 'both', 'none'}, default ``'either'``
+        - ``'either'``: color points significant in dataset A only, dataset B
+          only, and both, each with a distinct color (``sig_color_a``,
+          ``sig_color_b``, ``sig_color``) -- so you can see whether hits
+          replicate or are dataset-specific.
+        - ``'both'``: single-color highlight (``sig_color``) for points
+          significant in both datasets; everything else grey.
+        - ``'none'``: no significance-based coloring.
+    top_n : int, default 0
+        Label the top N highlighted points per panel (any of the
+        significant categories under ``highlight='either'``) by ``min(p_col)``
+        across the two datasets. 0 = no labels.
+    dataset_names : tuple of 2 str, default ``('Dataset A', 'Dataset B')``
+        Names used in the shared x/y axis labels and in the "significant in
+        <name> only" legend entries.
+    sig_color : str, default ``'firebrick'``
+        Color for points significant in both datasets.
+    sig_color_a, sig_color_b : str
+        Colors for points significant in dataset A only / dataset B only
+        (only used when ``highlight='either'``).
+    nonsig_color : str
+        Color for non-significant (or, if ``highlight='none'``, all) points.
+    label_fontsize : int, default 7
+    figsize : tuple, optional
+        Defaults to ``(4 * n_groups_a, 4 * n_groups_b)``.
+    show : bool, default True
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    Raises
+    ------
+    ValueError
+        If ``highlight`` isn't one of ``'either'``, ``'both'``, ``'none'``;
+        or if either dataframe has zero groups with usable (``ok == True``,
+        finite ``value_col``/``p_col``) rows.
+
+    Notes
+    -----
+    Panels with no shared features between the two datasets for that
+    (group_a, group_b) pair are left blank with an annotation rather than
+    raising -- expected when the two group grids don't align 1:1.
+
+    Each panel draws a dashed reference crosshair (both axes) at the null
+    value for whatever's plotted: 0 for effect-size columns (gray dotted),
+    or the FDR threshold on the -log10 scale for p-value columns
+    (``sig_color`` dashed, matching ``plot_systematic_shift_volcano``'s
+    threshold line).
+
+    Examples
+    --------
+    >>> fig_shift = plot_cross_dataset_correlation(
+    ...     res, res_Domingo, value_col='shift_est',
+    ...     dataset_names=('This run', 'Domingo'))
+    >>> fig_p = plot_cross_dataset_correlation(
+    ...     res, res_Domingo, value_col='p_adj',
+    ...     dataset_names=('This run', 'Domingo'))
+    """
+    if highlight not in ("either", "both", "none"):
+        raise ValueError("highlight must be 'either', 'both', or 'none'.")
+
+    group_col_a = _detect_group_col(res_a, group_col_a)
+    group_col_b = _detect_group_col(res_b, group_col_b)
+
+    p_known = {"p_adj", "shift_p_adj", "pval", "p_lrt", "shift_p"}
+    do_log = (value_col in p_known) if transform is None else (transform == "-log10")
+
+    ok_a = res_a[res_a["ok"] & np.isfinite(res_a[value_col]) & np.isfinite(res_a[p_col])]
+    ok_b = res_b[res_b["ok"] & np.isfinite(res_b[value_col]) & np.isfinite(res_b[p_col])]
+
+    groups_a = sorted(ok_a[group_col_a].unique())
+    groups_b = sorted(ok_b[group_col_b].unique())
+    if not groups_a or not groups_b:
+        raise ValueError(
+            f"No usable rows (ok=True, finite {value_col}/{p_col}) in "
+            f"{'res_a' if not groups_a else 'res_b'}."
+        )
+
+    n_cols, n_rows = len(groups_a), len(groups_b)
+    if figsize is None:
+        figsize = (4 * n_cols, 4 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+
+    axis_label = f"$-\\log_{{10}}$({value_col})" if do_log else value_col
+    tiny = np.finfo(float).tiny
+
+    # Build legend proxies up front (rather than harvesting handles from
+    # whichever panel happens to be plotted first) so the legend always
+    # shows every category ``highlight`` can produce, even if some category
+    # is empty in every panel.
+    def _dot(color, alpha, label):
+        return mlines.Line2D([], [], marker="o", linestyle="None",
+                              color=color, alpha=alpha, markersize=6, label=label)
+    if highlight == "none":
+        legend_elements = [_dot(nonsig_color, 0.4, "Data")]
+    elif highlight == "both":
+        legend_elements = [
+            _dot(nonsig_color, 0.4, "Not significant"),
+            _dot(sig_color, 0.9, f"{_P_COL_LABELS.get(p_col, p_col)} < {fdr_threshold} (both)"),
+        ]
+    else:  # either
+        legend_elements = [
+            _dot(nonsig_color, 0.4, "Not significant"),
+            _dot(sig_color_a, 0.8, f"Significant in {dataset_names[0]} only"),
+            _dot(sig_color_b, 0.8, f"Significant in {dataset_names[1]} only"),
+            _dot(sig_color, 0.9, "Significant in both"),
+        ]
+
+    # Avoid selecting the same column twice (e.g. value_col == p_col == 'p_adj'
+    # for the p-value correlation call) -- that would duplicate the column
+    # name within a single dataframe, before merge suffixing even applies.
+    cols = [label_col, value_col] + ([p_col] if p_col != value_col else [])
+
+    for i, gb in enumerate(groups_b):
+        db_full = ok_b[ok_b[group_col_b] == gb][cols]
+        for j, ga in enumerate(groups_a):
+            ax = axes[i, j]
+            da_full = ok_a[ok_a[group_col_a] == ga][cols]
+            merged = pd.merge(da_full, db_full, on=label_col, suffixes=("_a", "_b"))
+
+            if merged.empty:
+                ax.text(
+                    0.5, 0.5, "no shared\nfeatures", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8, color="gray",
+                )
+                ax.set_xticks([])
+                ax.set_yticks([])
+            else:
+                if p_col == value_col:
+                    # Both columns are the same underlying values (merge only
+                    # suffixed them once) -- no separate "_a"/"_b" p_col pair.
+                    x_raw = merged[f"{value_col}_a"].to_numpy()
+                    y_raw = merged[f"{value_col}_b"].to_numpy()
+                    pa, pb = x_raw, y_raw
+                else:
+                    x_raw = merged[f"{value_col}_a"].to_numpy()
+                    y_raw = merged[f"{value_col}_b"].to_numpy()
+                    pa = merged[f"{p_col}_a"].to_numpy()
+                    pb = merged[f"{p_col}_b"].to_numpy()
+                if do_log:
+                    x = -np.log10(np.clip(x_raw, tiny, None))
+                    y = -np.log10(np.clip(y_raw, tiny, None))
+                else:
+                    x, y = x_raw, y_raw
+
+                sig_a = pa < fdr_threshold
+                sig_b = pb < fdr_threshold
+
+                if highlight == "either":
+                    cat_both = sig_a & sig_b
+                    cat_a_only = sig_a & ~sig_b
+                    cat_b_only = ~sig_a & sig_b
+                elif highlight == "both":
+                    cat_both = sig_a & sig_b
+                    cat_a_only = np.zeros(len(merged), dtype=bool)
+                    cat_b_only = np.zeros(len(merged), dtype=bool)
+                else:
+                    cat_both = np.zeros(len(merged), dtype=bool)
+                    cat_a_only = np.zeros(len(merged), dtype=bool)
+                    cat_b_only = np.zeros(len(merged), dtype=bool)
+                sig_mask = cat_both | cat_a_only | cat_b_only
+                cat_none = ~sig_mask
+
+                # Reference line: null effect (0) for effect-size columns,
+                # or the FDR threshold (on the -log10 scale) for p-value columns.
+                if do_log:
+                    ref = -np.log10(fdr_threshold)
+                    ref_color, ref_style = sig_color, "--"
+                else:
+                    ref = 0.0
+                    ref_color, ref_style = "gray", ":"
+                ax.axhline(ref, linestyle=ref_style, color=ref_color, linewidth=1, zorder=1)
+                ax.axvline(ref, linestyle=ref_style, color=ref_color, linewidth=1, zorder=1)
+
+                ax.scatter(x[cat_none], y[cat_none], s=10, alpha=0.4,
+                           color=nonsig_color, zorder=2)
+                if cat_a_only.any():
+                    ax.scatter(x[cat_a_only], y[cat_a_only], s=14, alpha=0.8,
+                               color=sig_color_a, zorder=3)
+                if cat_b_only.any():
+                    ax.scatter(x[cat_b_only], y[cat_b_only], s=14, alpha=0.8,
+                               color=sig_color_b, zorder=3)
+                if cat_both.any():
+                    ax.scatter(x[cat_both], y[cat_both], s=16, alpha=0.9,
+                               color=sig_color, zorder=4)
+
+                if len(x) > 1 and np.std(x) > 0 and np.std(y) > 0:
+                    r, _ = pearsonr(x, y)
+                    rho, _ = spearmanr(x, y)
+                    stats_txt = f"r={r:.2f}\nρ={rho:.2f}\nn={len(merged):,}"
+                else:
+                    stats_txt = f"n={len(merged):,}"
+                ax.text(0.03, 0.97, stats_txt, transform=ax.transAxes,
+                        va="top", ha="left", fontsize=7)
+
+                if top_n > 0 and sig_mask.any():
+                    min_p = np.minimum(pa, pb)
+                    sig_idx = np.flatnonzero(sig_mask)
+                    top_idx = sig_idx[np.argsort(min_p[sig_idx])][:top_n]
+                    texts, orig_xy = [], []
+                    x_span = x.max() - x.min()
+                    y_span = y.max() - y.min()
+                    dx0 = 0.01 * x_span if x_span > 0 else 0.01
+                    dy0 = 0.02 * y_span if y_span > 0 else 0.02
+                    for k in top_idx:
+                        xi, yi = x[k], y[k]
+                        txt = ax.text(
+                            xi + dx0, yi + dy0, str(merged[label_col].iloc[k]),
+                            fontsize=label_fontsize, zorder=4,
+                        )
+                        txt.set_path_effects(
+                            [pe.Stroke(linewidth=2, foreground="white"), pe.Normal()]
+                        )
+                        texts.append(txt)
+                        orig_xy.append((xi, yi))
+                    try:
+                        from adjustText import adjust_text
+                        adjust_text(
+                            texts, ax=ax,
+                            arrowprops=dict(arrowstyle="-", color="gray", lw=0.5),
+                        )
+                    except ImportError:
+                        _declutter_texts(fig, ax, texts)
+                        _draw_leader_lines(ax, texts, orig_xy)
+
+            if i == 0:
+                ax.set_title(f"{group_col_a}={ga}")
+            if i == n_rows - 1:
+                ax.set_xlabel(f"{dataset_names[0]}\n{axis_label}")
+            if j == 0:
+                ax.set_ylabel(f"{dataset_names[1]}\n{axis_label}")
+            if j == n_cols - 1:
+                ax.annotate(
+                    f"{group_col_b}={gb}", xy=(1.05, 0.5), xycoords="axes fraction",
+                    rotation=270, va="center", ha="left", fontsize=10, fontweight="bold",
+                )
+
+    fig.suptitle(
+        f"{value_col} correlation: {dataset_names[0]} (cols) vs {dataset_names[1]} (rows)",
+        y=0.99,
+    )
+    fig.legend(
+        handles=legend_elements, loc="upper center", bbox_to_anchor=(0.5, 0.955),
+        ncol=len(legend_elements), frameon=False, fontsize=8,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.90])
     if show:
         plt.show()
     return fig

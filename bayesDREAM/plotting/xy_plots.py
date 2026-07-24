@@ -5342,6 +5342,7 @@ def plot_xy_data(
     figsize: Optional[Tuple[int, int]] = None,
     src_barcodes: Optional[np.ndarray] = None,
     subset_meta: Optional[Dict[str, Any]] = None,
+    exclude_cells: Optional[List[str]] = None,
     only_dependent: bool = False,
     ci_level: float = 95.0,
     mark_params = False,
@@ -5414,6 +5415,13 @@ def plot_xy_data(
         Example: {'cell_line': 'K562'} - plot only K562 cells
         Example: {'lane': 'L1', 'cell_line': 'K562'} - plot L1 lane K562 cells
         Multiple conditions are combined with AND logic.
+    exclude_cells : list of str, optional
+        Cell names (matched against ``model.meta['cell']``) to drop before
+        plotting, e.g. cells identified by ``check_systematic_shift``'s
+        ``exclude_cells`` filtering logic. AND-combined with ``subset_meta``
+        when both are given, without needing to call ``model.subset_cells()``
+        first.
+        Example: ``exclude_cells=['cell_1', 'cell_2']``
     only_dependent : bool
         If True and plotting multiple features (gene name), filter to only "dependent" features
         where the Hill coefficient (n_a or n_b) credible interval excludes 0 (default: False).
@@ -5492,9 +5500,10 @@ def plot_xy_data(
 
         **Combining with other parameters:**
 
-        - ``subset_meta``: each facet mask is AND-combined with the global
-          ``subset_meta`` filter, so you can first narrow to CRISPRi cells and
-          then facet by cell line within that subset.
+        - ``subset_meta`` / ``exclude_cells``: each facet mask is AND-combined
+          with the global ``subset_meta`` / ``exclude_cells`` filters, so you
+          can first narrow to CRISPRi cells (or drop specific cells) and then
+          facet by cell line within that subset.
         - ``color_by``: works independently within each panel — e.g.
           ``facet_by='cell_line'`` splits cell lines into columns while
           ``color_by='targeting'`` still draws NTC / Targeting lines *inside*
@@ -5595,6 +5604,9 @@ def plot_xy_data(
     >>>
     >>> # Plot only cells from one group
     >>> model.plot_xy_data('GFI1B', subset_meta={'cell_line': 'K562'})
+    >>>
+    >>> # Drop a specific list of cells (e.g. flagged by check_systematic_shift)
+    >>> model.plot_xy_data('GFI1B', exclude_cells=exclude_cells)
     >>>
     >>> # Plot all junctions for a gene, but only show dependent ones (n_a or n_b CI excludes 0)
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj', only_dependent=True, ci_level=95.0)
@@ -5706,12 +5718,22 @@ def plot_xy_data(
                 raise ValueError(f"Column '{col}' not found in model.meta. Available columns: {list(model.meta.columns)}")
             subset_mask &= (model.meta[col] == value).values
 
+    if exclude_cells is not None:
+        if subset_mask is None:
+            subset_mask = np.ones(len(model.meta), dtype=bool)
+        cell_col = model.meta['cell'].values if 'cell' in model.meta.columns else model.meta.index.values
+        excl_mask = np.isin(cell_col, list(exclude_cells))
+        subset_mask &= ~excl_mask
+        print(f"[SUBSET] Excluding {excl_mask.sum()} cells via exclude_cells")
+
+    if subset_mask is not None:
         n_cells_before = len(model.meta)
         n_cells_after = subset_mask.sum()
         if n_cells_after == 0:
-            raise ValueError(f"No cells match subset_meta criteria: {subset_meta}")
+            raise ValueError(f"No cells remain after subset_meta={subset_meta} / exclude_cells filtering.")
 
-        print(f"[SUBSET] Filtering {n_cells_before} → {n_cells_after} cells based on {subset_meta}")
+        if subset_meta is not None:
+            print(f"[SUBSET] Filtering {n_cells_before} → {n_cells_after} cells based on {subset_meta}")
 
         # NOTE: Don't subset x_true here - let _align_cells_to_modality() handle it
         # (subsetting here causes IndexError when mask is applied again in alignment)
