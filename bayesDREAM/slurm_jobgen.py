@@ -193,6 +193,17 @@ class SlurmJobGenerator:
         dict
             Memory estimates for each step with resource recommendations.
         """
+        # docs/ is a sibling of bayesDREAM/ at the repo root, not an installed package --
+        # only importable as `docs.memory_calculator` when the repo root is on sys.path.
+        # That's true when a script is run with the repo root as cwd (or PYTHONPATH set
+        # to it), but NOT when a script is invoked by its full path from elsewhere (e.g.
+        # `$PYTHON_ENV $EXAMPLES/generate_slurm.py ...`), which puts the script's own
+        # directory on sys.path[0] instead. Resolve relative to this file so the import
+        # works regardless of how/from-where the caller was invoked.
+        import sys
+        _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
         from docs.memory_calculator import estimate_memory
 
         # Estimate for fit_technical

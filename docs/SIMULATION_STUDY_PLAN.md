@@ -291,10 +291,12 @@ re-run standalone without re-deriving indices.
    cost (set by `niters`, independent of dataset size), which the estimator doesn't
    model. Rather than change that heuristic in `slurm_jobgen.py` itself (a judgment
    call, not a clear bug), `generate_slurm.py` floors the fit step's time budget with
-   a `--min_fit_hours` flag (default 2h) and prints both the raw estimate and the
-   floored value it used. **This floor is a placeholder — recalibrate `--min_fit_hours`
-   from an actual timed `run_recovery_fit.py` run on the target hardware before
-   submitting the full 720-task array.**
+   a `--min_fit_hours` flag and prints both the raw estimate and the floored value it
+   used. **Calibrated (2026-07-28)**: default is now 3h, based on a real
+   `run_recovery_fit.py` run on the largest (`cells_per_gene=1000`) scenario on
+   Berzelius, predicted to take just over 2h — 3h leaves a margin. If your own timing
+   differs (different hardware, or the grid/defaults change), override
+   `--min_fit_hours` rather than trusting this value blindly.
 
    **Resolved (niters/nsamples)**: `run_recovery_fit.py` does not expose `niters`/
    `nsamples` at all — every `fit_ntc`/`fit_cis`/`fit_trans` call uses bayesDREAM's own
@@ -329,32 +331,31 @@ For each fitted `trans_summary.csv` joined to `trans_ground_truth.csv`:
 
 **Done**: simulator (`bayesDREAM/simulation/cis_panel_simulation.py`), driver scripts
 in `examples/simulation_study/` (design matrix, simulate/fit CLIs, SLURM generation),
-the two `slurm_jobgen.py` bugs, the `effect_type='null'`/pandas-na_values bug, the
-`device` auto-detect bug, scran-based `sum_factor` recomputation +
-`adjust_ntc_sum_factor`/`refit_sumfactor` in the fit pipeline, and the niters/nsamples
-decision (always library defaults). Design matrix is now 144 scenarios × 5 replicates
-= 720 rows.
+the two original `slurm_jobgen.py` bugs plus a third (`docs.memory_calculator` import
+failing when `generate_slurm.py` is invoked by full path outside the repo root — the
+exact way `BERZELIUS_GUIDE.md` instructs running it), the `effect_type='null'`/
+pandas-na_values bug, the `device` auto-detect bug, scran-based `sum_factor`
+recomputation + `adjust_ntc_sum_factor`/`refit_sumfactor` in the fit pipeline, the
+niters/nsamples decision (always library defaults), the `fit_ntc` NaN crash at
+production scale (root-caused and fixed — `AutoIAFNormal`'s auto-selection ignored
+data sparsity; `AutoNormal` is now the default, verified against the exact crashing
+scenario/seed), git-tag provenance for the whole study, and incremental
+`save_ntc_fit`/`save_cis_fit`/`save_trans_fit` after each step rather than only at the
+end. Design matrix is now 144 scenarios × 5 replicates = 720 rows. Berzelius
+deployment is confirmed working end-to-end (env, account, git push access all
+verified live on the cluster).
+
+`--min_fit_hours` default is calibrated at **3h** (§7 step 5), based on a real
+`run_recovery_fit.py` run on the largest scenario on Berzelius, predicted to take just
+over 2h.
 
 **Still open**:
 
-1. **NaN crash in `fit_ntc` at production scale (1000 cells, 1736 features), still
-   undiagnosed.** The only full-scale test crashed with NaN parameters in
-   `AutoIAFNormal` right after step 0. Root cause unknown — could be a simulator data
-   issue or a library edge case at this feature count. Blocks trusting any 1000-cell
-   scenario.
-2. **No successful run yet at real (library-default) `niters`, at any scale** — every
-   test so far used a reduced `niters` override (now removed from the script) or
-   crashed. No evidence yet that the recovery model actually recovers known Hill
-   curves reasonably well on this data.
-3. **`--min_fit_hours` is still a guessed placeholder**, blocked by #1/#2 — needs a
-   real timed `run_recovery_fit.py` run (at library-default `niters`) on the target
-   hardware.
-4. **Evaluation/aggregation script doesn't exist yet** — §8 is a sketch, no code.
-5. **Storage footprint not estimated** — 720 scenarios × (`counts.csv`, several
+1. **The validation run above hasn't been confirmed complete/successful yet** — it was
+   predicted to take just over 2h; confirm it actually finished without error and
+   inspect the recovered parameters before trusting the fix at scale.
+2. **Evaluation/aggregation script doesn't exist yet** — §8 is a sketch, no code.
+3. **Storage footprint not estimated** — 720 scenarios × (`counts.csv`, several
    `posterior_samples_*.pt`, `fit_trans` checkpoint files, `sum_factor_scran/`
    intermediates) could be a meaningful chunk of quota; worth estimating from one
    completed scenario's directory size before committing to the full run.
-6. **Berzelius deployment paths are still placeholders** (`--python_env`,
-   `--bayesdream_path`, `--data_path`, `--examples_path`, `--account`) — fill in with
-   your actual project allocation, and confirm the `bayesdream` conda env (with
-   `bioconductor-scran`) is actually built there, not just locally.

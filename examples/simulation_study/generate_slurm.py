@@ -104,7 +104,7 @@ def generate_slurm_scripts(
     max_concurrent_jobs: int = 50,
     time_multiplier: float = 1.0,
     partition_preference: str = 'auto',
-    min_fit_hours: float = 2.0,
+    min_fit_hours: float = 3.0,
 ):
     design_matrix = pd.read_csv(design_matrix_path)
     max_index = int(design_matrix['row_index'].max())
@@ -218,11 +218,14 @@ if __name__ == '__main__':
     parser.add_argument('--max_concurrent_jobs', type=int, default=50)
     parser.add_argument('--time_multiplier', type=float, default=1.0)
     parser.add_argument('--partition_preference', default='auto')
-    parser.add_argument('--min_fit_hours', type=float, default=2.0,
+    parser.add_argument('--min_fit_hours', type=float, default=3.0,
                          help="Floor for the fit step's SLURM time limit, since "
                               "SlurmJobGenerator's size-based estimator underestimates "
-                              "at this study's scale (see printed NOTE). Recalibrate "
-                              "from a real timed run before the full submission.")
+                              "at this study's scale (see printed NOTE). Default (3h) "
+                              "is based on a real run_recovery_fit.py run on the largest "
+                              "(cells_per_gene=1000) scenario, predicted to take just "
+                              "over 2h; override if your own timing differs (e.g. "
+                              "different hardware or dataset).")
     args = parser.parse_args()
 
     generate_slurm_scripts(

@@ -121,7 +121,9 @@ tail -100 $OUT/logs/validate_<jobid>.out
 ```
 
 Record the `Elapsed` time — you'll pass a safety-margined version of it as
-`--min_fit_hours` next.
+`--min_fit_hours` next. **Calibrated (2026-07-28)**: a real run on the largest
+scenario was predicted to take just over 2h, so `--min_fit_hours 3` (also
+`generate_slurm.py`'s default now) — override if your own timing differs.
 
 ## 4. Generate the SLURM scripts
 
@@ -134,7 +136,7 @@ $PYTHON_ENV $EXAMPLES/generate_slurm.py \
   --bayesdream_path $CODE \
   --examples_path $EXAMPLES \
   --account $ACCOUNT \
-  --min_fit_hours <measured-elapsed-from-step-3-with-margin>
+  --min_fit_hours 3
 ```
 
 This writes `$OUT/slurm/{01_simulate.sh, 02_fit.sh, submit_all.sh, logs/}`. It
