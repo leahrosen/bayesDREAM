@@ -249,6 +249,21 @@ cross-reference a slow or killed step against `sacct`/`jobgraph` for that exact 
 Written incrementally after each step completes, so a later step crashing or getting
 killed still leaves the earlier steps' stats on disk.
 
+To compare `fit_stats.json` across scenario directories (e.g. a baseline run vs. a
+GPU-packing test), use `compare_fit_stats.py`:
+
+```bash
+$PYTHON_ENV compare_fit_stats.py \
+    $DATA/scenario_0/rep_0 \
+    $DATA/scenario_0/rep_1 \
+    $DATA/scenario_0/rep_2
+```
+
+The first directory is treated as the baseline; per-step elapsed time for the others
+is printed alongside its ratio to baseline (>1 means slower), plus peak CPU/GPU memory
+from whichever step got furthest. Missing/partial `fit_stats.json` (job still running,
+or killed before a step finished) are handled gracefully.
+
 ## Troubleshooting
 
 **Lost environment variables.** If a command fails with a path that looks like it's
