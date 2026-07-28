@@ -276,22 +276,30 @@ class SlurmJobGenerator:
                     'rationale': 'User requested CPU'
                 }
             elif self.partition_preference == 'fat':
+                _tech_gpus = max(1, int(np.ceil(tech_vram / 80)))
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
-                    'gpus': max(1, int(np.ceil(tech_vram / 80))),
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'gpus': _tech_gpus,
+                    # NSC recommends CPU cores proportional to GPUs on a shared node:
+                    # 128 cores / 8 GPUs per node = 16 cores per GPU.
+                    'cpus': 16 * _tech_gpus,
+                    # NSC proportional default (safe headroom over the estimate, which
+                    # the tier-selection thresholds already guarantee doesn't exceed
+                    # this): fat nodes have 256GB RAM per GPU.
+                    'mem_gb': 256 * _tech_gpus,
                     'vram_gb': tech_vram,
                     'rationale': 'User requested fat nodes'
                 }
             else:  # thin
+                _tech_gpus = max(1, int(np.ceil(tech_vram / 40)))
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'thin',
-                    'gpus': max(1, int(np.ceil(tech_vram / 40))),
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'gpus': _tech_gpus,
+                    'cpus': 16 * _tech_gpus,
+                    # thin nodes have 128GB RAM per GPU (~7995MB per core x 16 cores/GPU)
+                    'mem_gb': 128 * _tech_gpus,
                     'vram_gb': tech_vram,
                     'rationale': 'User requested thin nodes'
                 }
@@ -303,8 +311,8 @@ class SlurmJobGenerator:
                     'partition': 'berzelius',
                     'constraint': 'thin',
                     'gpus': 1,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 16,  # NSC: 128 cores / 8 GPUs per node = 16 cores/GPU
+                    'mem_gb': 128,  # thin: 128GB RAM per GPU, safe default over the estimate
                     'vram_gb': tech_vram,
                     'rationale': 'Fits on 1 thin GPU (40GB VRAM, 128GB RAM)'
                 }
@@ -314,8 +322,8 @@ class SlurmJobGenerator:
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 1,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 16,
+                    'mem_gb': 256,  # fat: 256GB RAM per GPU
                     'vram_gb': tech_vram,
                     'rationale': 'Fits on 1 fat GPU (80GB VRAM, 256GB RAM)'
                 }
@@ -325,8 +333,8 @@ class SlurmJobGenerator:
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 2,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 32,
+                    'mem_gb': 512,
                     'vram_gb': tech_vram,
                     'rationale': 'Requires 2 fat GPUs (160GB VRAM, 512GB RAM)'
                 }
@@ -336,8 +344,8 @@ class SlurmJobGenerator:
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 4,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 64,
+                    'mem_gb': 1024,
                     'vram_gb': tech_vram,
                     'rationale': 'Requires 4 fat GPUs (320GB VRAM, 1024GB RAM)'
                 }
@@ -347,8 +355,8 @@ class SlurmJobGenerator:
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 8,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 128,
+                    'mem_gb': 2048,
                     'vram_gb': tech_vram,
                     'rationale': 'Requires 8 fat GPUs (640GB VRAM, 2048GB RAM) - full node'
                 }
@@ -388,8 +396,8 @@ class SlurmJobGenerator:
                 'partition': 'berzelius',
                 'constraint': 'thin',
                 'gpus': 1,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 16,  # NSC: 128 cores / 8 GPUs per node = 16 cores/GPU
+                'mem_gb': 128,  # thin: 128GB RAM per GPU, safe default over the estimate
                 'vram_gb': trans_vram,
                 'rationale': 'Fits on 1 thin GPU (40GB VRAM, 128GB RAM)'
             }
@@ -399,8 +407,8 @@ class SlurmJobGenerator:
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 1,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 16,
+                'mem_gb': 256,  # fat: 256GB RAM per GPU
                 'vram_gb': trans_vram,
                 'rationale': 'Fits on 1 fat GPU (80GB VRAM, 256GB RAM)'
             }
@@ -410,8 +418,8 @@ class SlurmJobGenerator:
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 2,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 32,
+                'mem_gb': 512,
                 'vram_gb': trans_vram,
                 'rationale': 'Requires 2 fat GPUs (160GB VRAM, 512GB RAM)'
             }
@@ -421,8 +429,8 @@ class SlurmJobGenerator:
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 4,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 64,
+                'mem_gb': 1024,
                 'vram_gb': trans_vram,
                 'rationale': 'Requires 4 fat GPUs (320GB VRAM, 1024GB RAM)'
             }
@@ -432,8 +440,8 @@ class SlurmJobGenerator:
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 8,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 128,
+                'mem_gb': 2048,
                 'vram_gb': trans_vram,
                 'rationale': 'Requires 8 fat GPUs (640GB VRAM, 2048GB RAM) - full node'
             }
