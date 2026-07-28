@@ -50,14 +50,23 @@ directories — the generator only needs to know where the code is
 
 ## 2. Build the design matrix
 
-Cheap, runs on the login node:
+Cheap, runs on the login node. **Commit and push any pending code changes first** —
+this step creates a git tag pinning the exact commit used, and refuses to tag a dirty
+working tree (a tag on a dirty tree would only pin the last commit, not what's about
+to actually run):
 
 ```bash
 mkdir -p $OUT
 $PYTHON_ENV $EXAMPLES/build_design_matrix.py --outdir $OUT
 ```
 
-Expected output: `Wrote 720 rows (144 scenarios x 5 replicates) to .../design_matrix.csv`.
+Expected output: `Wrote 720 rows (144 scenarios x 5 replicates) to .../design_matrix.csv`,
+followed by `Stable snapshot tag: sim-study-<timestamp> (pushed: True)`. If you instead
+see a `[WARNING] Working tree has uncommitted changes` line, commit/push first and
+re-run — otherwise `design_matrix.csv` will carry `bayesdream_tag` empty, meaning the
+recorded commit hash is only reliably reproducible for as long as the `LUR` branch
+itself isn't deleted or rewritten (see [Reproducibility](#reproducibility) below).
+
 This `design_matrix.csv` is the single source of truth every later step reads by
 `row_index` — nothing downstream re-derives the parameter grid.
 
@@ -178,6 +187,40 @@ for just that index):
 ```bash
 sbatch --array=<i> 02_fit.sh
 ```
+
+## Reproducibility
+
+A commit hash alone is sufficient to reproduce the exact code *content* (git is
+content-addressed — the same hash always means the same tree, regardless of which
+branch, if any, points to it), but it's only guaranteed to still *exist* in the repo
+if something keeps it reachable. If the `LUR` branch is later deleted, rebased, or
+force-pushed past the commit used here, that commit can become unreachable and
+eventually get garbage-collected by `git gc` — even though its hash was recorded
+faithfully at the time.
+
+To guard against this, step 2 (`build_design_matrix.py`) creates and pushes an
+**annotated git tag** at the current commit — a tag is a ref, so it keeps the commit
+reachable independent of any branch's fate. Every row of `design_matrix.csv` carries
+`bayesdream_tag`, `bayesdream_commit`, `bayesdream_branch`, and
+`bayesdream_git_dirty` from that moment. Each scenario's own `config.json` then
+*independently* re-checks commit/branch/dirty at simulate time (recorded as
+`bayesdream_commit`/etc. there, alongside `build_commit`/`build_tag` copied from the
+design matrix) — if you built the design matrix, pulled new commits, and only then
+ran the SLURM array, `bayesdream_commit` in a scenario's `config.json` will disagree
+with its `build_commit`, and that drift is visible by comparing the two.
+
+To check out the exact code later, regardless of what's happened to the `LUR` branch
+since:
+
+```bash
+git fetch --tags
+git checkout <bayesdream_tag from design_matrix.csv or config.json>
+```
+
+If `bayesdream_tag` is empty for a run, only the commit hash/branch were recorded —
+still reproducible today, but not protected against the branch being deleted or
+rewritten later. `--no_tag`/`--no_push` on `build_design_matrix.py` skip this
+protection deliberately (e.g. for local testing); omit them for a real study run.
 
 ## Output layout
 

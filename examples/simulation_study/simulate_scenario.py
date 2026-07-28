@@ -28,22 +28,11 @@ Writes to <outdir>/scenario_<scenario_id>/rep_<replicate_id>/:
 import argparse
 import json
 import os
-import subprocess
 
 import pandas as pd
 
 from bayesDREAM.simulation import simulate_scenario, recompute_sum_factor_scran
-
-
-def _git_commit_hash() -> str:
-    try:
-        return subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-    except Exception:
-        return 'unknown'
+from _git_provenance import git_provenance
 
 
 def run_one(design_matrix: pd.DataFrame, row_index: int, outdir: str) -> str:
@@ -69,8 +58,16 @@ def run_one(design_matrix: pd.DataFrame, row_index: int, outdir: str) -> str:
         row_index=int(row_index),
         scenario_id=int(row['scenario_id']),
         replicate_id=int(row['replicate_id']),
-        bayesdream_commit=_git_commit_hash(),
     ))
+    # Fresh provenance check at simulate-time, independent of whatever was recorded
+    # in design_matrix.csv at build-time -- if the two disagree (e.g. new commits were
+    # pulled between building the design matrix and running this scenario), that drift
+    # is visible by comparing bayesdream_commit here against build_commit below.
+    config.update(git_provenance())
+    build_tag = row.get('bayesdream_tag', None)
+    config['build_tag'] = None if pd.isna(build_tag) else str(build_tag)
+    build_commit = row.get('bayesdream_commit', None)
+    config['build_commit'] = None if pd.isna(build_commit) else str(build_commit)
     with open(os.path.join(scen_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
 

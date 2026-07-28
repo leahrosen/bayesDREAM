@@ -225,8 +225,19 @@ re-run standalone without re-deriving indices.
   assigning `scenario_seed = MASTER_SEED + 1000 * scenario_id + replicate_id`
   (plain integer arithmetic — no `hash()`).
 - Each scenario's `config.json` records: every parameter value, `scenario_id`,
-  `replicate_id`, `scenario_seed`, and the exact bayesDREAM commit hash
-  (`git rev-parse HEAD`) used to run it.
+  `replicate_id`, `scenario_seed`, and git provenance for the exact bayesDREAM code
+  used to run it — `bayesdream_commit` (`git rev-parse HEAD`; sufficient on its own to
+  reproduce the code content, since git is content-addressed), `bayesdream_branch`
+  (aids discovery if the commit ever becomes unreachable and is garbage-collected),
+  `bayesdream_git_dirty` (**tracked** files only — modified/staged/deleted; `dirty=True`
+  means the recorded commit hash does *not* fully capture what ran), and
+  `bayesdream_untracked_count` (informational only, does not count as dirty — a stray
+  untracked file, e.g. leftover pre-refactor modules or docs on a lived-in clone, isn't
+  a reproducibility hazard unless it's actually imported/used, which git can't tell
+  from its mere presence; confirmed in practice necessary on the Berzelius clone used
+  for this study). A stable git tag pinning the exact commit is also created once per
+  `design_matrix.csv` build — see `examples/simulation_study/BERZELIUS_GUIDE.md`'s
+  "Reproducibility" section and `_git_provenance.py`.
 - Within a scenario, `scenario_seed` seeds `numpy`, `torch`, and `pyro`
   (`np.random.default_rng`, `torch.manual_seed`, `pyro.set_rng_seed`) once before any
   sampling, and is also passed as `seed=` to `simulate_from_trans_summary` (which uses

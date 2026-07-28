@@ -74,6 +74,11 @@ def run_recovery_fit(
     # code path in fit_ntc/fit_cis/fit_trans, not a degenerate/unsupported case.
     model.set_technical_groups(['cell_line'])
     model.fit_ntc(sum_factor_col='sum_factor')
+    # Save immediately after each step, not just at the end: fit_cis/fit_trans are the
+    # steps most likely to fail (longer runtime, more iterations, e.g. the AutoIAFNormal
+    # NaN failure mode this study surfaced) -- if a later step crashes or times out, the
+    # earlier steps' results are still on disk to inspect rather than lost entirely.
+    model.save_ntc_fit()
 
     # meta's 'sum_factor' is scran-recomputed from realized counts (see
     # simulate_scenario.py), so guide identity is genuinely correlated with it (strong
@@ -86,6 +91,7 @@ def run_recovery_fit(
         covariates=['cell_line'],
     )
     model.fit_cis(sum_factor_col='sum_factor_adj')
+    model.save_cis_fit()
 
     model.refit_sumfactor(
         sum_factor_col_old='sum_factor_adj',
@@ -96,9 +102,6 @@ def run_recovery_fit(
         sum_factor_col='sum_factor_refit',
         function_type='single_hill',
     )
-
-    model.save_ntc_fit()
-    model.save_cis_fit()
     model.save_trans_fit()
     model.save_trans_summary(fdr_threshold=0.05)
 
