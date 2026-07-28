@@ -715,9 +715,16 @@ class NTCFitter:
               lines have different perturbation efficiencies).
             - Low-MOI experiments with a clear NTC vs. perturbed cell distinction.
         force_iaf : bool, default False
-            If ``True``, force use of an IAF (Inverse Autoregressive Flow) guide for
-            multinomial models regardless of the number of categories.  By default,
-            IAF is only used when the number of categories exceeds a threshold.
+            Applies to negbinom (and other non-multinomial) distributions. By
+            default, ``fit_ntc`` uses ``AutoNormal`` (mean-field) — robust across
+            dataset sizes and sparsity levels. Pass ``True`` to use ``AutoIAFNormal``
+            (a jointly-coupled autoregressive flow) instead, which can give a more
+            expressive posterior for small, deeply-sequenced datasets with few
+            near-zero-count features. Not recommended when any feature has very low
+            NTC counts (e.g. single-digit total reads across NTC cells): IAF's single
+            shared network couples all features together, so one such feature's
+            exploding gradient can corrupt every other feature's parameters in one
+            SVI step.
 
         Warnings
         --------
@@ -1596,8 +1603,19 @@ class NTCFitter:
             ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
         else:
-            # For negbinom and other distributions: check if IAF is feasible
-            # Estimate number of latent variables
+            # AutoNormal (mean-field) is the default guide for negbinom/other
+            # distributions, regardless of device or dataset size -- it's robust
+            # across dataset sizes and sparsity levels. AutoIAFNormal (a single
+            # jointly-coupled autoregressive flow over ALL T features) is opt-in via
+            # force_iaf=True: it can give a more expressive posterior for small,
+            # deeply-sequenced datasets, but its shared network means one sparse
+            # gene's exploding gradient (near-zero mu_final -> huge d/dx log(x+eps)
+            # as x->0) can corrupt every other feature's parameters in a single step.
+            # A prior memory-based auto-selection (IAF whenever estimated memory fit
+            # the budget, which is almost always true at realistic gene counts)
+            # silently exposed every user to this failure mode without them asking
+            # for IAF or knowing the risk -- see docs/SIMULATION_STUDY_PLAN.md's
+            # fit_ntc NaN diagnosis for the full trace.
             if distribution == 'negbinom':
                 # log2_alpha_y: (C-1) × T_fit
                 # o_y: T_fit
@@ -1607,54 +1625,38 @@ class NTCFitter:
                 # Conservative estimate for unknown distributions
                 n_latent = C * T_fit
 
-            # IAF memory estimate (rough approximation):
+            # IAF memory estimate (rough approximation), informational only now that
+            # the choice is explicit rather than memory-driven:
             # - Transformation matrices: n_latent × n_latent × 4 bytes (float32)
             # - Hidden states: ~2× the matrix size
             # - Safety margin: 1.5×
             iaf_memory_gb = (n_latent ** 2 * 4 * 3 * 1.5) / 1e9
 
-            # Check available VRAM
-            use_iaf = False
-            if self.model.device.type == 'cuda':
-                try:
-                    # torch is already imported at module level
-                    total_memory_gb = torch.cuda.get_device_properties(self.model.device).total_memory / 1e9
-                    # Reserve 10 GB for data, gradients, and other operations
-                    available_for_guide_gb = total_memory_gb - 10.0
-
-                    if force_iaf:
-                        use_iaf = True
+            use_iaf = force_iaf
+            if use_iaf:
+                if self.model.device.type == 'cuda':
+                    try:
+                        # torch is already imported at module level
+                        total_memory_gb = torch.cuda.get_device_properties(self.model.device).total_memory / 1e9
+                        # Reserve 10 GB for data, gradients, and other operations
+                        available_for_guide_gb = total_memory_gb - 10.0
+                        oom_note = (" — OOM risk if estimate is accurate"
+                                    if iaf_memory_gb >= available_for_guide_gb else "")
                         print(f"[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_memory_gb:.1f} GB, "
-                              f"{available_for_guide_gb:.1f} GB available — OOM risk if estimate is accurate)")
-                    elif iaf_memory_gb < available_for_guide_gb:
-                        use_iaf = True
-                        print(f"[INFO] Using AutoIAFNormal guide (estimated {iaf_memory_gb:.1f} GB < {available_for_guide_gb:.1f} GB available)")
-                    else:
-                        print(f"[WARNING] AutoIAFNormal would require ~{iaf_memory_gb:.1f} GB VRAM (>{available_for_guide_gb:.1f} GB available)")
-                        print(f"[WARNING] Falling back to AutoNormal (mean-field approximation) for {n_latent} latent variables")
-                        # Increase niters for AutoNormal if using default (AutoNormal needs more iterations)
-                        if niters_was_default and niters < 100_000:
-                            old_niters = niters
-                            niters = 100_000
-                            print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
-                except Exception as e:
-                    print(f"[WARNING] Could not check VRAM ({e}), using AutoNormal for safety")
-                    # Increase niters for AutoNormal if using default
-                    if niters_was_default and niters < 100_000:
-                        old_niters = niters
-                        niters = 100_000
-                        print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
-            else:
-                # CPU: always use AutoNormal for large models
-                if n_latent > 5000:
-                    print(f"[INFO] Using AutoNormal for CPU fitting with {n_latent} latent variables")
-                    # Increase niters for AutoNormal if using default
-                    if niters_was_default and niters < 100_000:
-                        old_niters = niters
-                        niters = 100_000
-                        print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
+                              f"{available_for_guide_gb:.1f} GB available{oom_note})")
+                    except Exception as e:
+                        print(f"[WARNING] force_iaf=True but could not check VRAM ({e})")
                 else:
-                    use_iaf = True
+                    print(f"[INFO] force_iaf=True: using AutoIAFNormal ({n_latent} latent variables, "
+                          f"estimated {iaf_memory_gb:.1f} GB) on CPU")
+            else:
+                print(f"[INFO] Using AutoNormal (default; pass force_iaf=True for AutoIAFNormal) "
+                      f"for {n_latent} latent variables")
+                # Increase niters for AutoNormal if using default (AutoNormal needs more iterations)
+                if niters_was_default and niters < 100_000:
+                    old_niters = niters
+                    niters = 100_000
+                    print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
 
             if use_iaf:
                 ntc_guide = AutoIAFNormal(self._model_ntc, init_loc_fn=init_loc_fn)

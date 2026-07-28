@@ -4,16 +4,17 @@ See docs/SIMULATION_STUDY_PLAN.md §7.
 
 bayesDREAM.slurm_jobgen.SlurmJobGenerator is built around "N cis genes within one
 dataset" (1 fit_ntc + N fit_cis + N fit_trans jobs). This study is the opposite shape:
-540 independent tiny datasets (scenario x replicate), each with its own
+many independent tiny datasets (scenario x replicate), each with its own
 fit_ntc+fit_cis+fit_trans. So this script does NOT call
 SlurmJobGenerator.generate_all_scripts() — it reuses SlurmJobGenerator only for its
 memory/time *estimation* math (estimate_memory_requirements /
 estimate_time_requirements), run once on the largest scenario (cells_per_gene=1000)
-as a representative sizing reference, then writes two custom array scripts:
+as a representative sizing reference, then writes two custom array scripts, sized off
+however many rows are in design_matrix.csv:
 
-    01_simulate.sh   array 0-539, CPU, one task = one simulate_scenario.py call
-    02_fit.sh        array 0-539, depends on 01, one task = one run_recovery_fit.py call
-    submit_all.sh    submits 01 then 02 with --dependency=afterok
+    01_simulate.sh   array 0-N, CPU, one task = one simulate_scenario.py call
+    02_fit.sh        array 0-N, depends on 01, one task = one run_recovery_fit.py call
+    submit_all.sh    submits 01 then 02 with --dependency=aftercorr
 
 Usage:
     python generate_slurm.py --design_matrix ./sim_study_out/design_matrix.csv \
@@ -21,7 +22,8 @@ Usage:
         --data_path /proj/.../sim_study_out/data \
         --python_env /proj/.../pyroenv/bin/python \
         --bayesdream_path /proj/.../bayesDREAM \
-        --examples_path /proj/.../bayesDREAM/examples/simulation_study
+        --examples_path /proj/.../bayesDREAM/examples/simulation_study \
+        --account berzelius-2024-XXX
 """
 
 import argparse
@@ -37,7 +39,7 @@ from bayesDREAM.slurm_jobgen import SlurmJobGenerator
 def _representative_dataset(design_matrix: pd.DataFrame):
     """Simulate the largest scenario (cells_per_gene=1000) once, to size fit_trans
     (the expensive step: T~1737 features x up to 1000 cells) for the whole study.
-    All 540 scenarios share the same 1736-feature trans panel, so T is constant;
+    Every scenario shares the same 1736-feature trans panel, so T is constant;
     only N (cells_per_gene) varies, and 1000 is the max."""
     row = design_matrix.loc[design_matrix['cells_per_gene'] == design_matrix['cells_per_gene'].max()].iloc[0]
     result = simulate_scenario(
@@ -54,6 +56,7 @@ def _representative_dataset(design_matrix: pd.DataFrame):
 
 SBATCH_HEADER = """#!/bin/bash
 #SBATCH --job-name={job_name}
+#SBATCH --account={account}
 #SBATCH --output={log_dir}/%x_%A_%a.out
 #SBATCH --error={log_dir}/%x_%A_%a.err
 #SBATCH --array=0-{max_index}%{max_concurrent}
@@ -79,13 +82,14 @@ def _hours_to_slurm_time(hours: float) -> str:
 
 
 def _resource_block(resources: dict, max_index: int, max_concurrent: int, job_name: str,
-                     log_dir: str, time_str: str) -> str:
+                     log_dir: str, time_str: str, account: str) -> str:
     constraint_line = f"#SBATCH -C {resources['constraint']}\n" if resources.get('constraint') else ""
     gpu_line = f"#SBATCH --gpus={resources['gpus']}\n" if resources.get('gpus') else ""
     return SBATCH_HEADER.format(
-        job_name=job_name, log_dir=log_dir, max_index=max_index, max_concurrent=max_concurrent,
-        time=time_str, partition=resources['partition'], constraint_line=constraint_line,
-        gpu_line=gpu_line, cpus=resources.get('cpus', 1), mem_gb=int(np.ceil(resources['mem_gb'])),
+        job_name=job_name, account=account, log_dir=log_dir, max_index=max_index,
+        max_concurrent=max_concurrent, time=time_str, partition=resources['partition'],
+        constraint_line=constraint_line, gpu_line=gpu_line, cpus=resources.get('cpus', 1),
+        mem_gb=int(np.ceil(resources['mem_gb'])),
     )
 
 
@@ -96,6 +100,7 @@ def generate_slurm_scripts(
     python_env: str,
     bayesdream_path: str,
     examples_path: str,
+    account: str,
     max_concurrent_jobs: int = 50,
     time_multiplier: float = 1.0,
     partition_preference: str = 'auto',
@@ -125,7 +130,7 @@ def generate_slurm_scripts(
     sim_resources = dict(partition='berzelius-cpu', cpus=1, mem_gb=8.0)
     sim_script = _resource_block(
         sim_resources, max_index, max_concurrent_jobs, f"{gen.label}_simulate", log_dir,
-        time_str='00:15:00',
+        time_str='00:15:00', account=account,
     )
     sim_script += (
         f"\n{python_env} {examples_path}/simulate_scenario.py "
@@ -151,7 +156,7 @@ def generate_slurm_scripts(
     fit_time_str = _hours_to_slurm_time(fit_time_hours)
     fit_script = _resource_block(
         fit_resources, max_index, max_concurrent_jobs, f"{gen.label}_fit", log_dir,
-        time_str=fit_time_str,
+        time_str=fit_time_str, account=account,
     )
     device = 'cuda' if fit_resources.get('gpus') else 'cpu'
     fit_script += (
@@ -188,7 +193,7 @@ def generate_slurm_scripts(
     print(f"  fit step time budget: {fit_time_str} (raw size-based estimate was "
           f"{raw_trans_time}; floored to --min_fit_hours={min_fit_hours}). "
           f"Recalibrate --min_fit_hours from a real timed run before submitting the "
-          f"full 540-task array — see docs/SIMULATION_STUDY_PLAN.md §7.")
+          f"full {max_index + 1}-task array — see docs/SIMULATION_STUDY_PLAN.md §7.")
     print("NOTE: --dependency=aftercorr ties each fit array task to the matching "
           "simulate array task (same index), not to the whole simulate array "
           "finishing first — this lets fitting start on scenario k as soon as "
@@ -207,6 +212,9 @@ if __name__ == '__main__':
     parser.add_argument('--examples_path', required=True,
                          help="Cluster path to examples/simulation_study/ "
                               "(containing simulate_scenario.py, run_recovery_fit.py).")
+    parser.add_argument('--account', required=True,
+                         help="Berzelius project/account for #SBATCH --account "
+                              "(e.g. berzelius-2024-XXX).")
     parser.add_argument('--max_concurrent_jobs', type=int, default=50)
     parser.add_argument('--time_multiplier', type=float, default=1.0)
     parser.add_argument('--partition_preference', default='auto')
@@ -224,6 +232,7 @@ if __name__ == '__main__':
         python_env=args.python_env,
         bayesdream_path=args.bayesdream_path,
         examples_path=args.examples_path,
+        account=args.account,
         min_fit_hours=args.min_fit_hours,
         max_concurrent_jobs=args.max_concurrent_jobs,
         time_multiplier=args.time_multiplier,

@@ -402,6 +402,31 @@ whether they have contracted from the prior before treating the overdispersion e
 The same reasoning applies to \texttt{fit\_trans} (Section~3), where $\beta_o$ plays the
 identical structural role for the negative-binomial likelihood.
 
+\paragraph{Variational guide selection.}
+\texttt{fit\_ntc} fits all likelihood families with a mean-field \texttt{AutoNormal}
+variational guide by default, independent of $T$ or the compute device.
+A more expressive alternative, \texttt{AutoIAFNormal}~\cite{bingham2019pyro}—a single
+inverse-autoregressive-flow transform that jointly parameterises all latent
+variables—is available for negative-binomial and other non-multinomial modalities via
+an opt-in flag, and is best suited to small, deeply sequenced panels in which no
+feature has near-zero NTC counts.
+This restriction reflects a numerical instability specific to jointly-coupled guides.
+In the negative-binomial observation model (equation~\ref{eq:ntc_negbinom_obs}), the
+natural-parameter (logit) computation involves $\log(\mu_{i,t} + \epsilon)$ for a small
+numerical-stability constant $\epsilon$; its derivative $1/(\mu_{i,t} + \epsilon)$ grows
+without bound as the size-factor-adjusted mean $\mu_{i,t} = \mu_t\,\alpha_{c_i,t}\,s_i
+\to 0$, which occurs whenever a feature has very low NTC counts (e.g.\ a handful of
+total reads across all NTC cells) together with a low-size-factor cell—an expected
+occurrence in realistically sparse single-cell data, not a data-quality defect.
+Under \texttt{AutoIAFNormal}, a single autoregressive network parameterises the joint
+posterior over all $T$ features simultaneously, so one such feature's exploding
+gradient can, after a single optimiser step, corrupt the transform's shared weights and
+hence every feature's sample—observed empirically as the entire fit diverging to
+\texttt{NaN} within the first few SVI iterations.
+\texttt{AutoNormal}'s per-feature factorisation is far less susceptible to this failure
+mode: a poorly-conditioned gradient for one feature does not propagate through
+parameters shared with the others.
+
 \subsection{Output}
 
 The technical fitting step produces the following outputs for downstream use:

@@ -68,7 +68,7 @@ swept grid.
 | `n_guides` (targeting only; +1 NTC) | 3, 5 | 2 |
 | guide effect shape | even, gap, small | 3 |
 | `sigma_eff` (log2 within-guide SD) | 0.7 (fixed) | 1 |
-| `log2(X_NTC)` (cis expression at NTC) | 0, 1, 2 | 3 |
+| `log2(X_NTC)` (cis expression at NTC) | -1, 0, 1, 2 | 4 |
 | `log2(o_x)` (cis overdispersion) | -1.5, 0 | 2 |
 
 Guide log2FC patterns (relative to NTC, guide count implied by pattern):
@@ -80,7 +80,7 @@ Guide log2FC patterns (relative to NTC, guide count implied by pattern):
 
 `n_guides × shape` = 6 guide-design combinations.
 
-**Cell-design scenarios = 3 × 6 × 3 × 2 = 108**, each replicated 5× → **540 total
+**Cell-design scenarios = 3 × 6 × 4 × 2 = 144**, each replicated 5× → **720 total
 (`fit_ntc` + `fit_cis` + `fit_trans`) pipeline runs.**
 
 ### 3.2 Trans-gene scenario (one panel of features per cell-design scenario)
@@ -96,7 +96,7 @@ Guide log2FC patterns (relative to NTC, guide count implied by pattern):
 
 Per `y_ntc × o_y` combo: 1 null + 6×9×4 = 217 single_hill combos → 217 trans-gene
 scenarios. Total trans panel size: **8 × 217 = 1736 features per cell-design
-scenario** (constant across all 108 scenarios — the trans grid doesn't depend on the
+scenario** (constant across all 144 scenarios — the trans grid doesn't depend on the
 cis-side design).
 
 ---
@@ -161,6 +161,29 @@ semantics by construction. `_compute_AV_from_fc` docstring confirms: `K = x_ntc 
 
 No `group_col` / `alpha_y` columns are included (C=1 ⇒ no technical correction).
 
+### 4.3 Sum factor: simulated vs. recomputed
+
+`sim_sum_factor` above (§4.1's `sf`, drawn independently per cell) is what
+`simulate_from_trans_summary` uses to *generate* the counts — it is **not** what gets
+fit against. `simulate_from_trans_summary`'s own docstring is explicit: "sum factors
+used for simulation are NOT the same as sum factors for downstream fitting... After
+simulation, recalculate sum factors from the simulated counts (e.g. via
+`scran::calculateSumFactors`)". So after `counts.csv` is written,
+`recompute_sum_factor_scran()` (`bayesDREAM/simulation/cis_panel_simulation.py`) shells
+out to `Rscript` running `calculateSumFactors(counts, clusters=guide×cell_line,
+ref.clust='NTC')` on the realized counts, and **that** value — not the true simulated
+one — is what ends up in `meta.csv`'s `sum_factor` column (mirroring what a real
+analyst actually has). The true simulated value is preserved as `sum_factor_true` in
+`cis_ground_truth.csv`.
+
+Because `sum_factor` is now estimated from *realized*, post-perturbation counts,
+guide identity is genuinely correlated with it (strong cis perturbations shift a
+measurable fraction of the 1737-feature library's composition) — so
+`run_recovery_fit.py` follows the full documented workflow
+(`docs/FIT_TRANS_GUIDE.md`): `fit_ntc` → `adjust_ntc_sum_factor` (→
+`sum_factor_adj`) → `fit_cis` → `refit_sumfactor` (→ `sum_factor_refit`) →
+`fit_trans`, rather than feeding raw `sum_factor` straight into `fit_cis`/`fit_trans`.
+
 ---
 
 ## 5. Ground truth to save (per cell-design scenario × replicate)
@@ -168,18 +191,20 @@ No `group_col` / `alpha_y` columns are included (C=1 ⇒ no technical correction
 ```
 outdir/<label>/scenario_<sid>/rep_<r>/
 ├── config.json              # full resolved parameter set + seeds (see §6)
-├── meta.csv                 # cell, guide, target, cell_line(constant), sum_factor
+├── meta.csv                 # cell, guide, target, cell_line(constant),
+│                             # sum_factor (scran-recomputed, §4.3 — NOT the true value)
 ├── counts.csv               # CisGene + 1736 trans genes × cells
 ├── cis_ground_truth.csv     # guide, x_eff_g_true, sigma_eff (per guide);
-│                             # cell, guide, log2_x_true (latent), x_true_true (per cell)
+│                             # cell, guide, log2_x_true, x_true, sum_factor_true (per cell)
+├── guide_ground_truth.csv   # guide, target, guide_log2FC, x_eff_g_true, sigma_eff, n_cells
 ├── trans_ground_truth.csv   # feature, y_ntc, o_y, effect_type(no_effect/single_hill),
 │                             # n_true, K_log2FC_true, full_log2FC_true,
-│                             # A_true, V_true, K_true (reconstructed absolute values)
-└── fit/
-    ├── posterior_samples_ntc.pt
-    ├── posterior_samples_cis.pt
-    ├── posterior_samples_trans.pt
-    └── trans_summary.csv    # from save_trans_summary(); fitted A/n/K/full_log2FC + fdr_alpha
+│                             # A_true, Vmax_true, K_true (reconstructed absolute values)
+├── sum_factor_scran/        # R script + intermediate CSVs from §4.3 (kept, not cleaned up)
+└── fit/recovery/
+    ├── posterior_samples_ntc.pt, posterior_samples_cis.pt, posterior_samples_trans.pt
+    ├── trans_checkpoint_gene_*.pt     # fit_trans's own checkpointing
+    └── trans_feature_summary_gene.csv # from save_trans_summary(); fitted A/n/K/full_log2FC + fdr_alpha
 ```
 
 `trans_ground_truth.csv` and the fitted `trans_summary.csv` are both keyed by
@@ -215,28 +240,29 @@ re-run standalone without re-deriving indices.
 
 ## 7. Execution plan (Berzelius)
 
-1. **Simulate** all 540 datasets locally or in a CPU array job (cheap: no SVI, just
-   NB/RNG sampling) — write `meta.csv`/`counts.csv`/ground-truth CSVs per
-   scenario/replicate.
+1. **Simulate** all 720 datasets locally or in a CPU array job (cheap: no SVI, just
+   NB/RNG sampling, plus one Rscript/scran subprocess per scenario — see §4.2 update
+   below) — write `meta.csv`/`counts.csv`/ground-truth CSVs per scenario/replicate.
 2. **`fit_ntc`**: single technical group (C=1) is cheap; can run as CPU or 1 thin GPU
-   per `SlurmJobGenerator`'s auto-selection. One job (array of 540) since it's shared
+   per `SlurmJobGenerator`'s auto-selection. One job (array of 720) since it's shared
    input to `fit_cis`.
 3. **`fit_cis`**: CPU partition, per `SlurmJobGenerator` default and confirmed by
    `docs/FIT_TRANS_GUIDE.md`/`CIS_MODEL_PARAMETERS.md` — cheap even at 1000 cells.
-   Array job of 540 tasks.
+   Array job of 720 tasks.
 4. **`fit_trans`**: T=1736 features × up to 1000 cells is the expensive step — likely
    1 thin/fat GPU per task per `SlurmJobGenerator`'s memory-based auto-selection.
-   Array job of 540 tasks, `function_type='single_hill'` only (per §1).
+   Array job of 720 tasks, `function_type='single_hill'` only (per §1).
 5. Use `bayesDREAM.slurm_jobgen.SlurmJobGenerator.estimate_memory_requirements()` /
    `estimate_time_requirements()` on one representative simulated scenario (largest:
-   `cells_per_gene=1000`) **before** generating the full 540-task array, to get
-   real (not hand-estimated) memory/time numbers and set `--array=0-539%<N>`
+   `cells_per_gene=1000`) **before** generating the full 720-task array, to get
+   real (not hand-estimated) memory/time numbers and set `--array=0-719%<N>`
    throttling appropriately. `SlurmJobGenerator` doesn't currently have a notion of
-   "540 independent tiny datasets sharing one script" — it's built around N cis genes
+   "720 independent tiny datasets sharing one script" — it's built around N cis genes
    within one dataset. **Resolved**: `examples/simulation_study/generate_slurm.py`
    writes a thin custom wrapper (two array scripts templated over
    `design_matrix.csv` row index, not `cis_genes`) that calls `SlurmJobGenerator`
-   only for its memory/time *estimation* math, not `generate_all_scripts()`.
+   only for its memory/time *estimation* math, not `generate_all_scripts()`. Each
+   generated script also carries `#SBATCH --account=<account>` (required CLI arg).
 
    **Found during implementation**: `estimate_memory_requirements()` was completely
    broken (two pre-existing bugs, unrelated to this study, fixed with user approval):
@@ -256,8 +282,16 @@ re-run standalone without re-deriving indices.
    call, not a clear bug), `generate_slurm.py` floors the fit step's time budget with
    a `--min_fit_hours` flag (default 2h) and prints both the raw estimate and the
    floored value it used. **This floor is a placeholder — recalibrate `--min_fit_hours`
-   from an actual timed `run_recovery_fit.py` run on the target hardware (with the
-   real `niters` you intend to use) before submitting the full 540-task array.**
+   from an actual timed `run_recovery_fit.py` run on the target hardware before
+   submitting the full 720-task array.**
+
+   **Resolved (niters/nsamples)**: `run_recovery_fit.py` does not expose `niters`/
+   `nsamples` at all — every `fit_ntc`/`fit_cis`/`fit_trans` call uses bayesDREAM's own
+   library defaults (`fit_ntc`: 50,000; `fit_cis`: 100,000; `fit_trans`: 100,000–
+   200,000 depending on distribution). This was a deliberate decision: the point of
+   this study is to validate the *default* settings, not some study-specific
+   iteration count. This makes the `--min_fit_hours` calibration above straightforward
+   to determine (one real timed run at the actual defaults, not a parameter sweep).
 
 ---
 
@@ -282,16 +316,34 @@ For each fitted `trans_summary.csv` joined to `trans_ground_truth.csv`:
 
 ## Next Steps
 
-1. Confirm/adjust the flagged items in §2 (sum-factor units, cells/guide rounding,
-   guide-count × shape pairing, hash-based-seed avoidance) if any assumption is wrong.
-2. Implement the simulator (§4) — proposed location:
-   `bayesDREAM/simulation/cis_panel_simulation.py`, reusing
-   `simulate_from_trans_summary` for the trans side as described in §4.2. Driver
-   scripts (design matrix, per-scenario simulate/fit CLIs, SLURM generation) live in
-   `examples/simulation_study/`, matching the existing `examples/illustration/`
-   convention — this repo has no `run_pipeline/` directory (that layout is from the
-   sibling non-refactored codebase at the parent `bayesDREAM code/` level).
-3. Build `design_matrix.csv` generation (§6) and confirm the 540-run scale is what you
-   want before spending cluster time.
-4. Decide the `slurm_jobgen.py` adaptation question in §7 step 5.
-5. Implement the evaluation/aggregation script (§8) once real fits exist.
+**Done**: simulator (`bayesDREAM/simulation/cis_panel_simulation.py`), driver scripts
+in `examples/simulation_study/` (design matrix, simulate/fit CLIs, SLURM generation),
+the two `slurm_jobgen.py` bugs, the `effect_type='null'`/pandas-na_values bug, the
+`device` auto-detect bug, scran-based `sum_factor` recomputation +
+`adjust_ntc_sum_factor`/`refit_sumfactor` in the fit pipeline, and the niters/nsamples
+decision (always library defaults). Design matrix is now 144 scenarios × 5 replicates
+= 720 rows.
+
+**Still open**:
+
+1. **NaN crash in `fit_ntc` at production scale (1000 cells, 1736 features), still
+   undiagnosed.** The only full-scale test crashed with NaN parameters in
+   `AutoIAFNormal` right after step 0. Root cause unknown — could be a simulator data
+   issue or a library edge case at this feature count. Blocks trusting any 1000-cell
+   scenario.
+2. **No successful run yet at real (library-default) `niters`, at any scale** — every
+   test so far used a reduced `niters` override (now removed from the script) or
+   crashed. No evidence yet that the recovery model actually recovers known Hill
+   curves reasonably well on this data.
+3. **`--min_fit_hours` is still a guessed placeholder**, blocked by #1/#2 — needs a
+   real timed `run_recovery_fit.py` run (at library-default `niters`) on the target
+   hardware.
+4. **Evaluation/aggregation script doesn't exist yet** — §8 is a sketch, no code.
+5. **Storage footprint not estimated** — 720 scenarios × (`counts.csv`, several
+   `posterior_samples_*.pt`, `fit_trans` checkpoint files, `sum_factor_scran/`
+   intermediates) could be a meaningful chunk of quota; worth estimating from one
+   completed scenario's directory size before committing to the full run.
+6. **Berzelius deployment paths are still placeholders** (`--python_env`,
+   `--bayesdream_path`, `--data_path`, `--examples_path`, `--account`) — fill in with
+   your actual project allocation, and confirm the `bayesdream` conda env (with
+   `bioconductor-scran`) is actually built there, not just locally.

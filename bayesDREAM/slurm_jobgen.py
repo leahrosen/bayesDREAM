@@ -62,6 +62,7 @@ class SlurmJobGenerator:
         bayesdream_path: str = '/proj/berzelius-aiics-real/users/x_learo/bayesDREAM',
         data_path: Optional[str] = None,
         nsamples: int = 1000,
+        force_iaf: bool = False,
     ):
         """
         Initialize SLURM job generator.
@@ -107,6 +108,14 @@ class SlurmJobGenerator:
             loaded from memory (not implemented - user must save data first)
         nsamples : int
             Number of posterior samples
+        force_iaf : bool
+            fit_ntc's guide defaults to AutoNormal (mean-field) — robust across
+            dataset sizes and sparsity levels. Set True to request AutoIAFNormal
+            instead (matches fit_ntc's own force_iaf parameter, and is threaded into
+            the generated fit_technical script). Only recommended for small,
+            deeply-sequenced datasets with no near-zero-count NTC features — IAF's
+            single shared network across all features means one sparse feature's
+            exploding gradient can corrupt every other feature's fit in one step.
         """
         self.meta = meta
         self.counts = counts
@@ -124,6 +133,7 @@ class SlurmJobGenerator:
         self.bayesdream_path = bayesdream_path
         self.data_path = data_path
         self.nsamples = nsamples
+        self.force_iaf = force_iaf
 
         # Auto-detect dataset characteristics
         self.n_features = counts.shape[0]
@@ -199,17 +209,23 @@ class SlurmJobGenerator:
             verbose=False
         )
 
-        # Determine if AutoIAFNormal can be used (< 20GB VRAM threshold)
+        # fit_ntc defaults to AutoNormal (mean-field) regardless of dataset size —
+        # see bayesDREAM/fitting/ntc.py's fit_ntc docstring. AutoIAFNormal is opt-in
+        # via force_iaf=True (matches fit_ntc's own parameter, threaded into the
+        # generated fit_technical script below). This estimator used to auto-select
+        # IAF whenever it fit an (essentially always crossed at realistic gene
+        # counts) 20GB VRAM budget, which silently assumed IAF's 50k-iteration
+        # profile almost universally — that no longer reflects fit_ntc's real
+        # default, so the choice here now mirrors self.force_iaf directly.
         n_latent = (self.n_groups - 1 + 2) * self.n_features
         iaf_vram_gb = (n_latent ** 2 * 4 * 3 * 1.5) / 1e9
-        self.use_autonormal = (iaf_vram_gb >= 20.0)
+        self.use_autonormal = not self.force_iaf
 
         if self.use_autonormal:
-            print(f"\n[INFO] AutoIAFNormal would require {iaf_vram_gb:.1f} GB VRAM")
-            print(f"[INFO] Will use AutoNormal (mean-field) with niters=100,000")
+            print(f"\n[INFO] Using AutoNormal (mean-field, default) with niters=100,000")
+            print(f"[INFO] (AutoIAFNormal would need ~{iaf_vram_gb:.1f} GB VRAM — pass force_iaf=True to use it)")
         else:
-            print(f"\n[INFO] AutoIAFNormal estimated at {iaf_vram_gb:.1f} GB VRAM")
-            print(f"[INFO] Will use AutoIAFNormal with niters=50,000")
+            print(f"\n[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_vram_gb:.1f} GB VRAM) with niters=50,000")
 
         # Add resource recommendations
         results['resources'] = self._recommend_resources(results)
@@ -649,7 +665,8 @@ print("Running fit_ntc...")
 model.fit_ntc(
     niters={niters},
     use_all_cells={use_all_cells_flag},
-    nsamples={self.nsamples}
+    nsamples={self.nsamples},
+    force_iaf={self.force_iaf}
 )
 
 print("fit_ntc completed successfully")
@@ -960,7 +977,8 @@ model.set_technical_groups(['cell_line'])
 model.fit_ntc(
     niters={niters},
     use_all_cells={str(self.use_all_cells_technical)},
-    nsamples={self.nsamples}
+    nsamples={self.nsamples},
+    force_iaf={self.force_iaf}
 )
 ```
 

@@ -8,6 +8,11 @@ so the simulation and the real fitting code share the exact same A/V/K reconstru
 semantics (see plan §4.2).
 """
 
+import os
+import shutil
+import subprocess
+import sys
+
 import numpy as np
 import pandas as pd
 
@@ -185,6 +190,7 @@ def simulate_cis_panel(
         'guide': guides,
         'log2_x_true': log2_x_true,
         'x_true': x_true,
+        'sum_factor_true': sum_factor,
     })
     guide_ground_truth = pd.DataFrame(guide_ground_truth_rows)
 
@@ -265,3 +271,88 @@ def simulate_scenario(
         trans_ground_truth=trans_ground_truth,
         config=config,
     )
+
+
+def _find_rscript() -> str:
+    """Resolve Rscript, preferring the one installed alongside the running Python
+    interpreter's conda env (where bioconductor-scran actually lives per
+    environment_{cpu,cuda,rocm}.yml) over whatever 'Rscript' resolves to on PATH --
+    invoking a specific python binary doesn't add its env's bin/ to subprocess PATH,
+    so a bare ['Rscript', ...] call can silently pick up an unrelated system R."""
+    sibling = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'Rscript')
+    if os.path.isfile(sibling):
+        return sibling
+    on_path = shutil.which('Rscript')
+    if on_path:
+        return on_path
+    raise RuntimeError(
+        "Rscript not found (checked alongside the current Python interpreter and on "
+        "PATH). Install r-base/bioconductor-scran in this environment "
+        "(see environment_cpu.yml) or ensure Rscript is on PATH."
+    )
+
+
+def recompute_sum_factor_scran(counts_csv_path: str, meta: pd.DataFrame, workdir: str) -> np.ndarray:
+    """Recompute per-cell sum factors from simulated counts via scran::calculateSumFactors,
+    clustered by guide x cell_line (any cluster containing 'NTC' collapsed to a single
+    'NTC' cluster, used as the reference cluster).
+
+    The sum factor used to *generate* the data (sim_sum_factor passed into
+    simulate_from_trans_summary) is not a valid stand-in for what a real analysis would
+    estimate from the resulting counts -- simulate_from_trans_summary's own docstring
+    says so explicitly (plan §4.2). This mirrors the scran step from this repo's own
+    real-data preprocessing convention (the same clustered calculateSumFactors call is
+    referenced in bayesDREAM/simulation/simulation.py's module docstring).
+
+    Parameters
+    ----------
+    counts_csv_path : str
+        Path to an already-written counts CSV (features x cells, first column =
+        feature name) -- callers should reuse the scenario's own counts.csv rather
+        than write a duplicate copy.
+
+    Writes small intermediate CSVs into `workdir` (kept, not cleaned up, for
+    debuggability) and shells out to Rscript. Requires bioconductor-scran and
+    r-data.table (already declared in environment_{cpu,cuda,rocm}.yml).
+
+    Returns
+    -------
+    np.ndarray, shape (n_cells,), aligned to `meta['cell']` order.
+    """
+    os.makedirs(workdir, exist_ok=True)
+    meta_path = os.path.join(workdir, 'meta_for_sumfactor.csv')
+    sf_path = os.path.join(workdir, 'sum_factor_scran.csv')
+    r_script_path = os.path.join(workdir, 'sum_factor.R')
+
+    meta[['cell', 'guide', 'target', 'cell_line']].to_csv(meta_path, index=False)
+
+    r_script = f"""
+suppressPackageStartupMessages(library(scran))
+suppressPackageStartupMessages(library(data.table))
+
+counts_sub <- fread("{counts_csv_path}", data.table=FALSE)
+rownames(counts_sub) <- counts_sub[[1]]
+counts_sub[[1]] <- NULL
+counts_sub <- as.matrix(counts_sub)
+
+meta_sub <- fread("{meta_path}", data.table=FALSE)
+my_cell_order <- copy(meta_sub$cell)
+
+myclusts <- as.character(paste0(meta_sub$guide, '_', meta_sub$cell_line))
+myclusts[grepl('NTC', myclusts)] <- 'NTC'
+meta_sub$clustered.sum.factor <- calculateSumFactors(counts_sub, clusters=myclusts, ref.clust='NTC')
+
+write.table(as.data.table(meta_sub)[match(my_cell_order, cell)]$clustered.sum.factor,
+            file="{sf_path}", row.names=FALSE, col.names=FALSE, sep=",", quote=FALSE)
+"""
+    with open(r_script_path, 'w') as f:
+        f.write(r_script)
+
+    subprocess.run([_find_rscript(), r_script_path], check=True)
+
+    sum_factor = pd.read_csv(sf_path, header=None).squeeze('columns').to_numpy(dtype=float)
+    if len(sum_factor) != len(meta):
+        raise RuntimeError(
+            f"scran returned {len(sum_factor)} sum factors but meta has {len(meta)} cells"
+        )
+    return sum_factor

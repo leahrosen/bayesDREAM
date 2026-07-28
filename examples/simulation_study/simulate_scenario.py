@@ -1,11 +1,15 @@
 """
 Simulate one cell-design scenario (array-job entry point). See docs/SIMULATION_STUDY_PLAN.md.
 
-This step is pure NumPy/negbinom sampling (no SVI) — no torch/pyro dependency and no
-seeding needed beyond the design matrix's per-row seed, which is threaded entirely
-through numpy.random.Generator instances (never global numpy/torch/pyro state).
-torch/pyro seeding happens in run_recovery_fit.py, which is the step that actually
-uses them.
+This step is NumPy/negbinom sampling (no SVI, no torch/pyro) plus one Rscript
+subprocess call (scran::calculateSumFactors, to recompute a realistic sum_factor from
+the simulated counts -- see recompute_sum_factor_scran). No seeding needed beyond the
+design matrix's per-row seed, which is threaded entirely through numpy.random.Generator
+instances (never global numpy/torch/pyro state). torch/pyro seeding happens in
+run_recovery_fit.py, which is the step that actually uses them.
+
+Requires Rscript on PATH with bioconductor-scran and r-data.table installed (declared
+in environment_{cpu,cuda,rocm}.yml).
 
 Usage (single task):
     python simulate_scenario.py --design_matrix design_matrix.csv --row_index 0 \
@@ -15,8 +19,10 @@ Usage (SLURM array; reads $SLURM_ARRAY_TASK_ID if --row_index is omitted):
     python simulate_scenario.py --design_matrix design_matrix.csv --outdir ./sim_study_out
 
 Writes to <outdir>/scenario_<scenario_id>/rep_<replicate_id>/:
-    config.json, meta.csv, counts.csv, cis_ground_truth.csv,
-    guide_ground_truth.csv, trans_ground_truth.csv
+    config.json, meta.csv (sum_factor = scran-recomputed), counts.csv,
+    cis_ground_truth.csv (includes sum_factor_true, the value actually used to
+    generate the data), guide_ground_truth.csv, trans_ground_truth.csv,
+    sum_factor_scran/ (R script + intermediate CSVs, kept for debuggability)
 """
 
 import argparse
@@ -26,7 +32,7 @@ import subprocess
 
 import pandas as pd
 
-from bayesDREAM.simulation import simulate_scenario
+from bayesDREAM.simulation import simulate_scenario, recompute_sum_factor_scran
 
 
 def _git_commit_hash() -> str:
@@ -68,8 +74,19 @@ def run_one(design_matrix: pd.DataFrame, row_index: int, outdir: str) -> str:
     with open(os.path.join(scen_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
 
-    result['meta'].to_csv(os.path.join(scen_dir, 'meta.csv'), index=False)
-    result['counts'].to_csv(os.path.join(scen_dir, 'counts.csv'))
+    counts_path = os.path.join(scen_dir, 'counts.csv')
+    result['counts'].to_csv(counts_path)
+
+    # simulate_from_trans_summary's own docstring: the sum factor used to *generate*
+    # the data is not a valid stand-in for what a real analysis would estimate from
+    # the resulting counts. meta.csv gets the scran-recomputed value (what a real
+    # analyst would have); the true simulated value is preserved separately in
+    # cis_ground_truth.csv as 'sum_factor_true'.
+    meta = result['meta']
+    scran_workdir = os.path.join(scen_dir, 'sum_factor_scran')
+    meta['sum_factor'] = recompute_sum_factor_scran(counts_path, meta, workdir=scran_workdir)
+
+    meta.to_csv(os.path.join(scen_dir, 'meta.csv'), index=False)
     result['cis_ground_truth'].to_csv(os.path.join(scen_dir, 'cis_ground_truth.csv'), index=False)
     result['guide_ground_truth'].to_csv(os.path.join(scen_dir, 'guide_ground_truth.csv'), index=False)
     result['trans_ground_truth'].to_csv(os.path.join(scen_dir, 'trans_ground_truth.csv'), index=False)

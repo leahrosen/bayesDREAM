@@ -4,6 +4,7 @@ from .cis_panel_simulation import (
     build_trans_panel_grid,
     simulate_cis_panel,
     simulate_scenario,
+    recompute_sum_factor_scran,
     GUIDE_PATTERNS,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     'build_trans_panel_grid',
     'simulate_cis_panel',
     'simulate_scenario',
+    'recompute_sum_factor_scran',
     'GUIDE_PATTERNS',
 ]
