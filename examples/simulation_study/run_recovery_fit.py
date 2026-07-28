@@ -13,6 +13,15 @@ Reuses the scenario's own seed (recorded in config.json by simulate_scenario.py)
 numpy/torch/pyro, so a rerun of a given scenario+replicate is deterministic end to end
 (plan §6).
 
+Writes fit/recovery/fit_stats.json: per-step (fit_ntc/fit_cis/fit_trans) wall-clock
+time, peak CPU RSS, and peak GPU memory (torch.cuda.max_memory_allocated(), true
+per-step since it's reset before each step -- CPU RSS is a running high-water mark,
+not resettable, see _peak_rss_mb), plus hostname/SLURM job+array-task ID/resolved
+device for cross-referencing against sacct or cluster GPU-utilization dashboards.
+Written incrementally after each step, not just at the end, so a later step crashing
+or getting killed (e.g. by an external SIGTERM, which skips Python cleanup code)
+still leaves completed earlier steps' stats on disk.
+
 Usage (single task):
     python run_recovery_fit.py --scenario_dir ./sim_study_out/data/scenario_0/rep_0
 
@@ -25,6 +34,11 @@ Usage (SLURM array over design_matrix rows; resolves scenario_dir from
 import argparse
 import json
 import os
+import platform
+import resource
+import socket
+import time
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -40,6 +54,49 @@ def resolve_scenario_dir(data_root: str, design_matrix_path: str, row_index: int
     return os.path.join(
         data_root, f"scenario_{int(row['scenario_id'])}", f"rep_{int(row['replicate_id'])}",
     )
+
+
+def _peak_rss_mb() -> float:
+    """Peak resident set size (high-water mark since process start) in MB.
+
+    NOT resettable per step (unlike GPU memory tracking below) -- ru_maxrss only
+    ever increases, so each step's reported value is the peak *up to and including*
+    that step, not that step in isolation. Still informative: shows the running
+    high-water mark growing through the pipeline. Units differ by platform: Linux
+    reports KB, macOS (BSD) reports bytes.
+    """
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024.0 if platform.system() == 'Linux' else 1024.0 ** 2)
+
+
+def _write_stats(stats: dict, stats_path: str) -> None:
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+
+
+@contextmanager
+def _timed_step(name: str, stats: dict, device_is_cuda: bool, stats_path: str):
+    """Time one fit step, record elapsed wall-clock + peak memory, and write the
+    stats file immediately -- if a later step crashes or gets killed (e.g. by an
+    external SIGTERM, which doesn't give Python a chance to run cleanup code), the
+    completed earlier steps' stats are still on disk rather than lost. GPU memory
+    is a true per-step peak (torch.cuda.reset_peak_memory_stats() before each step);
+    CPU memory is not (see _peak_rss_mb).
+    """
+    if device_is_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - t0
+    entry = {
+        'elapsed_sec': elapsed,
+        'peak_rss_mb': _peak_rss_mb(),
+        'peak_gpu_mb': (torch.cuda.max_memory_allocated() / 1024.0 ** 2) if device_is_cuda else None,
+    }
+    stats['steps'][name] = entry
+    _write_stats(stats, stats_path)
+    gpu_note = f", peak_gpu={entry['peak_gpu_mb']:.0f}MB" if device_is_cuda else ""
+    print(f"[TIMING] {name}: {elapsed:.1f}s, peak_rss={entry['peak_rss_mb']:.0f}MB{gpu_note}")
 
 
 def run_recovery_fit(
@@ -69,15 +126,31 @@ def run_recovery_fit(
         device=device,
         random_seed=seed,
     )
+    device_is_cuda = model.device.type == 'cuda'
+
+    recovery_dir = os.path.join(fit_dir, 'recovery')
+    os.makedirs(recovery_dir, exist_ok=True)
+    stats_path = os.path.join(recovery_dir, 'fit_stats.json')
+    stats = {
+        'device_requested': device,
+        'device_resolved': str(model.device),
+        'hostname': socket.gethostname(),
+        'slurm_job_id': os.environ.get('SLURM_JOB_ID'),
+        'slurm_array_task_id': os.environ.get('SLURM_ARRAY_TASK_ID'),
+        'steps': {},
+    }
+    _write_stats(stats, stats_path)
 
     # single technical group (plan §2 / §4.1): C=1 is an explicit no-group-effect
     # code path in fit_ntc/fit_cis/fit_trans, not a degenerate/unsupported case.
     model.set_technical_groups(['cell_line'])
-    model.fit_ntc(sum_factor_col='sum_factor')
+    with _timed_step('fit_ntc', stats, device_is_cuda, stats_path):
+        model.fit_ntc(sum_factor_col='sum_factor')
     # Save immediately after each step, not just at the end: fit_cis/fit_trans are the
     # steps most likely to fail (longer runtime, more iterations, e.g. the AutoIAFNormal
     # NaN failure mode this study surfaced) -- if a later step crashes or times out, the
-    # earlier steps' results are still on disk to inspect rather than lost entirely.
+    # earlier steps' results (and this step's timing/memory stats) are still on disk to
+    # inspect rather than lost entirely.
     model.save_ntc_fit()
 
     # meta's 'sum_factor' is scran-recomputed from realized counts (see
@@ -90,7 +163,15 @@ def run_recovery_fit(
         sum_factor_col_adj='sum_factor_adj',
         covariates=['cell_line'],
     )
-    model.fit_cis(sum_factor_col='sum_factor_adj')
+    # force=True: fit_cis() refuses by default when the cis gene's fitted NTC log2
+    # expression is < -1 (overdispersion from near-zero counts can be unreliable on
+    # real data). This study's log2_X_NTC grid deliberately sweeps down to -1 (plan
+    # §3.1), and sampling noise (sigma_eff=0.7) means the *fitted* value can land
+    # below -1 by chance even when the true value sits right at the boundary -- that's
+    # exactly the low-expression stress-test scenario this study is designed to
+    # include, not a real data-quality problem, so the safety check doesn't apply here.
+    with _timed_step('fit_cis', stats, device_is_cuda, stats_path):
+        model.fit_cis(sum_factor_col='sum_factor_adj', force=True)
     model.save_cis_fit()
 
     model.refit_sumfactor(
@@ -98,12 +179,16 @@ def run_recovery_fit(
         sum_factor_col_refit='sum_factor_refit',
         covariates=['cell_line'],
     )
-    model.fit_trans(
-        sum_factor_col='sum_factor_refit',
-        function_type='single_hill',
-    )
+    with _timed_step('fit_trans', stats, device_is_cuda, stats_path):
+        model.fit_trans(
+            sum_factor_col='sum_factor_refit',
+            function_type='single_hill',
+        )
     model.save_trans_fit()
     model.save_trans_summary(fdr_threshold=0.05)
+
+    stats['total_elapsed_sec'] = sum(s['elapsed_sec'] for s in stats['steps'].values())
+    _write_stats(stats, stats_path)
 
     return model
 

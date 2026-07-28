@@ -237,8 +237,17 @@ $OUT/
         ├── sum_factor_scran/            # R script + intermediates (kept for debugging)
         └── fit/recovery/
             ├── posterior_samples_{ntc,cis,trans}.pt
-            └── trans_feature_summary_gene.csv
+            ├── trans_feature_summary_gene.csv
+            └── fit_stats.json           # per-step timing/memory -- see below
 ```
+
+`fit_stats.json` records, per step (`fit_ntc`/`fit_cis`/`fit_trans`): wall-clock
+seconds, peak CPU RSS, and peak GPU memory (a true per-step peak — reset before each
+step; CPU RSS is a running high-water mark instead, not resettable), plus hostname,
+`SLURM_JOB_ID`/`SLURM_ARRAY_TASK_ID`, and the resolved device — enough to directly
+cross-reference a slow or killed step against `sacct`/`jobgraph` for that exact job.
+Written incrementally after each step completes, so a later step crashing or getting
+killed still leaves the earlier steps' stats on disk.
 
 ## Troubleshooting
 

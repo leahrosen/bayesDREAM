@@ -204,7 +204,9 @@ outdir/<label>/scenario_<sid>/rep_<r>/
 └── fit/recovery/
     ├── posterior_samples_ntc.pt, posterior_samples_cis.pt, posterior_samples_trans.pt
     ├── trans_checkpoint_gene_*.pt     # fit_trans's own checkpointing
-    └── trans_feature_summary_gene.csv # from save_trans_summary(); fitted A/n/K/full_log2FC + fdr_alpha
+    ├── trans_feature_summary_gene.csv # from save_trans_summary(); fitted A/n/K/full_log2FC + fdr_alpha
+    └── fit_stats.json                 # per-step (fit_ntc/fit_cis/fit_trans) wall-clock time,
+                                        # peak CPU RSS, peak GPU memory, hostname, SLURM job/array-task ID
 ```
 
 `trans_ground_truth.csv` and the fitted `trans_summary.csv` are both keyed by
