@@ -237,15 +237,15 @@ gen = SlurmJobGenerator(
 
 The generator automatically selects optimal resources for Berzelius:
 
-#### Berzelius Node Types
+#### Berzelius Node Types (Ampere/A100 — Hopper/H200 not covered here)
 
-| Node Type | Constraint | GPUs per Node | VRAM per GPU | RAM per GPU | Best For |
-|-----------|------------|---------------|--------------|-------------|----------|
-| **Fat** | `-C fat` | 8 | 10 GB | 128 GB | Standard fitting |
-| **Thin** | `-C thin` | 8 | 5 GB | 64 GB | Small datasets |
-| **CPU** | `--partition=berzelius-cpu` | 0 | 0 | 7.76 GB/core | Extremely large datasets, fit_cis |
+| Node Type | Constraint | GPUs per Node | VRAM per GPU | RAM per GPU | RAM per Node | Best For |
+|-----------|------------|---------------|--------------|-------------|--------------|----------|
+| **Thin** | `-C thin` | 8 | 40 GB (A100) | 128 GB | 1 TB | Standard fitting, small-medium datasets |
+| **Fat** | `-C fat` | 8 | 80 GB (A100) | 256 GB | 2 TB | Large datasets |
+| **CPU** | `--partition=berzelius-cpu` | 0 | 0 | 7.76 GB/core | — | Extremely large datasets, fit_cis |
 
-**Note:** Full node = 8 GPUs. The generator will use up to 8 GPUs before switching to CPU.
+**Note:** Full node = 8 GPUs. RAM per GPU is the node's total RAM divided by 8 (SLURM allocates RAM proportional to GPUs requested, per the node's 1:8 GPU:CPU-core ratio). VRAM is *not* shared across GPUs — each GPU carries its own dedicated 40GB (thin) or 80GB (fat), regardless of how many GPUs are requested. The generator will use up to 8 GPUs before switching to CPU.
 
 #### Automatic Selection Logic
 
@@ -253,15 +253,15 @@ The generator analyzes memory requirements and selects:
 
 **fit_ntc and fit_trans** (same logic):
 ```
-If VRAM ≤ 5 GB and RAM ≤ 64 GB:
+If VRAM ≤ 40 GB and RAM ≤ 128 GB:
     → 1 thin GPU ✓ (most efficient for small datasets)
-Elif VRAM ≤ 10 GB and RAM ≤ 128 GB:
+Elif VRAM ≤ 80 GB and RAM ≤ 256 GB:
     → 1 fat GPU ✓ (most common case)
-Elif VRAM ≤ 20 GB and RAM ≤ 256 GB:
+Elif VRAM ≤ 160 GB and RAM ≤ 512 GB:
     → 2 fat GPUs
-Elif VRAM ≤ 40 GB and RAM ≤ 512 GB:
+Elif VRAM ≤ 320 GB and RAM ≤ 1024 GB:
     → 4 fat GPUs
-Elif VRAM ≤ 80 GB and RAM ≤ 1024 GB:
+Elif VRAM ≤ 640 GB and RAM ≤ 2048 GB:
     → 8 fat GPUs (full node)
 Else:
     → CPU partition (dataset too large for 8 GPUs)
@@ -722,8 +722,8 @@ Job killed due to memory usage
 
 3. **Use more GPUs:**
    ```python
-   # Each GPU on fat nodes provides 128GB RAM
-   # 2 GPUs = 256GB RAM
+   # Each GPU on fat nodes provides 256GB RAM
+   # 2 GPUs = 512GB RAM
    ```
 
 4. **Switch to CPU:**

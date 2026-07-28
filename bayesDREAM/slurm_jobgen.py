@@ -36,10 +36,10 @@ class SlurmJobGenerator:
     """
     Generate SLURM job submission scripts for bayesDREAM pipeline on Berzelius.
 
-    Berzelius resource specs:
-    - Fat nodes (-C fat): 128GB RAM + 10GB VRAM per GPU
-    - Thin nodes (-C thin): 64GB RAM + 5GB VRAM per GPU
-    - CPU partition: 7.76GB RAM per core
+    Berzelius resource specs (Ampere/A100 nodes only):
+    - Fat nodes (-C fat): A100 80GB VRAM per GPU, 256GB RAM per GPU (2TB per 8-GPU node)
+    - Thin nodes (-C thin): A100 40GB VRAM per GPU, 128GB RAM per GPU (1TB per 8-GPU node)
+    - CPU partition (berzelius-cpu): 7.76GB RAM per core
     """
 
     def __init__(
@@ -133,7 +133,7 @@ class SlurmJobGenerator:
             if sparse.issparse(counts):
                 self.sparsity = 1.0 - (counts.nnz / (counts.shape[0] * counts.shape[1]))
             else:
-                self.sparsity = (counts == 0).sum() / counts.size
+                self.sparsity = float(np.asarray(counts == 0).sum()) / counts.size
         else:
             self.sparsity = sparsity
 
@@ -233,8 +233,8 @@ class SlurmJobGenerator:
         resources = {}
 
         # fit_technical (same conditions as fit_trans)
-        tech_ram = memory['fit_technical_ram_gb']
-        tech_vram = memory['fit_technical_vram_gb']
+        tech_ram = memory['fit_ntc_ram_gb']
+        tech_vram = memory['fit_ntc_vram_gb']
 
         if self.partition_preference != 'auto':
             # User override
@@ -252,7 +252,7 @@ class SlurmJobGenerator:
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
-                    'gpus': max(1, int(np.ceil(tech_vram / 10))),
+                    'gpus': max(1, int(np.ceil(tech_vram / 80))),
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
@@ -262,7 +262,7 @@ class SlurmJobGenerator:
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'thin',
-                    'gpus': max(1, int(np.ceil(tech_vram / 5))),
+                    'gpus': max(1, int(np.ceil(tech_vram / 40))),
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
@@ -270,7 +270,7 @@ class SlurmJobGenerator:
                 }
         else:
             # Auto-select (same logic as fit_trans)
-            if tech_vram <= 5 and tech_ram <= 64:
+            if tech_vram <= 40 and tech_ram <= 128:
                 # Single thin GPU
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
@@ -279,9 +279,9 @@ class SlurmJobGenerator:
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
-                    'rationale': 'Fits on 1 thin GPU (5GB VRAM, 64GB RAM)'
+                    'rationale': 'Fits on 1 thin GPU (40GB VRAM, 128GB RAM)'
                 }
-            elif tech_vram <= 10 and tech_ram <= 128:
+            elif tech_vram <= 80 and tech_ram <= 256:
                 # Single fat GPU
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
@@ -290,9 +290,9 @@ class SlurmJobGenerator:
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
-                    'rationale': 'Fits on 1 fat GPU (10GB VRAM, 128GB RAM)'
+                    'rationale': 'Fits on 1 fat GPU (80GB VRAM, 256GB RAM)'
                 }
-            elif tech_vram <= 20 and tech_ram <= 256:
+            elif tech_vram <= 160 and tech_ram <= 512:
                 # 2 fat GPUs
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
@@ -301,9 +301,9 @@ class SlurmJobGenerator:
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
-                    'rationale': 'Requires 2 fat GPUs (20GB VRAM, 256GB RAM)'
+                    'rationale': 'Requires 2 fat GPUs (160GB VRAM, 512GB RAM)'
                 }
-            elif tech_vram <= 40 and tech_ram <= 512:
+            elif tech_vram <= 320 and tech_ram <= 1024:
                 # 4 fat GPUs
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
@@ -312,9 +312,9 @@ class SlurmJobGenerator:
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
-                    'rationale': 'Requires 4 fat GPUs (40GB VRAM, 512GB RAM)'
+                    'rationale': 'Requires 4 fat GPUs (320GB VRAM, 1024GB RAM)'
                 }
-            elif tech_vram <= 80 and tech_ram <= 1024:
+            elif tech_vram <= 640 and tech_ram <= 2048:
                 # 8 fat GPUs (full node)
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
@@ -323,7 +323,7 @@ class SlurmJobGenerator:
                     'cpus': 1,
                     'mem_gb': tech_ram,
                     'vram_gb': tech_vram,
-                    'rationale': 'Requires 8 fat GPUs (80GB VRAM, 1024GB RAM) - full node'
+                    'rationale': 'Requires 8 fat GPUs (640GB VRAM, 2048GB RAM) - full node'
                 }
             else:
                 # Too large for GPU, use CPU
@@ -355,7 +355,7 @@ class SlurmJobGenerator:
         trans_ram = memory['fit_trans_ram_gb']
         trans_vram = memory['fit_trans_vram_gb']
 
-        if trans_vram <= 5 and trans_ram <= 64:
+        if trans_vram <= 40 and trans_ram <= 128:
             # Single thin GPU
             resources['fit_trans'] = {
                 'partition': 'berzelius',
@@ -364,9 +364,9 @@ class SlurmJobGenerator:
                 'cpus': 1,
                 'mem_gb': trans_ram,
                 'vram_gb': trans_vram,
-                'rationale': 'Fits on 1 thin GPU (5GB VRAM, 64GB RAM)'
+                'rationale': 'Fits on 1 thin GPU (40GB VRAM, 128GB RAM)'
             }
-        elif trans_vram <= 10 and trans_ram <= 128:
+        elif trans_vram <= 80 and trans_ram <= 256:
             # Single fat GPU
             resources['fit_trans'] = {
                 'partition': 'berzelius',
@@ -375,9 +375,9 @@ class SlurmJobGenerator:
                 'cpus': 1,
                 'mem_gb': trans_ram,
                 'vram_gb': trans_vram,
-                'rationale': 'Fits on 1 fat GPU (10GB VRAM, 128GB RAM)'
+                'rationale': 'Fits on 1 fat GPU (80GB VRAM, 256GB RAM)'
             }
-        elif trans_vram <= 20 and trans_ram <= 256:
+        elif trans_vram <= 160 and trans_ram <= 512:
             # 2 fat GPUs
             resources['fit_trans'] = {
                 'partition': 'berzelius',
@@ -386,9 +386,9 @@ class SlurmJobGenerator:
                 'cpus': 1,
                 'mem_gb': trans_ram,
                 'vram_gb': trans_vram,
-                'rationale': 'Requires 2 fat GPUs (20GB VRAM, 256GB RAM)'
+                'rationale': 'Requires 2 fat GPUs (160GB VRAM, 512GB RAM)'
             }
-        elif trans_vram <= 40 and trans_ram <= 512:
+        elif trans_vram <= 320 and trans_ram <= 1024:
             # 4 fat GPUs
             resources['fit_trans'] = {
                 'partition': 'berzelius',
@@ -397,9 +397,9 @@ class SlurmJobGenerator:
                 'cpus': 1,
                 'mem_gb': trans_ram,
                 'vram_gb': trans_vram,
-                'rationale': 'Requires 4 fat GPUs (40GB VRAM, 512GB RAM)'
+                'rationale': 'Requires 4 fat GPUs (320GB VRAM, 1024GB RAM)'
             }
-        elif trans_vram <= 80 and trans_ram <= 1024:
+        elif trans_vram <= 640 and trans_ram <= 2048:
             # 8 fat GPUs (full node)
             resources['fit_trans'] = {
                 'partition': 'berzelius',
@@ -408,7 +408,7 @@ class SlurmJobGenerator:
                 'cpus': 1,
                 'mem_gb': trans_ram,
                 'vram_gb': trans_vram,
-                'rationale': 'Requires 8 fat GPUs (80GB VRAM, 1024GB RAM) - full node'
+                'rationale': 'Requires 8 fat GPUs (640GB VRAM, 2048GB RAM) - full node'
             }
         else:
             # Too large for GPU, use CPU
@@ -525,8 +525,8 @@ class SlurmJobGenerator:
     def _print_resource_summary(self, memory: Dict, times: Dict, resources: Dict):
         """Print summary of resource allocation."""
         print(f"Memory Requirements:")
-        print(f"  fit_technical: {memory['fit_technical_ram_gb']:.1f} GB RAM, "
-              f"{memory['fit_technical_vram_gb']:.1f} GB VRAM")
+        print(f"  fit_technical: {memory['fit_ntc_ram_gb']:.1f} GB RAM, "
+              f"{memory['fit_ntc_vram_gb']:.1f} GB VRAM")
         print(f"  fit_cis:       {memory['fit_cis_ram_gb']:.1f} GB RAM, "
               f"{memory['fit_cis_vram_gb']:.1f} GB VRAM")
         print(f"  fit_trans:     {memory['fit_trans_ram_gb']:.1f} GB RAM, "
@@ -906,7 +906,7 @@ Generated: {pd.Timestamp.now()}
 
 | Step | RAM | VRAM |
 |------|-----|------|
-| fit_technical | {memory['fit_technical_ram_gb']:.1f} GB | {memory['fit_technical_vram_gb']:.1f} GB |
+| fit_technical | {memory['fit_ntc_ram_gb']:.1f} GB | {memory['fit_ntc_vram_gb']:.1f} GB |
 | fit_cis | {memory['fit_cis_ram_gb']:.1f} GB | {memory['fit_cis_vram_gb']:.1f} GB |
 | fit_trans | {memory['fit_trans_ram_gb']:.1f} GB | {memory['fit_trans_vram_gb']:.1f} GB |
 

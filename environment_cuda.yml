@@ -1,6 +1,7 @@
 name: bayesdream_cuda
 channels:
   - pytorch
+  - nvidia
   - conda-forge
   - bioconda
   - defaults
