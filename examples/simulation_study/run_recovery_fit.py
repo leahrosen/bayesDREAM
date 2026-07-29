@@ -2,7 +2,7 @@
 Fit the recovery model for one simulated cell-design scenario/replicate, following
 bayesDREAM's documented full workflow (docs/FIT_TRANS_GUIDE.md "Complete Workflow
 Example"): fit_ntc -> adjust_ntc_sum_factor -> fit_cis -> refit_sumfactor ->
-fit_trans(single_hill). See docs/SIMULATION_STUDY_PLAN.md §7.
+fit_trans(additive_hill). See docs/SIMULATION_STUDY_PLAN.md §7.
 
 niters/nsamples are intentionally NOT exposed here -- every fit_ntc/fit_cis/fit_trans
 call uses bayesDREAM's own library defaults, deliberately: the point of this study is
@@ -29,11 +29,64 @@ Usage (SLURM array over design_matrix rows; resolves scenario_dir from
 --data_root/--design_matrix/$SLURM_ARRAY_TASK_ID):
     python run_recovery_fit.py --data_root ./sim_study_out/data \
         --design_matrix ./sim_study_out/design_matrix.csv
+
+Thread pinning (--cores / $SLURM_CPUS_PER_TASK): resolved and applied *before*
+numpy/pandas/pyro/torch/bayesDREAM are imported anywhere in this process, and
+deliberately not via bayesDREAM.utils.set_max_threads() -- that helper sets
+OMP_NUM_THREADS/MKL_NUM_THREADS/OPENBLAS_NUM_THREADS/NUMEXPR_NUM_THREADS, which are
+read once when each library's C-extension threadpool first initializes, not on every
+call, and bayesDREAM.utils itself imports numpy/torch at module load, so calling it
+the "normal" way is already too late. On a partition that hands out a whole node
+(or a fixed-size GPU slice) per job this doesn't matter -- there's nothing else on
+the node to oversubscribe. On a *shared* CPU partition (e.g. Dardel) where SLURM
+routinely co-locates multiple array tasks on the same physical node, it matters a
+lot: without this, each task's BLAS threadpool may try to use every core visible on
+the node rather than just the cores actually allocated to it, oversubscribing every
+co-located job at once.
 """
 
 import argparse
-import json
 import os
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--scenario_dir', default=None,
+                         help="Directory written by simulate_scenario.py for one "
+                              "scenario/replicate. Mutually exclusive with "
+                              "--data_root/--design_matrix/--row_index.")
+    parser.add_argument('--data_root', default=None)
+    parser.add_argument('--design_matrix', default=None)
+    parser.add_argument('--row_index', type=int, default=None,
+                         help="Defaults to $SLURM_ARRAY_TASK_ID when using "
+                              "--data_root/--design_matrix.")
+    parser.add_argument('--device', default=None,
+                         help="'cpu' or 'cuda'. Defaults to bayesDREAM's own "
+                              "auto-detection (cuda if available, else cpu) — pass "
+                              "explicitly to force one or the other.")
+    parser.add_argument('--cores', type=int, default=None,
+                         help="CPU threads to pin OMP/OpenBLAS/MKL/NumExpr and "
+                              "PyTorch's intra-op threadpool to. Defaults to "
+                              "$SLURM_CPUS_PER_TASK when set (normal under SLURM "
+                              "with --cpus-per-task); pass explicitly for local runs "
+                              "or schedulers that don't set that variable. See the "
+                              "module docstring for why this must be resolved before "
+                              "any heavy import in this file.")
+    return parser.parse_args()
+
+
+args = _parse_args()
+
+# Must happen before numpy/torch/bayesDREAM are imported anywhere in this process --
+# see module docstring ("Thread pinning").
+_cores = args.cores or os.environ.get('SLURM_CPUS_PER_TASK')
+if _cores is not None:
+    _cores = str(int(_cores))
+    for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        os.environ[_var] = _cores
+
+import json
 import platform
 import resource
 import socket
@@ -46,6 +99,12 @@ import pyro
 import torch
 
 from bayesDREAM import bayesDREAM
+
+if _cores is not None:
+    # The env vars above only bind the C-extension (BLAS/OpenMP) threadpools;
+    # PyTorch's own intra-op threadpool is a separate runtime-settable knob that
+    # works regardless of import order, so it's set here explicitly too.
+    torch.set_num_threads(int(_cores))
 
 
 def resolve_scenario_dir(data_root: str, design_matrix_path: str, row_index: int) -> str:
@@ -134,6 +193,7 @@ def run_recovery_fit(
     stats = {
         'device_requested': device,
         'device_resolved': str(model.device),
+        'cores_requested': _cores,
         'hostname': socket.gethostname(),
         'slurm_job_id': os.environ.get('SLURM_JOB_ID'),
         'slurm_array_task_id': os.environ.get('SLURM_ARRAY_TASK_ID'),
@@ -182,7 +242,7 @@ def run_recovery_fit(
     with _timed_step('fit_trans', stats, device_is_cuda, stats_path):
         model.fit_trans(
             sum_factor_col='sum_factor_refit',
-            function_type='single_hill',
+            function_type='additive_hill',
         )
     model.save_trans_fit()
     model.save_trans_summary(fdr_threshold=0.05)
@@ -194,22 +254,6 @@ def run_recovery_fit(
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--scenario_dir', default=None,
-                         help="Directory written by simulate_scenario.py for one "
-                              "scenario/replicate. Mutually exclusive with "
-                              "--data_root/--design_matrix/--row_index.")
-    parser.add_argument('--data_root', default=None)
-    parser.add_argument('--design_matrix', default=None)
-    parser.add_argument('--row_index', type=int, default=None,
-                         help="Defaults to $SLURM_ARRAY_TASK_ID when using "
-                              "--data_root/--design_matrix.")
-    parser.add_argument('--device', default=None,
-                         help="'cpu' or 'cuda'. Defaults to bayesDREAM's own "
-                              "auto-detection (cuda if available, else cpu) — pass "
-                              "explicitly to force one or the other.")
-    args = parser.parse_args()
-
     if args.scenario_dir is not None:
         scenario_dir = args.scenario_dir
     else:

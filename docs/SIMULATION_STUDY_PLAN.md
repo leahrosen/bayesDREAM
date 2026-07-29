@@ -2,9 +2,16 @@
 
 ## Purpose
 
-Assess `fit_cis` / `fit_trans` (`function_type='single_hill'`) parameter recovery and
-null/non-null discrimination across a wide grid of cell counts, guide designs, cis
-expression levels, and trans dose-response shapes, using fully known ground truth.
+Assess `fit_cis` / `fit_trans` parameter recovery and null/non-null discrimination
+across a wide grid of cell counts, guide designs, cis expression levels, and trans
+dose-response shapes, using fully known ground truth. Ground truth is generated as
+single-Hill dose-response curves (or null); recovery is fit with
+`fit_trans(function_type='additive_hill')` — a deliberately **misspecified**
+(more flexible) model relative to the single-Hill generating process, to test
+whether `additive_hill` still recovers sensible parameters (correct-direction
+component matching truth, opposite-direction component shrinking toward zero)
+rather than only testing a matched-model best case. See the 2026-07-29 update in
+[§1](#1-decisions-already-made-resolved-with-user-2026-07-27).
 Runs on Berzelius via `bayesDREAM.slurm_jobgen`.
 
 This document is the design spec. It does not implement the simulator or the SLURM
@@ -18,14 +25,30 @@ scripts — see [Next Steps](#next-steps).
   own NB overdispersion (`phi_x = 1/o_x^2`), not the trans-gene `o_y`. Confirmed.
 - **"Fits: no effect or single hill"** describes the **ground-truth generative
   scenario** for each simulated trans gene (flat/null vs. a true single-Hill
-  dose-response), not a choice among fitting model forms. Confirmed. Recovery fitting
-  uses **`fit_trans(function_type='single_hill')` only** (the matched model).
+  dose-response), not a choice among fitting model forms. Confirmed.
 - **Replicates**: **5** independent-seed replicates per cell-design scenario.
 - **Batching**: each cell-design scenario simulates **all trans-gene parameter
   combinations together as one synthetic gene panel** and fits them in a single
   `fit_cis` + `fit_trans` call (bayesDREAM natively vectorizes across trans features).
-  This is the only computationally feasible structure — the fully-crossed alternative
-  (one fit per individual trans-gene scenario) would be ~187,000 separate fits.
+  This is the only computationally feasible structure — (one fit per individual
+  trans-gene scenario) would be ~187,000 separate fits.
+
+**Update, 2026-07-29 (resolved with user):** Recovery fitting uses
+**`fit_trans(function_type='additive_hill')`**, not `single_hill` as originally
+planned — this is now deliberately a **misspecified-model** study: the simulator is
+unchanged (ground truth stays single-Hill/null only, see §4.2), but fitting uses the
+more flexible `additive_hill` form to test whether it still recovers sensible
+parameters (correct-direction Hill component tracking the true single-Hill curve,
+opposite-direction component's amplitude shrinking toward ~0) rather than only
+validating a matched-model best case. This changes total SVI steps per `fit_trans`
+call: `additive_hill` runs a `single_hill` curriculum-warmup phase first
+(`warmup_steps = round(niters * 0.5/0.9) ≈ 55,556` for the default `niters=100,000`),
+then the `niters` `additive_hill` steps proper — **~155,556 total steps**, vs. the
+flat 100,000 `single_hill` would have run. Per-step cost is also higher for the
+`additive_hill` phase (two Hill components instead of one). The `--min_fit_hours=3`
+default in §7 was calibrated against a `single_hill` timing run and has **not** been
+re-measured for `additive_hill` — treat it as stale until a real `additive_hill`
+timed run is available.
 
 ## 2. Parameters that were missing or under-specified, and how they're resolved here
 
@@ -264,7 +287,8 @@ re-run standalone without re-deriving indices.
    Array job of 720 tasks.
 4. **`fit_trans`**: T=1736 features × up to 1000 cells is the expensive step — likely
    1 thin/fat GPU per task per `SlurmJobGenerator`'s memory-based auto-selection.
-   Array job of 720 tasks, `function_type='single_hill'` only (per §1).
+   Array job of 720 tasks, `function_type='additive_hill'` only (per §1, updated
+   2026-07-29 — misspecified-model recovery against single-Hill-only ground truth).
 5. Use `bayesDREAM.slurm_jobgen.SlurmJobGenerator.estimate_memory_requirements()` /
    `estimate_time_requirements()` on one representative simulated scenario (largest:
    `cells_per_gene=1000`) **before** generating the full 720-task array, to get
@@ -294,23 +318,38 @@ re-run standalone without re-deriving indices.
    model. Rather than change that heuristic in `slurm_jobgen.py` itself (a judgment
    call, not a clear bug), `generate_slurm.py` floors the fit step's time budget with
    a `--min_fit_hours` flag and prints both the raw estimate and the floored value it
-   used. **Calibrated (2026-07-28)**: default is now 3h, based on a real
-   `run_recovery_fit.py` run on the largest (`cells_per_gene=1000`) scenario on
-   Berzelius, predicted to take just over 2h — 3h leaves a margin. If your own timing
-   differs (different hardware, or the grid/defaults change), override
-   `--min_fit_hours` rather than trusting this value blindly.
+   used. **Calibrated (2026-07-28) against `single_hill`, now stale**: default was
+   set to 3h based on a real `run_recovery_fit.py` run on the largest
+   (`cells_per_gene=1000`) scenario on Berzelius with `function_type='single_hill'`,
+   predicted to take just over 2h. Since 2026-07-29 the fit call uses `additive_hill`
+   instead (see §1 update), which runs ~1.56x the total SVI steps (curriculum
+   warmup + main phase, vs. `single_hill`'s flat step count) at a higher per-step
+   cost for the main phase — **`--min_fit_hours` needs to be re-measured from a
+   real `additive_hill` timed run before trusting it for the full 720-task array.**
 
    **Resolved (niters/nsamples)**: `run_recovery_fit.py` does not expose `niters`/
    `nsamples` at all — every `fit_ntc`/`fit_cis`/`fit_trans` call uses bayesDREAM's own
    library defaults (`fit_ntc`: 50,000; `fit_cis`: 100,000; `fit_trans`: 100,000–
-   200,000 depending on distribution). This was a deliberate decision: the point of
-   this study is to validate the *default* settings, not some study-specific
-   iteration count. This makes the `--min_fit_hours` calibration above straightforward
-   to determine (one real timed run at the actual defaults, not a parameter sweep).
+   200,000 `niters` depending on distribution, plus an automatic `single_hill`
+   curriculum-warmup phase before `additive_hill`'s main phase — see §1 update). This
+   was a deliberate decision: the point of this study is to validate the *default*
+   settings, not some study-specific iteration count. This makes the
+   `--min_fit_hours` calibration above straightforward to determine (one real timed
+   run at the actual defaults, not a parameter sweep).
 
 ---
 
 ## 8. Evaluation plan (sketch — not implemented)
+
+**Update, 2026-07-29**: since fitting now uses `additive_hill` against single-Hill-only
+ground truth (§1), the fitted model reports **two** Hill components (e.g. `n_a`/`K_a`/
+`Vmax_a` for the positive-direction component, `n_b`/`K_b`/`Vmax_b` for the
+negative-direction one — see `docs/FIT_TRANS_GUIDE.md`/`HILL_FUNCTION_PRIORS.md` for
+exact naming) rather than one. The bullets below need to be read against whichever
+component's direction matches the ground-truth `full_log2FC`'s sign as "the" recovered
+curve, with the opposite-direction component treated as a nuisance parameter expected
+to shrink toward `Vmax≈0` — this comparison logic is not yet designed in detail and
+should be worked out before implementing this section.
 
 For each fitted `trans_summary.csv` joined to `trans_ground_truth.csv`:
 
@@ -318,14 +357,17 @@ For each fitted `trans_summary.csv` joined to `trans_ground_truth.csv`:
   `fdr_alpha ≤ 0.05`; for single_hill-truth features, power = fraction with
   `fdr_alpha ≤ 0.05`, stratified by every grid dimension (`n`, `K_log2FC`,
   `full_log2FC`, `y_ntc`, `o_y`, `cells_per_gene`, guide design, `X_NTC`, `o_x`).
-- **Parameter recovery** (single_hill-truth, detected only): bias and RMSE of fitted
-  vs. true `n_a`, `K_a` (convert `K_log2FC_true` → absolute `K_true` for comparison,
-  since the fitted model reports `K_a` in absolute cis-expression units, not
-  log2FC — see `docs/HILL_FUNCTION_PRIORS.md` "Interpretation" section), and
-  `full_log2FC` (reconstruct from fitted `A`/`Vmax_a` the same way
-  `_compute_AV_from_fc` does it in reverse).
-- **Calibration**: coverage of 95% credible intervals for `n_a`/`K_a`/`Vmax_a`
-  against true values, across replicates.
+- **Parameter recovery** (single_hill-truth, detected only): bias and RMSE of the
+  matching-direction fitted component's `n`/`K` vs. true `n_a`, `K_a` (convert
+  `K_log2FC_true` → absolute `K_true` for comparison, since the fitted model reports
+  `K` in absolute cis-expression units, not log2FC — see
+  `docs/HILL_FUNCTION_PRIORS.md` "Interpretation" section), and `full_log2FC`
+  (reconstruct from the matching component's fitted `A`/`Vmax` the same way
+  `_compute_AV_from_fc` does it in reverse). Also report the opposite-direction
+  component's fitted `Vmax` (expected ≈0 if `additive_hill` is behaving well under
+  misspecification).
+- **Calibration**: coverage of 95% credible intervals for the matching-direction
+  component's `n`/`K`/`Vmax` against true values, across replicates.
 
 ---
 
