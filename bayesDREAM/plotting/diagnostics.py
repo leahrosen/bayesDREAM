@@ -15,9 +15,15 @@ from scipy.stats import pearsonr, spearmanr
 from .colors import ColorScheme
 
 
-# Collapse the 7-way additive-Hill `classification` column (see
-# `ModelSummarizer.export_trans_summary` in io/summary.py) into the 3 directions
-# of effect a viewer typically wants to facet/color trans hits by.
+# Collapse the additive-Hill `classification` column (see
+# `ModelSummarizer.export_trans_summary` / `_classify_additive_hill` in
+# io/summary.py) into the 3 directions of effect a viewer typically wants to
+# facet/color trans hits by. Includes 'non_monotonic' -- the generic fallback
+# _classify_additive_hill returns (summary.py's non_monotonic branch) when it
+# detects opposite-sign active components but the numeric root-finder couldn't
+# locate the extremum over the observed x-range, so no _min/_max could be
+# assigned. Missing this key previously caused those rows to map to NaN and
+# get silently dropped from the counts.
 _TRANS_CLASSIFICATION_TO_DIRECTION = {
     'single_positive':   'positive',
     'additive_positive': 'positive',
@@ -25,6 +31,7 @@ _TRANS_CLASSIFICATION_TO_DIRECTION = {
     'additive_negative': 'negative',
     'non_monotonic_min': 'non_monotonic',
     'non_monotonic_max': 'non_monotonic',
+    'non_monotonic':     'non_monotonic',
     'flat':              None,  # not a dependent hit -- dropped
 }
 _TRANS_DIRECTION_ORDER = ['positive', 'negative', 'non_monotonic']
@@ -34,28 +41,48 @@ _TRANS_DIRECTION_COLORS = {
     'non_monotonic': '#1baf7a',
 }
 
+# Full classification (all non-'flat' values of `classification`), for callers
+# who want single_hill vs additive_hill distinguished rather than collapsed
+# into direction. Ordered/colored so same-direction pairs (single vs additive)
+# share a warm/cool family: blue/aqua = positive, orange/yellow = negative,
+# magenta/green/violet = non-monotonic (incl. the unresolved-extremum fallback).
+_TRANS_CLASSIFICATION_ORDER = [
+    'single_positive', 'additive_positive',
+    'single_negative', 'additive_negative',
+    'non_monotonic_min', 'non_monotonic_max', 'non_monotonic',
+]
+_TRANS_CLASSIFICATION_COLORS = {
+    'single_positive':   '#2a78d6',
+    'additive_positive': '#1baf7a',
+    'single_negative':   '#eb6834',
+    'additive_negative': '#eda100',
+    'non_monotonic_min': '#e87ba4',
+    'non_monotonic_max': '#008300',
+    'non_monotonic':     '#4a3aa7',
+}
+
 
 def plot_trans_hits_by_gene(
     fdr_df,
     gene_col="gene",
     classification_col="classification",
     dependent_col="is_dependent",
+    color_by="direction",
     require_dependent=True,
     top_n=None,
     colors=None,
+    cis_gene=None,
     figsize=None,
     show=True,
 ):
     """
     Stacked bar chart of the number of trans-dependent features per gene,
-    colored by direction of effect.
+    colored by shape of the dose-response curve.
 
     Meant for feature-level modalities where several features can map to the
     same gene (e.g. ``splicing_sj``/``splicing_donor`` -- several SJs per
     gene, or ``transcript`` -- several transcripts per gene). Groups
-    ``fdr_df`` by ``gene_col``, collapses each row's ``classification_col``
-    into one of three directions (see ``_TRANS_CLASSIFICATION_TO_DIRECTION``),
-    and draws one stacked bar per gene.
+    ``fdr_df`` by ``gene_col`` and draws one stacked bar per gene.
 
     Parameters
     ----------
@@ -73,6 +100,14 @@ def plot_trans_hits_by_gene(
         ``'additive_negative'``, ``'non_monotonic_min'``, ``'flat'``, ...).
     dependent_col : str, default ``'is_dependent'``
         Column flagging FDR-significant, non-degenerate dose-response features.
+    color_by : {'direction', 'classification'}, default ``'direction'``
+        ``'direction'`` collapses ``classification_col`` into 3 groups --
+        ``positive`` (``single_positive``/``additive_positive``), ``negative``
+        (``single_negative``/``additive_negative``), ``non_monotonic``
+        (``non_monotonic_min``/``non_monotonic_max``).
+        ``'classification'`` keeps all 6 non-``'flat'`` values distinct, so
+        single-Hill and additive-Hill features are shown separately within
+        each direction.
     require_dependent : bool, default True
         If True, restrict to rows with ``dependent_col == True`` before
         counting (dropping ``'flat'``/non-significant rows in addition to the
@@ -81,8 +116,17 @@ def plot_trans_hits_by_gene(
         Only show the ``top_n`` genes with the most trans-dependent features
         (sorted descending by total). Default: show all genes.
     colors : dict, optional
-        Override the default direction -> color mapping (keys
-        ``'positive'``, ``'negative'``, ``'non_monotonic'``).
+        Override the default color mapping. Keys are ``'positive'``,
+        ``'negative'``, ``'non_monotonic'`` when ``color_by='direction'``, or
+        the classification values when ``color_by='classification'``.
+    cis_gene : str, optional
+        Name of the cis gene these trans features were fit against (e.g.
+        ``model.cis_gene``). Used only to make the y-axis label explicit
+        about what "dependent" means here -- every row in a trans summary is
+        a feature whose response was modeled as a function of this one cis
+        gene, so a bar's height is "number of features dependent on
+        ``cis_gene``", not some property intrinsic to the x-axis gene itself.
+        If omitted, the label falls back to generic wording.
     figsize : tuple, optional
         Figure size. Defaults to ``(max(6, 0.4 * n_genes), 5)``.
     show : bool, default True
@@ -97,8 +141,9 @@ def plot_trans_hits_by_gene(
     ValueError
         If ``classification_col`` or ``gene_col`` is missing from ``fdr_df``
         (e.g. ``fdr_df`` was exported with ``function_type='polynomial'``,
-        which has no Hill components to classify), or if no rows remain
-        after filtering.
+        which has no Hill components to classify), if ``color_by`` is not one
+        of ``'direction'``/``'classification'``, or if no rows remain after
+        filtering.
     """
     if classification_col not in fdr_df.columns:
         raise ValueError(
@@ -108,7 +153,18 @@ def plot_trans_hits_by_gene(
     if gene_col not in fdr_df.columns:
         raise ValueError(f"'{gene_col}' not found in fdr_df; pass gene_col= explicitly.")
 
-    color_map = dict(_TRANS_DIRECTION_COLORS)
+    if color_by == "direction":
+        group_map = _TRANS_CLASSIFICATION_TO_DIRECTION
+        group_order = _TRANS_DIRECTION_ORDER
+        color_map = dict(_TRANS_DIRECTION_COLORS)
+        legend_title = "Direction"
+    elif color_by == "classification":
+        group_map = {c: c for c in _TRANS_CLASSIFICATION_ORDER}
+        group_order = _TRANS_CLASSIFICATION_ORDER
+        color_map = dict(_TRANS_CLASSIFICATION_COLORS)
+        legend_title = "Classification"
+    else:
+        raise ValueError(f"color_by must be 'direction' or 'classification', got {color_by!r}")
     if colors:
         color_map.update(colors)
 
@@ -121,16 +177,16 @@ def plot_trans_hits_by_gene(
             )
         d = d[d[dependent_col] == True]  # noqa: E712 -- may be object/NaN dtype
 
-    direction = d[classification_col].map(_TRANS_CLASSIFICATION_TO_DIRECTION)
-    d = d.loc[direction.notna() & d[gene_col].notna()]
-    direction = direction.loc[d.index]
+    group = d[classification_col].map(group_map)
+    d = d.loc[group.notna() & d[gene_col].notna()]
+    group = group.loc[d.index]
 
     if len(d) == 0:
         raise ValueError("No rows left to plot after filtering (require_dependent / classification).")
 
     counts = (
-        pd.crosstab(d[gene_col], direction)
-        .reindex(columns=_TRANS_DIRECTION_ORDER, fill_value=0)
+        pd.crosstab(d[gene_col], group)
+        .reindex(columns=group_order, fill_value=0)
     )
     counts = counts.loc[counts.sum(axis=1).sort_values(ascending=False).index]
     if top_n is not None:
@@ -142,19 +198,21 @@ def plot_trans_hits_by_gene(
 
     x = np.arange(len(counts))
     bottom = np.zeros(len(counts))
-    for direction_name in _TRANS_DIRECTION_ORDER:
-        vals = counts[direction_name].values
-        ax.bar(x, vals, bottom=bottom, width=0.7, color=color_map[direction_name],
-               label=direction_name.replace('_', ' '), edgecolor='white', linewidth=1)
+    for group_name in group_order:
+        vals = counts[group_name].values
+        ax.bar(x, vals, bottom=bottom, width=0.7, color=color_map[group_name],
+               label=group_name.replace('_', ' '), edgecolor='white', linewidth=1)
         bottom += vals
 
     ax.set_xticks(x)
     ax.set_xticklabels(counts.index, rotation=90, fontsize=8)
-    ax.set_ylabel("Number of trans-dependent features")
+    ylabel = (f"Number of features dependent on {cis_gene}" if cis_gene
+              else "Number of features dependent on cis gene")
+    ax.set_ylabel(ylabel)
     ax.set_xlabel(gene_col)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.legend(frameon=False, title="Direction")
+    ax.legend(frameon=False, title=legend_title)
     fig.tight_layout()
 
     if show:

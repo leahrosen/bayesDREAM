@@ -4065,6 +4065,8 @@ def plot_binomial_xy(
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
+    log2fc: bool = False,
+    ntc_x_offset: Optional[float] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -4082,6 +4084,16 @@ def plot_binomial_xy(
         'uncorrected': no technical correction
         'corrected': apply alpha_y_add additive correction (PSI - alpha_y_add)
         'both': show both side-by-side
+    log2fc : bool
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true). The y-axis (PSI%) is left
+        as-is -- unlike negbinom, there is no natural log2FC transform for a
+        bounded proportion, so only the x-axis shifts. A grey dotted vertical
+        line is drawn at x=0 to mark the NTC reference.
+    ntc_x_offset : float, optional
+        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
+        and passes this automatically.
 
     Notes
     -----
@@ -4090,6 +4102,7 @@ def plot_binomial_xy(
     logit_corrected = logit(PSI) - alpha_y_add
     PSI_corrected = 1 / (1 + exp(-logit_corrected))
     """
+    _x_off = ntc_x_offset if (log2fc and ntc_x_offset is not None) else 0.0
     # Get data
     feature_idx = _get_feature_index(feature, modality)
     if feature_idx is None:
@@ -4253,7 +4266,7 @@ def plot_binomial_xy(
 
             # Plot (no additional smoothing needed - already binned)
             # Note: We don't currently support NTC gradient for binned data
-            ax_plot.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2, label=group_label)
+            ax_plot.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -4268,7 +4281,7 @@ def plot_binomial_xy(
                 # For binomial, PSI is in percentage scale [0, 100], so scale and clip predictions
                 y_pred_pct = y_pred * 100.0
                 y_pred_clipped = np.clip(y_pred_pct, 0, 100)
-                ax_plot.plot(np.log2(x_range), y_pred_clipped,
+                ax_plot.plot(np.log2(x_range) - _x_off, y_pred_clipped,
                            color='black', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
 
@@ -4278,12 +4291,14 @@ def plot_binomial_xy(
                 model, feature, modality,
                 log2_space=False, y_scale=100.0
             )
-            _draw_hill_markers(ax_plot, _markers)
+            _draw_hill_markers(ax_plot, _markers, x_offset=_x_off)
 
-        ax_plot.set_xlabel(xlabel)
+        ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
         ax_plot.set_ylabel('PSI (%)')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature} (min_counts={min_counts}{title_suffix})")
+        if log2fc:
+            ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
@@ -4319,6 +4334,8 @@ def plot_multinomial_xy(
     xlabel: str = "log2(x_true)",
     figsize: Optional[Tuple[int, int]] = None,
     subset_mask: Optional[np.ndarray] = None,
+    log2fc: bool = False,
+    ntc_x_offset: Optional[float] = None,
     **kwargs
 ) -> Union[plt.Figure, List[plt.Axes]]:
     """
@@ -4334,6 +4351,14 @@ def plot_multinomial_xy(
     show_ntc_gradient : bool
         If True, color lines by NTC proportion in k-NN window (default: False)
         **Note**: Not yet fully implemented for multinomial - will issue warning
+    log2fc : bool
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true). The y-axis (proportion) is
+        left as-is. A grey dotted vertical line is drawn at x=0 (NTC reference).
+    ntc_x_offset : float, optional
+        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
+        and passes this automatically.
 
     Notes
     -----
@@ -4341,6 +4366,7 @@ def plot_multinomial_xy(
     logits_corrected = logits - alpha_y_add
     proportions_corrected = softmax(logits_corrected)
     """
+    _x_off = ntc_x_offset if (log2fc and ntc_x_offset is not None) else 0.0
     if show_ntc_gradient:
         warnings.warn("NTC gradient coloring not yet implemented for multinomial distributions - using standard colors")
 
@@ -4535,13 +4561,15 @@ def plot_multinomial_xy(
                         y_smooth = props_binned[:, k]
 
                     # Plot (no additional smoothing needed - already binned)
-                    ax.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2,
+                    ax.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2,
                            label=group_label if plot_idx == 0 else None)
 
-                ax.set_xlabel(xlabel)
+                ax.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
                 ax.set_ylabel(f'Proportion')
                 title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                 ax.set_title(f"{cat_label}{title_suffix}")
+                if log2fc:
+                    ax.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
                 if plot_idx == 0:
                     ax.legend(frameon=False, loc='upper right')
         else:
@@ -4598,13 +4626,15 @@ def plot_multinomial_xy(
                     y_smooth = props_binned[:, k]
 
                 # Plot (no additional smoothing needed - already binned)
-                ax.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2,
+                ax.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2,
                        label=group_label if plot_idx == 0 else None)
 
-            ax.set_xlabel(xlabel)
+            ax.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
             ax.set_ylabel(f'Proportion')
             title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
             ax.set_title(f"{cat_label}{title_suffix}")
+            if log2fc:
+                ax.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
             if plot_idx == 0:
                 ax.legend(frameon=False, loc='upper right')
 
@@ -4629,6 +4659,8 @@ def plot_normal_xy(
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
+    log2fc: bool = False,
+    ntc_x_offset: Optional[float] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -4642,7 +4674,16 @@ def plot_normal_xy(
         If True, color lines by NTC proportion in k-NN window (default: False)
         Lighter colors = more NTC cells, Darker colors = fewer NTC cells
         Only applies to uncorrected plots
+    log2fc : bool
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true). The y-axis (raw value) is
+        left as-is. A grey dotted vertical line is drawn at x=0 (NTC reference).
+    ntc_x_offset : float, optional
+        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
+        and passes this automatically.
     """
+    _x_off = ntc_x_offset if (log2fc and ntc_x_offset is not None) else 0.0
     # Get data
     feature_idx = _get_feature_index(feature, modality)
     if feature_idx is None:
@@ -4772,7 +4813,7 @@ def plot_normal_xy(
                 # Color value = 1 - ntc_prop: high NTC → 0 → white, low NTC → 1 → group color
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
-                    x=np.log2(x_smooth),
+                    x=np.log2(x_smooth) - _x_off,
                     y=y_smooth,
                     color_values=1 - ntc_prop,  # Darker (group color) = fewer NTCs
                     cmap=group_cmap,
@@ -4797,7 +4838,7 @@ def plot_normal_xy(
                 x_smooth, y_smooth = _smooth_knn(df_group['x_true'].values, y_plot, k)
 
                 # Use standard coloring
-                ax_plot.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2, label=group_label)
+                ax_plot.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -4809,7 +4850,7 @@ def plot_normal_xy(
             y_pred = predict_trans_function(model, feature, x_range, modality_name=modality.name)
 
             if y_pred is not None:
-                ax_plot.plot(np.log2(x_range), y_pred,
+                ax_plot.plot(np.log2(x_range) - _x_off, y_pred,
                            color='black', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
 
@@ -4819,12 +4860,14 @@ def plot_normal_xy(
                 model, feature, modality,
                 log2_space=False, y_scale=1.0
             )
-            _draw_hill_markers(ax_plot, _markers)
+            _draw_hill_markers(ax_plot, _markers, x_offset=_x_off)
 
-        ax_plot.set_xlabel(xlabel)
+        ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
         ax_plot.set_ylabel('Value')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
+        if log2fc:
+            ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
@@ -5339,11 +5382,16 @@ def plot_xy_data(
         For non-negbinom distributions, all y-axis markers are in linear space.
         Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
     log2fc : bool
-        If True, plot log2FC relative to NTC instead of raw log2 counts
-        (default: False). Only applies to negbinom modalities.
-        x-axis: log2(x_true) - log2(mean NTC x_true)
-        y-axis: log2(counts) - log2(mean NTC counts, reference group)
-        A grey dotted crosshair is drawn at (0, 0) to mark the NTC reference.
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true) (default: False).
+        For **negbinom**, the y-axis also becomes log2FC relative to NTC
+        (log2(counts) - log2(mean NTC counts, reference group)), and a grey
+        dotted crosshair is drawn at (0, 0).
+        For **binomial/normal/studentt/multinomial**, only the x-axis
+        transforms -- the y-axis is left in its natural scale (PSI%, raw
+        value, proportion), since there's no natural log2FC transform for a
+        bounded/non-count quantity. Only a vertical grey dotted line is drawn
+        at x=0 to mark the NTC reference.
     color_by : str or list of two str
         What to color smoothed lines by (default: ``'technical_group'``).
         - ``'technical_group'``: one line per cell-line / technical group (default)
@@ -5903,6 +5951,7 @@ def plot_xy_data(
                     show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
                     subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
+                    log2fc=log2fc, ntc_x_offset=ntc_x_offset,
                     **kwargs
                 )
             elif distribution in ('normal', 'studentt'):
@@ -5912,6 +5961,7 @@ def plot_xy_data(
                     color_palette=color_palette, show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
                     subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
+                    log2fc=log2fc, ntc_x_offset=ntc_x_offset,
                     **kwargs
                 )
             else:
@@ -5929,8 +5979,11 @@ def plot_xy_data(
         _axes_by_feat = {feat_i: [] for feat_i in range(n_features)}
 
         for feat_i, feat_name in enumerate(feature_names_resolved):
-            # Pre-compute global NTC log2FC offsets for this feature (negbinom only).
-            if log2fc and distribution == 'negbinom':
+            # Pre-compute global NTC log2FC offsets for this feature. x_offset is
+            # distribution-agnostic (log2 of mean NTC x_true); y_offset is only
+            # meaningful/used for negbinom (other distributions keep their y-axis
+            # as-is -- only the x-axis becomes log2FC when log2fc=True).
+            if log2fc:
                 _ntc_x_off, _ntc_y_off = _compute_global_log2fc_offsets(
                     model, modality, feat_name, x_true, subset_mask, sum_factor_col
                 )
@@ -6020,17 +6073,20 @@ def plot_xy_data(
     # ── Single-feature path (no faceting) ─────────────────────────────────────
     feature = feature_names_resolved[0]  # Use resolved feature name
 
-    if distribution == 'negbinom':
-        # Pre-compute global NTC offsets for log2FC mode (same approach as grid path).
-        # This ensures the NTC reference is computed from ALL NTC cells (ignoring
-        # min_counts and color_by grouping), making y_ntc independent of which colour
-        # or subset is shown.
-        _sf_ntc_x_off = _sf_ntc_y_off = None
-        if log2fc:
-            _sf_ntc_x_off, _sf_ntc_y_off = _compute_global_log2fc_offsets(
-                model, modality, feature, x_true, subset_mask, sum_factor_col
-            )
+    # Pre-compute global NTC log2FC offsets (same approach as grid path). x_offset
+    # is distribution-agnostic (log2 of mean NTC x_true) and used by every
+    # distribution when log2fc=True; y_offset is only meaningful for negbinom
+    # (other distributions leave their y-axis as-is -- only x becomes log2FC).
+    # This ensures the NTC reference is computed from ALL NTC cells (ignoring
+    # min_counts and color_by grouping), making it independent of which colour
+    # or subset is shown.
+    _sf_ntc_x_off = _sf_ntc_y_off = None
+    if log2fc:
+        _sf_ntc_x_off, _sf_ntc_y_off = _compute_global_log2fc_offsets(
+            model, modality, feature, x_true, subset_mask, sum_factor_col
+        )
 
+    if distribution == 'negbinom':
         result = plot_negbinom_xy(
             model=model,
             feature=feature,
@@ -6079,6 +6135,8 @@ def plot_xy_data(
             ci_level=ci_level,
             legend_outside=legend_outside,
             figsize=figsize,
+            log2fc=log2fc,
+            ntc_x_offset=_sf_ntc_x_off,
             **kwargs
         )
 
@@ -6097,6 +6155,8 @@ def plot_xy_data(
             xlabel=xlabel,
             figsize=figsize,
             subset_mask=subset_mask,
+            log2fc=log2fc,
+            ntc_x_offset=_sf_ntc_x_off,
             **kwargs
         )
 
@@ -6117,6 +6177,8 @@ def plot_xy_data(
             ci_level=ci_level,
             legend_outside=legend_outside,
             figsize=figsize,
+            log2fc=log2fc,
+            ntc_x_offset=_sf_ntc_x_off,
             **kwargs
         )
 

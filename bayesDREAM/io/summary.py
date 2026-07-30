@@ -4564,10 +4564,16 @@ class ModelSummarizer:
 
         Classification Logic:
         - dep_mask_a: Component A is active — Bayesian q-value < fdr_threshold (default 0.05)
-          where q-value is derived from P(alpha*Vmax_a/A > epsilon) pooled over both components.
+          AND n_a's 95% CI excludes 0, where q-value is derived from
+          P(alpha*Vmax_a/A > epsilon) pooled over both components.
           Note: p_active_a is actually the q-value passed from _add_additive_hill_params_individual.
-        - dep_mask_b: Component B is active — q-value < fdr_threshold
-          Falls back to CI-based check if p_active_a/p_active_b not provided.
+          The n_a CI-exclusion guard matches the criterion used for `is_dependent`/`fit_type`
+          (see the `active_a`/`active_b` computation above): without it, a component can be
+          "significant" purely because alpha/beta absorbed a constant offset while n_a/n_b ≈ 0
+          (flat Hill, unidentified K) -- the same degenerate case is_dependent guards against.
+          Falls back to CI-based check on alpha/beta (instead of the q-value) if
+          p_active_a/p_active_b not provided.
+        - dep_mask_b: Component B is active — same as dep_mask_a for n_b/beta.
         - dep_mask: Either component is active
 
         Categories:
@@ -4584,21 +4590,27 @@ class ModelSummarizer:
         - 'non_monotonic_max': Both active, opposite signs, local maximum at nearest extremum to x_ntc
             (where S'=0, checked via S'' < 0 at that point)
         """
-        # Define dependency masks using Bayesian q-value < fdr_threshold when available
-        # (p_active_a/b are actually q-values passed from _add_additive_hill_params_individual),
-        # falling back to CI-based check otherwise.
+        # Define dependency masks using Bayesian q-value < fdr_threshold AND n's CI
+        # excluding 0 when q-values are available (p_active_a/b are actually q-values
+        # passed from _add_additive_hill_params_individual), falling back to a pure
+        # CI-based check on alpha/beta otherwise. This mirrors exactly the
+        # active_a/active_b criterion used for is_dependent/fit_type above, so
+        # dep_mask (and therefore whether classification == 'flat') is consistent
+        # with is_dependent: a component can no longer be classified as active from
+        # q-value alone while its Hill exponent is unidentified (CI includes 0).
+        n_a_active = not (n_a_lower <= 0 <= n_a_upper)
+        n_b_active = not (n_b_lower <= 0 <= n_b_upper)
+
         if p_active_a is not None:
-            dep_mask_a = p_active_a < fdr_threshold
+            dep_mask_a = (p_active_a < fdr_threshold) and n_a_active
         else:
             alpha_active = not (alpha_lower <= 0 <= alpha_upper)
-            n_a_active   = not (n_a_lower   <= 0 <= n_a_upper)
             dep_mask_a   = alpha_active and n_a_active
 
         if p_active_b is not None:
-            dep_mask_b = p_active_b < fdr_threshold
+            dep_mask_b = (p_active_b < fdr_threshold) and n_b_active
         else:
             beta_active = not (beta_lower <= 0 <= beta_upper)
-            n_b_active  = not (n_b_lower  <= 0 <= n_b_upper)
             dep_mask_b  = beta_active and n_b_active
         dep_mask = dep_mask_a or dep_mask_b  # At least one component active
 
