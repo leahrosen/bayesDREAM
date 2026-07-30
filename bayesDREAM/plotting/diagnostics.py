@@ -4,6 +4,7 @@ Diagnostic plotting functions.
 Provides quality control and diagnostic plots for bayesDREAM fits.
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -60,6 +61,32 @@ _TRANS_CLASSIFICATION_COLORS = {
     'non_monotonic_max': '#008300',
     'non_monotonic':     '#4a3aa7',
 }
+
+# Base column names (before the _median/_lower/_upper/_log2fc suffix) that are
+# specific to one Hill component of an additive_hill fit -- see the "For
+# additive_hill" column list in ModelSummarizer.export_trans_summary's
+# docstring (io/summary.py). A feature classified 'single_positive'/
+# 'single_negative' has only ONE of these two components active (the other's
+# alpha/beta absorbed a constant offset while its Hill exponent is
+# unidentified -- the exact degenerate case `is_dependent`/`classification`
+# guard against, see the fdr_threshold docstring fix). which_active ('a', 'b',
+# or 'both') says which. single_hill fit_type columns (B, K, xc, inflection --
+# no _a/_b suffix) aren't in this registry since they have only one component
+# and no analogous ambiguity.
+_COMPONENT_A_BASE_COLS = ['alpha', 'Vmax_a', 'K_a', 'EC50_a', 'n_a', 'inflection_a']
+_COMPONENT_B_BASE_COLS = ['beta', 'Vmax_b', 'K_b', 'EC50_b', 'n_b', 'inflection_b']
+
+
+def _component_for_value_col(value_col):
+    """Return 'a'/'b' if value_col is a component-specific additive_hill
+    parameter (see _COMPONENT_*_BASE_COLS), else None."""
+    for base in _COMPONENT_A_BASE_COLS:
+        if value_col == base or value_col.startswith(base + '_'):
+            return 'a'
+    for base in _COMPONENT_B_BASE_COLS:
+        if value_col == base or value_col.startswith(base + '_'):
+            return 'b'
+    return None
 
 
 def _prepare_trans_group_data(fdr_df, gene_col, classification_col, dependent_col,
@@ -257,10 +284,15 @@ def plot_trans_values_by_gene(
     top_n=None,
     gene_order=None,
     colors=None,
+    exclude_inactive_component=True,
+    active_col="which_active",
     jitter=0.3,
     point_size=20,
     alpha=0.8,
     show_zero_line=True,
+    show_gene_bands=True,
+    gene_band_color="#000000",
+    gene_band_alpha=0.06,
     figsize=None,
     show=True,
 ):
@@ -282,13 +314,28 @@ def plot_trans_values_by_gene(
         ``classification_col``, ``gene_col``, and ``value_col``.
     value_col : str
         Column in ``fdr_df`` to plot on the y-axis. Rows with a missing/NaN
-        value are dropped. Note some columns are only meaningful for the
-        *active* component of a feature (e.g. ``n_a_median`` is near-zero and
-        uninformative for a feature classified ``single_negative`` via
-        component B) -- check ``which_active``/``classification`` if a column
-        looks oddly bimodal.
+        value are dropped.
     gene_col, classification_col, dependent_col, color_by, require_dependent, colors :
         See ``plot_trans_hits_by_gene``.
+    exclude_inactive_component : bool, default True
+        ``value_col`` columns specific to one Hill component (``alpha``,
+        ``Vmax_a``/``Vmax_b``, ``K_a``/``K_b``, ``EC50_a``/``EC50_b``,
+        ``n_a``/``n_b``, ``inflection_a``/``inflection_b``, and their
+        ``_median``/``_lower``/``_upper``/``_log2fc`` variants) are meaningless
+        for a feature whose ``which_active`` doesn't include that component --
+        e.g. ``n_a_median`` for a feature classified ``single_negative`` via
+        component B, where component A's alpha absorbed a constant offset
+        while ``n_a`` is completely unidentified. When True (default) and
+        ``value_col`` is recognized as component-specific, rows where the
+        corresponding component isn't active (per ``active_col``) are dropped
+        before plotting. Has no effect on component-agnostic columns (e.g.
+        ``observed_delta_p_median``, ``A_median``, ``full_delta_p_median``).
+    active_col : str, default ``'which_active'``
+        Column naming which component(s) are active per feature (``'a'``,
+        ``'b'``, or ``'both'``). Only consulted when
+        ``exclude_inactive_component=True`` and ``value_col`` is
+        component-specific; if missing from ``fdr_df`` in that case, a warning
+        is issued and the extra filtering is skipped.
     top_n : int, optional
         Only show the ``top_n`` genes with the most dependent features
         (sorted descending by count, same criterion as
@@ -309,6 +356,17 @@ def plot_trans_values_by_gene(
         Draw a grey dotted horizontal line at y=0. Meaningful for signed
         columns (``*_delta_p_*``, ``n_a``/``n_b``, log2fc columns); harmless
         otherwise -- set False if it's not a useful reference for your column.
+    show_gene_bands : bool, default True
+        Shade every other gene's column with a faint background band (zebra
+        striping), so it's clear which gene a jittered point belongs to even
+        with many genes packed tightly on the x-axis. Purely visual --
+        doesn't affect ``gene_order``/alternation, just alternates starting
+        from the first gene.
+    gene_band_color : str, default ``'#000000'``
+        Fill color for the shaded bands (only visible via ``gene_band_alpha``).
+    gene_band_alpha : float, default 0.06
+        Opacity of the shaded bands. Keep low -- these are a background
+        reference, not data ink.
     figsize : tuple, optional
         Figure size. Defaults to ``(max(6, 0.4 * n_genes), 5)``.
     show : bool, default True
@@ -332,6 +390,22 @@ def plot_trans_values_by_gene(
         fdr_df, gene_col, classification_col, dependent_col,
         color_by, require_dependent, colors
     )
+
+    if exclude_inactive_component:
+        component = _component_for_value_col(value_col)
+        if component is not None:
+            if active_col in d.columns:
+                d = d.loc[d[active_col].isin([component, 'both'])]
+                group = group.loc[d.index]
+            else:
+                warnings.warn(
+                    f"'{value_col}' looks like a component-{component} parameter, but "
+                    f"'{active_col}' is not in fdr_df -- cannot exclude rows where "
+                    "that component is inactive (values may include degenerate/"
+                    "meaningless fits for the inactive component). Add "
+                    f"'{active_col}' (from save_trans_summary) or pass "
+                    "exclude_inactive_component=False to silence this warning."
+                )
 
     d = d.loc[d[value_col].notna()]
     group = group.loc[d.index]
@@ -360,6 +434,11 @@ def plot_trans_values_by_gene(
         figsize = (max(6, 0.4 * len(gene_order_list)), 5)
     fig, ax = plt.subplots(figsize=figsize)
 
+    if show_gene_bands:
+        for i in range(1, len(gene_order_list), 2):
+            ax.axvspan(i - 0.5, i + 0.5, color=gene_band_color,
+                       alpha=gene_band_alpha, zorder=0, linewidth=0)
+
     rng = np.random.RandomState(0)
     base_x = d[gene_col].map(gene_pos).values.astype(float)
     jittered_x = base_x + rng.uniform(-jitter, jitter, size=len(d))
@@ -371,10 +450,10 @@ def plot_trans_values_by_gene(
             continue
         ax.scatter(jittered_x[mask], values[mask], s=point_size, alpha=alpha,
                    color=color_map[group_name], label=group_name.replace('_', ' '),
-                   edgecolor='none')
+                   edgecolor='none', zorder=3)
 
     if show_zero_line:
-        ax.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
+        ax.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6, zorder=1)
 
     ax.set_xticks(range(len(gene_order_list)))
     ax.set_xticklabels(gene_order_list, rotation=90, fontsize=8)
