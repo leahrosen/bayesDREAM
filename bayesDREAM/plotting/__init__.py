@@ -76,6 +76,7 @@ from .diagnostics import (
     plot_cross_dataset_correlation,
     plot_systematic_shift_hits_xy,
     plot_trans_hits_by_gene,
+    plot_trans_values_by_gene,
 )
 
 __all__ = [
@@ -129,5 +130,6 @@ __all__ = [
     'plot_cross_dataset_correlation',
     'plot_systematic_shift_hits_xy',
     'plot_trans_hits_by_gene',
+    'plot_trans_values_by_gene',
     'restyle_targeting_lines',
 ]

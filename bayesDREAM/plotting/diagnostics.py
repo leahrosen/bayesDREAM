@@ -62,6 +62,62 @@ _TRANS_CLASSIFICATION_COLORS = {
 }
 
 
+def _prepare_trans_group_data(fdr_df, gene_col, classification_col, dependent_col,
+                                color_by, require_dependent, colors):
+    """
+    Shared setup for plot_trans_hits_by_gene / plot_trans_values_by_gene:
+    validate columns, resolve the direction-vs-classification grouping, and
+    apply the is_dependent / classification filters.
+
+    Returns
+    -------
+    d : pd.DataFrame
+        Filtered rows (subset of fdr_df, index preserved).
+    group : pd.Series
+        Per-row group label (direction or classification), aligned to d.index.
+    group_order : list of str
+    color_map : dict
+    legend_title : str
+    """
+    if classification_col not in fdr_df.columns:
+        raise ValueError(
+            f"'{classification_col}' not found in fdr_df. This column is only "
+            "populated for function_type='additive_hill' trans fits."
+        )
+    if gene_col not in fdr_df.columns:
+        raise ValueError(f"'{gene_col}' not found in fdr_df; pass gene_col= explicitly.")
+
+    if color_by == "direction":
+        group_map = _TRANS_CLASSIFICATION_TO_DIRECTION
+        group_order = _TRANS_DIRECTION_ORDER
+        color_map = dict(_TRANS_DIRECTION_COLORS)
+        legend_title = "Direction"
+    elif color_by == "classification":
+        group_map = {c: c for c in _TRANS_CLASSIFICATION_ORDER}
+        group_order = _TRANS_CLASSIFICATION_ORDER
+        color_map = dict(_TRANS_CLASSIFICATION_COLORS)
+        legend_title = "Classification"
+    else:
+        raise ValueError(f"color_by must be 'direction' or 'classification', got {color_by!r}")
+    if colors:
+        color_map.update(colors)
+
+    d = fdr_df
+    if require_dependent:
+        if dependent_col not in d.columns:
+            raise ValueError(
+                f"'{dependent_col}' not found in fdr_df; pass require_dependent=False "
+                "to skip the significance filter."
+            )
+        d = d[d[dependent_col] == True]  # noqa: E712 -- may be object/NaN dtype
+
+    group = d[classification_col].map(group_map)
+    d = d.loc[group.notna() & d[gene_col].notna()]
+    group = group.loc[d.index]
+
+    return d, group, group_order, color_map, legend_title
+
+
 def plot_trans_hits_by_gene(
     fdr_df,
     gene_col="gene",
@@ -145,41 +201,10 @@ def plot_trans_hits_by_gene(
         of ``'direction'``/``'classification'``, or if no rows remain after
         filtering.
     """
-    if classification_col not in fdr_df.columns:
-        raise ValueError(
-            f"'{classification_col}' not found in fdr_df. This column is only "
-            "populated for function_type='additive_hill' trans fits."
-        )
-    if gene_col not in fdr_df.columns:
-        raise ValueError(f"'{gene_col}' not found in fdr_df; pass gene_col= explicitly.")
-
-    if color_by == "direction":
-        group_map = _TRANS_CLASSIFICATION_TO_DIRECTION
-        group_order = _TRANS_DIRECTION_ORDER
-        color_map = dict(_TRANS_DIRECTION_COLORS)
-        legend_title = "Direction"
-    elif color_by == "classification":
-        group_map = {c: c for c in _TRANS_CLASSIFICATION_ORDER}
-        group_order = _TRANS_CLASSIFICATION_ORDER
-        color_map = dict(_TRANS_CLASSIFICATION_COLORS)
-        legend_title = "Classification"
-    else:
-        raise ValueError(f"color_by must be 'direction' or 'classification', got {color_by!r}")
-    if colors:
-        color_map.update(colors)
-
-    d = fdr_df
-    if require_dependent:
-        if dependent_col not in d.columns:
-            raise ValueError(
-                f"'{dependent_col}' not found in fdr_df; pass require_dependent=False "
-                "to skip the significance filter."
-            )
-        d = d[d[dependent_col] == True]  # noqa: E712 -- may be object/NaN dtype
-
-    group = d[classification_col].map(group_map)
-    d = d.loc[group.notna() & d[gene_col].notna()]
-    group = group.loc[d.index]
+    d, group, group_order, color_map, legend_title = _prepare_trans_group_data(
+        fdr_df, gene_col, classification_col, dependent_col,
+        color_by, require_dependent, colors
+    )
 
     if len(d) == 0:
         raise ValueError("No rows left to plot after filtering (require_dependent / classification).")
@@ -209,6 +234,152 @@ def plot_trans_hits_by_gene(
     ylabel = (f"Number of features dependent on {cis_gene}" if cis_gene
               else "Number of features dependent on cis gene")
     ax.set_ylabel(ylabel)
+    ax.set_xlabel(gene_col)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.legend(frameon=False, title=legend_title)
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
+    return fig
+
+
+def plot_trans_values_by_gene(
+    fdr_df,
+    value_col,
+    gene_col="gene",
+    classification_col="classification",
+    dependent_col="is_dependent",
+    color_by="direction",
+    require_dependent=True,
+    top_n=None,
+    gene_order=None,
+    colors=None,
+    jitter=0.3,
+    point_size=20,
+    alpha=0.8,
+    show_zero_line=True,
+    figsize=None,
+    show=True,
+):
+    """
+    Dot (strip) plot of a per-feature value column, grouped by gene along the
+    x-axis and colored by direction/classification.
+
+    Same gene grouping and direction/classification coloring as
+    ``plot_trans_hits_by_gene``, but instead of counting hits, plots one point
+    per feature at its actual value of ``value_col`` -- e.g.
+    ``'observed_delta_p_median'``, ``'full_delta_p_median'``, ``'n_a_median'``,
+    ``'n_b_median'``, ``'EC50_a_median'``, ``'EC50_b_median'``.
+
+    Parameters
+    ----------
+    fdr_df : pd.DataFrame
+        Trans summary dataframe, e.g. the output of
+        ``model.export_trans_summary()`` / ``save_trans_summary``. Must have
+        ``classification_col``, ``gene_col``, and ``value_col``.
+    value_col : str
+        Column in ``fdr_df`` to plot on the y-axis. Rows with a missing/NaN
+        value are dropped. Note some columns are only meaningful for the
+        *active* component of a feature (e.g. ``n_a_median`` is near-zero and
+        uninformative for a feature classified ``single_negative`` via
+        component B) -- check ``which_active``/``classification`` if a column
+        looks oddly bimodal.
+    gene_col, classification_col, dependent_col, color_by, require_dependent, colors :
+        See ``plot_trans_hits_by_gene``.
+    top_n : int, optional
+        Only show the ``top_n`` genes with the most dependent features
+        (sorted descending by count, same criterion as
+        ``plot_trans_hits_by_gene``). Ignored if ``gene_order`` is given.
+    gene_order : list of str, optional
+        Explicit x-axis gene order -- e.g. reuse ``counts.index.tolist()``
+        from a prior ``plot_trans_hits_by_gene()`` call so the two plots line
+        up side by side. Genes not in ``gene_order`` are dropped from the data;
+        genes in ``gene_order`` with no surviving rows appear as empty columns.
+    jitter : float, default 0.3
+        Half-width of horizontal jitter applied within each gene's column
+        (uniform, seeded for reproducibility) to separate overlapping points.
+    point_size : float, default 20
+        Marker size (``ax.scatter``'s ``s``).
+    alpha : float, default 0.8
+        Marker transparency.
+    show_zero_line : bool, default True
+        Draw a grey dotted horizontal line at y=0. Meaningful for signed
+        columns (``*_delta_p_*``, ``n_a``/``n_b``, log2fc columns); harmless
+        otherwise -- set False if it's not a useful reference for your column.
+    figsize : tuple, optional
+        Figure size. Defaults to ``(max(6, 0.4 * n_genes), 5)``.
+    show : bool, default True
+        Whether to call ``plt.show()``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    Raises
+    ------
+    ValueError
+        If ``classification_col``/``gene_col``/``value_col`` is missing from
+        ``fdr_df``, if ``color_by`` is invalid, or if no rows remain after
+        filtering.
+    """
+    if value_col not in fdr_df.columns:
+        raise ValueError(f"'{value_col}' not found in fdr_df.")
+
+    d, group, group_order, color_map, legend_title = _prepare_trans_group_data(
+        fdr_df, gene_col, classification_col, dependent_col,
+        color_by, require_dependent, colors
+    )
+
+    d = d.loc[d[value_col].notna()]
+    group = group.loc[d.index]
+
+    if len(d) == 0:
+        raise ValueError("No rows left to plot after filtering (require_dependent / classification / value_col).")
+
+    if gene_order is None:
+        gene_order_list = (
+            d[gene_col].value_counts().sort_values(ascending=False).index.tolist()
+        )
+        if top_n is not None:
+            gene_order_list = gene_order_list[:top_n]
+    else:
+        gene_order_list = list(gene_order)
+
+    d = d.loc[d[gene_col].isin(gene_order_list)]
+    group = group.loc[d.index]
+
+    if len(d) == 0:
+        raise ValueError("No rows left to plot for the requested genes (check gene_order/top_n).")
+
+    gene_pos = {g: i for i, g in enumerate(gene_order_list)}
+
+    if figsize is None:
+        figsize = (max(6, 0.4 * len(gene_order_list)), 5)
+    fig, ax = plt.subplots(figsize=figsize)
+
+    rng = np.random.RandomState(0)
+    base_x = d[gene_col].map(gene_pos).values.astype(float)
+    jittered_x = base_x + rng.uniform(-jitter, jitter, size=len(d))
+    values = d[value_col].values
+
+    for group_name in group_order:
+        mask = (group == group_name).values
+        if not mask.any():
+            continue
+        ax.scatter(jittered_x[mask], values[mask], s=point_size, alpha=alpha,
+                   color=color_map[group_name], label=group_name.replace('_', ' '),
+                   edgecolor='none')
+
+    if show_zero_line:
+        ax.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
+
+    ax.set_xticks(range(len(gene_order_list)))
+    ax.set_xticklabels(gene_order_list, rotation=90, fontsize=8)
+    ax.set_xlim(-0.5, len(gene_order_list) - 0.5)
+    ax.set_ylabel(value_col)
     ax.set_xlabel(gene_col)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
