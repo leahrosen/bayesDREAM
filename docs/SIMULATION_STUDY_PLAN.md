@@ -337,6 +337,68 @@ re-run standalone without re-deriving indices.
    `--min_fit_hours` calibration above straightforward to determine (one real timed
    run at the actual defaults, not a parameter sweep).
 
+## 7b. Execution plan (Dardel) — added 2026-07-29/30
+
+Moved to Dardel (PDC) CPU-only, using its `shared` partition (request `--cpus-per-task`,
+memory follows automatically — no separate `--mem`). `examples/simulation_study/
+generate_slurm_dardel.py` is the Dardel counterpart to `generate_slurm.py`: no GPU-tier
+memory estimation needed, just a fixed `--cores` per fit task.
+
+**Found during the move**: `run_recovery_fit.py` never pinned OMP/MKL/OpenBLAS/NumExpr
+thread counts, and calling `bayesDREAM.utils.set_max_threads()` the normal way wouldn't
+have fixed it either — that helper imports numpy/torch itself, by which point their
+threadpools have already initialized (those env vars are read once at library load, not
+per-call). Harmless on Berzelius (GPU jobs get an exclusive node slice), but Dardel's
+`shared` partition routinely co-locates multiple array tasks per physical node, so an
+unpinned task could try to use every core visible on the node rather than just the cores
+it was allocated, oversubscribing every co-located job at once. Fixed by resolving
+`--cores`/`$SLURM_CPUS_PER_TASK` and setting the env vars (plus `torch.set_num_threads()`)
+before any numpy/pandas/pyro/torch import in the file — verified empirically that the env
+var is set before each of those imports fires.
+
+**Core-count scaling benchmark (2026-07-29/30)**, largest scenario
+(`scenario_id=96`, `cells_per_gene=1000`), one replicate per core count
+(2/4/8/16/32 cores). All 5 jobs hit their 3h `--time` budget mid-`fit_trans` — the
+budget at the time was based on Berzelius's `single_hill` CPU timing, not
+`additive_hill`. Real per-step throughput during `fit_trans` was recovered from
+checkpoint timestamps (`trans_checkpoint_gene_stepNNNNNN.pt`, saved every 10,000
+steps, plus `trans_checkpoint_gene_warmup.pt` at the Phase 1→2 boundary — its
+timestamp always lands between the step-50000 and step-60000 checkpoints, confirming
+`warmup_steps=55,556` for `niters=100,000`, i.e. 155,556 total steps):
+
+| cores | fit_ntc | fit_cis | fit_trans rate | fit_trans (155,556 steps, extrapolated) | **total** | core-hours/job |
+|---|---|---|---|---|---|---|
+| 2 | 4590s | 1305s | 3.97 steps/s | 39,201s (10.9h) | **12.53h** | 25.1 |
+| 4 | 2878s | 1288s | 6.49 steps/s | 23,955s (6.65h) | **7.81h** | 31.2 |
+| 8 | 1790s | 1091s | 8.01 steps/s | 19,415s (5.39h) | **6.19h** | 49.5 |
+| 16 | 2477s | 1338s | 10.42 steps/s | 14,933s (4.15h) | **5.21h** | 83.3 |
+| 32 | 1351s | 1155s | 8.33 steps/s | 18,667s (5.19h) | **5.88h** | 188.2 |
+
+Caveats: `fit_trans` rate is extrapolated linearly across all 155,556 steps from each
+job's observed checkpoint interval; the 2-core rate comes from a single 42-minute
+interval (least reliable of the five), and Phase 2 (`additive_hill` proper, two Hill
+components) plausibly costs somewhat more per step than Phase 1 (`single_hill`
+warmup) — a flat-rate extrapolation from mostly-Phase-1 data likely understates true
+total time somewhat. `fit_ntc`/`fit_cis` (unlike `fit_trans`) still show ~flat/noisy
+scaling with core count, consistent with §7's Berzelius finding — but `fit_trans`
+(85-95% of total time) does show real scaling from 2→16 cores before dipping at 32
+(plausibly a NUMA/noisy-neighbor effect crossing Dardel's 2-socket, 64-core/socket
+node boundary — jobs also landed on different physical nodes on this shared
+partition, so some of the non-monotonicity, especially the 16-vs-32 reversal, may be
+contention noise rather than a true core-count effect). This revises §7's Berzelius
+conclusion that "cores don't matter much for this workload" — that held for
+`fit_ntc`/`fit_cis` but not for `fit_trans`, the step that actually dominates total
+time.
+
+**Throughput**: core-hours/job is lowest at 2 cores (25.1 vs. 49.5 at 8 cores) — for a
+fixed core budget, 2 cores/job completes roughly 2x more jobs than 8 cores/job, so it
+remains the throughput-optimal choice despite its longer 12.5h per-job wall-clock
+(vs. 5.2h at 16 cores). `generate_slurm_dardel.py --cores 2` (default) sets
+`--fit_time_hours=18` (raw 12.53h estimate + margin for the caveats above) —
+recalibrate if `--cores` is changed, using the table above as a starting point, and
+confirm 18h fits within Dardel's `shared` partition's max walltime before submitting
+the full 720-task array.
+
 ---
 
 ## 8. Evaluation plan (sketch — not implemented)
