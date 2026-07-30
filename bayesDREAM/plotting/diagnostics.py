@@ -15,6 +15,154 @@ from scipy.stats import pearsonr, spearmanr
 from .colors import ColorScheme
 
 
+# Collapse the 7-way additive-Hill `classification` column (see
+# `ModelSummarizer.export_trans_summary` in io/summary.py) into the 3 directions
+# of effect a viewer typically wants to facet/color trans hits by.
+_TRANS_CLASSIFICATION_TO_DIRECTION = {
+    'single_positive':   'positive',
+    'additive_positive': 'positive',
+    'single_negative':   'negative',
+    'additive_negative': 'negative',
+    'non_monotonic_min': 'non_monotonic',
+    'non_monotonic_max': 'non_monotonic',
+    'flat':              None,  # not a dependent hit -- dropped
+}
+_TRANS_DIRECTION_ORDER = ['positive', 'negative', 'non_monotonic']
+_TRANS_DIRECTION_COLORS = {
+    'positive':      '#2a78d6',
+    'negative':      '#eb6834',
+    'non_monotonic': '#1baf7a',
+}
+
+
+def plot_trans_hits_by_gene(
+    fdr_df,
+    gene_col="gene",
+    classification_col="classification",
+    dependent_col="is_dependent",
+    require_dependent=True,
+    top_n=None,
+    colors=None,
+    figsize=None,
+    show=True,
+):
+    """
+    Stacked bar chart of the number of trans-dependent features per gene,
+    colored by direction of effect.
+
+    Meant for feature-level modalities where several features can map to the
+    same gene (e.g. ``splicing_sj``/``splicing_donor`` -- several SJs per
+    gene, or ``transcript`` -- several transcripts per gene). Groups
+    ``fdr_df`` by ``gene_col``, collapses each row's ``classification_col``
+    into one of three directions (see ``_TRANS_CLASSIFICATION_TO_DIRECTION``),
+    and draws one stacked bar per gene.
+
+    Parameters
+    ----------
+    fdr_df : pd.DataFrame
+        Trans summary dataframe, e.g. the output of
+        ``model.export_trans_summary()`` / ``save_trans_summary``. Must have
+        ``classification_col`` (only produced for ``function_type='additive_hill'``)
+        and ``gene_col``.
+    gene_col : str, default ``'gene'``
+        Column giving the gene each row (feature) belongs to. For splicing
+        modalities this is aliased from ``gene_for_denominator`` by the
+        splicing loader (see ``docs/SPLICING_LOADER_GUIDE.md``).
+    classification_col : str, default ``'classification'``
+        Column with the per-feature shape classification (``'single_positive'``,
+        ``'additive_negative'``, ``'non_monotonic_min'``, ``'flat'``, ...).
+    dependent_col : str, default ``'is_dependent'``
+        Column flagging FDR-significant, non-degenerate dose-response features.
+    require_dependent : bool, default True
+        If True, restrict to rows with ``dependent_col == True`` before
+        counting (dropping ``'flat'``/non-significant rows in addition to the
+        ``classification_col`` mapping already excluding ``'flat'``).
+    top_n : int, optional
+        Only show the ``top_n`` genes with the most trans-dependent features
+        (sorted descending by total). Default: show all genes.
+    colors : dict, optional
+        Override the default direction -> color mapping (keys
+        ``'positive'``, ``'negative'``, ``'non_monotonic'``).
+    figsize : tuple, optional
+        Figure size. Defaults to ``(max(6, 0.4 * n_genes), 5)``.
+    show : bool, default True
+        Whether to call ``plt.show()``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    Raises
+    ------
+    ValueError
+        If ``classification_col`` or ``gene_col`` is missing from ``fdr_df``
+        (e.g. ``fdr_df`` was exported with ``function_type='polynomial'``,
+        which has no Hill components to classify), or if no rows remain
+        after filtering.
+    """
+    if classification_col not in fdr_df.columns:
+        raise ValueError(
+            f"'{classification_col}' not found in fdr_df. This column is only "
+            "populated for function_type='additive_hill' trans fits."
+        )
+    if gene_col not in fdr_df.columns:
+        raise ValueError(f"'{gene_col}' not found in fdr_df; pass gene_col= explicitly.")
+
+    color_map = dict(_TRANS_DIRECTION_COLORS)
+    if colors:
+        color_map.update(colors)
+
+    d = fdr_df
+    if require_dependent:
+        if dependent_col not in d.columns:
+            raise ValueError(
+                f"'{dependent_col}' not found in fdr_df; pass require_dependent=False "
+                "to skip the significance filter."
+            )
+        d = d[d[dependent_col] == True]  # noqa: E712 -- may be object/NaN dtype
+
+    direction = d[classification_col].map(_TRANS_CLASSIFICATION_TO_DIRECTION)
+    d = d.loc[direction.notna() & d[gene_col].notna()]
+    direction = direction.loc[d.index]
+
+    if len(d) == 0:
+        raise ValueError("No rows left to plot after filtering (require_dependent / classification).")
+
+    counts = (
+        pd.crosstab(d[gene_col], direction)
+        .reindex(columns=_TRANS_DIRECTION_ORDER, fill_value=0)
+    )
+    counts = counts.loc[counts.sum(axis=1).sort_values(ascending=False).index]
+    if top_n is not None:
+        counts = counts.iloc[:top_n]
+
+    if figsize is None:
+        figsize = (max(6, 0.4 * len(counts)), 5)
+    fig, ax = plt.subplots(figsize=figsize)
+
+    x = np.arange(len(counts))
+    bottom = np.zeros(len(counts))
+    for direction_name in _TRANS_DIRECTION_ORDER:
+        vals = counts[direction_name].values
+        ax.bar(x, vals, bottom=bottom, width=0.7, color=color_map[direction_name],
+               label=direction_name.replace('_', ' '), edgecolor='white', linewidth=1)
+        bottom += vals
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(counts.index, rotation=90, fontsize=8)
+    ax.set_ylabel("Number of trans-dependent features")
+    ax.set_xlabel(gene_col)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.legend(frameon=False, title="Direction")
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
+    return fig
+
+
 def scatter_with_smooth_by_group(
     x,
     y,
