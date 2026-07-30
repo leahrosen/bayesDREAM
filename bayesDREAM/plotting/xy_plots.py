@@ -3361,9 +3361,6 @@ def _compute_global_log2fc_offsets(
     x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(
         model, modality, x_true, y_obs, subset_mask
     )
-    sf_aligned = modality.sum_factors.loc[
-        meta_aligned['cell'].values, sum_factor_col
-    ].values
 
     is_ntc = (meta_aligned['target'].str.lower() == 'ntc').values
 
@@ -3394,17 +3391,29 @@ def _compute_global_log2fc_offsets(
                 y_offset = np.log2(y_ntc_val)
 
     if y_offset is None:
-        # Fallback: empirical NTC reference-group mean (when fit_technical not run)
-        if 'technical_group_code' in meta_aligned.columns:
-            ntc_ref_mask = is_ntc & (meta_aligned['technical_group_code'].values == 0)
-        else:
-            ntc_ref_mask = is_ntc
-        y_ntc_expr = y_obs_aligned[ntc_ref_mask] / sf_aligned[ntc_ref_mask]
-        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-        if len(y_ntc_valid) == 0:           # fallback: pooled NTC (all groups)
-            y_ntc_expr = y_obs_aligned[is_ntc] / sf_aligned[is_ntc]
+        # Fallback: empirical NTC reference-group mean (when fit_technical not run).
+        # Requires modality.sum_factors, which is only populated for modalities that
+        # went through sum-factor normalization (typically the primary 'gene'/'cis'
+        # modality) -- other modalities (e.g. splicing) may have sum_factors=None.
+        # This fallback -- and therefore y_offset -- is only meaningful for negbinom
+        # callers anyway (non-negbinom distributions discard y_offset), so silently
+        # fall back to 0.0 rather than raising when sum_factors is unavailable.
+        if getattr(modality, 'sum_factors', None) is not None:
+            sf_aligned = modality.sum_factors.loc[
+                meta_aligned['cell'].values, sum_factor_col
+            ].values
+            if 'technical_group_code' in meta_aligned.columns:
+                ntc_ref_mask = is_ntc & (meta_aligned['technical_group_code'].values == 0)
+            else:
+                ntc_ref_mask = is_ntc
+            y_ntc_expr = y_obs_aligned[ntc_ref_mask] / sf_aligned[ntc_ref_mask]
             y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-        y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+            if len(y_ntc_valid) == 0:           # fallback: pooled NTC (all groups)
+                y_ntc_expr = y_obs_aligned[is_ntc] / sf_aligned[is_ntc]
+                y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+            y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+        else:
+            y_offset = 0.0
 
     return x_offset, y_offset
 
