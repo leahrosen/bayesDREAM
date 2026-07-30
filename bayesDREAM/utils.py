@@ -9,7 +9,11 @@ This module contains helper functions used throughout the bayesDREAM package:
 """
 
 import os
+import warnings
+from typing import Optional
+
 import numpy as np
+import pandas as pd
 import torch
 from scipy.special import betainc
 from scipy.optimize import brentq
@@ -77,6 +81,75 @@ def make_names_unique(names, join: str = "-"):
             existing.add(candidate)
             out.append(candidate)
     return out
+
+
+# Columns that are many-to-one (e.g. a gene name repeats once per SJ/transcript
+# belonging to that gene) rather than a genuine per-feature identifier. Falling
+# back this far is worth flagging louder than the earlier, safer columns.
+_MANY_TO_ONE_NAME_COLS = ('gene_name', 'gene')
+
+
+def resolve_feature_names(
+    feature_meta: Optional[pd.DataFrame],
+    context: Optional[str] = None,
+) -> Optional[list]:
+    """
+    Derive a per-feature identifier list from feature_meta when explicit
+    feature_names weren't provided (e.g. modality built from a raw ndarray).
+
+    Prefers a real per-feature identifier column over many-to-one parent
+    columns — e.g. 'gene'/'gene_name' repeat once per SJ belonging to that
+    gene, so picking those first would silently make feature_names non-unique.
+    Priority: 'feature_id' > 'feature' > 'coord.intron' > 'junction_id' >
+    'gene_name' > 'gene' > a named index > the (unnamed, integer) index as a
+    last resort.
+
+    This is the single source of truth for the fallback; callers should not
+    re-implement their own column-guessing here.
+
+    Parameters
+    ----------
+    feature_meta : pd.DataFrame or None
+    context : str, optional
+        Label (e.g. modality name) used in the warning message when this
+        function has to guess. If None, no warning is emitted (used for
+        purely internal/no-guessing recomputation).
+
+    Returns
+    -------
+    list or None
+        None if feature_meta is None/empty.
+    """
+    if feature_meta is None or len(feature_meta) == 0:
+        return None
+
+    index_is_integer = (
+        isinstance(feature_meta.index, pd.RangeIndex) or
+        feature_meta.index.dtype.kind in ('i', 'u')
+    )
+    if not index_is_integer:
+        return feature_meta.index.tolist()
+
+    for col in ('feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene'):
+        if col in feature_meta.columns:
+            if context is not None:
+                if col in _MANY_TO_ONE_NAME_COLS:
+                    warnings.warn(
+                        f"{context}: no explicit feature_names given and feature_meta has no "
+                        f"per-feature identifier column (checked 'feature_id', 'feature', "
+                        f"'coord.intron', 'junction_id'); falling back to '{col}', which is "
+                        f"many-to-one for multi-feature genes (e.g. several SJs/transcripts "
+                        f"per gene). If features aren't actually 1:1 with '{col}', add a "
+                        f"unique 'feature_id' column to feature_meta or pass feature_names "
+                        f"explicitly.",
+                        UserWarning
+                    )
+                else:
+                    print(f"[INFO] {context}: no explicit feature_names given; "
+                          f"using feature_meta['{col}'] as the per-feature identifier.")
+            return feature_meta[col].tolist()
+
+    return feature_meta.index.tolist()
 
 
 ########################################

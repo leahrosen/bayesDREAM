@@ -412,29 +412,13 @@ def _resolve_features(feature_or_gene: str, modality) -> Tuple[List[int], List[s
             # Found matches
             indices = mask.values.nonzero()[0].tolist()
 
-            # Get feature names for matched indices
-            if hasattr(modality, 'feature_names') and modality.feature_names is not None:
-                # Use explicit feature_names attribute if available
+            # Get feature names for matched indices.
+            # modality.feature_names is the single source of truth (resolved +
+            # deduped in Modality.__init__), no need to re-derive it here.
+            if modality.feature_names is not None:
                 names = [modality.feature_names[i] for i in indices]
             else:
-                # Extract from feature_meta columns
-                # Priority: feature_id > feature > gene_name > gene > junction coordinates > fallback to index
-                name_cols = ['feature_id', 'feature', 'gene_name', 'gene', 'coord.intron', 'junction_id']
-                name_col_found = None
-                for col in name_cols:
-                    if col in modality.feature_meta.columns:
-                        name_col_found = col
-                        break
-
-                if name_col_found:
-                    # Extract names from the identified column
-                    names = modality.feature_meta.iloc[indices][name_col_found].tolist()
-                elif modality.feature_meta.index.name:
-                    # Use index if it has a name
-                    names = modality.feature_meta.iloc[indices].index.tolist()
-                else:
-                    # Last resort: use str(index)
-                    names = [str(i) for i in indices]
+                names = [str(i) for i in indices]
 
             return indices, names, True
 
@@ -1071,19 +1055,12 @@ def predict_trans_derivatives(
 
     A_samples = posterior['A']
 
-    # Get feature list — always from the modality, never from model.trans_genes
+    # Get feature list — always from the modality, never from model.trans_genes.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    if modality.feature_names is not None:
-        feature_list = modality.feature_names
-    elif modality.feature_meta is not None:
-        feature_list = None
-        for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-            if col in modality.feature_meta.columns:
-                feature_list = modality.feature_meta[col].tolist()
-                break
-        if feature_list is None:
-            feature_list = modality.feature_meta.index.tolist()
-    else:
+    feature_list = modality.feature_names
+    if feature_list is None:
         return None, None, None
 
     # Get dimensions
@@ -1295,23 +1272,11 @@ def predict_trans_log2fc(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            # Try other column names
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None, None, None, None
 
     feature_idx = feature_list.index(feature)
@@ -1414,22 +1379,11 @@ def predict_trans_log2fc_samples(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None
 
     feature_idx = feature_list.index(feature)
@@ -1531,22 +1485,11 @@ def predict_trans_delta_p(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None, None, None, None
 
     feature_idx = feature_list.index(feature)
@@ -1664,22 +1607,11 @@ def predict_trans_delta_p_samples(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None
 
     feature_idx = feature_list.index(feature)
@@ -2389,37 +2321,14 @@ def predict_trans_function(
             A_mean = A_mean.squeeze(0)
         n_genes_posterior = A_mean.shape[0]
 
-    # Get feature list from modality — always the ground truth
-    if modality_name == model.primary_modality:
-        # Use modality.feature_names — the modality is always the ground truth,
-        # since it matches the fitted posterior dimensions exactly.
-        _mod_obj = model.get_modality(modality_name)
-        feature_list = _mod_obj.feature_names if _mod_obj.feature_names is not None else []
-    else:
-        # Non-primary modality: get feature names from modality
-        modality = model.get_modality(modality_name)
-
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            # Fallback: Try common identifier columns in order of preference
-            # For splicing: prioritize coordinate-based identifiers (coord.intron, junction_id)
-            # For others: prioritize feature_id, feature, then fall back to gene names
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-
-            # If no column worked, try the index
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            # No feature metadata - try to use feature count from posterior
-            # Assume features are indexed 0, 1, 2, ... and cannot be matched by name
-            if debug: print(f"[predict_trans_function] returning None: non-primary modality has no feature_names or feature_meta")
-            return None
+    # Get feature list from modality — always the ground truth.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
+    modality = model.get_modality(modality_name)
+    feature_list = modality.feature_names if modality.feature_names is not None else []
+    if not feature_list and modality_name != model.primary_modality:
+        if debug: print(f"[predict_trans_function] returning None: non-primary modality has no feature_names or feature_meta")
+        return None
 
     n_features_list = len(feature_list)
 
@@ -2677,19 +2586,12 @@ def predict_trans_function_samples(
     else:
         A_samples = np.array(A_samples)
 
-    # Get feature list — always from the modality, never from model.trans_genes
+    # Get feature list — always from the modality, never from model.trans_genes.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    if modality.feature_names is not None:
-        feature_list = modality.feature_names
-    elif modality.feature_meta is not None:
-        feature_list = None
-        for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-            if col in modality.feature_meta.columns:
-                feature_list = modality.feature_meta[col].tolist()
-                break
-        if feature_list is None:
-            feature_list = modality.feature_meta.index.tolist()
-    else:
+    feature_list = modality.feature_names
+    if feature_list is None:
         return None
 
     # Handle dimension squeezing for non-primary modalities
@@ -2853,19 +2755,12 @@ def predict_trans_derivatives_samples(
     else:
         A_samples = np.array(A_samples)
 
-    # Get feature list — always from the modality, never from model.trans_genes
+    # Get feature list — always from the modality, never from model.trans_genes.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    if modality.feature_names is not None:
-        feature_list = modality.feature_names
-    elif modality.feature_meta is not None:
-        feature_list = None
-        for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-            if col in modality.feature_meta.columns:
-                feature_list = modality.feature_meta[col].tolist()
-                break
-        if feature_list is None:
-            feature_list = modality.feature_meta.index.tolist()
-    else:
+    feature_list = modality.feature_names
+    if feature_list is None:
         return None, None, None, None
 
     # Handle dimension squeezing
@@ -3318,18 +3213,11 @@ def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
             return []
         posterior = modality.posterior_samples_trans
-        if modality.feature_names is not None:
-            feature_list = list(modality.feature_names)
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                return []
-        else:
+        # modality.feature_names is the single source of truth (resolved + deduped
+        # in Modality.__init__), no need to re-derive it here.
+        if modality.feature_names is None:
             return []
+        feature_list = list(modality.feature_names)
 
     if feature not in feature_list:
         return []
@@ -5424,8 +5312,10 @@ def plot_xy_data(
         Example: ``exclude_cells=['cell_1', 'cell_2']``
     only_dependent : bool
         If True and plotting multiple features (gene name), filter to only "dependent" features
-        where the Hill coefficient (n_a or n_b) credible interval excludes 0 (default: False).
-        Requires fit_trans() to have been run with function_type='additive_hill'.
+        (default: False). When ``fdr_df`` is provided, uses its precomputed ``is_dependent``
+        column (FDR-significant AND the Hill coefficient's credible interval excludes 0).
+        Otherwise falls back to filtering on the n_a/n_b credible interval alone, which
+        requires fit_trans() to have been run with function_type='additive_hill'.
         Ignored for single-feature plots.
     ci_level : float
         Credible interval level for dependency filtering and parameter marker
@@ -5549,10 +5439,13 @@ def plot_xy_data(
         negbinom panel.  The feature name is matched via a ``gene_name`` or
         ``gene`` column.  Only applied to negbinom modalities.
     fdr_df : pd.DataFrame, optional
-        A ``trans_summary`` DataFrame with ``fdr_alpha`` and ``fdr_beta`` columns
-        (e.g. the output of ``save_trans_summary``).  Used for two purposes:
-        (1) greying out FDR-inactive parameter markers in ``mark_params`` mode,
-        (2) classifying the Hill regime for ``_compute_hill_markers``.
+        A ``trans_summary`` DataFrame with ``fdr_alpha``, ``fdr_beta``, and
+        ``is_dependent`` columns (e.g. the output of ``save_trans_summary``).
+        Used for three purposes:
+        (1) filtering to dependent features via the ``is_dependent`` column when
+        ``only_dependent=True``,
+        (2) greying out FDR-inactive parameter markers in ``mark_params`` mode,
+        (3) classifying the Hill regime for ``_compute_hill_markers``.
         Feature names are matched via a ``gene_name`` or ``gene`` column.
     fdr_threshold : float
         FDR threshold for classifying components as active (default: 0.05).
@@ -5845,32 +5738,37 @@ def plot_xy_data(
         n_before = len(feature_indices)
 
         if fdr_df is not None:
-            # FDR-based filtering: use min(fdr_alpha, fdr_beta) per feature.
-            # fdr_beta is NaN for single_hill/polynomial — nanmin treats NaN as inf.
-            fdr_lookup = {}
-            if 'feature' not in fdr_df.columns:
+            # Use the precomputed is_dependent column (FDR-significant AND the
+            # corresponding Hill exponent's CI excludes 0) rather than recomputing
+            # a weaker FDR-only criterion here.
+            if 'feature' not in fdr_df.columns or 'is_dependent' not in fdr_df.columns:
                 warnings.warn(
-                    "fdr_df must have a 'feature' column matching modality feature names. "
-                    "Showing all features instead.",
+                    "fdr_df must have 'feature' and 'is_dependent' columns "
+                    "(as produced by save_trans_summary). Showing all features instead.",
                     UserWarning
                 )
+            elif not fdr_df['feature'].is_unique:
+                _dupes = fdr_df['feature'][fdr_df['feature'].duplicated()].unique().tolist()
+                raise ValueError(
+                    f"fdr_df['feature'] is not unique ({len(_dupes)} duplicated value(s), "
+                    f"e.g. {_dupes[:5]}) — a per-feature lookup would silently use only "
+                    "the last matching row. This likely means fdr_df was saved by an "
+                    "older/buggy version of save_trans_summary; regenerate it."
+                )
             else:
-                for _, row in fdr_df.iterrows():
-                    fa = row.get('fdr_alpha', np.nan)
-                    fb = row.get('fdr_beta', np.nan)
-                    fdr_lookup[row['feature']] = float(np.nanmin([fa, fb]))
+                dep_lookup = dict(zip(fdr_df['feature'], fdr_df['is_dependent']))
 
                 kept_indices = []
                 kept_names = []
                 for idx, name in zip(feature_indices, feature_names_resolved):
-                    fdr_val = fdr_lookup.get(name, np.nan)
-                    if np.isfinite(fdr_val) and fdr_val <= fdr_threshold:
+                    dep_val = dep_lookup.get(name, np.nan)
+                    if pd.notna(dep_val) and bool(dep_val):
                         kept_indices.append(idx)
                         kept_names.append(name)
 
                 if len(kept_indices) == 0:
                     warnings.warn(
-                        f"No features passed FDR <= {fdr_threshold} for '{feature}'. "
+                        f"No features have is_dependent=True for '{feature}'. "
                         f"Showing all {n_before} features instead.",
                         UserWarning
                     )
@@ -5878,7 +5776,7 @@ def plot_xy_data(
                     feature_indices = kept_indices
                     feature_names_resolved = kept_names
                     print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
-                          f"(FDR <= {fdr_threshold})")
+                          f"(is_dependent=True)")
 
         else:
             # Fallback: CI-based filtering on n_a / n_b from posterior samples.

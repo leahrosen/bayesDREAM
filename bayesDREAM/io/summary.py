@@ -1071,6 +1071,17 @@ class ModelSummarizer:
             feature_names = modality.feature_names
         else:
             feature_names = modality.feature_meta.index.tolist()
+
+        _fn_series = pd.Series(feature_names, dtype=str)
+        if not _fn_series.is_unique:
+            _dupes = _fn_series[_fn_series.duplicated()].unique().tolist()
+            raise ValueError(
+                f"Resolved feature names for modality '{modality_name}' are not unique "
+                f"({len(_dupes)} duplicated value(s), e.g. {_dupes[:5]}). "
+                "feature_meta.index must be unique per feature, or set "
+                "modality.feature_names explicitly."
+            )
+
         n_features = len(feature_names)
         n_groups = alpha_y.shape[0]  # [C, T] → C groups
 
@@ -1618,34 +1629,32 @@ class ModelSummarizer:
         if modality.distribution == 'multinomial' and feature_meta is not None and len(feature_meta) > 0:
             if 'n_categories' in feature_meta.columns:
                 n_cats_per_feature = feature_meta['n_categories'].values.astype(int)
+        # modality.feature_names is populated by Modality.__init__ for every
+        # construction path (explicit, DataFrame index/columns, or resolved
+        # from feature_meta via resolve_feature_names()) and deduped there —
+        # this is the single source of truth, no need to re-derive it here.
         if modality.feature_names is not None:
-            # First priority: use modality.feature_names (this is what users see)
             feature_names = modality.feature_names
-        elif feature_meta is not None and len(feature_meta) > 0:
-            # Fallback: try feature_meta columns or index
-            # Check if index is integer-based (RangeIndex or integer dtype)
-            index_is_integer = (
-                isinstance(feature_meta.index, pd.RangeIndex) or
-                feature_meta.index.dtype in ['int64', 'int32', 'int']
-            )
-
-            if index_is_integer:
-                # Prefer named columns for feature identifiers
-                if 'gene' in feature_meta.columns:
-                    feature_names = feature_meta['gene'].tolist()
-                elif 'gene_name' in feature_meta.columns:
-                    feature_names = feature_meta['gene_name'].tolist()
-                elif 'feature' in feature_meta.columns:
-                    feature_names = feature_meta['feature'].tolist()
-                else:
-                    # Fall back to index
-                    feature_names = feature_meta.index.tolist()
-            else:
-                # Index is named, use it
-                feature_names = feature_meta.index.tolist()
         else:
-            # No feature_names or feature_meta, use range
+            # No feature_names or feature_meta at all
             feature_names = list(range(modality.counts.shape[0]))
+
+        # feature_names must be unique: it becomes the 'feature' column, which
+        # downstream code (plot_xy_data's dep_lookup/fdr_lookup, groupby, the
+        # feature_meta merge below, user analysis) treats as a per-row key.
+        # A silently non-unique key causes either lossy dict-based lookups or,
+        # worse, an unrestricted many-to-many merge that multiplies rows.
+        _fn_series = pd.Series(feature_names, dtype=str)
+        if not _fn_series.is_unique:
+            _dupes = _fn_series[_fn_series.duplicated()].unique().tolist()
+            raise ValueError(
+                f"Resolved feature names for modality '{modality_name}' are not unique "
+                f"({len(_dupes)} duplicated value(s), e.g. {_dupes[:5]}). "
+                "This usually means feature_meta lacks a proper per-feature identifier "
+                "column (e.g. 'feature_id') and fell back to a many-to-one column "
+                "like 'gene'. Set modality.feature_names explicitly or add a unique "
+                "'feature_id' column to feature_meta."
+            )
 
         n_features = len(feature_names)
 
@@ -1971,34 +1980,35 @@ class ModelSummarizer:
                     data[f'group_{g}_alpha_y_median'] = alpha_y_median[g, :n_features]
 
         df = pd.DataFrame(data)
+        df['feature'] = df['feature'].astype(str)
 
-        # Merge with feature_meta from modality
+        # Attach feature_meta columns from modality.
+        #
+        # This is a positional attach, not a key-based merge: feature_names (and
+        # therefore every row of `data`/`df`) was built directly from feature_meta's
+        # own rows/index above, in the same order, and optionally truncated to the
+        # first `max_features` rows. So feature_meta's rows are guaranteed row-aligned
+        # with df's rows by construction — merging on a guessed key column (e.g.
+        # 'gene') is both unnecessary and dangerous: 'gene' is many-to-one (many SJs
+        # share a gene), and merge(..., how='left') with no validate= silently turns
+        # that into an unrestricted many-to-many join, multiplying rows in the output.
         if modality.feature_meta is not None and len(modality.feature_meta) > 0:
-            # Reset index to get feature names as a column for merging
             feature_meta_df = modality.feature_meta.reset_index()
-            # Rename index column to avoid conflicts
             if 'index' in feature_meta_df.columns:
                 feature_meta_df = feature_meta_df.rename(columns={'index': 'feature_meta_idx'})
+            feature_meta_df = feature_meta_df.iloc[:n_features]
 
-            # Ensure feature column is string type for consistent merging
-            df['feature'] = df['feature'].astype(str)
+            if len(feature_meta_df) != len(df):
+                raise ValueError(
+                    f"feature_meta row count ({len(feature_meta_df)}) does not match "
+                    f"trans summary row count ({len(df)}) for modality '{modality_name}' "
+                    "after truncation — feature_meta is not row-aligned with the fitted "
+                    "features, so its columns cannot be safely attached."
+                )
 
-            # Merge on feature names - try to match by index or common columns
-            if 'feature' in feature_meta_df.columns:
-                feature_meta_df['feature'] = feature_meta_df['feature'].astype(str)
-                df = df.merge(feature_meta_df, on='feature', how='left')
-            elif 'gene' in feature_meta_df.columns:
-                feature_meta_df['gene'] = feature_meta_df['gene'].astype(str)
-                df = df.merge(feature_meta_df, left_on='feature', right_on='gene', how='left')
-            elif 'gene_name' in feature_meta_df.columns:
-                feature_meta_df['gene_name'] = feature_meta_df['gene_name'].astype(str)
-                df = df.merge(feature_meta_df, left_on='feature', right_on='gene_name', how='left')
-            else:
-                # Try direct concatenation if feature order matches
-                if len(feature_meta_df) == len(df):
-                    for col in feature_meta_df.columns:
-                        if col not in df.columns:
-                            df[col] = feature_meta_df[col].values
+            for col in feature_meta_df.columns:
+                if col not in df.columns:
+                    df[col] = feature_meta_df[col].values
 
         # Save
         os.makedirs(output_dir, exist_ok=True)

@@ -127,12 +127,11 @@ class ModelPlottingMixin:
 
         posterior = modality.posterior_samples_ntc
 
-        # Get feature names - will be adjusted based on alpha_y source later
-        if 'gene' in modality.feature_meta.columns:
-            modality_feature_names = modality.feature_meta['gene'].tolist()
-        elif 'gene_name' in modality.feature_meta.columns:
-            modality_feature_names = modality.feature_meta['gene_name'].tolist()
-        else:
+        # Get feature names - will be adjusted based on alpha_y source later.
+        # modality.feature_names is the single source of truth (resolved +
+        # deduped in Modality.__init__), no need to re-derive it here.
+        modality_feature_names = modality.feature_names
+        if modality_feature_names is None:
             modality_feature_names = modality.feature_meta.index.tolist()
 
         # Sample priors
@@ -506,11 +505,10 @@ class ModelPlottingMixin:
             distribution=modality.distribution
         )
 
-        if 'gene' in modality.feature_meta.columns:
-            feature_names = modality.feature_meta['gene'].tolist()
-        elif 'gene_name' in modality.feature_meta.columns:
-            feature_names = modality.feature_meta['gene_name'].tolist()
-        else:
+        # modality.feature_names is the single source of truth (resolved +
+        # deduped in Modality.__init__), no need to re-derive it here.
+        feature_names = modality.feature_names
+        if feature_names is None:
             feature_names = modality.feature_meta.index.tolist()
 
         post_samples = posterior['theta']

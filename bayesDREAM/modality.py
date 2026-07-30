@@ -12,7 +12,7 @@ import torch
 from typing import Literal, Optional, Union, Dict, Any
 from scipy import sparse
 
-from .utils import make_names_unique
+from .utils import make_names_unique, resolve_feature_names
 
 
 class Modality:
@@ -120,10 +120,20 @@ class Modality:
             self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
 
+        # If no explicit feature_names and no DataFrame index/columns to derive
+        # from (raw ndarray/sparse counts, e.g. add_custom_modality), fall back
+        # to feature_meta — same priority order used everywhere else in the
+        # codebase, so downstream code can always rely on modality.feature_names
+        # instead of re-deriving its own guess from feature_meta.
+        if self.feature_names is None:
+            self.feature_names = resolve_feature_names(feature_meta, context=f"Modality '{name}'")
+
         # Disambiguate duplicate feature names (e.g. Ensembl gene_name collisions
-        # from pseudogenes/readthrough transcripts). Name-based lookups throughout
-        # the codebase (feature_names.index(), pd.Series indexed by feature_names,
-        # get_feature_subset(), plotting by gene name, etc.) all assume uniqueness.
+        # from pseudogenes/readthrough transcripts, or a many-to-one fallback
+        # column like 'gene' repeating once per SJ belonging to that gene).
+        # Name-based lookups throughout the codebase (feature_names.index(),
+        # pd.Series indexed by feature_names, get_feature_subset(), plotting by
+        # gene name, etc.) all assume uniqueness.
         if self.feature_names is not None:
             deduped = make_names_unique(self.feature_names)
             if deduped != self.feature_names:

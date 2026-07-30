@@ -1281,14 +1281,9 @@ def plot_parameter_ci_panel(
                 f"Available: {list(tech_posterior.keys())}"
             )
 
-    # Get feature names from modality
+    # Get feature names from modality — the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
     feature_names = modality.feature_names
-    if feature_names is None:
-        # Fallback to feature_meta
-        for col in ['gene_name', 'gene', 'feature_id', 'feature']:
-            if col in modality.feature_meta.columns:
-                feature_names = modality.feature_meta[col].tolist()
-                break
     if feature_names is None:
         feature_names = [str(i) for i in range(modality.dims['n_features'])]
 
@@ -1646,13 +1641,9 @@ def extract_posterior_dataframe(
             "Must run fit_trans() first."
         )
 
-    # Get gene names
+    # Get gene names — modality.feature_names is the single source of truth
+    # (resolved + deduped in Modality.__init__), no need to re-derive it here.
     gene_names = modality.feature_names
-    if gene_names is None:
-        for col in ['gene_name', 'gene', 'feature_id', 'feature']:
-            if col in modality.feature_meta.columns:
-                gene_names = modality.feature_meta[col].tolist()
-                break
     if gene_names is None:
         gene_names = [str(i) for i in range(modality.dims['n_features'])]
 
