@@ -2526,8 +2526,9 @@ class ModelSummarizer:
         data['n_b_lower'] = n_b_lower
         data['n_b_upper'] = n_b_upper
 
-        # Use raw posterior medians for n; component activity is determined by FDR
-        # (q_active_a / q_active_b, computed below) rather than CI-based n-zeroing.
+        # Use raw posterior medians for n; component activity is determined by
+        # active_a / active_b (q-value + n CI-exclusion, computed below), not by
+        # clamping n itself.
         n_a_used = n_a_median
         n_b_used = n_b_median
 
@@ -2726,9 +2727,23 @@ class ModelSummarizer:
         q_active_a = _qall[:n_features]
         q_active_b = _qall[n_features:]
 
+        # Single "active" definition used everywhere a component needs to be gated
+        # on/off (point estimates, CIs, plotted curves, markers): Bayesian q-value
+        # < fdr_threshold AND the Hill exponent's 95% CI excludes 0. The q-value
+        # alone can't tell a real dose-response apart from alpha/beta absorbing a
+        # constant offset while n ≈ 0 (flat Hill, unidentified K); the CI-exclusion
+        # guard catches that degenerate case. This matches is_dependent/fit_type
+        # below exactly, so every downstream consumer (summary columns, plotting,
+        # predict_trans_function, _compute_hill_markers) agrees on one criterion.
+        n_a_excludes_zero = ~((n_a_lower <= 0) & (0 <= n_a_upper))
+        n_b_excludes_zero = ~((n_b_lower <= 0) & (0 <= n_b_upper))
+        active_a = (q_active_a < fdr_threshold) & n_a_excludes_zero
+        active_b = (q_active_b < fdr_threshold) & n_b_excludes_zero
+
         # Compute inflection points for individual Hill components
         if compute_inflection:
-            # Use raw n means (FDR controls activity, not CI-based n-zeroing)
+            # Use raw n means (activity is controlled by active_a/active_b below,
+            # not by clamping n_a_used/n_b_used themselves)
             nA = np.asarray(n_a_used, dtype=float)
             nB = np.asarray(n_b_used, dtype=float)
 
@@ -2741,8 +2756,8 @@ class ModelSummarizer:
             nBabs_hi = np.maximum(np.abs(n_b_lower), np.abs(n_b_upper))
 
             # FDR-inactive components: zero inflection magnitude bounds
-            _fdr_inactive_a = q_active_a >= fdr_threshold
-            _fdr_inactive_b = q_active_b >= fdr_threshold
+            _fdr_inactive_a = ~active_a
+            _fdr_inactive_b = ~active_b
             nAabs_lo[_fdr_inactive_a] = 0.0
             nAabs_hi[_fdr_inactive_a] = 0.0
             nBabs_lo[_fdr_inactive_b] = 0.0
@@ -2794,11 +2809,11 @@ class ModelSummarizer:
             return
 
         # Timing accumulators for the per-feature loop
-        _n_sig = int(np.sum((q_active_a < fdr_threshold) | (q_active_b < fdr_threshold)))
+        _n_sig = int(np.sum(active_a | active_b))
         if verbose:
             _S_val = Vmax_a_full.shape[0] if Vmax_a_full.ndim > 1 else 1
             print(f"  [loop1] {n_features} features  "
-                  f"{_n_sig} FDR-significant  "
+                  f"{_n_sig} active (q<{fdr_threshold} & n CI excludes 0)  "
                   f"{_S_val} posterior samples")
             _loop1_t = {'x_roots': 0.0, 'u_roots': 0.0, 'classify': 0.0,
                         'full_lfc_mean': 0.0, 'full_lfc_ci': 0.0,
@@ -2809,7 +2824,7 @@ class ModelSummarizer:
         _iter = tqdm(range(n_features), desc="  [loop1]", disable=not verbose)
         for i in _iter:
             # Compute FDR activity flag once, used throughout this iteration
-            _is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
+            _is_flat_i = (not active_a[i]) and (not active_b[i])
 
             # Get median parameters for this feature
             alpha_i = alpha_median[i]
@@ -3027,19 +3042,27 @@ class ModelSummarizer:
 
             # Compute full and observed dynamic ranges — only when compute_log2fc_params=True.
             # For negbinom: log2(y_max / y_min); for binomial: y_max - y_min (delta_p).
+            # Inactive components (active_a/active_b False — q >= fdr_threshold OR n's CI
+            # includes 0) are gated to zero here (same criterion used below for the
+            # per-sample CI), so a point estimate never includes a "phantom" contribution
+            # from a component that's individually insignificant or unidentified —
+            # consistent with predict_trans_function, _compute_hill_markers, and
+            # predict_hill_from_summary_row.
             if compute_log2fc_params:
+                _alpha_range_i = 0.0 if not active_a[i] else alpha_i
+                _beta_range_i  = 0.0 if not active_b[i] else beta_i
                 if _is_flat_i:
                     full_log2fc_i = 0.0
                 elif is_binomial:
                     full_log2fc_i = self._full_delta_p_from_extrema_and_boundaries(
-                        A_i, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                        beta_i, Vmax_b_i, K_b_i, n_b_i,
+                        A_i, _alpha_range_i, Vmax_a_i, K_a_i, n_a_i,
+                        _beta_range_i, Vmax_b_i, K_b_i, n_b_i,
                         x_range if x_range is not None else np.linspace(1e-3, 1e3, 6000)
                     )
                 else:
                     full_log2fc_i = self._full_log2fc_from_extrema_and_boundaries(
-                        A_i, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                        beta_i, Vmax_b_i, K_b_i, n_b_i,
+                        A_i, _alpha_range_i, Vmax_a_i, K_a_i, n_a_i,
+                        _beta_range_i, Vmax_b_i, K_b_i, n_b_i,
                         x_range if x_range is not None else np.linspace(1e-3, 1e3, 6000)
                     )
                 full_log2fc_mean_list.append(full_log2fc_i)
@@ -3050,14 +3073,14 @@ class ModelSummarizer:
                 if x_obs_min is not None and x_obs_max is not None:
                     if is_binomial:
                         obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_delta_p_fitted(
-                            A_i, alpha_i, Vmax_a_i, beta_i, Vmax_b_i,
+                            A_i, _alpha_range_i, Vmax_a_i, _beta_range_i, Vmax_b_i,
                             K_a_i, n_a_i, K_b_i, n_b_i,
                             x_obs_min, x_obs_max,
                             return_argextrema=True
                         )
                     else:
                         obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_log2fc_fitted(
-                            A_i, alpha_i, Vmax_a_i, beta_i, Vmax_b_i,
+                            A_i, _alpha_range_i, Vmax_a_i, _beta_range_i, Vmax_b_i,
                             K_a_i, n_a_i, K_b_i, n_b_i,
                             x_obs_min, x_obs_max,
                             return_argextrema=True
@@ -3098,9 +3121,9 @@ class ModelSummarizer:
                             K_b_s    = float(K_b_full[s, i])
                             n_a_s = float(n_a_full[s, i])
                             n_b_s = float(n_b_full[s, i])
-                            if q_active_a[i] >= fdr_threshold:
+                            if not active_a[i]:
                                 alpha_s = 0.0
-                            if q_active_b[i] >= fdr_threshold:
+                            if not active_b[i]:
                                 beta_s = 0.0
 
                             if is_binomial:
@@ -3156,9 +3179,9 @@ class ModelSummarizer:
                             K_b_s    = float(K_b_full[s, i])
                             n_a_s = float(n_a_full[s, i])
                             n_b_s = float(n_b_full[s, i])
-                            if q_active_a[i] >= fdr_threshold:
+                            if not active_a[i]:
                                 alpha_s = 0.0
-                            if q_active_b[i] >= fdr_threshold:
+                            if not active_b[i]:
                                 beta_s = 0.0
 
                             if is_binomial:
@@ -3365,7 +3388,7 @@ class ModelSummarizer:
                     return dg_du, d2g_du2, d3g_du3
 
             for i in range(n_features):
-                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
+                is_flat_i = (not active_a[i]) and (not active_b[i])
                 
                 if is_flat_i:
                     y_ntc_i = y_ntc[i] if y_ntc is not None else np.nan
@@ -3393,9 +3416,14 @@ class ModelSummarizer:
                         d3g_du3_at_0_upper[i] = 0.0
                     continue
 
-                # Get median parameters for this feature
-                alpha_i = alpha_median[i]
-                beta_i = beta_median[i]
+                # Get median parameters for this feature.
+                # Inactive components (active_a/active_b False) are gated to zero (same
+                # criterion as the per-sample CI loop below), so y_at_ntc/log2fc_at_0/
+                # delta_p_at_0 never include a phantom contribution from an individually
+                # inactive component — consistent with the full/observed range point
+                # estimates above.
+                alpha_i = 0.0 if not active_a[i] else alpha_median[i]
+                beta_i = 0.0 if not active_b[i] else beta_median[i]
                 Vmax_a_i = Vmax_a_median[i]
                 Vmax_b_i = Vmax_b_median[i]
                 K_a_i = K_a_median[i]
@@ -3441,9 +3469,9 @@ class ModelSummarizer:
                                 K_b_s = K_b_full[s, i]
                                 n_a_s = float(n_a_full[s, i])
                                 n_b_s = float(n_b_full[s, i])
-                                if q_active_a[i] >= fdr_threshold:
+                                if not active_a[i]:
                                     alpha_s = 0.0
-                                if q_active_b[i] >= fdr_threshold:
+                                if not active_b[i]:
                                     beta_s = 0.0
                                 A_s = A_full[s, i] if A_full.ndim > 1 else A_full[i]
 

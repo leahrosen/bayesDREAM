@@ -1005,7 +1005,9 @@ def predict_trans_derivatives(
     model,
     feature: str,
     x_range: np.ndarray,
-    modality_name: Optional[str] = None
+    modality_name: Optional[str] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute first, second, and third derivatives of trans effect function.
@@ -1022,6 +1024,12 @@ def predict_trans_derivatives(
         X values to compute derivatives at
     modality_name : str, optional
         Modality name (default: primary modality)
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero, matching predict_trans_function so the derivative is of the
+        *same* curve that gets plotted.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -1096,6 +1104,14 @@ def predict_trans_derivatives(
             n_a = _extract_param_mean(posterior['n_a'], feature_idx)
             n_b = _extract_param_mean(posterior['n_b'], feature_idx)
 
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
+
             # First derivatives
             dHill_a = Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
             dHill_b = Hill_first_derivative(x_range, Vmax=Vmax_b, K=K_b, n=n_b)
@@ -1127,6 +1143,14 @@ def predict_trans_derivatives(
             K_b = _extract_param_mean(posterior['K_b'], feature_idx)
             n_a = _extract_param_mean(posterior['n_a'], feature_idx)
             n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
 
             # First derivatives
             dHill_a = Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1187,7 +1211,9 @@ def predict_trans_log2fc(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    return_derivatives: bool = True
+    return_derivatives: bool = True,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function and derivatives in log2FC space.
@@ -1227,7 +1253,8 @@ def predict_trans_log2fc(
         All are None if computation fails
     """
     # Get S(x) - the function values
-    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name)
+    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name,
+                                     fdr_threshold=fdr_threshold, fdr_df=fdr_df)
     if y_pred is None:
         return None, None, None, None, None
 
@@ -1291,7 +1318,10 @@ def predict_trans_log2fc(
         return y_log2fc, u_range, None, None, None
 
     # Get S'(x), S''(x), and S'''(x)
-    first_deriv, second_deriv, third_deriv = predict_trans_derivatives(model, feature, x_range, modality_name=modality_name)
+    first_deriv, second_deriv, third_deriv = predict_trans_derivatives(
+        model, feature, x_range, modality_name=modality_name,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
+    )
     if first_deriv is None:
         return y_log2fc, u_range, None, None, None
 
@@ -1308,7 +1338,9 @@ def predict_trans_log2fc_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function in log2FC space for all posterior samples.
@@ -1325,6 +1357,10 @@ def predict_trans_log2fc_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return
+    fdr_threshold : float, default 0.05
+        FDR-inactive components are gated to zero; see predict_trans_function.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -1335,7 +1371,8 @@ def predict_trans_log2fc_samples(
     """
     # Get all posterior samples for S(x)
     y_samples = predict_trans_function_samples(
-        model, feature, x_range, modality_name=modality_name, max_samples=max_samples
+        model, feature, x_range, modality_name=modality_name, max_samples=max_samples,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
     )
     if y_samples is None:
         return None, None
@@ -1404,7 +1441,9 @@ def predict_trans_delta_p(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    return_derivatives: bool = True
+    return_derivatives: bool = True,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function in delta_p (probability difference) space for binomial modalities.
@@ -1440,7 +1479,8 @@ def predict_trans_delta_p(
         All are None if computation fails
     """
     # Get p(x) - the probability values from fitted function
-    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name)
+    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name,
+                                     fdr_threshold=fdr_threshold, fdr_df=fdr_df)
     if y_pred is None:
         return None, None, None, None, None
 
@@ -1505,7 +1545,8 @@ def predict_trans_delta_p(
 
     # Get dp/dx derivatives
     first_deriv_dx, second_deriv_dx, third_deriv_dx = predict_trans_derivatives(
-        model, feature, x_range, modality_name=modality_name
+        model, feature, x_range, modality_name=modality_name,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
     )
     if first_deriv_dx is None:
         return delta_p, u_range, None, None, None
@@ -1536,7 +1577,9 @@ def predict_trans_delta_p_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function in delta_p space for all posterior samples.
@@ -1553,6 +1596,10 @@ def predict_trans_delta_p_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return
+    fdr_threshold : float, default 0.05
+        FDR-inactive components are gated to zero; see predict_trans_function.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -1563,7 +1610,8 @@ def predict_trans_delta_p_samples(
     """
     # Get all posterior samples for p(x)
     y_samples = predict_trans_function_samples(
-        model, feature, x_range, modality_name=modality_name, max_samples=max_samples
+        model, feature, x_range, modality_name=modality_name, max_samples=max_samples,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
     )
     if y_samples is None:
         return None, None
@@ -1656,6 +1704,8 @@ def plot_trans_functions(
     overlay_roots_lw: float = 1.0,
     overlay_roots_alpha: float = 0.8,
     overlay_roots_also_on_function: bool = True,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> plt.Figure:
     """
     Plot fitted trans functions and/or their derivatives.
@@ -1755,6 +1805,14 @@ def plot_trans_functions(
         Transparency for root vlines (default 0.8).
     overlay_roots_also_on_function : bool
         If True (default), draw all root sets also on the function subplot.
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero in the plotted curve/derivatives, consistent with
+        _compute_hill_markers, predict_hill_from_summary_row, and
+        save_trans_summary's point estimates.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from, instead
+        of recomputing Bayesian FDR live from the posterior for each feature.
 
     Returns
     -------
@@ -1922,7 +1980,8 @@ def plot_trans_functions(
             if use_log2fc:
                 # Get log2FC transformed values
                 y_log2fc, u_range, first_deriv, second_deriv, third_deriv = predict_trans_log2fc(
-                    model, feature, x_range, modality_name=modality_name, return_derivatives=True
+                    model, feature, x_range, modality_name=modality_name, return_derivatives=True,
+                    fdr_threshold=fdr_threshold, fdr_df=fdr_df
                 )
                 if y_log2fc is None:
                     continue
@@ -1931,15 +1990,20 @@ def plot_trans_functions(
             elif use_delta_p:
                 # Get delta_p transformed values (probability difference from NTC)
                 delta_p, u_range, first_deriv, second_deriv, third_deriv = predict_trans_delta_p(
-                    model, feature, x_range, modality_name=modality_name, return_derivatives=True
+                    model, feature, x_range, modality_name=modality_name, return_derivatives=True,
+                    fdr_threshold=fdr_threshold, fdr_df=fdr_df
                 )
                 if delta_p is None:
                     continue
                 y_pred = delta_p
                 x_plot_feat = u_range  # Use u (log2FC of x) for this feature
             else:
-                y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name)
-                first_deriv, second_deriv, third_deriv = predict_trans_derivatives(model, feature, x_range, modality_name=modality_name)
+                y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name,
+                                                 fdr_threshold=fdr_threshold, fdr_df=fdr_df)
+                first_deriv, second_deriv, third_deriv = predict_trans_derivatives(
+                    model, feature, x_range, modality_name=modality_name,
+                    fdr_threshold=fdr_threshold, fdr_df=fdr_df
+                )
                 # X values for plotting (same for all features when not using log2fc/delta_p)
                 x_plot_feat = np.log2(x_range) if use_log2_x else x_range
         except ValueError as e:
@@ -1967,7 +2031,8 @@ def plot_trans_functions(
                     delta_p_samples, _ = predict_trans_delta_p_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     y_samples = delta_p_samples
 
@@ -1977,7 +2042,8 @@ def plot_trans_functions(
                     S_samples, dS_samples, d2S_samples, d3S_samples = predict_trans_derivatives_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     if S_samples is not None and dS_samples is not None:
                         # Transform derivatives to delta_p u-space using chain rule
@@ -2006,7 +2072,8 @@ def plot_trans_functions(
                     y_log2fc_samples, _ = predict_trans_log2fc_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     y_samples = y_log2fc_samples
 
@@ -2016,7 +2083,8 @@ def plot_trans_functions(
                     S_samples, dS_samples, d2S_samples, d3S_samples = predict_trans_derivatives_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     if S_samples is not None and dS_samples is not None:
                         # Transform derivatives to log2FC space using chain rule
@@ -2052,14 +2120,16 @@ def plot_trans_functions(
                     y_samples = predict_trans_function_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
 
                 if need_derivs:
                     _, first_deriv_samples, second_deriv_samples, third_deriv_samples = predict_trans_derivatives_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
 
         # Plot each requested type
@@ -2239,6 +2309,8 @@ def predict_trans_function(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
     debug: bool = False
 ) -> Optional[np.ndarray]:
     """
@@ -2257,6 +2329,18 @@ def predict_trans_function(
         X values to predict at (cis expression levels)
     modality_name : str, optional
         Modality name (default: primary modality)
+    fdr_threshold : float, default 0.05
+        For additive_hill: components with Bayesian q-value >= fdr_threshold are
+        FDR-inactive and gated to zero, so the curve reflects only statistically
+        significant components — consistent with _compute_hill_markers,
+        predict_hill_from_summary_row, and save_trans_summary's
+        full_log2fc/observed_log2fc point estimates. Without gating, alpha/beta
+        for null components are ~0.4-0.5 (RelaxedBernoulli prior) rather than 0,
+        producing a spurious partial Hill contribution.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame (with fdr_alpha/fdr_beta columns) to
+        source activity calls from, instead of recomputing Bayesian FDR live from
+        the posterior on every call.
 
     Returns
     -------
@@ -2369,6 +2453,14 @@ def predict_trans_function(
             n_a = _extract_param_mean(posterior['n_a'], feature_idx)
             n_b = _extract_param_mean(posterior['n_b'], feature_idx)
 
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
+
             if debug:
                 print(f"[predict_trans_function] additive_hill: A={A:.4g}, alpha={alpha:.4g}, beta={beta:.4g}, Vmax_a={Vmax_a:.4g}, Vmax_b={Vmax_b:.4g}, K_a={K_a:.4g}, K_b={K_b:.4g}, n_a={n_a:.4g}, n_b={n_b:.4g}")
 
@@ -2398,6 +2490,14 @@ def predict_trans_function(
             K_b = _extract_param_mean(posterior['K_b'], feature_idx)
             n_a = _extract_param_mean(posterior['n_a'], feature_idx)
             n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
 
             # IMPORTANT: Match the actual model computation in fit_trans!
             # Model uses: y = A + (alpha * Hill_a(Vmax=Vmax_a)) + (beta * Hill_b(Vmax=Vmax_b))
@@ -2474,6 +2574,33 @@ def predict_trans_function(
         return None
 
 
+def _row_component_active(row, fdr_col, n_lower_col, n_upper_col, fdr_threshold=0.05):
+    """
+    Whether a Hill component is active per a trans_summary row: Bayesian q-value
+    < fdr_threshold AND the Hill exponent's 95% CI excludes 0 (permissive True
+    fallback if the CI columns are missing/NaN). This is the row-based half of
+    the single active-component definition shared with io/summary.py's
+    active_a/active_b and xy_plots.py's _resolve_hill_null_flags — used by
+    predict_hill_from_summary_row and (via _resolve_hill_null_flags) by
+    _compute_hill_markers's fdr_df path.
+    """
+    fdr_val = row.get(fdr_col, 1.0)
+    try:
+        fdr_val = float(fdr_val)
+    except (TypeError, ValueError):
+        fdr_val = 1.0
+    if not np.isfinite(fdr_val):
+        fdr_val = 1.0
+
+    lo, hi = row.get(n_lower_col), row.get(n_upper_col)
+    if lo is None or hi is None or pd.isna(lo) or pd.isna(hi):
+        n_excludes_zero = True
+    else:
+        n_excludes_zero = not (float(lo) <= 0 <= float(hi))
+
+    return (fdr_val < fdr_threshold) and n_excludes_zero
+
+
 def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float = 0.05) -> Optional[np.ndarray]:
     """
     Compute a Hill curve from a trans_summary DataFrame row.
@@ -2482,10 +2609,15 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
     Parameters are read from columns named A_median, alpha_median, Vmax_a_median,
     K_a_median, n_a_median, beta_median, Vmax_b_median, K_b_median, n_b_median.
 
-    FDR gating: components with fdr_alpha > fdr_threshold (or fdr_beta) are zeroed
-    out so the curve reflects only statistically significant effects. Without gating,
-    alpha/beta for null components are ~0.4-0.5 (RelaxedBernoulli prior) rather than 0,
-    producing a spurious partial Hill contribution.
+    Gating: a component is zeroed out unless it's active — Bayesian q-value
+    (fdr_alpha/fdr_beta) < fdr_threshold AND its Hill exponent's 95% CI
+    (n_a_lower/n_a_upper, n_b_lower/n_b_upper) excludes 0 — so the curve reflects
+    only components with an identified, statistically significant dose-response.
+    Without gating, alpha/beta for null components are ~0.4-0.5 (RelaxedBernoulli
+    prior) rather than 0, producing a spurious partial Hill contribution; the q-value
+    alone would also let through alpha absorbing a constant offset while n ≈ 0
+    (flat Hill, unidentified K). Matches active_a/active_b in io/summary.py and
+    _resolve_hill_null_flags/_compute_hill_markers.
 
     Returns y values at x_range, or None if required columns are missing.
     """
@@ -2505,9 +2637,7 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
     if Vmax_a is None or K_a is None or n_a is None:
         return None
 
-    # Apply FDR gating to alpha component
-    fdr_alpha = _g('fdr_alpha')
-    if fdr_alpha is not None and fdr_alpha > fdr_threshold:
+    if not _row_component_active(row, 'fdr_alpha', 'n_a_lower', 'n_a_upper', fdr_threshold):
         alpha = 0.0
 
     Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
@@ -2518,9 +2648,7 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
     K_b    = _g('K_b_median')
     n_b    = _g('n_b_median')
 
-    # Apply FDR gating to beta component
-    fdr_beta = _g('fdr_beta')
-    if fdr_beta is not None and fdr_beta > fdr_threshold:
+    if not _row_component_active(row, 'fdr_beta', 'n_b_lower', 'n_b_upper', fdr_threshold):
         beta = 0.0
 
     if Vmax_b is not None and K_b is not None and n_b is not None and beta != 0.0:
@@ -2535,7 +2663,9 @@ def predict_trans_function_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Optional[np.ndarray]:
     """
     Predict trans effect function for all posterior samples.
@@ -2555,6 +2685,13 @@ def predict_trans_function_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return. If None, returns all samples.
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero for every sample, matching predict_trans_function so
+        posterior-sample overlays and CI bands reflect the same gated curve as
+        the mean line.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -2636,6 +2773,14 @@ def predict_trans_function_samples(
             n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
             n_b = _extract_param_samples(posterior, 'n_b', feature_idx)
 
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = np.zeros_like(alpha)
+            if b_null:
+                beta = np.zeros_like(beta)
+
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
                 # Subsample
@@ -2707,7 +2852,9 @@ def predict_trans_derivatives_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans function and derivatives for all posterior samples.
@@ -2724,6 +2871,11 @@ def predict_trans_derivatives_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero for every sample, matching predict_trans_derivatives.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -2800,6 +2952,14 @@ def predict_trans_derivatives_samples(
             K_b = _extract_param_samples(posterior, 'K_b', feature_idx)
             n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
             n_b = _extract_param_samples(posterior, 'n_b', feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = np.zeros_like(alpha)
+            if b_null:
+                beta = np.zeros_like(beta)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -2964,6 +3124,80 @@ def _compute_posterior_fdr(posterior, activity_epsilon: float = 0.01):
         fdr_beta  = nan_col
 
     return fdr_alpha, fdr_beta
+
+
+def _posterior_n_excludes_zero(posterior, feature_idx):
+    """
+    Return (n_a_excludes_zero, n_b_excludes_zero): whether each Hill exponent's
+    95% posterior CI (2.5%/97.5% quantiles, matching io/summary.py's extract_param)
+    excludes 0 for this feature. True (excludes zero) is the permissive fallback
+    when there aren't enough samples to assess a CI, so a missing/degenerate
+    posterior doesn't spuriously gate a component off.
+    """
+    def _excludes_zero(key):
+        if key not in posterior:
+            return True
+        v = posterior[key]
+        if hasattr(v, 'cpu'):
+            v = v.detach().cpu().numpy()
+        v = np.asarray(v, dtype=float)
+        if v.ndim >= 3 and v.shape[1] == 1:
+            v = v.squeeze(1)
+        if v.ndim < 2 or feature_idx >= v.shape[1]:
+            return True
+        col = v[:, feature_idx]
+        lo = np.quantile(col, 0.025)
+        hi = np.quantile(col, 0.975)
+        return not (lo <= 0 <= hi)
+
+    return _excludes_zero('n_a'), _excludes_zero('n_b')
+
+
+def _resolve_hill_null_flags(feature, feature_idx, posterior, fdr_df=None, fdr_threshold=0.05):
+    """
+    Resolve (a_null, b_null): whether the additive-hill A/B components are
+    inactive for this feature, i.e. whether they should be gated to zero.
+
+    Single source of truth for component-activity gating shared by
+    predict_trans_function, predict_trans_derivatives, and _compute_hill_markers
+    (and their _samples variants), so the fitted curve, its derivatives, and its
+    markers always agree on which component(s) are "on". A component is active
+    iff BOTH: Bayesian q-value < fdr_threshold AND its Hill exponent's (n_a/n_b)
+    95% CI excludes 0 — this is exactly the active_a/active_b criterion in
+    io/summary.py (is_dependent/fit_type and the point-estimate/CI gating). The
+    q-value alone can't distinguish a real dose-response from alpha/beta
+    absorbing a constant offset while n ≈ 0 (flat Hill, unidentified K); the CI
+    check catches that degenerate case.
+
+    Prefers a precomputed fdr_df (e.g. a save_trans_summary row, which already
+    has fdr_alpha/fdr_beta/n_a_lower/n_a_upper/n_b_lower/n_b_upper columns) when
+    available — cheap and avoids recomputing q-values/quantiles on every call —
+    falling back to a live computation from the posterior otherwise.
+
+    Returns
+    -------
+    (a_null, b_null) : (bool, bool)
+    """
+    if fdr_df is not None:
+        _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
+        if _name_col:
+            _match = fdr_df[fdr_df[_name_col] == feature]
+            if not _match.empty:
+                row = _match.iloc[0]
+                a_null = not _row_component_active(row, 'fdr_alpha', 'n_a_lower', 'n_a_upper', fdr_threshold)
+                b_null = not _row_component_active(row, 'fdr_beta', 'n_b_lower', 'n_b_upper', fdr_threshold)
+                return a_null, b_null
+
+    fdr_a, fdr_b = _compute_posterior_fdr(posterior)
+    if fdr_a is not None and feature_idx < len(fdr_a):
+        n_a_excludes_zero, n_b_excludes_zero = _posterior_n_excludes_zero(posterior, feature_idx)
+        a_null = not (float(fdr_a[feature_idx]) < fdr_threshold and n_a_excludes_zero)
+        b_null = (not (float(fdr_b[feature_idx]) < fdr_threshold and n_b_excludes_zero)
+                  if fdr_b is not None and not np.isnan(fdr_b[feature_idx])
+                  else False)
+        return a_null, b_null
+
+    return False, False
 
 
 # ============================================================================
@@ -3245,28 +3479,12 @@ def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0
         beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
         K_b    = pmean('K_b');   n_b    = pmean('n_b')
 
-        # Null classification: prefer fdr_df (pre-computed summary), then compute
-        # Bayesian FDR from the posterior (same formula as save_trans_summary),
-        # matching on P(alpha*Vmax/A > epsilon) + pooled q-values across all features.
-        _fdr_row = None
-        if fdr_df is not None:
-            _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
-            if _name_col:
-                _match = fdr_df[fdr_df[_name_col] == feature]
-                if not _match.empty:
-                    _fdr_row = _match.iloc[0]
-        if _fdr_row is not None:
-            a_null = float(_fdr_row.get('fdr_alpha', 1.0)) >= fdr_threshold
-            b_null = float(_fdr_row.get('fdr_beta',  1.0)) >= fdr_threshold
-        else:
-            _fdr_a, _fdr_b = _compute_posterior_fdr(posterior)
-            if _fdr_a is not None and feature_idx < len(_fdr_a):
-                a_null = float(_fdr_a[feature_idx]) >= fdr_threshold
-                b_null = (float(_fdr_b[feature_idx]) >= fdr_threshold
-                          if _fdr_b is not None and not np.isnan(_fdr_b[feature_idx])
-                          else not is_additive)
-            else:
-                a_null = b_null = False
+        # Null classification: same criterion used everywhere else (predict_trans_function,
+        # predict_trans_derivatives, save_trans_summary) so the curve, its derivatives,
+        # and these markers always agree on which component(s) are "on".
+        a_null, b_null = _resolve_hill_null_flags(
+            feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+        )
     else:
         a_null = b_null = False
 
@@ -3871,7 +4089,12 @@ def plot_negbinom_xy(
                                         log2_min = min(log2_min, np.log2(_k_val))
                                         log2_max = max(log2_max, np.log2(_k_val))
             x_range = 2 ** np.linspace(log2_min, log2_max, 2000)
-            y_pred = predict_trans_function(model, feature, x_range, modality_name=None)
+            # Use reference_df as FDR source if no explicit fdr_df provided (also
+            # used below for markers, so components are gated consistently
+            # between the plotted curve and its parameter markers).
+            _effective_fdr_df = fdr_df if fdr_df is not None else reference_df
+            y_pred = predict_trans_function(model, feature, x_range, modality_name=None,
+                                             fdr_threshold=fdr_threshold, fdr_df=_effective_fdr_df)
 
             if y_pred is not None:
                 # Transform prediction to log2(y) space to match data
@@ -3894,8 +4117,6 @@ def plot_negbinom_xy(
                 _ax_y_hill_xh = _ax_y_hill_yh = None
 
             # Full parameter markers (replaces simple A baseline)
-            # Use reference_df as FDR source if no explicit fdr_df provided
-            _effective_fdr_df = fdr_df if fdr_df is not None else reference_df
             _show_fit_markers = mark_params in (True, 'both', 'fit')
             _show_ref_markers = mark_params in (True, 'both', 'reference')
             if _show_fit_markers and (corrected or not has_technical_fit):
@@ -3943,7 +4164,8 @@ def plot_negbinom_xy(
             # (which suppresses the A+Vmax ceiling h_marker in mark_params mode).
             if expand_y_to_params and y_pred is not None:
                 _x_asym = np.array([max(x_range[0] * 1e-6, 1e-30), x_range[-1] * 1e6])
-                _y_asym = predict_trans_function(model, feature, _x_asym, modality_name=None)
+                _y_asym = predict_trans_function(model, feature, _x_asym, modality_name=None,
+                                                  fdr_threshold=fdr_threshold, fdr_df=_effective_fdr_df)
                 if _y_asym is not None:
                     _valid_asym = _y_asym > 0
                     if _valid_asym.any():
