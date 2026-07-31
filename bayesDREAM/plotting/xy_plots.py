@@ -3679,6 +3679,7 @@ def plot_negbinom_xy(
     ref_label: str = 'Reference Function',
     expand_x_to_params: bool = False,
     expand_y_to_params: bool = False,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -4226,7 +4227,7 @@ def plot_negbinom_xy(
                                     ax_plot.axvline(_m['value'] - _x_ref_mk_offset, **_kw)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
-        ax_plot.set_ylabel("log2FC(counts)" if log2fc else "log2(counts)")
+        ax_plot.set_ylabel(ylabel if ylabel is not None else ("log2FC(counts)" if log2fc else "log2(counts)"))
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
         if log2fc:
@@ -4298,12 +4299,18 @@ def plot_binomial_xy(
     figsize: Optional[Tuple[float, float]] = None,
     log2fc: bool = False,
     ntc_x_offset: Optional[float] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Axes:
     """
-    Plot binomial (PSI - percent spliced in).
+    Plot binomial (a bounded count/denominator ratio, e.g. PSI or a
+    spliced/unspliced fraction).
 
-    Y-axis: PSI (%) = (counts / denominator) * 100  (percentage scale: 0-100)
+    Y-axis: 100 * counts / denominator (percentage scale: 0-100). Labeled
+    ``'Percentage (%)'`` by default since this distribution is used for any
+    bounded count/denominator ratio, not just splicing PSI (e.g. gene-level
+    spliced-vs-unspliced fractions for velocity) -- pass ``ylabel='PSI (%)'``
+    (or another description) to be more specific for a given modality.
     Filter: min_counts on denominator
 
     Parameters
@@ -4325,6 +4332,10 @@ def plot_binomial_xy(
         Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
         Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
         and passes this automatically.
+    ylabel : str, optional
+        Override the y-axis label (default: ``'Percentage (%)'``). Pass
+        ``ylabel='PSI (%)'`` for splicing modalities, or e.g.
+        ``ylabel='Spliced (%)'`` for a gene velocity modality.
 
     Notes
     -----
@@ -4525,7 +4536,7 @@ def plot_binomial_xy(
             _draw_hill_markers(ax_plot, _markers, x_offset=_x_off)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
-        ax_plot.set_ylabel('PSI (%)')
+        ax_plot.set_ylabel(ylabel if ylabel is not None else 'Percentage (%)')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature} (min_counts={min_counts}{title_suffix})")
         if log2fc:
@@ -4567,6 +4578,7 @@ def plot_multinomial_xy(
     subset_mask: Optional[np.ndarray] = None,
     log2fc: bool = False,
     ntc_x_offset: Optional[float] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> Union[plt.Figure, List[plt.Axes]]:
     """
@@ -4796,7 +4808,7 @@ def plot_multinomial_xy(
                            label=group_label if plot_idx == 0 else None)
 
                 ax.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
-                ax.set_ylabel(f'Proportion')
+                ax.set_ylabel(ylabel if ylabel is not None else 'Proportion')
                 title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                 ax.set_title(f"{cat_label}{title_suffix}")
                 if log2fc:
@@ -4892,6 +4904,7 @@ def plot_normal_xy(
     figsize: Optional[Tuple[float, float]] = None,
     log2fc: bool = False,
     ntc_x_offset: Optional[float] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -5094,7 +5107,7 @@ def plot_normal_xy(
             _draw_hill_markers(ax_plot, _markers, x_offset=_x_off)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
-        ax_plot.set_ylabel('Value')
+        ax_plot.set_ylabel(ylabel if ylabel is not None else 'Value')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
         if log2fc:
@@ -5136,6 +5149,7 @@ def _plot_multinomial_multifeature(
     xlabel: str,
     figsize: Optional[Tuple[int, int]] = None,
     subset_mask: Optional[np.ndarray] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Figure:
     """
@@ -5406,7 +5420,7 @@ def _plot_multinomial_multifeature(
                                label=group_label if cat_plot_idx == 0 and feat_i == 0 else None)
 
                     ax.set_xlabel(xlabel)
-                    ax.set_ylabel(f'Proportion')
+                    ax.set_ylabel(ylabel if ylabel is not None else 'Proportion')
                     title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                     ax.set_title(f"{feat_name[:20]}... {cat_label}{title_suffix}", fontsize=9)
                     if cat_plot_idx == 0 and feat_i == 0:
@@ -5469,7 +5483,7 @@ def _plot_multinomial_multifeature(
                            label=group_label if cat_plot_idx == 0 and feat_i == 0 else None)
 
                 ax.set_xlabel(xlabel)
-                ax.set_ylabel(f'Proportion')
+                ax.set_ylabel(ylabel if ylabel is not None else 'Proportion')
                 title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                 ax.set_title(f"{feat_name[:20]}... {cat_label}{title_suffix}", fontsize=9)
                 if cat_plot_idx == 0 and feat_i == 0:
@@ -5501,6 +5515,7 @@ def plot_xy_data(
     show_ntc_gradient: bool = False,
     sum_factor_col: str = 'sum_factor',
     xlabel: str = "log2(x_true)",
+    ylabel: Optional[str] = None,
     figsize: Optional[Tuple[int, int]] = None,
     src_barcodes: Optional[np.ndarray] = None,
     subset_meta: Optional[Dict[str, Any]] = None,
@@ -5567,6 +5582,15 @@ def plot_xy_data(
         Only used for negbinom distribution (gene expression)
     xlabel : str
         X-axis label (default: "log2(x_true)")
+    ylabel : str, optional
+        Override the y-axis label (default: None, uses a distribution-specific
+        default -- ``"log2(counts)"`` for negbinom, ``"Percentage (%)"`` for
+        binomial (0-100 scale), ``"Proportion"`` for multinomial (0-1 scale),
+        ``"Value"`` for normal/studentt). The binomial default is deliberately
+        generic since that distribution covers any bounded count/denominator
+        ratio, not just splicing PSI -- pass e.g. ``ylabel='PSI (%)'`` for
+        splicing modalities or ``ylabel='Spliced (%)'`` for a gene velocity
+        modality.
     figsize : tuple, optional
         Figure size (auto-sized if None)
     src_barcodes : np.ndarray, optional
@@ -6130,6 +6154,7 @@ def plot_xy_data(
                 show_correction=show_correction,
                 color_palette=color_palette,
                 xlabel=xlabel,
+                ylabel=ylabel,
                 figsize=figsize,
                 subset_mask=subset_mask,
                 **kwargs
@@ -6172,6 +6197,7 @@ def plot_xy_data(
                     ntc_x_offset=ntc_x_offset, ntc_y_offset=ntc_y_offset,
                     expand_x_to_params=expand_x_to_params,
                     expand_y_to_params=expand_y_to_params,
+                    ylabel=ylabel,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -6183,6 +6209,7 @@ def plot_xy_data(
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
                     subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
                     log2fc=log2fc, ntc_x_offset=ntc_x_offset,
+                    ylabel=ylabel,
                     **kwargs
                 )
             elif distribution in ('normal', 'studentt'):
@@ -6193,6 +6220,7 @@ def plot_xy_data(
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
                     subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
                     log2fc=log2fc, ntc_x_offset=ntc_x_offset,
+                    ylabel=ylabel,
                     **kwargs
                 )
             else:
@@ -6345,6 +6373,7 @@ def plot_xy_data(
             ntc_y_offset=_sf_ntc_y_off,
             expand_x_to_params=expand_x_to_params,
             expand_y_to_params=expand_y_to_params,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -6368,6 +6397,7 @@ def plot_xy_data(
             figsize=figsize,
             log2fc=log2fc,
             ntc_x_offset=_sf_ntc_x_off,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -6388,6 +6418,7 @@ def plot_xy_data(
             subset_mask=subset_mask,
             log2fc=log2fc,
             ntc_x_offset=_sf_ntc_x_off,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -6410,6 +6441,7 @@ def plot_xy_data(
             figsize=figsize,
             log2fc=log2fc,
             ntc_x_offset=_sf_ntc_x_off,
+            ylabel=ylabel,
             **kwargs
         )
 
