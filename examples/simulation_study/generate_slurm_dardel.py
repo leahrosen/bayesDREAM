@@ -1,6 +1,6 @@
 """
 Generate SLURM array scripts for the additive-Hill recovery study on Dardel (PDC),
-CPU-only. See docs/SIMULATION_STUDY_PLAN.md §7 and the Berzelius counterpart,
+CPU-only. See docs/SIMULATION_STUDY_PLAN.md §7/§7b and the Berzelius counterpart,
 generate_slurm.py.
 
 Unlike Berzelius's generator, this does NOT use bayesDREAM.slurm_jobgen.SlurmJobGenerator
@@ -11,10 +11,24 @@ on this study's own dataset sizes (plan §7, 2026-07-29) showed fit_ntc/fit_cis/
 don't meaningfully benefit from more than a handful of cores -- so resource sizing here is
 just a fixed --cpus-per-task passed in by the caller, not a per-scenario estimate.
 
-Writes the same three-script shape as generate_slurm.py:
-    01_simulate.sh   array 0-N, 1 core, one task = one simulate_scenario.py call
-    02_fit.sh        array 0-N, depends on 01, one task = one run_recovery_fit.py call
-    submit_all.sh    submits 01 then 02 with --dependency=aftercorr
+Writes a SINGLE combined array script (not separate simulate+fit arrays with a
+dependency, see §7b 2026-07-31 update):
+    01_run.sh        array 0-N, one task = simulate_scenario.py then run_recovery_fit.py
+    submit_all.sh    submits 01_run.sh
+
+Originally this was two scripts (01_simulate.sh + 02_fit.sh) chained with
+--dependency=aftercorr, matching generate_slurm.py's Berzelius shape. That breaks on
+Dardel: sbatch registers every array task as a distinct submitted job record
+immediately, regardless of dependency state (a dependency only delays when a task is
+*allowed to run*, not when it's *counted* against the account's submit quota) -- so two
+720-task arrays outstanding at once is 1440 submitted records. Dardel's per-account
+MaxSubmitJobs was found to be 1024 (`sacctmgr show assoc user=$USER format=...
+MaxSubmitJobs`), so the second array submission failed outright with
+AssocMaxSubmitJobLimit, and even the first array's *running* count was throttled well
+below the requested %N. Merging both steps into one script per array task keeps total
+submitted records at 720 (one array), safely under the limit, with identical per-task
+behavior (simulate always runs immediately before fit for that same scenario/replicate,
+same effective ordering `aftercorr` was providing).
 
 Usage:
     python generate_slurm_dardel.py --design_matrix $OUT/design_matrix.csv \
@@ -66,8 +80,7 @@ def generate_slurm_scripts(
     account: str,
     cores: int = 2,
     partition: str = 'shared',
-    max_concurrent_jobs: int = 50,
-    sim_cores: int = 1,
+    max_concurrent_jobs: int = 128,
     sim_time_hours: float = 0.25,
     fit_time_hours: float = 18.0,
 ):
@@ -78,82 +91,78 @@ def generate_slurm_scripts(
     log_dir = os.path.join(outdir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
 
-    # --- 01_simulate.sh: cheap, no SVI, no bayesDREAM fitting ---
-    sim_script = _resource_block(
-        sim_cores, max_index, max_concurrent_jobs, 'sim_study_dardel_simulate', log_dir,
-        time_str=_hours_to_slurm_time(sim_time_hours), account=account, partition=partition,
-    )
-    sim_script += (
-        f"\n{python_env} {examples_path}/simulate_scenario.py "
-        f"--design_matrix {design_matrix_path} "
-        f"--row_index $SLURM_ARRAY_TASK_ID "
-        f"--outdir {data_path}\n"
-    )
-    with open(os.path.join(outdir, '01_simulate.sh'), 'w') as f:
-        f.write(sim_script)
-
-    # --- 02_fit.sh: fit_ntc + fit_cis + fit_trans(additive_hill), fixed core count ---
+    # --- 01_run.sh: simulate_scenario.py then run_recovery_fit.py, one array task each ---
     # Calibrated 2026-07-30 from checkpoint timestamps of a real (timed-out) additive_hill
     # run at --cores 2 on the largest scenario (cells_per_gene=1000, scenario_96/rep_0):
     # fit_ntc=4590s + fit_cis=1305s + fit_trans (extrapolated from 3.97 steps/s over
     # 155,556 total steps [55,556 warmup + 100,000 main] = 39,201s) = 12.53h raw estimate.
-    # 18h default here adds margin for (a) the rep_0 rate coming from a single 42-minute
+    # 18h fit budget adds margin for (a) the rep_0 rate coming from a single 42-minute
     # interval, the noisiest of the 5 core counts tested, and (b) Phase 2 (additive_hill
     # proper, 2 Hill components) plausibly costing somewhat more per step than Phase 1
     # (single_hill warmup), which a flat-rate extrapolation from mostly-Phase-1 data
-    # doesn't fully capture. See docs/SIMULATION_STUDY_PLAN.md §7. If you change --cores
-    # away from 2, this default no longer applies -- see the §7 table for other core
-    # counts (4/8/16/32 cores measured at 7.8h/6.2h/5.2h/5.9h total respectively).
-    fit_time_str = _hours_to_slurm_time(fit_time_hours)
-    fit_script = _resource_block(
-        cores, max_index, max_concurrent_jobs, 'sim_study_dardel_fit', log_dir,
-        time_str=fit_time_str, account=account, partition=partition,
+    # doesn't fully capture. Subsequently confirmed by real completed additive_hill runs
+    # at --cores 2 (2026-07-31): 12.4-13.6h total, in line with the estimate. See
+    # docs/SIMULATION_STUDY_PLAN.md §7b. If you change --cores away from 2, override
+    # --fit_time_hours -- see the §7b table for other core counts (4/8/16/32 cores
+    # measured at 7.8h/6.2h/5.2h/5.9h total respectively).
+    total_time_hours = sim_time_hours + fit_time_hours
+    total_time_str = _hours_to_slurm_time(total_time_hours)
+    run_script = _resource_block(
+        cores, max_index, max_concurrent_jobs, 'sim_study_dardel_run', log_dir,
+        time_str=total_time_str, account=account, partition=partition,
     )
-    fit_script += (
+    run_script += (
+        # Thread pinning for simulate_scenario.py's own process/subprocesses (e.g. its
+        # Rscript/scran call) -- run_recovery_fit.py pins its own threads internally
+        # (see its module docstring), but simulate_scenario.py doesn't, so pin at the
+        # shell level here to match --cpus-per-task and avoid oversubscribing this
+        # task's cgroup-allocated cores on Dardel's shared (multi-tenant) partition.
+        f"\nexport OMP_NUM_THREADS={cores} OPENBLAS_NUM_THREADS={cores} "
+        f"MKL_NUM_THREADS={cores} VECLIB_MAXIMUM_THREADS={cores} "
+        f"NUMEXPR_NUM_THREADS={cores}\n"
+        f"\n{python_env} {examples_path}/simulate_scenario.py "
+        f"--design_matrix {design_matrix_path} "
+        f"--row_index $SLURM_ARRAY_TASK_ID "
+        f"--outdir {data_path}\n"
         f"\n{python_env} {examples_path}/run_recovery_fit.py "
         f"--data_root {data_path} "
         f"--design_matrix {design_matrix_path} "
         f"--row_index $SLURM_ARRAY_TASK_ID "
         f"--device cpu --cores {cores}\n"
     )
-    with open(os.path.join(outdir, '02_fit.sh'), 'w') as f:
-        f.write(fit_script)
+    with open(os.path.join(outdir, '01_run.sh'), 'w') as f:
+        f.write(run_script)
 
     # --- submit_all.sh ---
     submit_script = (
         "#!/bin/bash\n"
         "set -euo pipefail\n"
         "cd \"$(dirname \"$0\")\"\n"
-        "SIM_JOB=$(sbatch --parsable 01_simulate.sh)\n"
-        "echo \"Submitted 01_simulate.sh: $SIM_JOB\"\n"
-        "FIT_JOB=$(sbatch --parsable --dependency=aftercorr:$SIM_JOB 02_fit.sh)\n"
-        "echo \"Submitted 02_fit.sh: $FIT_JOB (dependency: aftercorr:$SIM_JOB)\"\n"
+        "RUN_JOB=$(sbatch --parsable 01_run.sh)\n"
+        "echo \"Submitted 01_run.sh: $RUN_JOB\"\n"
     )
     submit_path = os.path.join(outdir, 'submit_all.sh')
     with open(submit_path, 'w') as f:
         f.write(submit_script)
     os.chmod(submit_path, 0o755)
 
-    print(f"Wrote SLURM scripts for {max_index + 1} array tasks to {outdir}")
-    print(f"  fit step: --cpus-per-task={cores}, no explicit --mem (Dardel's `{partition}` "
-          f"partition derives memory from cores automatically), time budget {fit_time_str}")
-    print(f"  {fit_time_hours}h default is calibrated (2026-07-30) for --cores 2 from real "
-          f"checkpoint-timestamp throughput on the largest scenario, with margin for "
-          f"noise/Phase-2-vs-Phase-1 rate uncertainty -- see docs/SIMULATION_STUDY_PLAN.md "
-          f"§7. If --cores={cores} != 2, override --fit_time_hours using the §7 table "
+    n_tasks = max_index + 1
+    print(f"Wrote SLURM scripts for {n_tasks} array tasks to {outdir}")
+    print(f"  01_run.sh: --cpus-per-task={cores}, no explicit --mem (Dardel's `{partition}` "
+          f"partition derives memory from cores automatically), time budget {total_time_str} "
+          f"(sim {_hours_to_slurm_time(sim_time_hours)} + fit {_hours_to_slurm_time(fit_time_hours)})")
+    print(f"  {fit_time_hours}h fit budget is calibrated for --cores 2 from real completed "
+          f"additive_hill runs (2026-07-30/31) -- see docs/SIMULATION_STUDY_PLAN.md §7b. "
+          f"If --cores={cores} != 2, override --fit_time_hours using the §7b table "
           f"(measured totals: 2c=12.5h, 4c=7.8h, 8c=6.2h, 16c=5.2h, 32c=5.9h -- add your "
           f"own margin). Also confirm this fits within Dardel's `shared` partition's max "
           f"walltime.")
-    print(f"  max_concurrent_jobs={max_concurrent_jobs} (--array=0-{max_index}%{max_concurrent_jobs}) "
-          f"-- since each fit task only requests {cores} cores, this is very likely far "
-          f"below what your Dardel allocation can support concurrently; check your "
-          f"project's core limit and raise --max_concurrent_jobs accordingly for better "
-          f"throughput (see docs/SIMULATION_STUDY_PLAN.md §7 discussion on sublinear "
-          f"core scaling -- more concurrent small jobs beats fewer big ones here).")
-    print("NOTE: --dependency=aftercorr ties each fit array task to the matching "
-          "simulate array task (same index), not to the whole simulate array "
-          "finishing first -- this lets fitting start on scenario k as soon as "
-          "scenario k's data exists.")
+    print(f"  Single array of {n_tasks} tasks -- total submitted job records "
+          f"({n_tasks}) is what counts against your account's MaxSubmitJobs, "
+          f"independent of --max_concurrent_jobs={max_concurrent_jobs} (which only "
+          f"throttles how many run *simultaneously*, via --array=0-{max_index}%"
+          f"{max_concurrent_jobs}). Check `sacctmgr show assoc user=$USER "
+          f"format=MaxSubmitJobs` before submitting if unsure this fits.")
 
 
 if __name__ == '__main__':
@@ -170,23 +179,28 @@ if __name__ == '__main__':
     parser.add_argument('--account', required=True,
                          help="Dardel project/account for #SBATCH --account.")
     parser.add_argument('--cores', type=int, default=2,
-                         help="CPU cores per fit task (passed through to "
-                              "run_recovery_fit.py's --cores, which pins OMP/MKL/"
-                              "OpenBLAS/NumExpr/torch thread counts before any heavy "
-                              "import -- required for correctness on Dardel's shared "
-                              "partition). Default 2, per the core-count-scaling "
-                              "benchmark showing near-flat/sublinear returns beyond a "
-                              "few cores for this workload -- see plan §7.")
+                         help="CPU cores per array task (shared sequentially by "
+                              "simulate_scenario.py then run_recovery_fit.py's --cores, "
+                              "which pins OMP/MKL/OpenBLAS/NumExpr/torch thread counts "
+                              "before any heavy import -- required for correctness on "
+                              "Dardel's shared partition). Default 2, per the "
+                              "core-count-scaling benchmark showing near-flat/sublinear "
+                              "returns beyond a few cores for this workload -- see "
+                              "plan §7/§7b.")
     parser.add_argument('--partition', default='shared')
-    parser.add_argument('--max_concurrent_jobs', type=int, default=50)
-    parser.add_argument('--sim_cores', type=int, default=1)
+    parser.add_argument('--max_concurrent_jobs', type=int, default=128,
+                         help="Throttles how many array tasks run simultaneously "
+                              "(--array=0-N%%<this>). Does NOT reduce how many job "
+                              "records are submitted -- that's controlled by the "
+                              "design matrix size (720) and must stay under your "
+                              "account's MaxSubmitJobs regardless of this value.")
     parser.add_argument('--sim_time_hours', type=float, default=0.25)
     parser.add_argument('--fit_time_hours', type=float, default=18.0,
-                         help="Calibrated for --cores 2 (2026-07-30, real checkpoint-"
-                              "timestamp throughput, largest scenario, plus margin). "
-                              "Override if using a different --cores -- see plan §7 "
-                              "table (2c=12.5h, 4c=7.8h, 8c=6.2h, 16c=5.2h, 32c=5.9h "
-                              "raw measured totals, add your own margin).")
+                         help="Calibrated for --cores 2 (real completed additive_hill "
+                              "runs, 2026-07-30/31). Override if using a different "
+                              "--cores -- see plan §7b table (2c=12.5h, 4c=7.8h, "
+                              "8c=6.2h, 16c=5.2h, 32c=5.9h raw measured totals, add "
+                              "your own margin).")
     args = parser.parse_args()
 
     generate_slurm_scripts(
@@ -199,7 +213,6 @@ if __name__ == '__main__':
         cores=args.cores,
         partition=args.partition,
         max_concurrent_jobs=args.max_concurrent_jobs,
-        sim_cores=args.sim_cores,
         sim_time_hours=args.sim_time_hours,
         fit_time_hours=args.fit_time_hours,
     )

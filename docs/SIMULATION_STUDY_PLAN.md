@@ -399,6 +399,25 @@ recalibrate if `--cores` is changed, using the table above as a starting point, 
 confirm 18h fits within Dardel's `shared` partition's max walltime before submitting
 the full 720-task array.
 
+**`AssocMaxSubmitJobLimit` (2026-07-31)**: the first full-study submission attempt
+failed. `generate_slurm_dardel.py` originally wrote two separate 720-task arrays
+(`01_simulate.sh` + `02_fit.sh`, chained with `--dependency=aftercorr`, mirroring
+`generate_slurm.py`'s Berzelius shape) — but `sbatch` registers every array task as a
+submitted job record immediately regardless of dependency state (a dependency only
+delays when a task is *allowed to run*, not when it's counted against the account's
+submit quota). Two 720-task arrays outstanding at once is 1440 submitted records.
+`sacctmgr show assoc user=$USER format=Account,User,QOS,MaxJobs,MaxSubmitJobs` showed
+`MaxSubmitJobs=1024` per account — so the second array's submission was rejected
+outright, and even the first array's *running* count was throttled well below the
+requested `%128`. **Fixed**: `generate_slurm_dardel.py` now writes a single combined
+`01_run.sh` (simulate then fit, sequentially, per array task) instead of two chained
+arrays — 720 total submitted records, safely under 1024, with identical per-task
+ordering to what `aftercorr` was providing. `submit_all.sh` is now a single `sbatch`
+call. If `--max_concurrent_jobs` is later raised well past what's needed, or the study
+grid grows, re-check against `MaxSubmitJobs` — total records submitted is set by the
+design matrix row count, not by `--max_concurrent_jobs` (which only throttles
+concurrent *running* tasks).
+
 ---
 
 ## 8. Evaluation plan (sketch — not implemented)
