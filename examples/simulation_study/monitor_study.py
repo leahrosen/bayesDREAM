@@ -122,6 +122,12 @@ def main(design_matrix_path: str, data_root: str, job_id: str = None):
                   f"fit_trans never completed):")
             print(problem[['row_index', 'scenario_id', 'replicate_id', 'stage',
                             'slurm_state']].to_string(index=False))
+            array_spec = ','.join(str(i) for i in sorted(problem['row_index']))
+            print()
+            print(f"--array spec for resubmitting just these tasks (fit_trans will "
+                  f"auto-resume from each one's last checkpoint, if any -- see "
+                  f"docs/SIMULATION_STUDY_PLAN.md):")
+            print(f"  sbatch --array={array_spec} <path to 01_run.sh>")
         else:
             print("No terminal-but-incomplete tasks detected.")
         print()
