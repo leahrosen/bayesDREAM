@@ -34,6 +34,11 @@
 #       prop_log2FC_observed = |log2(y(x_max)) - log2(y(x_min))| / full_log2FC_true
 #     NA for effect_type=='no_effect' (K_true/n_true/full_log2FC_true aren't meaningful
 #     for null features).
+#   - guide_log2_range: log2(x_max) - log2(x_min) of the guides' achieved cis-expression
+#     range for that scenario/replicate (same x_min/x_max used for prop_log2FC_observed
+#     above) -- a scenario-level quantity (same value for every feature row within a
+#     scenario/replicate), for plots that want to see effects vs. raw guide dynamic
+#     range rather than the per-feature fraction-of-curve-observed.
 #   - estimated_n / estimated_K_log2FC / estimated_Vmax: pulled from whichever fitted
 #     component (a or b) matches `which_active`, NA if which_active is 'both' or NA
 #     (ambiguous -- no single recovered curve to compare against a single-Hill truth).
@@ -108,6 +113,7 @@ process_one <- function(design_row) {
   }
   x_min <- min(guide_gt$x_eff_g_true, na.rm = TRUE)
   x_max <- max(guide_gt$x_eff_g_true, na.rm = TRUE)
+  guide_log2_range <- log2(x_max) - log2(x_min)
 
   fit <- fread(fit_path, fill = TRUE)
   present_cols <- intersect(fit_cols_wanted, names(fit))
@@ -116,6 +122,7 @@ process_one <- function(design_row) {
   for (col in missing_cols) fit[[col]] <- NA
 
   merged <- merge(gt, fit, by = "feature", all.x = TRUE)
+  merged[, guide_log2_range := guide_log2_range]
 
   # prop_log2FC_observed: only meaningful for single_hill-truth rows.
   merged[, prop_log2FC_observed := NA_real_]
