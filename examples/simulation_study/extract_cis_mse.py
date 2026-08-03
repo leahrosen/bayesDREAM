@@ -47,11 +47,15 @@ def compute_one(scenario_dir: str):
         if not os.path.exists(p):
             return None, f"missing {os.path.basename(p)}"
 
-    log2_x_true_fitted = torch.load(log2_x_true_path, map_location='cpu')
+    # weights_only=False (explicit, not just the pre-2.6 default) to match how the rest
+    # of bayesDREAM loads these self-generated checkpoints (e.g. bayesDREAM/fitting/
+    # trans.py, bayesDREAM/io/load.py) and to silence torch's FutureWarning -- these are
+    # files this same pipeline wrote, not untrusted third-party data.
+    log2_x_true_fitted = torch.load(log2_x_true_path, map_location='cpu', weights_only=False)
     if hasattr(log2_x_true_fitted, 'numpy'):
         log2_x_true_fitted = log2_x_true_fitted.numpy()
 
-    posterior_cis = torch.load(posterior_cis_path, map_location='cpu')
+    posterior_cis = torch.load(posterior_cis_path, map_location='cpu', weights_only=False)
     if 'cell_names' not in posterior_cis:
         return None, "posterior_samples_cis.pt has no 'cell_names' key"
     cell_names = list(posterior_cis['cell_names'])
