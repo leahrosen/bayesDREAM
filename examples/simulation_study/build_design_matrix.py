@@ -16,13 +16,28 @@ design_matrix.csv, and each scenario's own config.json re-checks provenance agai
 simulate time (see simulate_scenario.py) so drift between build-time and run-time can
 be detected.
 
+Each run writes into its own dated subdirectory of --outdir (added 2026-08-04, at the
+user's request after --outdir accumulated multiple unrelated projects' output
+alongside this study's -- keeping each run of this pipeline self-contained under its
+own timestamped directory means re-running this script never collides with or
+overwrites a previous run's data, and old runs stay trivially easy to find/archive/
+delete independently). The subdirectory shares the exact same timestamp as the git
+tag (when tagging isn't skipped), so the two are trivially cross-referenceable:
+    <outdir>/<tag_prefix>-<UTC timestamp>/design_matrix.csv
+e.g. .../sim_study_out/sim-study-20260804T153012Z/design_matrix.csv
+
 Usage:
     python build_design_matrix.py --outdir ./sim_study_out [--master_seed 20260728] [--n_replicates 5]
     python build_design_matrix.py --outdir ./sim_study_out --no_tag   # skip git tagging
+
+    # Downstream steps then use the printed dated directory, e.g.:
+    #   export OUT=./sim_study_out/sim-study-20260804T153012Z
+    #   export DATA=$OUT/data
 """
 
 import argparse
 import os
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -83,7 +98,13 @@ if __name__ == '__main__':
                          help="Create the tag locally but don't push it to origin.")
     args = parser.parse_args()
 
-    os.makedirs(args.outdir, exist_ok=True)
+    # Generated once, up front, so the run directory and the git tag (if created)
+    # share the exact same timestamp rather than two independently-generated ones a
+    # few milliseconds apart.
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    run_dir = os.path.join(args.outdir, f"{args.tag_prefix}-{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
     design_matrix = build_design_matrix(
         master_seed=args.master_seed, n_replicates=args.n_replicates,
     )
@@ -92,11 +113,12 @@ if __name__ == '__main__':
     if args.no_tag:
         tag_info = {'bayesdream_tag': None, 'bayesdream_tag_pushed': False}
     else:
-        tag_info = create_stable_snapshot_tag(prefix=args.tag_prefix, push=not args.no_push)
+        tag_info = create_stable_snapshot_tag(prefix=args.tag_prefix, push=not args.no_push,
+                                               timestamp=timestamp)
     for col, val in {**prov, **tag_info}.items():
         design_matrix[col] = val
 
-    out_path = os.path.join(args.outdir, 'design_matrix.csv')
+    out_path = os.path.join(run_dir, 'design_matrix.csv')
     design_matrix.to_csv(out_path, index=False)
 
     n_scenarios = design_matrix['scenario_id'].nunique()
@@ -109,3 +131,7 @@ if __name__ == '__main__':
         print("No stable snapshot tag created (see warnings above) — "
               "design_matrix.csv only carries the commit hash/branch, which is not "
               "guaranteed to remain reachable if the branch is later deleted.")
+    print(f"\nRun directory: {run_dir}")
+    print(f"Update your shell for subsequent steps:")
+    print(f"  export OUT={run_dir}")
+    print(f"  export DATA=$OUT/data")

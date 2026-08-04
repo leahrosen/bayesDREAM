@@ -56,7 +56,8 @@ def git_provenance() -> dict:
                 'bayesdream_git_dirty': None, 'bayesdream_untracked_count': None}
 
 
-def create_stable_snapshot_tag(prefix: str = 'sim-study', push: bool = True) -> dict:
+def create_stable_snapshot_tag(prefix: str = 'sim-study', push: bool = True,
+                                timestamp: str = None) -> dict:
     """Create (and by default push) an annotated tag at the current HEAD.
 
     Call this ONCE per design-matrix build, not per-scenario -- many concurrent
@@ -66,6 +67,12 @@ def create_stable_snapshot_tag(prefix: str = 'sim-study', push: bool = True) -> 
     not what's actually about to run -- misleading rather than helpful). Never
     raises: tagging is best-effort provenance, not a hard requirement for the
     design matrix to be written.
+
+    timestamp : str, optional
+        Pre-generated '%Y%m%dT%H%M%SZ' string to reuse (e.g. so the tag name and
+        the run's dated output directory name share the exact same timestamp,
+        not two independently-generated ones a few milliseconds apart). Generates
+        its own if not given.
 
     Returns
     -------
@@ -85,7 +92,9 @@ def create_stable_snapshot_tag(prefix: str = 'sim-study', push: bool = True) -> 
         print(f"[INFO] {prov['bayesdream_untracked_count']} untracked file(s) present "
               f"(not counted as dirty -- see git_provenance() docstring). Tagging anyway.")
 
-    tag_name = f"{prefix}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    tag_name = f"{prefix}-{timestamp}"
     try:
         _git('tag', '-a', tag_name, '-m', f"Stable snapshot for simulation study run ({tag_name})")
         print(f"[INFO] Created git tag '{tag_name}' at {prov['bayesdream_commit'][:12]} "
