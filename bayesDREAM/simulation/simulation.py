@@ -90,9 +90,19 @@ def _compute_AV_from_fc(n, y_ntc, x_ntc, K_log2FC, full_log2FC, eps=1e-12):
     Given y(x) = A + V * x^n / (x^n + K^n) with y_ntc = y(x_ntc):
         K    = x_ntc * 2^K_log2FC
         s_0  = 1 / (1 + 2^(n * K_log2FC))
-        F_eff = sign(n) * full_log2FC
+        F_eff = full_log2FC
         A    = y_ntc / (1 + (2^F_eff - 1) * s_0)
         V    = A * (2^F_eff - 1)
+
+    F_eff is NOT sign(n)-adjusted (fixed 2026-08-04): the Hill term x^n/(x^n+K^n)
+    already flips direction with sign(n) on its own (term(x,-m) = 1 - term(x,+m) for
+    m = |n|), so multiplying full_log2FC by sign(n) on top of that cancels the flip --
+    both signs of n previously produced a curve that increased with x, making n's sign
+    unrecoverable from any guide design that only samples x <= x_ntc (i.e. repression-
+    only guides, as used throughout this repo's GUIDE_PATTERNS). With F_eff=full_log2FC
+    unconditionally, positive n gives a curve that increases with x (knockdown lowers
+    y) and negative n gives one that decreases with x (knockdown raises y) --
+    genuinely different, and distinguishable from repression-only guide data alone.
 
     Null genes (n == 0 or full_log2FC == 0) return A = y_ntc, V = 0.
     Non-finite K_log2FC is replaced with 0 (K = x_ntc) to avoid NaN propagation
@@ -112,7 +122,7 @@ def _compute_AV_from_fc(n, y_ntc, x_ntc, K_log2FC, full_log2FC, eps=1e-12):
     K = x_ntc * np.power(2.0, K_log2FC_safe)
     s_0 = 1.0 / (1.0 + np.power(2.0, n_safe * K_log2FC_safe))
 
-    F_eff = np.sign(n) * full_log2FC
+    F_eff = full_log2FC
     scale = np.power(2.0, F_eff) - 1.0
 
     A_active = y_ntc / (1.0 + scale * s_0 + eps)

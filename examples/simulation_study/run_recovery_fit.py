@@ -22,6 +22,28 @@ Written incrementally after each step, not just at the end, so a later step cras
 or getting killed (e.g. by an external SIGTERM, which skips Python cleanup code)
 still leaves completed earlier steps' stats on disk.
 
+Resuming a killed/timed-out run (re-running this script on the same --scenario_dir):
+  - fit_ntc/fit_cis: auto-detected via the *previous* fit_stats.json -- if it recorded
+    that step as completed, this run calls model.load_ntc_fit()/load_cis_fit() instead
+    of re-fitting, and copies that step's prior elapsed_sec/peak_rss_mb/peak_gpu_mb
+    forward unchanged (no new SVI work happened, so there's nothing new to time).
+    Deliberately keyed off fit_stats.json rather than just checking whether the
+    output .pt files exist: save_ntc_fit()/save_cis_fit() use plain torch.save(), not
+    the atomic write-then-rename pattern fit_trans's checkpointing uses, so a file
+    that exists isn't proof it's complete/uncorrupted if the process died mid-write --
+    fit_stats.json's step entry is only written after that step's `with _timed_step`
+    block exits normally, so its presence is a much stronger completion signal.
+  - fit_trans: already resumes from its own last checkpoint automatically (bayesDREAM
+    default, restart_from_checkpoint=True) -- no change needed to trigger that. What
+    IS new: fit_trans's checkpoints now also carry 'cumulative_elapsed_sec' (wall-clock
+    summed across every resume, not just this process's own timer -- a single
+    process's clock can't see time spent in earlier, separately-killed attempts). This
+    script reads that back from the checkpoint after fit_trans() returns and records
+    THAT as fit_trans's elapsed_sec, rather than this attempt's own (undercounting)
+    timer. Peak memory for fit_trans is max(this attempt, prior attempt) -- unlike
+    time, memory across separate processes was never simultaneous, so summing would
+    overstate true peak usage.
+
 Usage (single task):
     python run_recovery_fit.py --scenario_dir ./sim_study_out/data/scenario_0/rep_0
 
@@ -133,6 +155,36 @@ def _write_stats(stats: dict, stats_path: str) -> None:
         json.dump(stats, f, indent=2)
 
 
+def _load_prior_stats(stats_path: str):
+    """Returns the previous run's fit_stats.json dict, or None if this is a fresh
+    (never-attempted) scenario/replicate."""
+    if not os.path.exists(stats_path):
+        return None
+    try:
+        with open(stats_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # Prior attempt was killed mid-write to this exact file (plain open(...,'w'),
+        # not atomic) -- treat as if there were no prior attempt rather than crashing.
+        return None
+
+
+def _step_completed(prior_stats, step_name: str) -> bool:
+    if prior_stats is None:
+        return False
+    return prior_stats.get('steps', {}).get(step_name) is not None
+
+
+def _max_metric(prior_value, new_value):
+    """max(prior, new), None-safe (e.g. peak_gpu_mb is None on CPU runs, or there's
+    no prior attempt at all)."""
+    if prior_value is None:
+        return new_value
+    if new_value is None:
+        return prior_value
+    return max(prior_value, new_value)
+
+
 @contextmanager
 def _timed_step(name: str, stats: dict, device_is_cuda: bool, stats_path: str):
     """Time one fit step, record elapsed wall-clock + peak memory, and write the
@@ -190,60 +242,128 @@ def run_recovery_fit(
     recovery_dir = os.path.join(fit_dir, 'recovery')
     os.makedirs(recovery_dir, exist_ok=True)
     stats_path = os.path.join(recovery_dir, 'fit_stats.json')
+
+    prior_stats = _load_prior_stats(stats_path)
+    resumed_ntc = _step_completed(prior_stats, 'fit_ntc')
+    resumed_cis = _step_completed(prior_stats, 'fit_cis')
+
     stats = {
         'device_requested': device,
         'device_resolved': str(model.device),
         'cores_requested': _cores,
         'hostname': socket.gethostname(),
         'slurm_job_id': os.environ.get('SLURM_JOB_ID'),
+        'slurm_array_job_id': os.environ.get('SLURM_ARRAY_JOB_ID'),
         'slurm_array_task_id': os.environ.get('SLURM_ARRAY_TASK_ID'),
-        'steps': {},
+        'resumed_fit_ntc': resumed_ntc,
+        'resumed_fit_cis': resumed_cis,
+        # fit_ntc/fit_cis carried forward verbatim below if resumed; fit_trans always
+        # gets a fresh entry once it returns (see the checkpoint-time-read below).
+        'steps': {
+            'fit_ntc': prior_stats['steps']['fit_ntc'] if resumed_ntc else None,
+            'fit_cis': prior_stats['steps']['fit_cis'] if resumed_cis else None,
+        },
     }
+    stats['steps'] = {k: v for k, v in stats['steps'].items() if v is not None}
     _write_stats(stats, stats_path)
 
     # single technical group (plan §2 / §4.1): C=1 is an explicit no-group-effect
     # code path in fit_ntc/fit_cis/fit_trans, not a degenerate/unsupported case.
     model.set_technical_groups(['cell_line'])
-    with _timed_step('fit_ntc', stats, device_is_cuda, stats_path):
-        model.fit_ntc(sum_factor_col='sum_factor')
-    # Save immediately after each step, not just at the end: fit_cis/fit_trans are the
-    # steps most likely to fail (longer runtime, more iterations, e.g. the AutoIAFNormal
-    # NaN failure mode this study surfaced) -- if a later step crashes or times out, the
-    # earlier steps' results (and this step's timing/memory stats) are still on disk to
-    # inspect rather than lost entirely.
-    model.save_ntc_fit()
+    if resumed_ntc:
+        print(f"[RESUME] fit_ntc already completed in a prior attempt "
+              f"({prior_stats['steps']['fit_ntc']['elapsed_sec']:.1f}s) — loading instead of refitting.")
+        model.load_ntc_fit()
+    else:
+        with _timed_step('fit_ntc', stats, device_is_cuda, stats_path):
+            model.fit_ntc(sum_factor_col='sum_factor')
+        # Save immediately after each step, not just at the end: fit_cis/fit_trans are
+        # the steps most likely to fail (longer runtime, more iterations, e.g. the
+        # AutoIAFNormal NaN failure mode this study surfaced) -- if a later step
+        # crashes or times out, the earlier steps' results (and this step's
+        # timing/memory stats) are still on disk to inspect rather than lost entirely.
+        model.save_ntc_fit()
 
     # meta's 'sum_factor' is scran-recomputed from realized counts (see
     # simulate_scenario.py), so guide identity is genuinely correlated with it (strong
     # cis perturbations shift library composition) -- follow the documented full
     # workflow (docs/FIT_TRANS_GUIDE.md) rather than feeding raw sum_factor straight
-    # into fit_cis/fit_trans.
+    # into fit_cis/fit_trans. Not persisted to disk by save_ntc_fit/save_cis_fit, so
+    # this runs every time regardless of whether fit_ntc/fit_cis were loaded or fit.
     model.adjust_ntc_sum_factor(
         sum_factor_col_old='sum_factor',
         sum_factor_col_adj='sum_factor_adj',
         covariates=['cell_line'],
     )
-    # force=True: fit_cis() refuses by default when the cis gene's fitted NTC log2
-    # expression is < -1 (overdispersion from near-zero counts can be unreliable on
-    # real data). This study's log2_X_NTC grid deliberately sweeps down to -1 (plan
-    # §3.1), and sampling noise (sigma_eff=0.7) means the *fitted* value can land
-    # below -1 by chance even when the true value sits right at the boundary -- that's
-    # exactly the low-expression stress-test scenario this study is designed to
-    # include, not a real data-quality problem, so the safety check doesn't apply here.
-    with _timed_step('fit_cis', stats, device_is_cuda, stats_path):
-        model.fit_cis(sum_factor_col='sum_factor_adj', force=True)
-    model.save_cis_fit()
+
+    if resumed_cis:
+        print(f"[RESUME] fit_cis already completed in a prior attempt "
+              f"({prior_stats['steps']['fit_cis']['elapsed_sec']:.1f}s) — loading instead of refitting.")
+        model.load_cis_fit()
+    else:
+        # force=True: fit_cis() refuses by default when the cis gene's fitted NTC log2
+        # expression is < -1 (overdispersion from near-zero counts can be unreliable on
+        # real data). This study's log2_X_NTC grid deliberately sweeps down to -1 (plan
+        # §3.1), and sampling noise (sigma_eff=0.7) means the *fitted* value can land
+        # below -1 by chance even when the true value sits right at the boundary --
+        # that's exactly the low-expression stress-test scenario this study is designed
+        # to include, not a real data-quality problem, so the safety check doesn't
+        # apply here.
+        with _timed_step('fit_cis', stats, device_is_cuda, stats_path):
+            model.fit_cis(sum_factor_col='sum_factor_adj', force=True)
+        model.save_cis_fit()
 
     model.refit_sumfactor(
         sum_factor_col_old='sum_factor_adj',
         sum_factor_col_refit='sum_factor_refit',
         covariates=['cell_line'],
     )
-    with _timed_step('fit_trans', stats, device_is_cuda, stats_path):
-        model.fit_trans(
-            sum_factor_col='sum_factor_refit',
-            function_type='additive_hill',
-        )
+
+    if device_is_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    _fit_trans_t0 = time.perf_counter()
+    model.fit_trans(
+        sum_factor_col='sum_factor_refit',
+        function_type='additive_hill',
+    )
+    _fit_trans_this_attempt_sec = time.perf_counter() - _fit_trans_t0
+
+    # fit_trans's own checkpoint carries the TRUE cumulative wall-clock across every
+    # resume attempt (bayesDREAM/fitting/trans.py writes 'cumulative_elapsed_sec' into
+    # every checkpoint, seeded from whichever checkpoint it resumed from) -- read that
+    # back rather than trusting this process's own timer, which can't see time spent
+    # in earlier, separately-killed attempts. Falls back to this attempt's own timer
+    # (undercounts prior attempts, but degrades gracefully) if the checkpoint is
+    # missing the field for any reason (e.g. an older bayesDREAM version).
+    _complete_ckpt_path = os.path.join(recovery_dir, 'trans_checkpoint_gene_complete.pt')
+    _fit_trans_elapsed = _fit_trans_this_attempt_sec
+    if os.path.exists(_complete_ckpt_path):
+        try:
+            _ckpt = torch.load(_complete_ckpt_path, map_location='cpu', weights_only=False)
+            _fit_trans_elapsed = _ckpt.get('cumulative_elapsed_sec', _fit_trans_this_attempt_sec)
+        except Exception as e:
+            print(f"[WARNING] Could not read cumulative_elapsed_sec from {_complete_ckpt_path}: {e}. "
+                  f"Recording this attempt's own elapsed time only ({_fit_trans_this_attempt_sec:.1f}s), "
+                  f"which undercounts any prior killed attempts.")
+
+    _this_attempt_peak_rss = _peak_rss_mb()
+    _this_attempt_peak_gpu = (torch.cuda.max_memory_allocated() / 1024.0 ** 2) if device_is_cuda else None
+    _prior_fit_trans_entry = (prior_stats or {}).get('steps', {}).get('fit_trans') or {}
+    stats['steps']['fit_trans'] = {
+        'elapsed_sec': _fit_trans_elapsed,
+        # max, not sum: separate SLURM job attempts are different processes that were
+        # never running simultaneously, so summing their peaks would overstate true
+        # peak memory pressure at any single moment.
+        'peak_rss_mb': _max_metric(_prior_fit_trans_entry.get('peak_rss_mb'), _this_attempt_peak_rss),
+        'peak_gpu_mb': _max_metric(_prior_fit_trans_entry.get('peak_gpu_mb'), _this_attempt_peak_gpu),
+    }
+    _write_stats(stats, stats_path)
+    gpu_note = (f", peak_gpu={stats['steps']['fit_trans']['peak_gpu_mb']:.0f}MB"
+                if device_is_cuda else "")
+    print(f"[TIMING] fit_trans: {_fit_trans_elapsed:.1f}s cumulative "
+          f"({_fit_trans_this_attempt_sec:.1f}s this attempt), "
+          f"peak_rss={stats['steps']['fit_trans']['peak_rss_mb']:.0f}MB{gpu_note}")
+
     model.save_trans_fit()
     model.save_trans_summary(fdr_threshold=0.05)
 

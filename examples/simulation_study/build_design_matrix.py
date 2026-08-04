@@ -1,8 +1,10 @@
 """
 Build design_matrix.csv for the single-Hill recovery study (docs/SIMULATION_STUDY_PLAN.md).
 
-Enumerates the 144 cell-design scenarios (§3.1) x 5 replicates = 720 rows, each with a
+Enumerates the 240 cell-design scenarios (§3.1) x 5 replicates = 1200 rows, each with a
 deterministic integer seed (§6): seed = MASTER_SEED + 1000*scenario_id + replicate_id.
+(Grid widened 2026-08-04: added cells_per_gene=250 and log2_X_NTC=-2, up from 144
+scenarios/720 rows -- see docs/SIMULATION_STUDY_PLAN.md §3.1 update.)
 No use of Python's builtin hash() — that's salted per-process and not reproducible
 across separate SLURM job launches (see plan §2).
 
@@ -27,8 +29,8 @@ import pandas as pd
 from bayesDREAM.simulation.cis_panel_simulation import GUIDE_PATTERNS
 from _git_provenance import create_stable_snapshot_tag, git_provenance
 
-CELLS_PER_GENE_VALUES = (100, 500, 1000)
-LOG2_X_NTC_VALUES = (-1, 0, 1, 2)
+CELLS_PER_GENE_VALUES = (100, 250, 500, 1000)
+LOG2_X_NTC_VALUES = (-2, -1, 0, 1, 2)
 LOG2_O_X_VALUES = (-1.5, 0.0)
 SIGMA_EFF = 0.7
 MASTER_SEED_DEFAULT = 20260728

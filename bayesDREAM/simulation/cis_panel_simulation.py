@@ -22,7 +22,7 @@ from .simulation import simulate_from_trans_summary, _compute_AV_from_fc
 # Trans-panel grid (plan §3.2) — identical across all cell-design scenarios
 # ---------------------------------------------------------------------------
 
-Y_NTC_LOG2_LEVELS = (-4, -1, 1, 4)
+Y_NTC_LOG2_LEVELS = (-4, -2, -1, 1, 4)
 N_VALUES = (-5, -1, -0.5, 0.5, 1, 5)
 K_LOG2FC_VALUES = (-4, -3, -2, -1, 0, 1, 2, 3, 4)
 FULL_LOG2FC_VALUES = (0.5, 1, 2, 4)
@@ -40,14 +40,16 @@ GUIDE_PATTERNS = {
 
 def _o_y_log2_levels(y_ntc_log2: float) -> tuple:
     """o_y grid depends on y_ntc level (plan §3.2): the y_ntc=-4 regime uses a
-    different, higher pair to keep the negbinom draw informative at such low counts."""
+    different, higher pair to keep the negbinom draw informative at such low counts.
+    y_ntc=-2 (added 2026-08-04) deliberately falls through to the standard (-1.5, 0.0)
+    pair, same as -1/1/4 -- only the most extreme -4 level needs the special pair."""
     if y_ntc_log2 == -4:
         return (-0.3, 2.0)
     return (-1.5, 0.0)
 
 
 def build_trans_panel_grid() -> pd.DataFrame:
-    """Build the 1736-row synthetic trans_summary_df grid (8 y_ntc/o_y combos x 217
+    """Build the 2170-row synthetic trans_summary_df grid (10 y_ntc/o_y combos x 217
     effect scenarios: 1 null + 6 n x 9 K_log2FC x 4 full_log2FC).
 
     Returns a DataFrame with the columns ``simulate_from_trans_summary`` expects for

@@ -5,6 +5,7 @@ This module contains the trans model and fitting logic.
 """
 
 import os
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -2555,6 +2556,13 @@ class TransFitter:
         smoothed_loss = None
         _phase2_announced = False
         start_step = 0
+        # Cumulative wall-clock across all resume attempts (not just this process's own
+        # timer) -- restored from the checkpoint being resumed from, if any, so a job
+        # killed and resubmitted multiple times still ends up with an accurate total.
+        # Written into every checkpoint dict below; the caller (e.g. run_recovery_fit.py)
+        # reads it back from the final/latest checkpoint rather than timing fit_trans()
+        # itself, since a single process's timer can't see time spent in prior attempts.
+        _cumulative_elapsed_baseline = 0.0
 
         # ── Checkpoint setup ──────────────────────────────────────────────────
         # Metadata stored in every checkpoint; validated on reload to catch
@@ -2662,6 +2670,10 @@ class TransFitter:
                 self.losses_trans = _ckpt['losses']
                 smoothed_loss = _ckpt['smoothed_loss']
                 _phase2_announced = _ckpt.get('phase2_announced', False)
+                # .get(..., 0.0): checkpoints written before this field existed just
+                # start the cumulative count from 0 (undercounts prior attempts, but
+                # degrades gracefully rather than erroring on old checkpoints).
+                _cumulative_elapsed_baseline = _ckpt.get('cumulative_elapsed_sec', 0.0)
                 pyro.get_param_store().set_state(_ckpt['param_store'])
                 try:
                     optimizer.set_state(_ckpt['optimizer_state'])
@@ -2669,6 +2681,10 @@ class TransFitter:
                     print(f"[WARNING] Could not restore optimizer state: {e}. "
                           f"Continuing with fresh optimizer.")
                 print(f"[INFO] Resumed from step {start_step} / {total_steps}")
+
+        # Wall-clock for *this* process only; combined with _cumulative_elapsed_baseline
+        # (restored above from the resumed checkpoint, if any) at every checkpoint write.
+        _fit_trans_loop_start_time = time.time()
 
         prev_finite = None  # only used in debug mode; kept here so checkpoint-resume works
         for step in range(start_step, total_steps):
@@ -2695,6 +2711,8 @@ class TransFitter:
                             # effective_function_type='single_hill' lets the user pass
                             # function_type='single_hill' to predictive_checkpoint= without a warning
                             'effective_function_type': 'single_hill',
+                            'cumulative_elapsed_sec': (_cumulative_elapsed_baseline +
+                                                        (time.time() - _fit_trans_loop_start_time)),
                             **_ckpt_metadata,
                         }
                         _warmup_path = checkpoint_path.replace('_latest.pt', '_warmup.pt')
@@ -2798,6 +2816,8 @@ class TransFitter:
                     'optimizer_state': optimizer.get_state(),
                     'complete': False,
                     'effective_function_type': _eff_ft,
+                    'cumulative_elapsed_sec': (_cumulative_elapsed_baseline +
+                                                (time.time() - _fit_trans_loop_start_time)),
                     **_ckpt_metadata,
                 }
                 # Rolling checkpoint (overwrites previous; used for crash-resume)
@@ -2824,6 +2844,8 @@ class TransFitter:
                 'optimizer_state': optimizer.get_state(),
                 'complete': True,
                 'effective_function_type': function_type,
+                'cumulative_elapsed_sec': (_cumulative_elapsed_baseline +
+                                            (time.time() - _fit_trans_loop_start_time)),
                 **_ckpt_metadata,
             }
             self._save_checkpoint_atomic(checkpoint_path, _complete_data)
