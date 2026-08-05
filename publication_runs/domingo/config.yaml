@@ -1,0 +1,76 @@
+# Domingo dataset -- orchestration config, consumed by generate_slurm.py.
+# NOT the bayesdream-CLI-schema config (see publication_runs/README.md);
+# generate_slurm.py renders that per gene/stage from this file plus
+# common_bayesdream.yaml below.
+
+dataset: domingo
+label_prefix: domingo_20260731   # -> bayesdream label = <label_prefix>_<gene>
+
+paths:
+  # Cluster-absolute paths (Dardel). Fill in before generating.
+  repo_dir: /proj/<project>/users/<user>/bayesDREAM_forClaude
+  python_env: /proj/<project>/users/<user>/envs/bayesdream/bin/python
+  data_dir: /proj/<project>/users/<user>/data/domingo
+  output_dir: /proj/<project>/users/<user>/output/domingo
+  meta: "{data_dir}/meta.csv"
+  counts: "{data_dir}/gene_counts.csv"
+
+cluster:
+  account: "<dardel-account>"          # sacctmgr show assoc user=$USER format=account
+  partition_cpu: shared
+  gpu_partition: "<confirm via sinfo>"  # see common/slurm/sbatch_blocks.py docstring
+  max_submit_jobs_hint: 1024            # sacctmgr show assoc user=$USER format=MaxSubmitJobs
+
+model_defaults:
+  modality_name: gene
+  guide_covariates: [cell_line]
+  guide_covariates_ntc: [cell_line]
+
+cis_genes: [GFI1B, MYB, NFE2, TET2]
+
+# fit_ntc is shared across all 4 cis genes (low-MOI deferred-cis-gene
+# workflow -- see CLAUDE.md "Deferred Cis-Gene Workflow"). One job, all
+# genes' fit_cis/compensation/trans depend on it.
+ntc_shared:
+  set_technical_groups: [cell_line]
+  resources: {cores: 8, time_hours: 4, device: cpu}
+
+cis:
+  resources: {cores: 8, time_hours: 6, device: cpu}
+  adjust_ntc_sum_factor:
+    enabled: true
+    covariates: [lane, cell_line]
+
+compensation:
+  resources: {cores: 4, time_hours: 1, device: cpu}
+  # Per-gene exclude_cells overrides, if any (e.g. a gene with a known bad
+  # guide/lane you want dropped from the NTC-vs-targeted comparison only).
+  # Path is relative to paths.data_dir. Leave empty list for "exclude nothing".
+  exclude_cells:
+    GFI1B: []
+    MYB: []
+    NFE2: []
+    TET2: []
+
+trans:
+  resources: {cores: 16, time_hours: 12, device: cpu}
+  function_type: additive_hill
+  refit_sumfactor: true
+
+  permutation:
+    n_reps: 20
+    resources: {cores: 16, time_hours: 12, device: cpu}
+
+  simulation:
+    n_reps: 10
+    resources: {cores: 8, time_hours: 6, device: cpu}
+
+# Further modalities (splicing/velocity/donor/acceptor efficiency), fit per
+# cis gene after that gene's own cis fit. See config_modalities.yaml.
+modalities:
+  config: config_modalities.yaml
+  data_dir: /proj/<project>/users/<user>/data/domingo_splicing
+  resources: {cores: 8, time_hours: 8, device: cpu}
+  trans:
+    permutation: {n_reps: 20}
+    simulation: {n_reps: 10}

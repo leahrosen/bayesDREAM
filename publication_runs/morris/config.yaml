@@ -1,0 +1,100 @@
+# Morris dataset -- orchestration config, consumed by generate_slurm.py.
+# High-MOI. NOT the bayesdream-CLI-schema config -- see
+# publication_runs/README.md and morris/README.md (the latter explains the
+# high-MOI shared-fit_ntc workaround this dataset relies on).
+
+dataset: morris
+label_prefix: morris_20260731
+
+paths:
+  repo_dir: /proj/<project>/users/<user>/bayesDREAM_forClaude
+  python_env: /proj/<project>/users/<user>/envs/bayesdream/bin/python
+  data_dir: /proj/<project>/users/<user>/data/morris
+  output_dir: /proj/<project>/users/<user>/output/morris
+  meta: "{data_dir}/meta.csv"
+  counts: "{data_dir}/gene_counts.csv"
+  guide_assignment: "{data_dir}/guide_assignment.npy"
+  guide_meta: "{data_dir}/guide_meta.csv"
+  guide_target: "{data_dir}/guide_target.csv"   # optional; omit key if guide_meta['target'] suffices
+
+cluster:
+  account: "<dardel-account>"
+  partition_cpu: shared
+  gpu_partition: "<confirm via sinfo>"           # only needed if cis_sweep.use_gpu_node_queue: true
+  max_submit_jobs_hint: 1024                     # sacctmgr show assoc user=$USER format=MaxSubmitJobs
+
+model_defaults:
+  modality_name: gene
+  guide_covariates: [cell_line]
+  guide_covariates_ntc: [cell_line]
+
+# Guides to drop entirely (e.g. a known-bad guide/batch) -- applied once, at
+# the shared fit_ntc build. High-MOI mode's own exclude_guides constructor
+# arg (bayesDREAM/core.py) handles this; low-MOI would use exclude_targets
+# instead, see run_cis_deferred.py.
+exclude_guides: []   # TODO: e.g. [sgFOO_1, sgFOO_2]
+
+# Shared fit_ntc, once, over the (near-)full gene panel. High-MOI requires
+# cis_gene at construction (see morris/README.md) -- placeholder_cis_gene
+# must be a real gene NOT in primary_genes or cis_sweep's gene list, since
+# it gets carved out of the panel like any other cis gene.
+ntc_shared:
+  placeholder_cis_gene: "<pick a gene not analysed elsewhere>"   # TODO
+  set_technical_groups: [cell_line]
+  resources: {cores: 8, time_hours: 6}
+
+# Full pipeline (ntc[shared] -> cis -> compensation -> trans -> permutation
+# -> recapitulation) for these 5.
+primary_genes: [GFI1B, NFE2, IKZF1, HHEX, RUNX1]
+
+cis:
+  resources: {cores: 8, time_hours: 6}
+  adjust_ntc_sum_factor:
+    enabled: true
+    covariates: [cell_line]
+
+compensation:
+  resources: {cores: 4, time_hours: 1}
+  exclude_cells:
+    GFI1B: []
+    NFE2: []
+    IKZF1: []
+    HHEX: []
+    RUNX1: []
+
+trans:
+  resources: {cores: 16, time_hours: 12}
+  function_type: additive_hill
+
+  permutation:
+    n_reps: 20
+    resources: {cores: 16, time_hours: 12}
+
+  simulation:
+    n_reps: 10
+    resources: {cores: 8, time_hours: 6}
+
+# fit_cis ONLY (no compensation/trans) for every gene in genes_csv that is
+# NOT in primary_genes, reusing the same ntc_shared fit. This is the "don't
+# run fit_ntc hundreds of times" sweep.
+cis_sweep:
+  genes_csv: genes_all.csv        # one 'gene' column, ~hundreds of rows
+  genes_csv_column: gene
+  resources: {cores: 4, time_hours: 3}   # per gene, if not using GPU node packing
+
+  # false (default): one CPU array job on the 'shared' partition, one task
+  #   per gene, --array=0-N%array_max_concurrent (one submitted job record
+  #   for the whole sweep -- see README.md's MaxSubmitJobs note).
+  # true: pack `gpu_node_queue.concurrency_per_node` genes' worth of tasks
+  #   at a time onto each of `gpu_node_queue.n_nodes` whole GPU nodes via
+  #   common/slurm/run_node_queue.sh (see publication_runs/README.md "GPU
+  #   node packing"). Only worth it if fit_cis for this dataset's gene
+  #   count/size is actually GPU-bound -- the CPU array is the default
+  #   because nothing in this pipeline has needed a GPU so far (see
+  #   examples/simulation_study/generate_slurm_dardel.py's benchmark notes).
+  use_gpu_node_queue: false
+  array_max_concurrent: 100
+  gpu_node_queue:
+    concurrency_per_node: 8
+    n_nodes: 1
+    time_hours: 24
