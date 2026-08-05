@@ -120,14 +120,22 @@ def generate_slurm_scripts(
         f"\nexport OMP_NUM_THREADS={cores} OPENBLAS_NUM_THREADS={cores} "
         f"MKL_NUM_THREADS={cores} VECLIB_MAXIMUM_THREADS={cores} "
         f"NUMEXPR_NUM_THREADS={cores}\n"
+        # ROW_OFFSET (unset -> 0) lets a design matrix bigger than SLURM's MaxArraySize
+        # (a per-job cap on the max *array index* value, separate from MaxSubmitJobs)
+        # be submitted in multiple waves, each using array indices 0..(wave_size-1) --
+        # safely under any reasonable MaxArraySize -- while still resolving the correct
+        # row_index via e.g. `sbatch --array=0-599 --export=ALL,ROW_OFFSET=600 01_run.sh`
+        # for a second wave covering row_index 600-1199. Normal single-wave submission
+        # (ROW_OFFSET unset) is unaffected: ROW_INDEX == SLURM_ARRAY_TASK_ID as before.
+        f"\nROW_INDEX=$((SLURM_ARRAY_TASK_ID + ${{ROW_OFFSET:-0}}))\n"
         f"\n{python_env} {examples_path}/simulate_scenario.py "
         f"--design_matrix {design_matrix_path} "
-        f"--row_index $SLURM_ARRAY_TASK_ID "
+        f"--row_index $ROW_INDEX "
         f"--outdir {data_path}\n"
         f"\n{python_env} {examples_path}/run_recovery_fit.py "
         f"--data_root {data_path} "
         f"--design_matrix {design_matrix_path} "
-        f"--row_index $SLURM_ARRAY_TASK_ID "
+        f"--row_index $ROW_INDEX "
         f"--device cpu --cores {cores}\n"
     )
     with open(os.path.join(outdir, '01_run.sh'), 'w') as f:
