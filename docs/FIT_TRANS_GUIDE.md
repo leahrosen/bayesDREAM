@@ -308,6 +308,38 @@ def fit_trans(
   - Lower values encourage stronger sparsity (more genes at baseline)
   - Higher values allow more genes to respond
 
+## Excluding Genes Before Fitting
+
+Call `model.exclude_trans_genes()` before `fit_trans()` to permanently drop
+features from a modality (typically the primary `'gene'` modality). Any
+combination of three criteria can be given; a feature is dropped if it
+matches ANY of them:
+
+```python
+# 1. Named features
+model.exclude_trans_genes(genes=['MALAT1', 'XIST'])
+
+# 2. feature_meta selection (pandas DataFrame.eval() syntax)
+model.exclude_trans_genes(feature_query='protein_coding == False')
+
+# 3. Low NTC expression (requires fit_ntc() to have been run first)
+model.exclude_trans_genes(min_log2_mu_ntc=-4)
+
+# Criteria combine freely in one call
+model.exclude_trans_genes(
+    genes=['MALAT1'],
+    feature_query='protein_coding == False',
+    min_log2_mu_ntc=-4,
+)
+```
+
+`alpha_y_prefit_mult`/`alpha_y_prefit_add` and `posterior_samples_ntc` already
+stored on the modality are trimmed to match, so `fit_trans()` (and, if called
+again, `fit_ntc()`) sees a consistent, reduced feature set. If the modality
+already has `posterior_samples_trans` from a previous `fit_trans()` call, it
+is dropped with a warning since it would no longer match the reduced feature
+count — re-run `fit_trans()` afterward.
+
 ## Complete Workflow Example
 
 ### Step-by-Step Trans Fitting

@@ -852,6 +852,179 @@ class bayesDREAM(
         if mod.alpha_y_prefit_add is not None and mod.alpha_y_prefit_add.shape[-1] == T:
             mod.alpha_y_prefit_add = mod.alpha_y_prefit_add[..., keep_idx]
 
+    def exclude_trans_genes(
+        self,
+        genes: list = None,
+        feature_query: str = None,
+        min_log2_mu_ntc: float = None,
+        modality_name: str = None,
+    ) -> None:
+        """
+        Permanently drop features from a modality before fit_trans().
+
+        Three exclusion criteria can be given, alone or combined (a feature is
+        dropped if it matches ANY of them):
+
+        1. ``genes``: explicit feature name(s), matched against
+           ``modality.feature_names``.
+        2. ``feature_query``: a boolean expression evaluated against
+           ``modality.feature_meta`` (``DataFrame.eval()`` syntax); rows where
+           it evaluates ``True`` are dropped, e.g.
+           ``"protein_coding == False"`` or ``"chrom == 'chrY'"``.
+        3. ``min_log2_mu_ntc``: drop features whose log2 NTC mean expression
+           (the ``mu_ntc`` posterior from ``fit_ntc()``) is below this value,
+           e.g. ``min_log2_mu_ntc=-4`` drops genes with ``log2(mu_ntc) < -4``.
+           Requires ``fit_ntc()`` to already have been run on the modality;
+           if it hasn't, this criterion is skipped with a warning (so it can
+           still be combined with the other two before fit_ntc()).
+
+        Any per-feature results already stored on the modality
+        (``alpha_y_prefit_mult``/``add``, ``posterior_samples_ntc``) are
+        trimmed to match, so a subsequent ``fit_ntc()``/``fit_trans()`` call
+        sees a consistent, reduced feature set. Call this **before**
+        ``fit_trans()`` — if the modality already has
+        ``posterior_samples_trans`` from a previous fit, it is dropped (now
+        mismatched with the reduced feature set) with a warning.
+
+        Parameters
+        ----------
+        genes : str or list of str, optional
+            Feature name(s) to exclude outright.
+        feature_query : str, optional
+            Boolean expression over ``modality.feature_meta`` columns
+            (pandas ``DataFrame.eval()`` syntax). Matching rows are excluded.
+        min_log2_mu_ntc : float, optional
+            Lower bound on log2 NTC mean expression; features below it are
+            excluded.
+        modality_name : str, optional
+            Modality to filter. Defaults to the primary modality.
+
+        Examples
+        --------
+        >>> model.exclude_trans_genes(genes=['MALAT1', 'XIST'])
+        >>> model.exclude_trans_genes(feature_query='protein_coding == False')
+        >>> model.exclude_trans_genes(min_log2_mu_ntc=-4)  # requires fit_ntc() first
+        """
+        if genes is None and feature_query is None and min_log2_mu_ntc is None:
+            raise ValueError(
+                "Provide at least one of: genes, feature_query, min_log2_mu_ntc."
+            )
+        if isinstance(genes, str):
+            genes = [genes]
+
+        if modality_name is None:
+            modality_name = self.primary_modality
+        mod = self.get_modality(modality_name)
+
+        n_features = mod.dims['n_features']
+        exclude_mask = np.zeros(n_features, dtype=bool)
+
+        if genes is not None:
+            if mod.feature_names is None:
+                raise ValueError(
+                    f"Modality '{modality_name}' has no feature_names; cannot exclude by name."
+                )
+            name_to_idx = {}
+            for i, n in enumerate(mod.feature_names):
+                name_to_idx.setdefault(n, []).append(i)
+            not_found = []
+            for g in genes:
+                idxs = name_to_idx.get(g)
+                if idxs is None:
+                    not_found.append(g)
+                else:
+                    exclude_mask[idxs] = True
+            if not_found:
+                warnings.warn(
+                    f"exclude_trans_genes: {len(not_found)} gene(s) not found in "
+                    f"modality '{modality_name}' and were skipped: {not_found}",
+                    UserWarning,
+                )
+            print(f"[INFO] exclude_trans_genes: {int(exclude_mask.sum())} feature(s) "
+                  f"matched by name")
+
+        if feature_query is not None:
+            try:
+                query_mask = mod.feature_meta.eval(feature_query, engine='python').to_numpy(dtype=bool)
+            except Exception as e:
+                raise ValueError(
+                    f"exclude_trans_genes: failed to evaluate feature_query={feature_query!r} "
+                    f"against modality '{modality_name}' feature_meta "
+                    f"(columns: {list(mod.feature_meta.columns)}): {e}"
+                )
+            if query_mask.shape[0] != n_features:
+                raise ValueError(
+                    f"feature_query evaluated to {query_mask.shape[0]} values but modality "
+                    f"'{modality_name}' has {n_features} features."
+                )
+            print(f"[INFO] exclude_trans_genes: {int(query_mask.sum())} feature(s) "
+                  f"matched feature_query={feature_query!r}")
+            exclude_mask |= query_mask
+
+        if min_log2_mu_ntc is not None:
+            ps = mod.posterior_samples_ntc
+            if ps is None or 'mu_ntc' not in ps:
+                warnings.warn(
+                    f"exclude_trans_genes: min_log2_mu_ntc requires fit_ntc() to have been "
+                    f"run on modality '{modality_name}' first; this criterion was skipped.",
+                    UserWarning,
+                )
+            else:
+                mu_ntc = ps['mu_ntc']
+                mu_ntc_mean = mu_ntc.mean(dim=0) if mu_ntc.dim() > 1 else mu_ntc
+                mu_ntc_np = mu_ntc_mean.detach().cpu().numpy().flatten()
+                if mu_ntc_np.shape[0] != n_features:
+                    warnings.warn(
+                        f"exclude_trans_genes: mu_ntc has {mu_ntc_np.shape[0]} entries but "
+                        f"modality '{modality_name}' has {n_features} features; "
+                        f"min_log2_mu_ntc criterion was skipped.",
+                        UserWarning,
+                    )
+                else:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        log2_mu_ntc = np.log2(mu_ntc_np)
+                    low_expr_mask = log2_mu_ntc < min_log2_mu_ntc
+                    print(f"[INFO] exclude_trans_genes: {int(low_expr_mask.sum())} feature(s) "
+                          f"matched log2(mu_ntc) < {min_log2_mu_ntc}")
+                    exclude_mask |= low_expr_mask
+
+        n_excluded = int(exclude_mask.sum())
+        if n_excluded == 0:
+            print(f"[INFO] exclude_trans_genes: no features matched any exclusion criterion "
+                  f"for modality '{modality_name}'.")
+            return
+
+        keep_idx = np.where(~exclude_mask)[0]
+        if len(keep_idx) == 0:
+            raise ValueError(
+                f"exclude_trans_genes: all {n_features} features in modality "
+                f"'{modality_name}' were excluded. Loosen the exclusion criteria."
+            )
+
+        if mod.posterior_samples_trans is not None:
+            warnings.warn(
+                f"exclude_trans_genes: modality '{modality_name}' already has "
+                f"posterior_samples_trans from a previous fit_trans() call; discarding it "
+                f"since it no longer matches the reduced feature set. Re-run fit_trans().",
+                UserWarning,
+            )
+
+        # Trim stored NTC posteriors and alpha_y_prefit before creating the feature subset
+        self._trim_feature_axis_in_posteriors(mod, keep_idx, n_features)
+
+        new_mod = mod.get_feature_subset(keep_idx.tolist())
+        new_mod.posterior_samples_ntc = mod.posterior_samples_ntc  # already trimmed
+        new_mod.alpha_y_prefit_mult   = mod.alpha_y_prefit_mult
+        new_mod.alpha_y_prefit_add    = mod.alpha_y_prefit_add
+        new_mod.sum_factors           = mod.sum_factors
+        if hasattr(mod, 'loss_ntc'):
+            new_mod.loss_ntc = mod.loss_ntc
+
+        self.modalities[modality_name] = new_mod
+
+        print(f"[INFO] exclude_trans_genes: dropped {n_excluded}/{n_features} feature(s) "
+              f"from modality '{modality_name}' ({len(keep_idx)} remaining)")
+
     def _init_sum_factors(self, sum_factor_col: str = 'sum_factor'):
         """
         Initialise sum_factors DataFrame on negbinom modalities from self.meta.
