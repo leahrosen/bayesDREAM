@@ -35,10 +35,12 @@ Config must OMIT model.cis_gene (deferred), and must have a top-level
     ntc:
       set_technical_groups: [cell_line]
 
+    sum_factor:                     # only compute_scran/adjust_ntc_sum_factor run at
+      adjust_ntc_sum_factor:        # this stage (steps= restricts to a prefix) --
+        enabled: true                # refit_sumfactor needs x_true, which doesn't
+        args: {covariates: [lane, cell_line]}   # exist until AFTER fit_cis.
+
     cis:
-      adjust_ntc_sum_factor:
-        enabled: true
-        args: {covariates: [lane, cell_line]}
       fit:
         sum_factor_col: sum_factor_adj
       save: true
@@ -57,6 +59,7 @@ from config_utils import (  # noqa: E402
     load_bayesdream_yaml,
     normalize_stage_args,
     is_enabled,
+    apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 
@@ -90,10 +93,9 @@ def run_cis_deferred(cfg: dict) -> None:
     model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True)
     model.add_cis_gene(cis_gene)
 
-    cis_cfg = cfg.get("cis") or {}
-    if is_enabled(cis_cfg.get("adjust_ntc_sum_factor"), default=False):
-        model.adjust_ntc_sum_factor(**normalize_stage_args(cis_cfg.get("adjust_ntc_sum_factor")))
+    apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {}, steps=("compute_scran", "adjust_ntc_sum_factor"))
 
+    cis_cfg = cfg.get("cis") or {}
     fit_args = normalize_stage_args(cis_cfg.get("fit"))
     model.fit_cis(**fit_args)
 

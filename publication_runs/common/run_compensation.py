@@ -7,15 +7,15 @@ check_systematic_shift() directly. Mirrors the load/fit/save structure of
 bayesDREAM.cli._run_fit_cis so it slots into the same config file the cis/
 trans stages use.
 
+Deliberately does NOT call adjust_ntc_sum_factor()/refit_sumfactor() --
+check_systematic_shift() always uses the raw 'sum_factor' column (its own
+default) here, by design: zoomed in along the x-axis the raw factor is
+close enough, and both reference pipelines (Domingo, Morris) call it with
+no sum_factor_col override.
+
 Usage
 -----
     python run_compensation.py --config <path/to/gene_stage_config.yaml>
-
-Also expects the same top-level ``sum_factor:`` block used by run_trans.py
-(adjust_ntc_sum_factor + refit_sumfactor are re-run here too -- neither
-survives a save/load round trip, see
-config_utils.apply_sum_factor_adjustments's docstring), so that
-``sum_factor_refit`` matches what fit_trans() actually used.
 
 Expects a top-level ``compensation:`` block in the config, e.g.::
 
@@ -23,14 +23,19 @@ Expects a top-level ``compensation:`` block in the config, e.g.::
       load_ntc: {enabled: true}
       load_cis: {enabled: true}
       args:
-        sum_factor_col: sum_factor_refit   # must match what fit_trans() will use
         exclude_cells: exclude_cells.txt   # optional: path, one cell name per line
+                                            # OR a literal list
+                                            # OR {module: ..., function: ..., kwargs: {...}}
+                                            #    to compute it dynamically (e.g. Morris'
+                                            #    padj-based rule, see
+                                            #    morris/compensation_exclude_cells.py)
         min_cells_per_group: 30
       output: compensation_shift.csv       # optional; defaults to
                                             # <output_dir>/<label>/compensation_<modality>.csv
 """
 
 import argparse
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -43,28 +48,42 @@ from config_utils import (  # noqa: E402
     load_bayesdream_yaml,
     normalize_stage_args,
     is_enabled,
-    apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 
 
-def _load_exclude_cells(path: str):
-    p = Path(path)
-    if not p.is_absolute():
-        # Resolve relative to the config file's directory, not the CWD.
-        p = Path(path)
-    with open(p) as f:
+def _load_exclude_cells_file(path: str):
+    with open(path) as f:
         return [line.strip() for line in f if line.strip()]
 
 
-def run_compensation(cfg: dict) -> "object":
-    import pandas as pd  # local import: keep module import cheap for --help
+def _resolve_exclude_cells(spec, model, cfg):
+    """spec is one of: None, a list of cell names, a path (str) to a
+    newline-delimited file, or a dict {module, function, kwargs} naming a
+    dataset-specific function ``fn(model, cfg, **kwargs) -> list[str]`` to
+    call dynamically (e.g. morris/compensation_exclude_cells.py)."""
+    if spec is None:
+        return None
+    if isinstance(spec, list):
+        return spec
+    if isinstance(spec, str):
+        return _load_exclude_cells_file(spec)
+    if isinstance(spec, dict):
+        module_name = spec["module"]
+        # Make dataset directories (morris/, domingo/, ...) importable regardless of CWD.
+        for candidate in (Path(cfg.get("_config_dir", ".")), Path(__file__).resolve().parents[1]):
+            sys.path.insert(0, str(candidate))
+        mod = importlib.import_module(module_name)
+        fn = getattr(mod, spec["function"])
+        return fn(model, cfg, **spec.get("kwargs", {}))
+    raise ValueError(f"run_compensation: unsupported exclude_cells spec type: {type(spec)}")
 
+
+def run_compensation(cfg: dict) -> "object":
     model = build_model_from_config(cfg)
 
     comp_cfg = cfg.get("compensation") or {}
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
-    cis_cfg = cfg.get("cis") or {}
 
     if is_enabled(comp_cfg.get("load_ntc", comp_cfg.get("load_technical")), default=True):
         load_args = normalize_stage_args(comp_cfg.get("load_ntc") or comp_cfg.get("load_technical"))
@@ -81,11 +100,8 @@ def run_compensation(cfg: dict) -> "object":
         if covariates:
             model.set_technical_groups(covariates)
 
-    apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {})
-
     args = normalize_stage_args(comp_cfg.get("args"))
-    if isinstance(args.get("exclude_cells"), str):
-        args["exclude_cells"] = _load_exclude_cells(args["exclude_cells"])
+    args["exclude_cells"] = _resolve_exclude_cells(args.get("exclude_cells"), model, cfg)
 
     result = model.check_systematic_shift(**args)
 
@@ -112,6 +128,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_bayesdream_yaml(Path(args.config))
+    cfg["_config_dir"] = str(Path(args.config).resolve().parent)
     run_compensation(cfg)
 
 

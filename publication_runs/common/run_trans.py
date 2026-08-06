@@ -23,6 +23,10 @@ Config (top-level ``trans:`` and ``sum_factor:`` blocks)::
         enabled: true
         args: {covariates: [lane, cell_line], sum_factor_col_old: sum_factor_adj}
 
+    exclude_low_ntc_genes:                   # optional; see exclude_low_ntc_genes.py
+      enabled: true
+      args: {threshold: -4.0}
+
     trans:
       load_ntc: {args: {input_dir: <ntc_shared_dir>, mask_features: true}}
       load_cis: {enabled: true}
@@ -48,6 +52,7 @@ from config_utils import (  # noqa: E402
     apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from exclude_low_ntc_genes import exclude_low_ntc_genes  # noqa: E402
 
 
 def run_trans(cfg: dict) -> None:
@@ -67,6 +72,10 @@ def run_trans(cfg: dict) -> None:
             model.set_technical_groups(covariates)
 
     apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {})
+
+    excl_cfg = cfg.get("exclude_low_ntc_genes") or {}
+    if is_enabled(excl_cfg, default=False):
+        exclude_low_ntc_genes(model, **normalize_stage_args(excl_cfg))
 
     fit_args = normalize_stage_args(trans_cfg.get("fit"))
     model.fit_trans(**fit_args)

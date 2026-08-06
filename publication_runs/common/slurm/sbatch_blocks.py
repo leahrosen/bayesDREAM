@@ -4,19 +4,32 @@ SBATCH header builders shared by every dataset's generate_slurm.py.
 Conventions follow examples/simulation_study/generate_slurm_dardel.py
 (the one script in this repo already tuned against real Dardel behavior):
 
-- CPU steps target the 'shared' partition, sized by --cpus-per-task alone
-  (Dardel derives --mem from cores automatically there; don't pass --mem).
+- CPU steps target the 'shared' partition (`-p shared`), sized by
+  --cpus-per-task alone -- confirmed via `scontrol show partition shared`:
+  DefMemPerCPU=MaxMemPerCPU=888 (MB), i.e. RAM is a FIXED 888MB per core,
+  not a flexible pool -- don't pass --mem, and treat --cpus-per-task as your
+  actual memory dial (cores * 888MB = your job's RAM budget). MaxTime on
+  this partition is 7-00:00:00.
+- GPU steps target `-p gpu`.
 - Thread-pinning env vars (OMP/MKL/OPENBLAS/NUMEXPR) are exported in every
-  block so a task's own BLAS threadpool can't oversubscribe its cgroup's
-  cores on a shared, multi-tenant node.
+  CPU block so a task's own BLAS threadpool can't oversubscribe its
+  cgroup's cores on a shared, multi-tenant node.
 - GPU whole-node blocks are for steps that need a GPU at all; see
   run_node_queue.sh for packing several such steps onto one node allocation
   instead of requesting one node per step.
 
-Dardel-specific values you MUST confirm for your account before using this
-(sinfo / sacctmgr, not guessed here):
-- GPU partition name and any node --constraint (Dardel's GPU nodes are not
-  the same partition as 'shared'; check `sinfo -o "%P %G %N"`).
+Restart policy (see publication_runs/README.md): only fit_trans-derived
+stages (trans/permutation/recapitulation) auto-resubmit on timeout, via
+`auto_requeue_on_timeout=True` below -- `fit_trans()` has its own built-in
+checkpoint/resume (bayesDREAM/fitting/trans.py), so a requeued task picks
+back up close to where it left off. fit_ntc/fit_cis/compensation have NO
+checkpoint support in bayesDREAM at all -- requeuing those would just
+restart from scratch, so they are deliberately left to fail/time out and be
+reviewed manually (`common/slurm/list_job_status.py`) rather than
+auto-resubmitted.
+
+Dardel-specific values you MUST still confirm for your account (sacctmgr,
+not guessed here):
 - --account value (`sacctmgr show assoc user=$USER format=account`).
 - MaxSubmitJobs (`sacctmgr show assoc user=$USER format=MaxSubmitJobs`) --
   see publication_runs/README.md's note on array-job submit-quota limits.
@@ -47,9 +60,40 @@ def _provenance_echo(repo_dir: str) -> str:
     )
 
 
+# Seconds before the SLURM time limit that --signal fires. Must leave enough
+# time for the trap to run `scontrol requeue` and exit before SLURM SIGKILLs
+# the job outright.
+_REQUEUE_SIGNAL_LEAD_SECONDS = 120
+
+
+def _requeue_trap(is_array: bool) -> str:
+    requeue_target = '"${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"' if is_array else '"$SLURM_JOB_ID"'
+    return (
+        f"on_timeout() {{\n"
+        f'    echo "[requeue] caught imminent timeout, requeuing {requeue_target}"\n'
+        f"    scontrol requeue {requeue_target}\n"
+        f"    exit 0\n"
+        f"}}\n"
+        f"trap on_timeout USR1\n"
+    )
+
+
+def _run_in_background_and_wait(commands: List[str]) -> List[str]:
+    """Wraps commands so the USR1 trap can fire while they're running --
+    a foreground `command` blocks signal delivery to the trap until it
+    returns, so it must run backgrounded with an explicit `wait`."""
+    body = "\n".join(commands)
+    return [f"(\n{body}\n) &\nwait $!\n"]
+
+
 @dataclass
 class SbatchStep:
-    """One SBATCH script for a single CPU step (not an array)."""
+    """One SBATCH script for a single CPU step (not an array).
+
+    auto_requeue_on_timeout: only set True for trans/permutation/
+    recapitulation (fit_trans has its own checkpoint/resume) -- see this
+    module's docstring for why ntc/cis/compensation must NOT set this.
+    """
 
     job_name: str
     account: str
@@ -60,6 +104,7 @@ class SbatchStep:
     partition: str = "shared"
     repo_dir: Optional[str] = None
     extra_sbatch_lines: List[str] = field(default_factory=list)
+    auto_requeue_on_timeout: bool = False
 
     def render(self) -> str:
         lines = [
@@ -71,6 +116,11 @@ class SbatchStep:
             f"#SBATCH --time={hours_to_slurm_time(self.time_hours)}",
             f"#SBATCH --partition={self.partition}",
             f"#SBATCH --cpus-per-task={self.cpus}",
+        ]
+        if self.auto_requeue_on_timeout:
+            lines.append(f"#SBATCH --signal=B:USR1@{_REQUEUE_SIGNAL_LEAD_SECONDS}")
+            lines.append("#SBATCH --requeue")
+        lines += [
             *self.extra_sbatch_lines,
             "",
             "set -euo pipefail",
@@ -80,7 +130,11 @@ class SbatchStep:
         if self.repo_dir:
             lines.append(_provenance_echo(self.repo_dir))
         lines.append("")
-        lines.extend(self.commands)
+        if self.auto_requeue_on_timeout:
+            lines.append(_requeue_trap(is_array=False))
+            lines.extend(_run_in_background_and_wait(self.commands))
+        else:
+            lines.extend(self.commands)
         return "\n".join(lines) + "\n"
 
 
@@ -88,6 +142,8 @@ class SbatchStep:
 class SbatchArray:
     """One SBATCH script for a CPU array job (%N throttles concurrency, does
     NOT reduce submitted-job-record count -- see publication_runs/README.md).
+
+    auto_requeue_on_timeout: see SbatchStep's docstring -- same rule.
     """
 
     job_name: str
@@ -101,6 +157,7 @@ class SbatchArray:
     partition: str = "shared"
     repo_dir: Optional[str] = None
     extra_sbatch_lines: List[str] = field(default_factory=list)
+    auto_requeue_on_timeout: bool = False
 
     def render(self) -> str:
         lines = [
@@ -113,6 +170,11 @@ class SbatchArray:
             f"#SBATCH --time={hours_to_slurm_time(self.time_hours)}",
             f"#SBATCH --partition={self.partition}",
             f"#SBATCH --cpus-per-task={self.cpus}",
+        ]
+        if self.auto_requeue_on_timeout:
+            lines.append(f"#SBATCH --signal=B:USR1@{_REQUEUE_SIGNAL_LEAD_SECONDS}")
+            lines.append("#SBATCH --requeue")
+        lines += [
             *self.extra_sbatch_lines,
             "",
             "set -euo pipefail",
@@ -122,7 +184,11 @@ class SbatchArray:
         if self.repo_dir:
             lines.append(_provenance_echo(self.repo_dir))
         lines.append("")
-        lines.extend(self.commands)
+        if self.auto_requeue_on_timeout:
+            lines.append(_requeue_trap(is_array=True))
+            lines.extend(_run_in_background_and_wait(self.commands))
+        else:
+            lines.extend(self.commands)
         return "\n".join(lines) + "\n"
 
 

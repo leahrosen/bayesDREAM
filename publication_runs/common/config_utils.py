@@ -12,13 +12,22 @@ Two layers of YAML, deliberately kept separate (see publication_runs/README.md):
    deep-merging a dataset-wide base dict with per-gene overrides, and
    ``write_yaml`` writes the result to ``<output_dir>/<label>/configs/``.
 
-``build_model_from_config`` / ``load_bayesdream_yaml`` intentionally reuse
-``bayesDREAM.cli``'s private ``_build_model``/``_load_yaml``/
-``_normalize_stage_args``/``_is_enabled`` helpers rather than reimplementing
-model construction here -- that logic (reading data.meta/data.counts,
-resolving guide_assignment formats, filtering allowed model kwargs, ...) is
-non-trivial and already correct in cli.py. This is reuse, not a fork: if
-cli.py's config schema changes, these scripts pick it up automatically.
+``load_bayesdream_yaml``/``normalize_stage_args``/``is_enabled``/
+``read_table``/``load_guide_assignment`` reuse ``bayesDREAM.cli``'s private
+helpers of the same name (underscore-prefixed there) rather than
+reimplementing them -- straightforward, config-shape-agnostic logic that's
+already correct in cli.py.
+
+``build_model_from_config`` is NOT a re-export of ``cli.py``'s
+``_build_model``, though -- it duplicates that function's data-loading logic
+but with an EXTENDED ``allowed_model_keys`` set. ``_build_model`` filters
+``model:`` config keys through an allow-list that's missing ``exclude_guides``
+and ``min_count`` (both needed by Morris on essentially every model
+construction) -- see the ``_EXTENDED_MODEL_KEYS`` comment below. Editing
+``bayesDREAM/cli.py`` itself would be a core-code change needing sign-off
+(see CLAUDE.md); duplicating ~30 lines here instead keeps every dataset's
+scripts working without one. If ``cli.py``'s own allow-list is ever extended
+upstream, ``_EXTENDED_MODEL_KEYS`` should be reconciled with it.
 """
 
 import copy
@@ -27,14 +36,94 @@ from typing import Any, Dict
 
 import yaml
 
+from bayesDREAM import bayesDREAM
 from bayesDREAM.cli import (
-    _build_model as build_model_from_config,
     _load_yaml as load_bayesdream_yaml,
     _normalize_stage_args as normalize_stage_args,
     _is_enabled as is_enabled,
     _read_table as read_table,
     _load_guide_assignment as load_guide_assignment,
 )
+
+# Superset of bayesDREAM.cli._build_model's allowed_model_keys (as of this
+# writing) -- adds 'exclude_guides' and 'min_count', both accepted by
+# bayesDREAM.__init__ but not forwarded by the CLI's own allow-list.
+_EXTENDED_MODEL_KEYS = {
+    "modality_name", "cis_gene", "cis_feature", "guide_covariates", "guide_covariates_ntc",
+    "sum_factor_col", "output_dir", "label", "device", "random_seed", "cores",
+    "exclude_targets", "require_ntc",
+    "exclude_guides", "min_count",
+}
+
+
+def _read_counts(path, read_csv_kwargs):
+    """Like bayesDREAM.cli's own counts loading, but also accepts a `.npz`
+    sparse matrix (`scipy.sparse.load_npz`) -- needed for Morris, where a
+    dense CSV of ~31k genes x ~94k cells is infeasible. Sparse `.npz` counts
+    have NO row/column labels; bayesDREAM aligns them to `meta` PURELY BY
+    POSITION in that case (confirmed: bayesDREAM/core.py:331-336 falls back
+    to `self._cell_names = self.meta['cell'].tolist()` when counts isn't a
+    DataFrame -- i.e. column i of counts is assumed to be cell i of meta,
+    unchecked). The `.npz` file's columns MUST already be in the exact same
+    order as the `data.meta` CSV's rows -- see morris/preprocess.py, which
+    guarantees this by construction.
+    """
+    path = str(path)
+    if path.endswith(".npz"):
+        from scipy import sparse
+        return sparse.load_npz(path)
+    return read_table(path, read_csv_kwargs or {"index_col": 0})
+
+
+def build_model_from_config(cfg: Dict[str, Any]) -> "bayesDREAM":
+    """Construct a bayesDREAM model from a bayesdream-CLI-schema config dict.
+
+    See module docstring: duplicates bayesDREAM.cli._build_model's
+    data-loading logic with an extended model-kwarg allow-list
+    (_EXTENDED_MODEL_KEYS) rather than reusing it directly.
+    """
+    data_cfg = cfg.get("data") or {}
+    model_cfg = cfg.get("model") or {}
+
+    if "meta" not in data_cfg:
+        raise ValueError("Config missing required key: data.meta")
+    if "counts" not in data_cfg:
+        raise ValueError("Config missing required key: data.counts")
+
+    meta = read_table(data_cfg["meta"], data_cfg.get("meta_read_csv_kwargs"))
+    counts = _read_counts(data_cfg["counts"], data_cfg.get("counts_read_csv_kwargs"))
+
+    feature_meta = None
+    if data_cfg.get("feature_meta"):
+        feature_meta = read_table(
+            data_cfg["feature_meta"],
+            data_cfg.get("feature_meta_read_csv_kwargs") or {"index_col": 0},
+        )
+
+    guide_assignment = None
+    if data_cfg.get("guide_assignment"):
+        guide_assignment = load_guide_assignment(data_cfg["guide_assignment"])
+
+    guide_meta = None
+    if data_cfg.get("guide_meta"):
+        guide_meta = read_table(data_cfg["guide_meta"], data_cfg.get("guide_meta_read_csv_kwargs"))
+
+    guide_target = None
+    if data_cfg.get("guide_target"):
+        guide_target = read_table(data_cfg["guide_target"], data_cfg.get("guide_target_read_csv_kwargs"))
+
+    model_kwargs = {k: v for k, v in model_cfg.items() if k in _EXTENDED_MODEL_KEYS}
+    if feature_meta is not None:
+        model_kwargs["feature_meta"] = feature_meta
+
+    return bayesDREAM(
+        meta=meta,
+        counts=counts,
+        guide_assignment=guide_assignment,
+        guide_meta=guide_meta,
+        guide_target=guide_target,
+        **model_kwargs,
+    )
 
 __all__ = [
     "build_model_from_config",
@@ -92,34 +181,63 @@ def render_bayesdream_config(base: Dict[str, Any], overrides: Dict[str, Any]) ->
     return deep_merge(base, overrides)
 
 
-def apply_sum_factor_adjustments(model, section: Dict[str, Any]) -> None:
-    """Re-run adjust_ntc_sum_factor() / refit_sumfactor() in THIS process.
+def apply_sum_factor_adjustments(model, section: Dict[str, Any], steps=("compute_scran", "adjust_ntc_sum_factor", "refit_sumfactor")) -> None:
+    """Re-run compute_scran_sum_factor() / adjust_ntc_sum_factor() /
+    refit_sumfactor() in THIS process, in that order (skipping whichever
+    aren't both requested via `steps` and enabled in `section`).
 
-    Both are pure, deterministic transforms of meta['sum_factor'] (and, for
-    refit_sumfactor, self.x_true) -- neither 'sum_factor_adj' nor
-    'sum_factor_refit' is written by save_cis_fit()/save_trans_fit() or
-    restored by load_cis_fit() (see bayesDREAM/io/save.py, io/load.py --
-    only the sum_factors DataFrame's existing columns are subset on load,
-    never recomputed). So every stage after fit_cis that references either
-    column (compensation, trans, permutation, recapitulation) must call this
-    itself, right after load_cis_fit(), with the SAME covariates used during
-    the original fit_cis/fit_trans run -- otherwise it silently gets a
-    KeyError (column missing) or, worse, an inconsistent sum factor if a
-    caller made its own ad hoc partial version.
+    None of these survive a save/load round trip -- 'sum_factor_new' (Morris'
+    per-cell-subset scran factor), 'sum_factor_adj', and 'sum_factor_refit'
+    are computed into the in-memory sum_factors DataFrame and never written
+    by save_cis_fit()/save_trans_fit() or restored by load_cis_fit() (see
+    bayesDREAM/io/save.py, io/load.py -- only EXISTING sum_factors columns
+    are subset on load, never recomputed). So every stage after fit_cis that
+    references any of these columns (cis itself, trans, permutation,
+    recapitulation -- NOT compensation, which always uses the raw
+    'sum_factor' column per project convention) must call this itself, with
+    the SAME covariates/args used everywhere else for this dataset --
+    otherwise it silently gets a KeyError (column missing) or, worse, an
+    inconsistent sum factor from an ad hoc partial recomputation.
 
-    Expects a ``sum_factor:`` config block, reused verbatim across cis/
-    compensation/trans/permutation/recapitulation stage configs so they all
-    stay consistent::
+    `steps` lets a caller select a PREFIX of the chain: the cis stage only
+    needs ('compute_scran', 'adjust_ntc_sum_factor') (refit_sumfactor needs
+    x_true, which doesn't exist until AFTER fit_cis); trans/permutation/
+    recapitulation use the full default chain (with 'refit_sumfactor'
+    typically disabled outright in `section` for datasets that don't use its
+    output -- e.g. Morris, see morris/config.yaml).
+
+    Also handles a specific known collision: some datasets' meta ships a
+    precomputed 'adjustment_factor' column from upstream R preprocessing
+    (Domingo's does, always -- see domingo/README.md). adjust_ntc_sum_factor()
+    computes its own internal column of that same name; if the stale one is
+    still there it can collide. Renamed (not dropped) to
+    'adjustment_factor_old' automatically, once, right before
+    adjust_ntc_sum_factor() runs, whenever present -- a no-op for datasets
+    that don't have it.
+
+    Expects a ``sum_factor:`` config block, reused verbatim across cis/trans/
+    permutation/recapitulation stage configs so they all stay consistent::
 
         sum_factor:
+          compute_scran:                          # Morris only
+            enabled: true
+            args: {batch_col: lane, sum_factor_col_out: sum_factor_new}
           adjust_ntc_sum_factor:
             enabled: true
             args: {covariates: [lane, cell_line]}
           refit_sumfactor:
             enabled: true
-            args: {covariates: [lane, cell_line], sum_factor_col_old: sum_factor_adj}
+            args: {covariates: [lane, cell_line]}
     """
-    if is_enabled(section.get("adjust_ntc_sum_factor"), default=False):
+    if "compute_scran" in steps and is_enabled(section.get("compute_scran"), default=False):
+        from compute_scran_sum_factor import compute_scran_sum_factor
+        compute_scran_sum_factor(model, **normalize_stage_args(section.get("compute_scran")))
+
+    if "adjust_ntc_sum_factor" in steps and is_enabled(section.get("adjust_ntc_sum_factor"), default=False):
+        if "adjustment_factor" in model.meta.columns:
+            model.meta["adjustment_factor_old"] = model.meta["adjustment_factor"].copy()
+            del model.meta["adjustment_factor"]
         model.adjust_ntc_sum_factor(**normalize_stage_args(section.get("adjust_ntc_sum_factor")))
-    if is_enabled(section.get("refit_sumfactor"), default=False):
+
+    if "refit_sumfactor" in steps and is_enabled(section.get("refit_sumfactor"), default=False):
         model.refit_sumfactor(**normalize_stage_args(section.get("refit_sumfactor")))

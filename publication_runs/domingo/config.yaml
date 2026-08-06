@@ -1,25 +1,27 @@
 # Domingo dataset -- orchestration config, consumed by generate_slurm.py.
 # NOT the bayesdream-CLI-schema config (see publication_runs/README.md);
-# generate_slurm.py renders that per gene/stage from this file plus
-# common_bayesdream.yaml below.
+# generate_slurm.py renders that per gene/stage from this file.
 
 dataset: domingo
-label_prefix: domingo_20260731   # -> bayesdream label = <label_prefix>_<gene>
+label_prefix: domingo_20260806   # -> bayesdream label = <label_prefix>_<gene>
 
 paths:
-  # Cluster-absolute paths (Dardel). Fill in before generating.
-  repo_dir: /proj/<project>/users/<user>/bayesDREAM_forClaude
-  python_env: /proj/<project>/users/<user>/envs/bayesdream/bin/python
-  data_dir: /proj/<project>/users/<user>/data/domingo
-  output_dir: /proj/<project>/users/<user>/output/domingo
-  meta: "{data_dir}/meta.csv"
+  repo_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/CRISPRmodelling/BayesianModelling/bayesDREAM_forClaude
+  python_env: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_cpu/bin/python
+
+  # Written by the R preprocessing script (see domingo/README.md) --
+  # confirm these are the actual filenames/location once the script has
+  # been re-run; it uses relative `fwrite()` paths, so the exact directory
+  # depends on the R session's working directory when it was run.
+  data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah
+  meta: "{data_dir}/cell_meta.csv"
   counts: "{data_dir}/gene_counts.csv"
 
+  output_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/BayesianModel_outs
+
 cluster:
-  account: "<dardel-account>"          # sacctmgr show assoc user=$USER format=account
-  partition_cpu: shared
-  gpu_partition: "<confirm via sinfo>"  # see common/slurm/sbatch_blocks.py docstring
-  max_submit_jobs_hint: 1024            # sacctmgr show assoc user=$USER format=MaxSubmitJobs
+  account: naiss2025-5-479
+  partition_cpu: shared   # Domingo always runs on CPU -- no GPU partition needed.
 
 model_defaults:
   modality_name: gene
@@ -33,19 +35,27 @@ cis_genes: [GFI1B, MYB, NFE2, TET2]
 # genes' fit_cis/compensation/trans depend on it.
 ntc_shared:
   set_technical_groups: [cell_line]
-  resources: {cores: 8, time_hours: 4, device: cpu}
+  resources: {cores: 8}
+  fit: {tolerance: 0, niters: 50000}
+
+sum_factor:
+  # adjust_ntc_sum_factor/refit_sumfactor both use the library default
+  # sum_factor_col_old='sum_factor' (the R-preprocessed, already-scran-
+  # clustered column) -- NOT sum_factor_adj for refit; matches the reference
+  # GFI1B script exactly (model.refit_sumfactor(covariates=[...]) with no
+  # sum_factor_col_old override).
+  covariates: [lane, cell_line]
 
 cis:
-  resources: {cores: 8, time_hours: 6, device: cpu}
-  adjust_ntc_sum_factor:
-    enabled: true
-    covariates: [lane, cell_line]
+  resources: {cores: 8}
+  fit: {tolerance: 0, niters: 100000}
 
 compensation:
-  resources: {cores: 4, time_hours: 1, device: cpu}
-  # Per-gene exclude_cells overrides, if any (e.g. a gene with a known bad
-  # guide/lane you want dropped from the NTC-vs-targeted comparison only).
-  # Path is relative to paths.data_dir. Leave empty list for "exclude nothing".
+  resources: {cores: 4}
+  # check_systematic_shift() always uses the raw 'sum_factor' column (no
+  # override) -- see run_compensation.py. Per-gene exclude_cells overrides,
+  # if any; leave empty for "exclude nothing" (matches the reference script,
+  # which calls check_systematic_shift() with no exclude_cells at all).
   exclude_cells:
     GFI1B: []
     MYB: []
@@ -53,24 +63,25 @@ compensation:
     TET2: []
 
 trans:
-  resources: {cores: 16, time_hours: 12, device: cpu}
+  resources: {cores: 16}
   function_type: additive_hill
-  refit_sumfactor: true
+  fit: {tolerance: 0}
+  exclude_low_ntc_genes_threshold: -4.0   # log2(mu_ntc) < this -> excluded, all datasets
 
   permutation:
     n_reps: 20
-    resources: {cores: 16, time_hours: 12, device: cpu}
+    resources: {cores: 16}
 
   simulation:
     n_reps: 10
-    resources: {cores: 8, time_hours: 6, device: cpu}
+    resources: {cores: 8}
 
 # Further modalities (splicing/velocity/donor/acceptor efficiency), fit per
 # cis gene after that gene's own cis fit. See config_modalities.yaml.
 modalities:
   config: config_modalities.yaml
-  data_dir: /proj/<project>/users/<user>/data/domingo_splicing
-  resources: {cores: 8, time_hours: 8, device: cpu}
+  data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/splicing   # TODO confirm
+  resources: {cores: 8}
   trans:
     permutation: {n_reps: 20}
     simulation: {n_reps: 10}

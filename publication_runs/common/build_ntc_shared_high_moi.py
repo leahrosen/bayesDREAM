@@ -24,6 +24,7 @@ Config schema (its own, NOT the bayesdream-CLI schema)::
       meta: /path/to/meta.csv
       counts: /path/to/gene_counts.csv
       counts_read_csv_kwargs: {index_col: 0}
+      feature_meta: /path/to/gene_meta.csv   # optional; needs gene_name/gene_id columns
       guide_assignment: /path/to/guide_assignment.npy
       guide_meta: /path/to/guide_meta.csv
       guide_target: /path/to/guide_target.csv   # optional
@@ -33,6 +34,7 @@ Config schema (its own, NOT the bayesdream-CLI schema)::
       exclude_guides: [sgFOO_1, sgFOO_2]
       guide_covariates: [cell_line]
       guide_covariates_ntc: [cell_line]
+      min_count: 10
       output_dir: /path/to/output
       label: morris_20260731_ntc_shared
 
@@ -40,6 +42,12 @@ Config schema (its own, NOT the bayesdream-CLI schema)::
       set_technical_groups: [cell_line]
       fit: {}
       save: true
+
+    sum_factor:                 # optional; Morris needs its own scran sum factor
+      compute_scran:            # (see compute_scran_sum_factor.py) computed on
+        enabled: true           # THIS run's own (placeholder-gene) cell subset --
+        args: {batch_col: lane} # separate from any per-cis-gene run's own later
+                                 # recomputation on ITS cell subset.
 """
 
 import argparse
@@ -56,6 +64,8 @@ from config_utils import (  # noqa: E402
     is_enabled,
     read_table,
     load_guide_assignment,
+    apply_sum_factor_adjustments,
+    _read_counts,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 
@@ -68,7 +78,10 @@ def build_ntc_shared_high_moi(cfg: dict) -> None:
     ntc_cfg = cfg.get("ntc") or {}
 
     meta = read_table(data_cfg["meta"], data_cfg.get("meta_read_csv_kwargs"))
-    counts = read_table(data_cfg["counts"], data_cfg.get("counts_read_csv_kwargs") or {"index_col": 0})
+    counts = _read_counts(data_cfg["counts"], data_cfg.get("counts_read_csv_kwargs"))
+    feature_meta = None
+    if data_cfg.get("feature_meta"):
+        feature_meta = read_table(data_cfg["feature_meta"], data_cfg.get("feature_meta_read_csv_kwargs"))
     guide_assignment = load_guide_assignment(data_cfg["guide_assignment"])
     guide_meta = read_table(data_cfg["guide_meta"], data_cfg.get("guide_meta_read_csv_kwargs"))
     guide_target = None
@@ -80,17 +93,22 @@ def build_ntc_shared_high_moi(cfg: dict) -> None:
 
     model = bayesDREAM(
         meta=meta, counts=counts,
+        feature_meta=feature_meta,
         guide_assignment=guide_assignment, guide_meta=guide_meta, guide_target=guide_target,
         cis_gene=placeholder_cis_gene,
         exclude_guides=exclude_guides,
+        min_count=model_cfg.get("min_count", 1),
         guide_covariates=model_cfg.get("guide_covariates"),
         guide_covariates_ntc=model_cfg.get("guide_covariates_ntc"),
         output_dir=model_cfg.get("output_dir", "output"),
         label=model_cfg["label"],
+        device=model_cfg.get("device"),
     )
 
     if ntc_cfg.get("set_technical_groups"):
         model.set_technical_groups(ntc_cfg["set_technical_groups"])
+
+    apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {}, steps=("compute_scran",))
 
     fit_args = normalize_stage_args(ntc_cfg.get("fit"))
     model.fit_ntc(**fit_args)

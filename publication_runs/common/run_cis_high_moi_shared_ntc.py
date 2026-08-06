@@ -28,12 +28,18 @@ guide_meta, guide_target) plus a top-level ``ntc_shared_dir:``::
     ntc:
       set_technical_groups: [cell_line]
 
-    cis:
+    sum_factor:                       # compute_scran is per-cell-subset (see
+      compute_scran:                  # compute_scran_sum_factor.py) -- must be
+        enabled: true                 # recomputed HERE, on this gene's own subset,
+        args: {batch_col: lane}       # not reused from the shared ntc run.
       adjust_ntc_sum_factor:
         enabled: true
-        args: {covariates: [cell_line]}
+        args: {sum_factor_col_old: sum_factor_new, covariates: [lane]}
+
+    cis:
       fit:
         sum_factor_col: sum_factor_adj
+        independent_mu_sigma: true
       save: true
 """
 
@@ -50,6 +56,7 @@ from config_utils import (  # noqa: E402
     load_bayesdream_yaml,
     normalize_stage_args,
     is_enabled,
+    apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 from apply_shared_ntc_high_moi import apply_shared_ntc  # noqa: E402
@@ -76,10 +83,9 @@ def run_cis_high_moi_shared_ntc(cfg: dict) -> None:
 
     apply_shared_ntc(model, ntc_shared_dir=ntc_shared_dir, modality_name=model_cfg.get("modality_name"))
 
-    cis_cfg = cfg.get("cis") or {}
-    if is_enabled(cis_cfg.get("adjust_ntc_sum_factor"), default=False):
-        model.adjust_ntc_sum_factor(**normalize_stage_args(cis_cfg.get("adjust_ntc_sum_factor")))
+    apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {}, steps=("compute_scran", "adjust_ntc_sum_factor"))
 
+    cis_cfg = cfg.get("cis") or {}
     fit_args = normalize_stage_args(cis_cfg.get("fit"))
     model.fit_cis(**fit_args)
 

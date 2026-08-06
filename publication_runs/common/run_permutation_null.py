@@ -44,6 +44,7 @@ from config_utils import (  # noqa: E402
     apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from exclude_low_ntc_genes import exclude_low_ntc_genes  # noqa: E402
 
 from bayesDREAM.simulation import permute_from_ntc  # noqa: E402
 
@@ -83,6 +84,10 @@ def run_permutation_null(cfg: dict, rep: int) -> None:
     # their own default) and fit_trans below (sum_factor_refit) -- see
     # config_utils.apply_sum_factor_adjustments's docstring.
     apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {})
+
+    excl_cfg = cfg.get("exclude_low_ntc_genes") or {}
+    if is_enabled(excl_cfg, default=False):
+        exclude_low_ntc_genes(model, **normalize_stage_args(excl_cfg))
 
     covariates = perm_cfg.get("covariates")
     sum_factor_col = perm_cfg.get("sum_factor_col", "sum_factor_adj")

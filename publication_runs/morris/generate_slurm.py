@@ -1,10 +1,25 @@
 """
 Generate SLURM scripts + configs for the Morris dataset: high-MOI, one
 shared fit_ntc (over the full panel minus a placeholder cis gene -- see
-morris/README.md), 5 primary genes with the full pipeline (cis ->
-compensation -> trans -> permutation -> recapitulation), and a fit_cis-ONLY
-sweep over ~hundreds more genes from genes_all.csv, all reusing the one
-shared fit_ntc via apply_shared_ntc_high_moi.py's workaround.
+morris/README.md), the full pipeline (cis -> compensation -> trans ->
+permutation -> recapitulation) for config.yaml's `primary_genes`, and a
+fit_cis-ONLY sweep over every OTHER gene with padj<0.05 in
+Morris_gRNA2target_stats.csv, all reusing the one shared fit_ntc via
+apply_shared_ntc_high_moi.py's workaround.
+
+Assumes morris/preprocess.py has already been run once (writes the aligned
+meta.csv/gene_counts.npz/gene_meta.csv/guide_assignment.npy/guide_meta.csv/
+guide_target.csv this script's paths.data_dir points at).
+
+Placement: cis and compensation always run on CPU (bayesdream_cpu env,
+`-p shared`); ntc_shared/trans/permutation/recapitulation run on GPU
+(bayesdream_rocm env, `-p gpu`) -- per project convention (Domingo is
+CPU-only everywhere; Morris's fit_cis specifically is CPU-only regardless of
+dataset; everything else in Morris follows its own reference scripts, which
+required CUDA). Only trans/permutation/recapitulation auto-resubmit on
+timeout (fit_trans has its own checkpoint/resume) -- ntc_shared/cis/
+compensation/cis_sweep failures are left for manual review via
+common/slurm/list_job_status.py.
 
 Usage
 -----
@@ -22,10 +37,57 @@ THIS_DIR = Path(__file__).resolve().parent
 REPO_DIR_LOCAL = THIS_DIR.parents[1]
 sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common"))
 sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common" / "slurm"))
+sys.path.insert(0, str(THIS_DIR))
 
 from config_utils import load_yaml, write_yaml, render_bayesdream_config  # noqa: E402
 from git_provenance import create_stable_snapshot_tag  # noqa: E402
-from sbatch_blocks import SbatchStep, SbatchArray, SbatchGpuNodeQueue  # noqa: E402
+from sbatch_blocks import SbatchStep, SbatchArray  # noqa: E402
+from snp_exclusion import exclude_guides_for_cis_gene  # noqa: E402
+
+TIME_HOURS = 24.0  # fixed everywhere, per project convention
+
+
+def _resolve_paths(paths: dict) -> dict:
+    """Resolve {placeholder} cross-references, allowing chained references
+    (e.g. data_dir: "{raw_data_dir}/preprocessed") by repeatedly formatting
+    until nothing changes."""
+    resolved = dict(paths)
+    for _ in range(len(paths) + 1):
+        changed = False
+        for k, v in resolved.items():
+            if isinstance(v, str) and "{" in v:
+                new_v = v.format(**resolved)
+                if new_v != v:
+                    resolved[k] = new_v
+                    changed = True
+        if not changed:
+            break
+    return resolved
+
+
+def _select_cis_genes(stats_csv: str, gene_use_col: str, padj_col: str, padj_threshold: float,
+                       feature_meta_path: str, primary_genes: list):
+    stats = pd.read_csv(stats_csv)
+    sig_ids = stats.loc[stats[padj_col] < padj_threshold, gene_use_col].unique().tolist()
+
+    feature_meta = pd.read_csv(feature_meta_path)
+    id_to_name = dict(zip(feature_meta["gene_id"], feature_meta["gene_name"]))
+    name_to_id = {v: k for k, v in id_to_name.items()}
+
+    mapped = []
+    unmapped = []
+    for gid in sig_ids:
+        name = id_to_name.get(gid)
+        if name is None:
+            unmapped.append(gid)
+        else:
+            mapped.append((gid, name))
+    if unmapped:
+        print(f"[generate_slurm] WARNING: {len(unmapped)} padj<{padj_threshold} gene_use id(s) "
+              f"not found in feature_meta, skipped: {unmapped[:10]}{'...' if len(unmapped) > 10 else ''}")
+
+    sweep_genes = [name for _gid, name in mapped if name not in set(primary_genes)]
+    return sweep_genes, name_to_id
 
 
 def main() -> None:
@@ -48,153 +110,182 @@ def main() -> None:
         tag_info = create_stable_snapshot_tag(prefix=f"{cfg['dataset']}-run", push=not args.no_push_tag)
     print(f"[generate_slurm] git tag for this batch: {tag_info.get('bayesdream_tag')}")
 
-    paths = cfg["paths"]
-    meta_path = paths["meta"].format(**paths)
-    counts_path = paths["counts"].format(**paths)
-    guide_assignment_path = paths["guide_assignment"].format(**paths)
-    guide_meta_path = paths["guide_meta"].format(**paths)
-    guide_target_path = paths.get("guide_target", "").format(**paths) if paths.get("guide_target") else None
+    paths = _resolve_paths(cfg["paths"])
     output_dir = paths["output_dir"]
     repo_dir = paths["repo_dir"]
-    python_env = paths["python_env"]
+    python_env_cpu = paths["python_env_cpu"]
+    python_env_gpu = paths["python_env_gpu"]
 
     cluster = cfg["cluster"]
     account = cluster["account"]
     partition_cpu = cluster.get("partition_cpu", "shared")
+    partition_gpu = cluster.get("partition_gpu", "gpu")
 
     label_prefix = cfg["label_prefix"]
     model_defaults = cfg["model_defaults"]
-    exclude_guides = cfg.get("exclude_guides") or []
+    sf_cfg = cfg["sum_factor"]
+    gene_sel_cfg = cfg["gene_selection"]
     ntc_shared_cfg = cfg["ntc_shared"]
     cis_cfg = cfg["cis"]
     comp_cfg = cfg["compensation"]
     trans_cfg = cfg["trans"]
     cis_sweep_cfg = cfg["cis_sweep"]
 
-    data_block = {
-        "meta": meta_path, "counts": counts_path,
-        "counts_read_csv_kwargs": {"index_col": 0},
-        "guide_assignment": guide_assignment_path,
-        "guide_meta": guide_meta_path,
-    }
-    if guide_target_path:
-        data_block["guide_target"] = guide_target_path
+    primary_genes = gene_sel_cfg["primary_genes"]
+    sweep_genes, name_to_id = _select_cis_genes(
+        stats_csv=paths["stats_csv"], gene_use_col=gene_sel_cfg["gene_use_col"],
+        padj_col=gene_sel_cfg["padj_col"], padj_threshold=gene_sel_cfg["padj_threshold"],
+        feature_meta_path=paths["feature_meta"], primary_genes=primary_genes,
+    )
+    all_guide_names = pd.read_csv(paths["guide_meta"])["guide"].tolist()
 
+    data_block = {
+        "meta": paths["meta"], "counts": paths["counts"],
+        "feature_meta": paths["feature_meta"], "feature_meta_read_csv_kwargs": {},
+        "guide_assignment": paths["guide_assignment"],
+        "guide_meta": paths["guide_meta"], "guide_target": paths["guide_target"],
+    }
     base_cfg = {
         "data": data_block,
         "model": {
             "modality_name": model_defaults["modality_name"],
             "guide_covariates": model_defaults["guide_covariates"],
             "guide_covariates_ntc": model_defaults["guide_covariates_ntc"],
+            "min_count": model_defaults["min_count"],
             "output_dir": output_dir,
         },
         "ntc": {"set_technical_groups": ntc_shared_cfg["set_technical_groups"]},
     }
-
-    sum_factor_block = {
+    sum_factor_cis_block = {
+        "compute_scran": {"enabled": True, "args": {"batch_col": sf_cfg["batch_col"]}},
         "adjust_ntc_sum_factor": {
-            "enabled": cis_cfg["adjust_ntc_sum_factor"]["enabled"],
-            "args": {"covariates": cis_cfg["adjust_ntc_sum_factor"]["covariates"]},
-        },
-        "refit_sumfactor": {
             "enabled": True,
-            "args": {"covariates": cis_cfg["adjust_ntc_sum_factor"]["covariates"],
-                      "sum_factor_col_old": "sum_factor_adj"},
+            "args": {"sum_factor_col_old": "sum_factor_new", "covariates": sf_cfg["covariates"]},
         },
     }
 
-    def bd_cmd(kind: str, config_path, extra_args: str = "") -> str:
+    def bd_cmd(kind: str, config_path, python_env: str, extra_args: str = "") -> str:
         if kind in {"fit-ntc", "fit-cis", "fit-trans", "report"}:
             return f'cd "{repo_dir}" && "{python_env}" -m bayesDREAM {kind} --config "{config_path}"{extra_args}'
         script = f"{repo_dir}/publication_runs/common/run_{kind}.py"
         return f'"{python_env}" "{script}" --config "{config_path}"{extra_args}'
 
     scripts = []
+    submitted_rows = []  # (stage, label, script_placeholder) -- jobids filled in by submit_all.sh
 
     # ---------------------------------------------------------------- #
-    # 1. Shared fit_ntc (high-MOI workaround -- own config schema)       #
+    # 1. Shared fit_ntc (high-MOI workaround, GPU, own config schema)    #
     # ---------------------------------------------------------------- #
     label_ntc = f"{label_prefix}_ntc_shared"
     ntc_shared_dir = f"{output_dir}/{label_ntc}"
+    placeholder_gene = ntc_shared_cfg["placeholder_cis_gene"]
     ntc_own_cfg = {
         "data": data_block,
         "model": {
-            "placeholder_cis_gene": ntc_shared_cfg["placeholder_cis_gene"],
-            "exclude_guides": exclude_guides,
+            "placeholder_cis_gene": placeholder_gene,
+            "exclude_guides": exclude_guides_for_cis_gene(all_guide_names, placeholder_gene),
             "guide_covariates": model_defaults["guide_covariates"],
             "guide_covariates_ntc": model_defaults["guide_covariates_ntc"],
+            "min_count": model_defaults["min_count"],
             "output_dir": output_dir,
             "label": label_ntc,
         },
         "ntc": {"set_technical_groups": ntc_shared_cfg["set_technical_groups"], "fit": {}, "save": True},
+        "sum_factor": {"compute_scran": {"enabled": True, "args": {"batch_col": sf_cfg["batch_col"]}}},
     }
     ntc_cfg_path = configs_dir / f"{label_ntc}.yaml"
     write_yaml(ntc_cfg_path, ntc_own_cfg)
 
     ntc_step = SbatchStep(
         job_name="morris_ntc_shared", account=account, log_dir=str(logs_dir),
-        time_hours=ntc_shared_cfg["resources"]["time_hours"], cpus=ntc_shared_cfg["resources"]["cores"],
-        partition=partition_cpu, repo_dir=repo_dir,
+        time_hours=TIME_HOURS, cpus=ntc_shared_cfg["resources"]["cores"],
+        partition=partition_gpu, repo_dir=repo_dir,
         commands=[
-            f'"{python_env}" "{repo_dir}/publication_runs/common/build_ntc_shared_high_moi.py" --config "{ntc_cfg_path}"'
+            f'"{python_env_gpu}" "{repo_dir}/publication_runs/common/build_ntc_shared_high_moi.py" --config "{ntc_cfg_path}"'
         ],
     )
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
+    submitted_rows.append(("ntc_shared", label_ntc, "01_ntc_shared.sh"))
 
-    def render_gene_cfg(gene: str, label: str, extra: dict) -> dict:
-        return render_bayesdream_config(base_cfg, {
-            "model": {"label": label, "cis_gene": gene},
+    def render_gene_cfg(gene: str, label: str, device: str, extra: dict) -> dict:
+        overrides = {
+            "model": {"label": label, "cis_gene": gene, "device": device},
             **extra,
-        })
+        }
+        return render_bayesdream_config(base_cfg, overrides)
 
-    # ---------------------------------------------------------------- #
-    # 2. Primary genes: cis -> compensation -> trans -> perm/sim          #
-    # ---------------------------------------------------------------- #
-    for gene in cfg["primary_genes"]:
-        label = f"{label_prefix}_{gene}"
-
-        cis_bd_cfg = render_gene_cfg(gene, label, {
+    def render_cis_config(gene: str, label: str) -> Path:
+        cis_bd_cfg = render_gene_cfg(gene, label, "cpu", {
+            "model": {"exclude_guides": exclude_guides_for_cis_gene(all_guide_names, gene)},
             "ntc_shared_dir": ntc_shared_dir,
-            "cis": {
-                "adjust_ntc_sum_factor": sum_factor_block["adjust_ntc_sum_factor"],
-                "fit": {"sum_factor_col": "sum_factor_adj" if cis_cfg["adjust_ntc_sum_factor"]["enabled"] else "sum_factor"},
-                "save": True,
-            },
+            "sum_factor": sum_factor_cis_block,
+            "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
         })
         cis_cfg_path = configs_dir / f"{label}_cis.yaml"
         write_yaml(cis_cfg_path, cis_bd_cfg)
-        cis_step = SbatchStep(
-            job_name=f"morris_cis_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=cis_cfg["resources"]["time_hours"], cpus=cis_cfg["resources"]["cores"],
-            partition=partition_cpu, repo_dir=repo_dir,
-            commands=[bd_cmd("cis_high_moi_shared_ntc", cis_cfg_path)],
-        )
-        scripts.append((f"02_cis_{gene}.sh", cis_step.render()))
+        return cis_cfg_path
 
-        comp_bd_cfg = render_gene_cfg(gene, label, {
-            "sum_factor": sum_factor_block,
+    def cis_sbatch_step(gene: str, cis_cfg_path: Path) -> SbatchStep:
+        return SbatchStep(
+            job_name=f"morris_cis_{gene}", account=account, log_dir=str(logs_dir),
+            time_hours=TIME_HOURS, cpus=cis_cfg["resources"]["cores"],
+            partition=partition_cpu, repo_dir=repo_dir,
+            commands=[bd_cmd("cis_high_moi_shared_ntc", cis_cfg_path, python_env_cpu)],
+        )
+
+    # ---------------------------------------------------------------- #
+    # 2. Primary genes: cis(CPU) -> compensation(CPU) -> trans(GPU) ->   #
+    #    permutation(GPU array) -> recapitulation(GPU array)             #
+    # ---------------------------------------------------------------- #
+    for gene in primary_genes:
+        label = f"{label_prefix}_{gene}"
+
+        cis_cfg_path = render_cis_config(gene, label)
+        cis_step = cis_sbatch_step(gene, cis_cfg_path)
+        scripts.append((f"02_cis_{gene}.sh", cis_step.render()))
+        submitted_rows.append(("cis", label, f"02_cis_{gene}.sh"))
+
+        cis_gene_ensembl_id = name_to_id.get(gene)
+        comp_bd_cfg = render_gene_cfg(gene, label, "cpu", {
             "compensation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
-                "args": {"sum_factor_col": "sum_factor_refit", "exclude_cells": comp_cfg["exclude_cells"].get(gene, [])},
+                "args": {
+                    "exclude_cells": {
+                        "module": "compensation_exclude_cells",
+                        "function": "compute_padj_exclude_cells",
+                        "kwargs": {
+                            "stats_csv": paths["stats_csv"],
+                            "cis_gene_ensembl_id": cis_gene_ensembl_id,
+                            "padj_threshold": comp_cfg["padj_threshold"],
+                        },
+                    },
+                },
             },
         })
         comp_cfg_path = configs_dir / f"{label}_compensation.yaml"
         write_yaml(comp_cfg_path, comp_bd_cfg)
         comp_step = SbatchStep(
             job_name=f"morris_comp_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=comp_cfg["resources"]["time_hours"], cpus=comp_cfg["resources"]["cores"],
+            time_hours=TIME_HOURS, cpus=comp_cfg["resources"]["cores"],
             partition=partition_cpu, repo_dir=repo_dir,
-            commands=[bd_cmd("compensation", comp_cfg_path)],
+            commands=[bd_cmd("compensation", comp_cfg_path, python_env_cpu)],
         )
         scripts.append((f"03_compensation_{gene}.sh", comp_step.render()))
+        submitted_rows.append(("compensation", label, f"03_compensation_{gene}.sh"))
 
-        trans_bd_cfg = render_gene_cfg(gene, label, {
-            "sum_factor": sum_factor_block,
+        sum_factor_trans_block = {
+            "compute_scran": sum_factor_cis_block["compute_scran"],
+            "adjust_ntc_sum_factor": sum_factor_cis_block["adjust_ntc_sum_factor"],
+            "refit_sumfactor": {"enabled": False},  # vestigial for Morris -- fit_trans uses sum_factor_adj
+        }
+        trans_bd_cfg = render_gene_cfg(gene, label, None, {
+            "sum_factor": sum_factor_trans_block,
+            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
             "trans": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
-                "fit": {"sum_factor_col": "sum_factor_refit", "function_type": trans_cfg["function_type"]},
+                "fit": {"sum_factor_col": "sum_factor_adj", "function_type": trans_cfg["function_type"]},
                 "save": True,
             },
         })
@@ -202,20 +293,23 @@ def main() -> None:
         write_yaml(trans_cfg_path, trans_bd_cfg)
         trans_step = SbatchStep(
             job_name=f"morris_trans_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=trans_cfg["resources"]["time_hours"], cpus=trans_cfg["resources"]["cores"],
-            partition=partition_cpu, repo_dir=repo_dir,
-            commands=[bd_cmd("trans", trans_cfg_path)],
+            time_hours=TIME_HOURS, cpus=trans_cfg["resources"]["cores"],
+            partition=partition_gpu, repo_dir=repo_dir,
+            commands=[bd_cmd("trans", trans_cfg_path, python_env_gpu)],
+            auto_requeue_on_timeout=True,
         )
         scripts.append((f"04_trans_{gene}.sh", trans_step.render()))
+        submitted_rows.append(("trans", label, f"04_trans_{gene}.sh"))
 
-        perm_bd_cfg = render_gene_cfg(gene, label, {
-            "sum_factor": sum_factor_block,
+        perm_bd_cfg = render_gene_cfg(gene, label, None, {
+            "sum_factor": sum_factor_trans_block,
+            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
             "permutation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
-                "covariates": cis_cfg["adjust_ntc_sum_factor"]["covariates"],
+                "covariates": sf_cfg["covariates"],
                 "sum_factor_col": "sum_factor_adj",
-                "fit": {"sum_factor_col": "sum_factor_refit", "function_type": trans_cfg["function_type"]},
+                "fit": {"sum_factor_col": "sum_factor_adj", "function_type": trans_cfg["function_type"]},
             },
         })
         perm_cfg_path = configs_dir / f"{label}_permutation.yaml"
@@ -223,22 +317,23 @@ def main() -> None:
         n_perm = trans_cfg["permutation"]["n_reps"]
         perm_step = SbatchArray(
             job_name=f"morris_perm_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=trans_cfg["permutation"]["resources"]["time_hours"],
-            cpus=trans_cfg["permutation"]["resources"]["cores"],
+            time_hours=TIME_HOURS, cpus=trans_cfg["permutation"]["resources"]["cores"],
             max_index=n_perm - 1, max_concurrent=min(n_perm, 50),
-            partition=partition_cpu, repo_dir=repo_dir,
-            commands=[bd_cmd("permutation_null", perm_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
+            partition=partition_gpu, repo_dir=repo_dir,
+            commands=[bd_cmd("permutation_null", perm_cfg_path, python_env_gpu, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
+            auto_requeue_on_timeout=True,
         )
         scripts.append((f"05_permutation_{gene}.sh", perm_step.render()))
+        submitted_rows.append(("permutation", label, f"05_permutation_{gene}.sh"))
 
-        sim_bd_cfg = render_gene_cfg(gene, label, {
-            "sum_factor": sum_factor_block,
+        sim_bd_cfg = render_gene_cfg(gene, label, None, {
+            "sum_factor": sum_factor_trans_block,
+            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
             "simulation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
-                "load_cis": {"enabled": True},
-                "load_trans": {"enabled": True},
-                "sum_factor_col": "sum_factor_refit",
-                "fit": {"sum_factor_col": "sum_factor_refit", "function_type": trans_cfg["function_type"]},
+                "load_cis": {"enabled": True}, "load_trans": {"enabled": True},
+                "sum_factor_col": "sum_factor_adj",
+                "fit": {"sum_factor_col": "sum_factor_adj", "function_type": trans_cfg["function_type"]},
             },
         })
         sim_cfg_path = configs_dir / f"{label}_simulation.yaml"
@@ -246,111 +341,81 @@ def main() -> None:
         n_sim = trans_cfg["simulation"]["n_reps"]
         sim_step = SbatchArray(
             job_name=f"morris_sim_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=trans_cfg["simulation"]["resources"]["time_hours"],
-            cpus=trans_cfg["simulation"]["resources"]["cores"],
+            time_hours=TIME_HOURS, cpus=trans_cfg["simulation"]["resources"]["cores"],
             max_index=n_sim - 1, max_concurrent=min(n_sim, 50),
-            partition=partition_cpu, repo_dir=repo_dir,
-            commands=[bd_cmd("recapitulation_sim", sim_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
+            partition=partition_gpu, repo_dir=repo_dir,
+            commands=[bd_cmd("recapitulation_sim", sim_cfg_path, python_env_gpu, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
+            auto_requeue_on_timeout=True,
         )
         scripts.append((f"06_recapitulation_{gene}.sh", sim_step.render()))
+        submitted_rows.append(("recapitulation", label, f"06_recapitulation_{gene}.sh"))
 
     # ---------------------------------------------------------------- #
-    # 3. cis-ONLY sweep over genes_all.csv (excluding primary_genes)     #
+    # 3. cis-ONLY sweep (CPU array, one array submission for all genes)  #
     # ---------------------------------------------------------------- #
-    genes_csv_path = THIS_DIR / cis_sweep_cfg["genes_csv"]
-    genes_col = cis_sweep_cfg.get("genes_csv_column", "gene")
-    sweep_genes = pd.read_csv(genes_csv_path)[genes_col].tolist()
-    sweep_genes = [g for g in sweep_genes if g not in set(cfg["primary_genes"])]
-
     sweep_configs_list = configs_dir / "cis_sweep_configs.txt"
-    tasklist_path = configs_dir / "cis_sweep_tasklist.txt"
-    config_paths, task_commands = [], []
+    config_paths = []
     for gene in sweep_genes:
         label = f"{label_prefix}_{gene}"
-        sweep_bd_cfg = render_gene_cfg(gene, label, {
-            "ntc_shared_dir": ntc_shared_dir,
-            "cis": {
-                "adjust_ntc_sum_factor": sum_factor_block["adjust_ntc_sum_factor"],
-                "fit": {"sum_factor_col": "sum_factor_adj" if cis_cfg["adjust_ntc_sum_factor"]["enabled"] else "sum_factor"},
-                "save": True,
-            },
-        })
-        sweep_cfg_path = configs_dir / f"{label}_cis.yaml"
-        write_yaml(sweep_cfg_path, sweep_bd_cfg)
-        config_paths.append(str(sweep_cfg_path))
-        task_commands.append(bd_cmd("cis_high_moi_shared_ntc", sweep_cfg_path))
-
+        cis_cfg_path = render_cis_config(gene, label)
+        config_paths.append(str(cis_cfg_path))
     sweep_configs_list.write_text("\n".join(config_paths) + "\n")
-    tasklist_path.write_text("\n".join(task_commands) + "\n")
 
-    if cis_sweep_cfg["use_gpu_node_queue"]:
-        gnq = cis_sweep_cfg["gpu_node_queue"]
-        n_nodes = gnq["n_nodes"]
-        chunks = [task_commands[i::n_nodes] for i in range(n_nodes)]
-        for i, chunk in enumerate(chunks):
-            chunk_path = configs_dir / f"cis_sweep_tasklist_node{i}.txt"
-            chunk_path.write_text("\n".join(chunk) + "\n")
-            gpu_step = SbatchGpuNodeQueue(
-                job_name=f"morris_cis_sweep_node{i}", account=account, log_dir=str(logs_dir),
-                time_hours=gnq["time_hours"], tasklist_path=str(chunk_path),
-                concurrency=gnq["concurrency_per_node"],
-                gpu_partition=cluster["gpu_partition"],
-                node_queue_script=f"{repo_dir}/publication_runs/common/slurm/run_node_queue.sh",
-                repo_dir=repo_dir, gpu_sbatch_lines=["#SBATCH --gpus=1", "#SBATCH -N 1"],
-            )
-            scripts.append((f"07_cis_sweep_node{i}.sh", gpu_step.render()))
-    else:
-        # Single CPU array, one task per gene, reading its config path by
-        # line number from cis_sweep_configs.txt -- see README.md's
-        # MaxSubmitJobs note (this is ONE array submission regardless of
-        # sweep_genes count).
-        array_commands = [
-            f'CONFIG=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_configs_list}")',
-            bd_cmd("cis_high_moi_shared_ntc", "$CONFIG"),
-        ]
-        sweep_step = SbatchArray(
-            job_name="morris_cis_sweep", account=account, log_dir=str(logs_dir),
-            time_hours=cis_sweep_cfg["resources"]["time_hours"], cpus=cis_sweep_cfg["resources"]["cores"],
-            max_index=len(sweep_genes) - 1, max_concurrent=cis_sweep_cfg["array_max_concurrent"],
-            partition=partition_cpu, repo_dir=repo_dir, commands=array_commands,
-        )
-        scripts.append(("07_cis_sweep.sh", sweep_step.render()))
+    array_commands = [
+        f'CONFIG=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_configs_list}")',
+        bd_cmd("cis_high_moi_shared_ntc", "$CONFIG", python_env_cpu),
+    ]
+    sweep_step = SbatchArray(
+        job_name="morris_cis_sweep", account=account, log_dir=str(logs_dir),
+        time_hours=TIME_HOURS, cpus=cis_sweep_cfg["resources"]["cores"],
+        max_index=len(sweep_genes) - 1, max_concurrent=cis_sweep_cfg["array_max_concurrent"],
+        partition=partition_cpu, repo_dir=repo_dir, commands=array_commands,
+    )
+    scripts.append(("07_cis_sweep.sh", sweep_step.render()))
+    submitted_rows.append(("cis_sweep", f"{len(sweep_genes)} genes", "07_cis_sweep.sh"))
 
     for filename, text in scripts:
         (outdir / filename).write_text(text)
         os.chmod(outdir / filename, 0o755)
 
     # ---------------------------------------------------------------- #
-    # submit_all.sh                                                      #
+    # submit_all.sh -- writes submitted_jobs.tsv for                     #
+    # common/slurm/list_job_status.py (manual review of everything       #
+    # except trans/permutation/recapitulation, which auto-requeue).      #
     # ---------------------------------------------------------------- #
     submit_lines = [
         "#!/bin/bash", "set -euo pipefail", 'cd "$(dirname "$0")"', "",
+        'TSV="submitted_jobs.tsv"',
+        'echo -e "stage\\tlabel\\tjobid\\tscript" > "$TSV"',
+        "",
         'NTC_JOB=$(sbatch --parsable 01_ntc_shared.sh)',
-        'echo "ntc_shared: $NTC_JOB"', "",
+        'echo -e "ntc_shared\\tntc_shared\\t$NTC_JOB\\t01_ntc_shared.sh" >> "$TSV"',
+        "",
     ]
-    for gene in cfg["primary_genes"]:
+    for gene in primary_genes:
         submit_lines += [
             f'CIS_{gene}=$(sbatch --parsable --dependency=afterok:$NTC_JOB 02_cis_{gene}.sh)',
-            f'echo "cis_{gene}: $CIS_{gene}"',
+            f'echo -e "cis\\t{gene}\\t$CIS_{gene}\\t02_cis_{gene}.sh" >> "$TSV"',
             f'COMP_{gene}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 03_compensation_{gene}.sh)',
+            f'echo -e "compensation\\t{gene}\\t$COMP_{gene}\\t03_compensation_{gene}.sh" >> "$TSV"',
             f'TRANS_{gene}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 04_trans_{gene}.sh)',
-            f'sbatch --dependency=afterok:$TRANS_{gene} 05_permutation_{gene}.sh',
-            f'sbatch --dependency=afterok:$TRANS_{gene} 06_recapitulation_{gene}.sh',
+            f'echo -e "trans\\t{gene}\\t$TRANS_{gene}\\t04_trans_{gene}.sh" >> "$TSV"',
+            f'PERM_{gene}=$(sbatch --parsable --dependency=afterok:$TRANS_{gene} 05_permutation_{gene}.sh)',
+            f'echo -e "permutation\\t{gene}\\t$PERM_{gene}\\t05_permutation_{gene}.sh" >> "$TSV"',
+            f'SIM_{gene}=$(sbatch --parsable --dependency=afterok:$TRANS_{gene} 06_recapitulation_{gene}.sh)',
+            f'echo -e "recapitulation\\t{gene}\\t$SIM_{gene}\\t06_recapitulation_{gene}.sh" >> "$TSV"',
             "",
         ]
-    if cis_sweep_cfg["use_gpu_node_queue"]:
-        n_nodes = cis_sweep_cfg["gpu_node_queue"]["n_nodes"]
-        for i in range(n_nodes):
-            submit_lines.append(f'sbatch --dependency=afterok:$NTC_JOB 07_cis_sweep_node{i}.sh')
-    else:
-        submit_lines.append('sbatch --dependency=afterok:$NTC_JOB 07_cis_sweep.sh')
-
+    submit_lines += [
+        'SWEEP_JOB=$(sbatch --parsable --dependency=afterok:$NTC_JOB 07_cis_sweep.sh)',
+        'echo -e "cis_sweep\\tall\\t$SWEEP_JOB\\t07_cis_sweep.sh" >> "$TSV"',
+    ]
     (outdir / "submit_all.sh").write_text("\n".join(submit_lines) + "\n")
     os.chmod(outdir / "submit_all.sh", 0o755)
 
     print(f"[generate_slurm] wrote {len(scripts)} sbatch script(s) + submit_all.sh to {outdir}")
-    print(f"[generate_slurm] cis-only sweep: {len(sweep_genes)} genes "
-          f"({'GPU node queue' if cis_sweep_cfg['use_gpu_node_queue'] else 'CPU array'}).")
+    print(f"[generate_slurm] primary_genes={primary_genes}")
+    print(f"[generate_slurm] cis-only sweep: {len(sweep_genes)} genes (CPU array, single submission)")
 
 
 if __name__ == "__main__":
