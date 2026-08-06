@@ -389,34 +389,38 @@ class bayesDREAM(
 
         The method:
         1. Finds and extracts the cis gene from the primary modality, creating the 'cis' modality.
-        2. Subsets cells to NTC + cis-targeting cells only.
-        3. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
+        2. In high-MOI mode: reclassifies any cell carrying a guide targeting ``cis_gene`` from
+           'ntc'/'other' to ``cis_gene`` (excluded cells are never reclassified), then prunes
+           guide_assignment/guide_meta/guide_targets_dict down to NTC + cis-gene guides only.
+        3. Subsets cells to NTC + cis-targeting cells only.
+        4. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
            already been run, trims matching feature axes in the stored posteriors.
-        4. If fit_ntc() has already been run, extracts the cis gene's overdispersion parameters
+        5. If fit_ntc() has already been run, extracts the cis gene's overdispersion parameters
            from the primary modality posteriors into the 'cis' modality (equivalent to having
            set cis_gene at init time).
-        5. Recomputes guide_code for compact indexing over the retained cells.
-        6. Reinitialises sum_factors on the (now-final) cell set.
+        6. Recomputes guide_code for compact indexing over the retained cells (single-guide mode
+           only — stays -1 in high-MOI mode, matching eager-init behavior).
+        7. Reinitialises sum_factors on the (now-final) cell set.
+
+        Supported in both single-guide and high-MOI mode. In high-MOI mode, ``fit_ntc()`` should
+        typically be run before this call (with cis_gene left unset, ``fit_ntc()`` defaults to
+        using all cells — see its ``use_all_cells`` parameter).
 
         Parameters
         ----------
         cis_gene : str
-            Name of the cis gene (must exist in the primary modality's feature_meta).
+            Name of the cis gene (must exist in the primary modality's feature_meta, and in
+            high-MOI mode, must have at least one guide targeting it per guide_targets_dict).
 
         Raises
         ------
         ValueError
-            If cis_gene is already set, if called in high-MOI mode, if the gene is not
-            found, or if the gene has zero counts across NTC + cis cells.
+            If cis_gene is already set, if the gene is not found, if no guide targets it
+            (high-MOI mode), or if the gene has zero counts across NTC + cis cells.
         """
         if self.cis_gene is not None:
             raise ValueError(
                 f"cis_gene is already set to '{self.cis_gene}'. Cannot call add_cis_gene() again."
-            )
-        if self.is_high_moi:
-            raise ValueError(
-                "add_cis_gene() is not supported in high-MOI mode. "
-                "Provide cis_gene at initialization time."
             )
         if 'cis' in self.modalities:
             raise ValueError("'cis' modality already exists.")
@@ -521,11 +525,40 @@ class bayesDREAM(
         self.cis_gene = cis_gene
 
         # ----------------------------------------------------------------
-        # Step 5: subset cells to NTC + cis
+        # Step 5a (high-MOI only): reclassify cells carrying a cis_gene guide.
+        # At init (with cis_gene deferred), cells were classified only as
+        # 'excluded' / 'ntc' / 'other' (cis-target identity unknown). Now that
+        # cis_gene is known, promote any 'ntc'/'other' cell carrying a cis guide
+        # to target=cis_gene — mirroring the excluded > cis > ntc > other priority
+        # used at init. 'excluded' cells are never reclassified.
+        # ----------------------------------------------------------------
+        if self.is_high_moi:
+            cis_guide_indices = np.array([
+                pos_idx for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows())
+                if cis_gene in self.guide_targets_dict.get(guide_row['guide'], [])
+            ])
+            if len(cis_guide_indices) == 0:
+                raise ValueError(
+                    f"No guide in guide_targets_dict targets '{cis_gene}'. "
+                    f"Cannot commit to this cis gene in high-MOI mode."
+                )
+            has_cis_guide = self.guide_assignment[:, cis_guide_indices].sum(axis=1) > 0
+            new_targets = self.meta['target'].tolist()
+            for i, has_cis in enumerate(has_cis_guide):
+                if has_cis and new_targets[i] != 'excluded':
+                    new_targets[i] = cis_gene
+            self.meta['target'] = new_targets
+
+        # ----------------------------------------------------------------
+        # Step 5b: subset cells to NTC + cis
         # ----------------------------------------------------------------
         valid_cells = set(self.meta[self.meta['target'].isin(['ntc', cis_gene])]['cell'].unique())
         n_before = len(self.meta)
-        self.meta = self.meta[self.meta['cell'].isin(valid_cells)].copy()
+        keep_mask = self.meta['cell'].isin(valid_cells).values
+        if self.is_high_moi:
+            # guide_assignment rows are aligned 1:1 with self.meta rows at this point
+            self.guide_assignment = self.guide_assignment[keep_mask, :]
+        self.meta = self.meta[keep_mask].copy()
         n_after = len(self.meta)
         if n_after < n_before:
             print(f"[INFO] add_cis_gene: cells {n_before} → {n_after} (kept NTC + {cis_gene} only)")
@@ -545,14 +578,48 @@ class bayesDREAM(
                     self.modalities[mod_name] = new_mod
 
         # ----------------------------------------------------------------
+        # Step 5c (high-MOI only): prune guide_assignment/guide_meta/guide_targets_dict
+        # down to NTC + cis-gene guides, and rebuild guide_assignment_tensor.
+        # Mirrors the guide-column pruning done at init when cis_gene is provided eagerly.
+        # ----------------------------------------------------------------
+        if self.is_high_moi:
+            def _is_ntc_target(target_name):
+                ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+                return target_name in ntc_variants
+
+            keep_guide_indices = np.array([
+                pos_idx for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows())
+                if any(_is_ntc_target(t) for t in self.guide_targets_dict.get(guide_row['guide'], []))
+                or cis_gene in self.guide_targets_dict.get(guide_row['guide'], [])
+            ])
+            n_guides_before = self.guide_assignment.shape[1]
+            self.guide_assignment = self.guide_assignment[:, keep_guide_indices]
+            self.guide_meta = self.guide_meta.iloc[keep_guide_indices].copy()
+            self.guide_meta['guide_code'] = range(len(self.guide_meta))
+            kept_guide_names = set(self.guide_meta['guide'].values)
+            self.guide_targets_dict = {
+                guide: targets
+                for guide, targets in self.guide_targets_dict.items()
+                if guide in kept_guide_names
+            }
+            print(f"[INFO] add_cis_gene: subsetted guides {n_guides_before} → {len(keep_guide_indices)} "
+                  f"(keeping NTC + {cis_gene} guides only)")
+
+            self.guide_assignment_tensor = torch.tensor(
+                self.guide_assignment, dtype=torch.float32, device=self.device
+            )
+
+        # ----------------------------------------------------------------
         # Step 6: re-filter zero-count features after cell subsetting
         # ----------------------------------------------------------------
         self._refilter_zero_count_features(ntc_ran)
 
         # ----------------------------------------------------------------
         # Step 7: recompute guide_code for compact indices over retained cells
+        # (single-guide mode only; stays -1 in high-MOI mode, per init behavior)
         # ----------------------------------------------------------------
-        self.meta['guide_code'] = pd.Categorical(self.meta['guide_used']).codes
+        if not self.is_high_moi:
+            self.meta['guide_code'] = pd.Categorical(self.meta['guide_used']).codes
 
         # ----------------------------------------------------------------
         # Step 8: reinitialise sum_factors on the final cell set

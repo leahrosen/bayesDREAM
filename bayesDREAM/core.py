@@ -88,8 +88,11 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             Gene metadata DataFrame with genes as rows. Required to have at least one identifier column.
             Recommended columns: 'gene' (or use index), 'gene_name', 'gene_id'
             If not provided, will create minimal metadata from counts.index
-        cis_gene : str
-            The 'X' gene for cis modeling
+        cis_gene : str, optional
+            The 'X' gene for cis modeling. May be omitted (in both single-guide and
+            high-MOI mode) to defer commitment — call add_cis_gene() later, after
+            fit_ntc(), to specify it. label must be provided explicitly when cis_gene
+            is omitted.
         guide_covariates : list of str
             List of columns used to construct guide_used for non-NTC guides (single-guide mode only).
         guide_covariates_ntc : list of str or None
@@ -177,12 +180,6 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                         type(guide_assignment).__name__ if guide_assignment is not None else None,
                         type(guide_meta).__name__ if guide_meta is not None else None
                     )
-                )
-            if cis_gene is None:
-                raise ValueError(
-                    "cis_gene must be provided at initialization time in high-MOI mode. "
-                    "Deferred cis-gene specification via add_cis_gene() is not supported "
-                    "for high-MOI models."
                 )
             self.is_high_moi = True
 
@@ -422,13 +419,16 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             self.meta['guide_code'] = -1
 
             ntc_count = (np.array(targets) == 'ntc').sum()
-            cis_count = (np.array(targets) == self.cis_gene).sum()
             other_count = (np.array(targets) == 'other').sum()
             excluded_count = (np.array(targets) == 'excluded').sum()
             print(f"[INFO] Cell classification before subsetting:")
             print(f"  NTC cells (NTC guides, no cis): {ntc_count}")
-            print(f"  {self.cis_gene}-targeting cells (any cis guides): {cis_count}")
-            print(f"  Other-only cells (will be removed): {other_count}")
+            if self.cis_gene is not None:
+                cis_count = (np.array(targets) == self.cis_gene).sum()
+                print(f"  {self.cis_gene}-targeting cells (any cis guides): {cis_count}")
+                print(f"  Other-only cells (will be removed): {other_count}")
+            else:
+                print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {other_count}")
             if exclude_targets is not None or exclude_guides is not None:
                 print(f"  Excluded cells (exclude_targets/exclude_guides): {excluded_count}")
 
@@ -448,6 +448,17 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             n_excluded = n_before - len(self.meta)
             if n_excluded > 0:
                 print(f"[INFO] Excluded {n_excluded} cells carrying guides in exclude_guides={exclude_guides}")
+
+        # For high MOI mode, drop 'excluded' cells unconditionally (independent of cis_gene,
+        # since exclusion is determined purely by exclude_targets/exclude_guides). Doing this
+        # here — rather than folding it into the cis_gene-dependent filter below — ensures
+        # excluded cells don't linger into fit_ntc() when cis_gene is deferred.
+        if self.is_high_moi:
+            n_before_excl = len(self.meta)
+            self.meta = self.meta[self.meta["target"] != "excluded"].copy()
+            n_after_excl = len(self.meta)
+            if n_after_excl < n_before_excl:
+                print(f"[INFO] Excluded {n_before_excl - n_after_excl} cells (target='excluded')")
 
         # Subset meta and counts to relevant cells
         if self.cis_gene is not None:
@@ -476,8 +487,10 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             # Update cell names
             self._cell_names = [self._cell_names[i] for i in cell_indices]
 
-        # For high MOI: subset guide_assignment to remove "other"-targeting guide columns
-        if self.is_high_moi:
+        # For high MOI: subset guide_assignment to remove "other"-targeting guide columns.
+        # Only possible once cis_gene is known — if deferred, keep the full guide panel;
+        # add_cis_gene() will prune it once the cis gene is committed.
+        if self.is_high_moi and self.cis_gene is not None:
             # Keep only NTC and cis-gene targeting guides
             # A guide is kept if it has ANY NTC or cis target among its possible targets
             keep_guide_indices = []
@@ -518,6 +531,9 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             }
 
             print(f"[INFO] Subsetted guides from {n_guides_before} to {n_guides_after} (keeping NTC + {self.cis_gene} guides only)")
+        elif self.is_high_moi:
+            print(f"[INFO] No cis_gene at init — keeping all {self.guide_assignment.shape[1]} guide columns. "
+                  "Call add_cis_gene() to prune to NTC + cis-gene guides.")
 
         # Remove genes with zero total counts - works for DataFrame, dense, and sparse
         if isinstance(self.counts, pd.DataFrame):

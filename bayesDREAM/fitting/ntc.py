@@ -650,7 +650,7 @@ class NTCFitter:
         distribution: str = None,
         denominator: np.ndarray = None,
         modality_name: str = None,
-        use_all_cells: bool = False,
+        use_all_cells: bool = None,
         force_iaf: bool = False,
         **kwargs
     ):
@@ -700,9 +700,12 @@ class NTCFitter:
             from the modality.
         modality_name : str, optional
             Modality to fit.  If ``None`` (default), uses the primary modality.
-        use_all_cells : bool, default False
-            If ``False`` (default): fit using NTC cells only (standard approach).
+        use_all_cells : bool, optional
+            If ``False``: fit using NTC cells only (standard approach).
             If ``True``: fit using all cells, regardless of target.
+            If ``None`` (default): resolves to ``True`` when in high-MOI mode with
+            ``cis_gene`` not yet set (deferred — see ``add_cis_gene()``), since cell
+            classification into NTC/cis/other isn't possible yet; otherwise ``False``.
 
             **When to use** ``use_all_cells=True``:
 
@@ -731,6 +734,19 @@ class NTCFitter:
         Using ``use_all_cells=True`` when technical effects correlate with cis
         expression can lead to over-correction and spurious trans-effect calls.
         """
+
+        # ---------------------------
+        # Resolve use_all_cells default
+        # ---------------------------
+        if use_all_cells is None:
+            if self.model.is_high_moi and self.model.cis_gene is None:
+                use_all_cells = True
+                print(
+                    "[INFO] cis_gene not yet set (deferred, high-MOI mode): "
+                    "defaulting use_all_cells=True for fit_ntc()."
+                )
+            else:
+                use_all_cells = False
 
         # ---------------------------
         # Resolve modality/distribution
