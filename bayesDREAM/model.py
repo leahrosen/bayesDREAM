@@ -97,7 +97,8 @@ class bayesDREAM(
         Parameters
         ----------
         meta : pd.DataFrame
-            Cell-level metadata with columns: cell, guide, target, sum_factor, etc.
+            Cell-level metadata with columns: cell, guide, sum_factor, etc. A 'target'
+            column is required unless guide_target is supplied instead (see below).
         counts : pd.DataFrame, np.ndarray, or scipy.sparse matrix, optional
             Count matrix for the primary modality (features × cells). This will be used
             for trans modeling and must represent negbinom count data.
@@ -142,6 +143,15 @@ class bayesDREAM(
             1. Extracted as a separate 'cis' modality (1 feature)
             2. Removed from the primary modality (which becomes trans-only)
             3. Used for cis effect modeling in fit_cis()
+
+            May be omitted — in single-guide mode, high-MOI mode, and single-guide
+            mode with a ``guide_target`` mapping alike — to defer commitment. When
+            omitted: no 'cis' modality is created, no cells are subset by target,
+            and ``label`` must be provided explicitly (it normally defaults to the
+            gene name). Call ``fit_ntc()`` (once, shared across candidate cis genes)
+            and then ``add_cis_gene(gene)`` later to commit to a specific gene,
+            extract its 'cis' modality, and subset to NTC + that gene's cells before
+            calling ``fit_cis()``. See ``add_cis_gene()`` for the full behavior.
         cis_feature : str, optional
             Alternative to cis_gene for non-gene modalities. Specifies which feature
             to extract as the 'cis' modality.
@@ -153,6 +163,19 @@ class bayesDREAM(
             Guide metadata for high MOI mode. Required columns: 'guide', 'target'.
             Must be provided together with guide_assignment. Index should match
             guide order in guide_assignment matrix.
+        guide_target : pd.DataFrame, optional
+            Many-to-many guide-target mapping: rows of {'guide', 'target'}, with
+            multiple rows allowed per guide (e.g. a guide with an ambiguous or
+            off-target effect on more than one gene).
+
+            High MOI mode: overrides guide_meta['target'] if both are given.
+
+            Single-guide mode: lets meta omit the 'target' column entirely — each
+            cell's target is looked up from its 'guide' column against this mapping,
+            resolving to cis_gene if cis_gene is among the guide's plausible targets,
+            else 'ntc' if any plausible target is an NTC variant, else 'other'
+            (dropped). Because resolution depends on cis_gene, the same guide_target
+            mapping can be reused across separate cis-gene fits without editing meta.
         guide_covariates : list, optional
             Covariates for guide grouping (e.g., ['cell_line', 'batch'])
         guide_covariates_ntc : list, optional
@@ -162,7 +185,9 @@ class bayesDREAM(
         output_dir : str, default="./model_out"
             Output directory for saving results
         label : str, optional
-            Run label for organizing outputs
+            Run label for organizing outputs. Defaults to the gene name when
+            cis_gene is given. Required (raises ValueError) when cis_gene is
+            omitted, since there is then no gene name to default to.
         device : str, optional
             'cpu' or 'cuda'. If None, auto-detects.
         random_seed : int, default=2402
@@ -217,12 +242,25 @@ class bayesDREAM(
         ...     cis_feature='feature_123'
         ... )
 
+        Deferred cis gene (fit_ntc() once, shared across candidate cis genes):
+        >>> model = bayesDREAM(
+        ...     meta=cell_metadata,
+        ...     counts=gene_counts,
+        ...     label='run1',  # required: no cis_gene to default to
+        ... )
+        >>> model.set_technical_groups(['cell_line'])
+        >>> model.fit_ntc(sum_factor_col='sum_factor')
+        >>> model.add_cis_gene('GFI1B')  # commits to a cis gene; subsets to NTC + GFI1B
+        >>> model.fit_cis(sum_factor_col='sum_factor')
+
         Notes
         -----
         - The 'cis' modality is ONLY extracted during initialization from the primary modality
         - When you call add_*_modality() methods later, NO cis extraction occurs
         - The primary modality MUST be negbinom (count data) for cis/trans modeling
         - Additional modalities (transcripts, splicing, etc.) are added via add_*_modality() methods
+        - cis_gene may be deferred (omitted here) in single-guide mode, high-MOI mode,
+          and single-guide mode with a guide_target mapping — see add_cis_gene()
         """
         # Initialize modalities dict (always start empty, build from counts)
         self.modalities = {}
@@ -389,9 +427,10 @@ class bayesDREAM(
 
         The method:
         1. Finds and extracts the cis gene from the primary modality, creating the 'cis' modality.
-        2. In high-MOI mode: reclassifies any cell carrying a guide targeting ``cis_gene`` from
-           'ntc'/'other' to ``cis_gene`` (excluded cells are never reclassified), then prunes
-           guide_assignment/guide_meta/guide_targets_dict down to NTC + cis-gene guides only.
+        2. In high-MOI mode, or single-guide mode with a ``guide_target`` mapping supplied at
+           init: reclassifies any cell whose guide(s) target ``cis_gene`` from 'ntc'/'other' to
+           ``cis_gene`` (excluded cells are never reclassified). In high-MOI mode this also
+           prunes guide_assignment/guide_meta/guide_targets_dict down to NTC + cis-gene guides.
         3. Subsets cells to NTC + cis-targeting cells only.
         4. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
            already been run, trims matching feature axes in the stored posteriors.
@@ -404,19 +443,22 @@ class bayesDREAM(
 
         Supported in both single-guide and high-MOI mode. In high-MOI mode, ``fit_ntc()`` should
         typically be run before this call (with cis_gene left unset, ``fit_ntc()`` defaults to
-        using all cells — see its ``use_all_cells`` parameter).
+        using all cells — see its ``use_all_cells`` parameter). Single-guide mode with a
+        ``guide_target`` mapping behaves the same way for deferred-cis-gene reclassification.
 
         Parameters
         ----------
         cis_gene : str
-            Name of the cis gene (must exist in the primary modality's feature_meta, and in
-            high-MOI mode, must have at least one guide targeting it per guide_targets_dict).
+            Name of the cis gene (must exist in the primary modality's feature_meta). If the
+            model was built with guide_target (high-MOI, or single-guide with a guide_target
+            mapping), at least one guide must target it per guide_targets_dict.
 
         Raises
         ------
         ValueError
             If cis_gene is already set, if the gene is not found, if no guide targets it
-            (high-MOI mode), or if the gene has zero counts across NTC + cis cells.
+            (when a guide_target mapping is in use), or if the gene has zero counts across
+            NTC + cis cells.
         """
         if self.cis_gene is not None:
             raise ValueError(
@@ -546,6 +588,25 @@ class bayesDREAM(
             new_targets = self.meta['target'].tolist()
             for i, has_cis in enumerate(has_cis_guide):
                 if has_cis and new_targets[i] != 'excluded':
+                    new_targets[i] = cis_gene
+            self.meta['target'] = new_targets
+        elif self.guide_targets_dict is not None:
+            # Single-guide mode with a guide_target mapping: mirrors step 5a above.
+            # At init (with cis_gene deferred), each cell's guide could not resolve
+            # to cis_gene yet (unknown), so it landed in 'ntc'/'other'. Now that
+            # cis_gene is known, reclassify any cell whose guide's plausible targets
+            # include cis_gene.
+            if not any(cis_gene in targets for targets in self.guide_targets_dict.values()):
+                raise ValueError(
+                    f"No guide in guide_target maps to '{cis_gene}'. "
+                    f"Cannot commit to this cis gene."
+                )
+            has_cis_guide = self.meta['guide'].map(
+                lambda g: cis_gene in self.guide_targets_dict.get(g, [])
+            ).values
+            new_targets = self.meta['target'].tolist()
+            for i, has_cis in enumerate(has_cis_guide):
+                if has_cis:
                     new_targets[i] = cis_gene
             self.meta['target'] = new_targets
 

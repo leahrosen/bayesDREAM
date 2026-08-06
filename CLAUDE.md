@@ -230,6 +230,24 @@ for gene in ['GFI1B', 'MYB', 'TET2']:
 - `add_cis_gene(gene)` additionally: reclassifies any cell carrying a guide targeting `gene` from `'ntc'`/`'other'` to `gene` (excluded cells are never reclassified — same `excluded > cis > ntc > other` priority used in eager high-MOI init), then prunes `guide_assignment`/`guide_meta`/`guide_targets_dict` down to NTC + cis-gene guides only and rebuilds `guide_assignment_tensor`.
 - Known pre-existing issue (not introduced by deferred-cis-gene support): `fit_cis()` in high-MOI mode currently raises `RuntimeError: expected scalar type Float but found Double` from a dtype mismatch between `guide_assignment_tensor` and `log2_x_eff_g` in `_model_x` — reproduces identically in eager high-MOI mode (`cis_gene` set at init), so it's an existing bug in `fitting/cis.py`, not specific to the deferred workflow.
 
+### Single-Guide Mode with `guide_target` (Ambiguous/Multi-Target Guides)
+
+Single-guide mode normally requires a `target` column in `meta`, pre-computed one-to-one per cell. When a guide's true target is ambiguous (e.g. predicted off-target effects on more than one gene), pass a `guide_target` DataFrame instead — same schema as the high-MOI many-to-many mapping (`{'guide', 'target'}` rows, multiple rows allowed per guide):
+
+```python
+guide_target = pd.DataFrame({
+    'guide':  ['guide_A', 'guide_C', 'guide_C', 'ntc_1'],
+    'target': ['GFI1B',   'GFI1B',   'MYB',     'ntc'],  # guide_C is ambiguous: GFI1B or MYB
+})
+model = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_target=guide_target)
+```
+
+- `meta` does NOT need a `'target'` column when `guide_target` is supplied — each cell's target is derived from its `'guide'` column: resolves to `cis_gene` if `cis_gene` is among the guide's plausible targets, else `'ntc'` if any plausible target is an NTC variant, else `'other'` (dropped).
+- Because resolution depends on `cis_gene`, the same ambiguous guide resolves differently across separate fits/models for different cis genes — no need to hand-edit `meta['target']` per gene.
+- Works with the deferred-cis-gene workflow too: omit `cis_gene` at init (all cells kept, target is `'ntc'`/`'other'` only), then `add_cis_gene(gene)` reclassifies any cell whose guide targets `gene` — mirroring the high-MOI `add_cis_gene()` reclassification step, but without the guide-panel pruning (there's no `guide_assignment` matrix to prune in single-guide mode).
+- `exclude_targets` also works in this mode (previously high-MOI only): a guide targeting any excluded gene drops all its cells, even if it also targets `cis_gene`.
+- Implementation: `core.py` builds `self.guide_targets_dict` from `guide_target` in the single-guide branch (mirrors the high-MOI dict, but is never `None`-checked the same way — high-MOI always populates it or raises, single-guide leaves it `None` when no `guide_target` is given); `add_cis_gene()` in `model.py` has an `elif self.guide_targets_dict is not None:` branch parallel to its `if self.is_high_moi:` branch for the reclassification step.
+
 ### Testing Changes
 
 The `toydata/` directory contains small test datasets. Use these for quick validation before running on full data:

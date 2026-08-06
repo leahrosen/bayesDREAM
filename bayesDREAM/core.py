@@ -79,7 +79,8 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         Parameters
         ----------
         meta : pd.DataFrame
-            Cell metadata DataFrame. For single-guide mode: includes columns cell, guide, target, sum_factor, etc.
+            Cell metadata DataFrame. For single-guide mode: includes columns cell, guide, sum_factor, etc.
+            A 'target' column is required unless guide_target is supplied instead (see below).
             For high MOI mode: includes columns cell, sum_factor, etc. (NO guide or target columns)
             May optionally include technical group identifiers like 'cell_line', 'batch', 'lane', etc.
         counts : pd.DataFrame
@@ -118,16 +119,28 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             Index must match the column order of guide_assignment matrix.
             If provided, must also provide guide_assignment.
         guide_target : pd.DataFrame, optional
-            High MOI only: Many-to-many guide-target relationship DataFrame.
-            Must have columns 'guide' and 'target'. Multiple rows can have the same guide
-            (one guide can target multiple genes). If provided, overrides guide_meta['target'].
-            This allows flexible specification of guides with multiple possible targets.
-            NTC guides can be specified with 'ntc', 'NTC', 'non-targeting', or 'non-targeting-control'.
+            Many-to-many guide-target relationship DataFrame. Must have columns 'guide'
+            and 'target'. Multiple rows can have the same guide (one guide can target
+            multiple genes, e.g. a guide with an ambiguous or off-target effect). NTC
+            guides can be specified with 'ntc', 'NTC', 'non-targeting', or
+            'non-targeting-control'.
+
+            High MOI mode: if provided, overrides guide_meta['target'].
+
+            Single-guide mode: if provided, meta does NOT need a 'target' column —
+            each cell's target is derived from its 'guide' column by looking up that
+            guide's plausible targets here. A guide is resolved to the cis_gene
+            currently being fit if cis_gene is among its plausible targets, else to
+            'ntc' if any plausible target is an NTC variant, else to 'other' (dropped).
+            This means the same guide can resolve to different targets across separate
+            models/fits of different cis genes, or after add_cis_gene() commits to one.
         exclude_targets : list[str], optional
-            High MOI only: List of target gene names to exclude. Cells with ANY guide targeting
-            a gene in this list will be removed from analysis, regardless of other guides present.
+            List of target gene names to exclude. Cells with ANY guide targeting a gene
+            in this list will be removed from analysis, regardless of other guides present.
             Example: exclude_targets=['MYB'] will remove cells with guides targeting MYB,
             even if they also have NTC or cis-targeting guides.
+            High MOI mode: always available. Single-guide mode: only takes effect when
+            guide_target is also supplied (otherwise pre-filter meta yourself).
         exclude_guides : list[str], optional
             List of guide names to exclude. Cells carrying any guide in this list will be removed
             from analysis before fitting. Works in both single-guide and high MOI modes.
@@ -283,6 +296,26 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 
         else:
             self.is_high_moi = False
+            self.guide_targets_dict = None
+
+            # Single-guide mode may still resolve target(s) from a guide_target
+            # DataFrame instead of a pre-computed meta['target'] column — this
+            # allows a guide with multiple plausible targets (e.g. ambiguous
+            # off-target effects) to be resolved against whichever cis_gene is
+            # currently being fit. Same schema as high-MOI's guide_target: rows
+            # of {'guide', 'target'}, with multiple rows allowed per guide.
+            if guide_target is not None:
+                required_gt_cols = {'guide', 'target'}
+                missing_gt_cols = required_gt_cols - set(guide_target.columns)
+                if missing_gt_cols:
+                    raise ValueError(
+                        f"guide_target missing required columns: {missing_gt_cols}. "
+                        f"Available columns: {list(guide_target.columns)}"
+                    )
+                guide_targets_dict = {}
+                for _, row in guide_target.iterrows():
+                    guide_targets_dict.setdefault(row['guide'], []).append(row['target'])
+                self.guide_targets_dict = guide_targets_dict
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -311,11 +344,54 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 )
 
         else:
-            # Single-guide mode: require 'guide' and 'target' in meta
-            required_cols = {"target", "cell", sum_factor_col, "guide"} | set(guide_covariates) | set(guide_covariates_ntc)
+            # Single-guide mode: require 'guide' in meta. 'target' is required only
+            # when no guide_target mapping was supplied — otherwise it's derived
+            # per-cell from guide_targets_dict below.
+            required_cols = {"cell", sum_factor_col, "guide"} | set(guide_covariates) | set(guide_covariates_ntc)
+            if self.guide_targets_dict is None:
+                required_cols.add("target")
             missing_cols = required_cols - set(self.meta.columns)
             if missing_cols:
                 raise ValueError(f"[Single-guide] Missing required columns in meta: {missing_cols}")
+
+            if self.guide_targets_dict is not None:
+                # Derive 'target' per cell from its guide's list of plausible targets.
+                # Priority mirrors high-MOI classification: cis_gene > NTC > 'other'.
+                # A guide with multiple plausible targets resolves differently
+                # depending on which cis_gene is currently being fit.
+                def _is_ntc_target(target_name):
+                    """Check if target name is NTC (flexible matching)."""
+                    ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+                    return target_name in ntc_variants
+
+                def _classify_guide(guide_name):
+                    targets = self.guide_targets_dict.get(guide_name, [])
+                    if self.cis_gene is not None and self.cis_gene in targets:
+                        return self.cis_gene
+                    if any(_is_ntc_target(t) for t in targets):
+                        return 'ntc'
+                    return 'other'
+
+                self.meta['target'] = self.meta['guide'].map(_classify_guide)
+
+                if exclude_targets is not None:
+                    def _has_excluded_target(guide_name):
+                        targets = self.guide_targets_dict.get(guide_name, [])
+                        return any(t in exclude_targets for t in targets)
+                    n_before = len(self.meta)
+                    self.meta = self.meta[~self.meta['guide'].map(_has_excluded_target)].copy()
+                    n_excluded = n_before - len(self.meta)
+                    if n_excluded > 0:
+                        print(f"[INFO] Excluded {n_excluded} cells (guide targets a gene in exclude_targets={exclude_targets})")
+
+                target_counts = self.meta['target'].value_counts()
+                print(f"[INFO] Single-guide target classification from guide_target mapping:")
+                print(f"  NTC cells: {target_counts.get('ntc', 0)}")
+                if self.cis_gene is not None:
+                    print(f"  {self.cis_gene}-targeting cells: {target_counts.get(self.cis_gene, 0)}")
+                    print(f"  Other-only cells (will be removed): {target_counts.get('other', 0)}")
+                else:
+                    print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {target_counts.get('other', 0)}")
 
             if require_ntc and "ntc" not in self.meta["target"].values:
                 raise ValueError(
