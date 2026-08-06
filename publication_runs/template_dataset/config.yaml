@@ -1,7 +1,8 @@
 # Template dataset config -- copy this directory to publication_runs/<new_name>/
 # and fill everything in. See publication_runs/README.md for the general
 # conventions and domingo/ (low-MOI, shared ntc) or morris/ (high-MOI,
-# shared ntc via the apply_shared_ntc_high_moi.py workaround) for worked
+# shared ntc -- same add_cis_gene()-based deferred-cis_gene mechanism as
+# Domingo, bayesDREAM's high-MOI mode supports it natively) for worked
 # examples to crib from.
 
 dataset: template_dataset

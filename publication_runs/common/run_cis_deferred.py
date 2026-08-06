@@ -1,9 +1,22 @@
 """
-Low-MOI "deferred cis gene" fit_cis stage: reuse one shared fit_ntc() run
-across many cis genes via add_cis_gene() (see CLAUDE.md's "Deferred
-Cis-Gene Workflow"). Not usable for high-MOI datasets -- add_cis_gene()
-itself raises ValueError there; see apply_shared_ntc_high_moi.py for the
-high-MOI equivalent.
+"Deferred cis gene" fit_cis stage: reuse one shared fit_ntc() run across
+many cis genes via add_cis_gene() (see CLAUDE.md's "Deferred Cis-Gene
+Workflow"). Works for BOTH single-guide and high-MOI datasets --
+add_cis_gene() supports high-MOI mode as of bayesDREAM's "Support deferred
+cis_gene in high-MOI mode" change (previously high-MOI required cis_gene at
+construction; this script used to have a separate high-MOI-only sibling
+that worked around that with a manual alpha-extraction hack -- no longer
+needed, deleted).
+
+For high-MOI, pass model.exclude_guides (and model.min_count, etc.) per gene
+in the usual way -- since exclude_guides is a CONSTRUCTOR-time filter and
+this script builds a FRESH model per gene (not a deepcopy of one shared
+in-memory object), a per-gene exclude_guides list works correctly: cells
+dropped by exclude_guides at this gene's own construction are simply not in
+THIS process's model at all, independent of what any other gene's run
+excluded. See morris/generate_slurm.py for how a dataset-specific,
+per-cis-gene exclude_guides list gets computed and baked into each gene's
+own rendered config.
 
 Why this needs its own script rather than `python -m bayesDREAM fit-cis
 --config ...`: the plain CLI's _build_model always passes `model.cis_gene`
@@ -13,7 +26,15 @@ cis_gene deferred and then call add_cis_gene() through the existing CLI
 subcommands. This script does exactly that, as a separate process per gene,
 loading the ALREADY-FITTED shared ntc posteriors from disk (fit_ntc() itself
 only ever needs to run once, in a separate job -- see each dataset's
-ntc_shared stage).
+ntc_shared stage, common/run_ntc.py).
+
+KNOWN PRE-EXISTING ISSUE for high-MOI (not introduced by, or specific to,
+the deferred workflow -- see CLAUDE.md / docs/HIGH_MOI_GUIDE.md): fit_cis()
+in high-MOI mode currently raises `RuntimeError: expected scalar type Float
+but found Double` from a dtype mismatch in `_model_x`. Reproduces
+identically with cis_gene set eagerly at construction, so it's a
+bayesDREAM/fitting/cis.py bug, not something wrong with this script -- if
+you hit it, that's this, not a config mistake.
 
 Usage
 -----
@@ -28,6 +49,7 @@ Config must OMIT model.cis_gene (deferred), and must have a top-level
       output_dir: /path/to/output
       label: domingo_20260731_GFI1B
       guide_covariates: [cell_line]
+      exclude_guides: [...]    # high-MOI only, per-gene -- see module docstring
 
     cis_gene: GFI1B
     ntc_shared_dir: /path/to/output/domingo_20260731_ntc_shared
@@ -79,12 +101,6 @@ def run_cis_deferred(cfg: dict) -> None:
         raise ValueError("run_cis_deferred: config needs top-level 'cis_gene' and 'ntc_shared_dir' keys.")
 
     model = build_model_from_config(cfg)
-    if model.is_high_moi:
-        raise ValueError(
-            "run_cis_deferred: model is high-MOI -- add_cis_gene() is not supported "
-            "for high-MOI models (cis_gene must be set at init). Use "
-            "apply_shared_ntc_high_moi.py instead."
-        )
 
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     if ntc_cfg.get("set_technical_groups"):
@@ -106,7 +122,7 @@ def run_cis_deferred(cfg: dict) -> None:
     save_provenance_json(
         os.path.join(output_dir, "provenance_cis.json"),
         extra={"stage": "cis_deferred", "label": model_cfg.get("label"), "cis_gene": cis_gene,
-               "ntc_shared_dir": ntc_shared_dir},
+               "ntc_shared_dir": ntc_shared_dir, "is_high_moi": model.is_high_moi},
     )
     print(f"[run_cis_deferred] {cis_gene}: fit_cis complete, ntc reused from {ntc_shared_dir}")
 

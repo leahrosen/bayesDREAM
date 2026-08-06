@@ -146,7 +146,7 @@ def main() -> None:
         job_name="domingo_ntc_shared", account=account, log_dir=str(logs_dir),
         time_hours=TIME_HOURS, cpus=ntc_shared_cfg["resources"]["cores"],
         partition=partition_cpu, repo_dir=repo_dir,
-        commands=[bd_cmd("fit-ntc", ntc_cfg_path)],
+        commands=[bd_cmd("ntc", ntc_cfg_path)],
     )
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
     submitted_rows.append(("ntc_shared", label_ntc, "01_ntc_shared.sh"))
@@ -205,7 +205,7 @@ def main() -> None:
         trans_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
             "sum_factor": sum_factor_block,
-            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
+            "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "trans": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -231,7 +231,7 @@ def main() -> None:
         perm_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
             "sum_factor": sum_factor_block,
-            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
+            "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "permutation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -260,7 +260,7 @@ def main() -> None:
         sim_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
             "sum_factor": sum_factor_block,
-            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
+            "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "simulation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -286,9 +286,12 @@ def main() -> None:
         submitted_rows.append(("recapitulation", label, f"06_recapitulation_{gene}.sh"))
 
         # -- 7. extra modalities (one job per modality, after cis) --
+        # data_dir is ONE shared directory for every gene (not per-gene) --
+        # per-gene cell subsetting happens inside load_modalities.py by
+        # aligning against that gene's own model.meta -- see its docstring.
         for spec in modalities_cfg:
-            mod_name = spec["name"]
-            mod_data_dir = f"{modalities_dataset_cfg['data_dir']}/{gene}"
+            mod_name = spec["stype"]
+            mod_data_dir = modalities_dataset_cfg["data_dir"]
             mod_cfg = render_bayesdream_config(base_cfg, {
                 "model": {"label": label, "cis_gene": gene},
                 "cis": {"load_cis": {"enabled": True}},
@@ -349,7 +352,7 @@ def main() -> None:
             f'echo -e "recapitulation\\t{gene}\\t$SIM_{gene}\\t06_recapitulation_{gene}.sh" >> "$TSV"',
         ]
         for spec in modalities_cfg:
-            mod_name = spec["name"]
+            mod_name = spec["stype"]
             submit_lines += [
                 f'MOD_{gene}_{mod_name}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 07_modality_{gene}_{mod_name}.sh)',
                 f'echo -e "modality_{mod_name}\\t{gene}\\t$MOD_{gene}_{mod_name}\\t07_modality_{gene}_{mod_name}.sh" >> "$TSV"',

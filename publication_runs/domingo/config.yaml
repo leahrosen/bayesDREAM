@@ -66,7 +66,8 @@ trans:
   resources: {cores: 16}
   function_type: additive_hill
   fit: {tolerance: 0}
-  exclude_low_ntc_genes_threshold: -4.0   # log2(mu_ntc) < this -> excluded, all datasets
+  # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
+  exclude_trans_genes: {min_log2_mu_ntc: -4.0}
 
   permutation:
     n_reps: 20
@@ -76,11 +77,15 @@ trans:
     n_reps: 10
     resources: {cores: 8}
 
-# Further modalities (splicing/velocity/donor/acceptor efficiency), fit per
+# Further modalities (splicing/velocity/donor-acceptor choice), fit per
 # cis gene after that gene's own cis fit. See config_modalities.yaml.
+# data_dir is the shared loader_inputs/ directory (contains one subdirectory
+# per stype: sj/, exon_skip/, ..., donor_choice/) -- the SAME directory for
+# every gene, not a per-gene path; load_modalities.py aligns cells per gene
+# internally (see its module docstring).
 modalities:
   config: config_modalities.yaml
-  data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/splicing   # TODO confirm
+  data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/20260328_splicing/loader_inputs
   resources: {cores: 8}
   trans:
     permutation: {n_reps: 20}

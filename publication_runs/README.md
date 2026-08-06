@@ -23,12 +23,10 @@ publication_runs/
 │   ├── git_provenance.py            # commit/branch/dirty capture + optional stable tag
 │   ├── profile_memory.py            # real peak-RSS measurement -> cores needed (see "Memory")
 │   ├── compute_scran_sum_factor.py  # rpy2 scran sum factors, per-cell-subset (Morris only)
-│   ├── exclude_low_ntc_genes.py     # log2(mu_ntc)<threshold filter, applies to every dataset's trans stage
-│   ├── run_cis_deferred.py          # low-MOI shared-ntc cis stage (add_cis_gene)
-│   ├── run_cis_high_moi_shared_ntc.py / build_ntc_shared_high_moi.py / apply_shared_ntc_high_moi.py
-│   │                                 # high-MOI shared-ntc equivalent — see morris/README.md
+│   ├── run_ntc.py                   # standalone shared/deferred fit_ntc stage (extended model builder)
+│   ├── run_cis_deferred.py          # shared-ntc cis stage (add_cis_gene) -- both low-MOI and high-MOI
 │   ├── run_compensation.py          # standalone: model.check_systematic_shift() (always raw sum_factor)
-│   ├── run_trans.py                 # standalone: adjust/refit sum factor -> exclude_low_ntc_genes -> fit_trans
+│   ├── run_trans.py                 # standalone: adjust/refit sum factor -> exclude_trans_genes -> fit_trans
 │   ├── run_permutation_null.py      # standalone: permute_from_ntc + permute_x_true, then fit_trans
 │   ├── run_recapitulation_sim.py    # standalone: simulate_from_trans_summary + refit, compare
 │   └── slurm/
@@ -61,7 +59,7 @@ one `ntc` fit across 5+hundreds of cis genes).
    superset of) the schema `bayesDREAM/cli.py` expects (`data:`/`model:`/
    `ntc:`/`cis:`/`trans:`/`report:` keys, as in
    `examples/gfi1b_cli_config.yaml`, plus `sum_factor:`/
-   `exclude_low_ntc_genes:`/`compensation:`/`permutation:`/`simulation:`
+   `exclude_trans_genes:`/`compensation:`/`permutation:`/`simulation:`
    blocks the `common/run_*.py` scripts read). These are *generated* by
    `generate_slurm.py` from `config.yaml` (one per gene per stage, written
    to `<outdir>/configs/`) rather than hand-written, so a dataset's
@@ -84,12 +82,15 @@ exception: `check_systematic_shift()` always uses the raw `sum_factor`
 column, by design (both datasets' reference pipelines call it with no
 override).
 
-**exclude_low_ntc_genes.** Per project convention, genes with
-`log2(mu_ntc) < -4` are excluded from trans fitting in every dataset —
-wired into `run_trans.py`/`run_permutation_null.py`/`run_recapitulation_sim.py`
-via `common/exclude_low_ntc_genes.py` (there's no `fit_trans()` kwarg for
-this; it reuses bayesDREAM's own internal feature-subsetting machinery, see
-that module's docstring).
+**exclude_trans_genes.** Per project convention, genes with
+`log2(mu_ntc) < -4` are excluded from trans fitting in every dataset — wired
+into `run_trans.py`/`run_permutation_null.py`/`run_recapitulation_sim.py` via
+`model.exclude_trans_genes(min_log2_mu_ntc=...)`, bayesDREAM's own public
+method for this (also supports excluding by explicit gene name or a
+`feature_meta` query — see `bayesDREAM/model.py`'s docstring). An earlier
+version of this pipeline had its own `common/exclude_low_ntc_genes.py`
+reimplementing the same trim/subset logic by hand, from before bayesDREAM
+had a public method for it — deleted now that the library has one.
 
 **Git provenance.** Every generated `sbatch` script sources
 `common/git_provenance.py` at the top of its job (prints commit/branch/dirty

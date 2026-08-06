@@ -16,9 +16,9 @@ pipeline, plus a fit_cis-ONLY sweep over every OTHER gene with padj<0.05 in
    Run once, manually, NOT part of the SLURM pipeline (like Domingo's R
    preprocessing).
 2. Fill in `config.yaml`'s `paths:` (repo/env paths, `raw_data_dir`,
-   `stats_csv`), `ntc_shared.placeholder_cis_gene` (any real gene NOT in the
-   padj<0.05 cis-gene list — see below), and `exclude_guides` is no longer a
-   flat list you fill in (see "SNP exclusion" below).
+   `stats_csv`) and `global_exclude_guides` if any (distinct from the
+   per-cis-gene SNP exclusion table, which is computed automatically -- see
+   below).
 3. Confirm `guide_covariates`/`sum_factor.batch_col`/`sum_factor.covariates`
    (defaulted to `[lane]` everywhere — the reference scripts were
    inconsistent between `lane` and `experiment` on the `set_technical_groups`
@@ -27,44 +27,29 @@ pipeline, plus a fit_cis-ONLY sweep over every OTHER gene with padj<0.05 in
 4. Run `python generate_slurm.py`, inspect `slurm/`, then on Dardel:
    `bash slurm/submit_all.sh`.
 
-## Read this before running: the high-MOI shared-fit_ntc workaround
+## Shared fit_ntc across many cis genes (high-MOI)
 
-The low-MOI "run fit_ntc once, defer cis_gene" pattern
-(`add_cis_gene()`, see CLAUDE.md and `domingo/`) is **explicitly blocked**
-for high-MOI data:
+This now uses bayesDREAM's native deferred-`cis_gene` support for high-MOI
+models -- `cis_gene` can be omitted at construction and committed to later
+via `add_cis_gene()`, exactly like the low-MOI workflow Domingo uses (see
+CLAUDE.md's "Deferred Cis-Gene Workflow" and `common/run_cis_deferred.py`,
+which now serves BOTH datasets). This used to require a userland workaround
+in this pipeline (a placeholder cis gene + manual alpha extraction via
+`torch.load`/`set_alpha_x`) because `add_cis_gene()` originally raised
+`ValueError` for high-MOI; that workaround (`common/
+apply_shared_ntc_high_moi.py`/`build_ntc_shared_high_moi.py`/
+`run_cis_high_moi_shared_ntc.py`) is deleted now that the library supports
+this directly.
 
-```
-bayesDREAM/core.py:181-186
-    "cis_gene must be provided at initialization time in high-MOI mode.
-    Deferred cis-gene specification via add_cis_gene() is not supported
-    for high-MOI models."
-```
-
-Since running `fit_ntc()` separately for 5 + ~hundreds of genes is exactly
-what this dataset needs to avoid, `common/apply_shared_ntc_high_moi.py`
-reproduces what `add_cis_gene()` does for low-MOI, using only the public
-save/load API (no bayesDREAM source was modified -- see that module's
-docstring for the full mechanism and why it doesn't need core-code
-sign-off). In short:
-
-1. `common/build_ntc_shared_high_moi.py` builds ONE model over the (near-)
-   full gene panel, with `cis_gene` set to a placeholder gene not otherwise
-   analysed (`config.yaml`'s `ntc_shared.placeholder_cis_gene`), runs
-   `fit_ntc()` once, saves it.
-2. For every other gene, `common/run_cis_high_moi_shared_ntc.py` builds a
-   normal per-gene high-MOI model (`cis_gene=<that gene>`, required at
-   construction) and calls `apply_shared_ntc()` on it *before* `fit_cis()`
-   to seed `alpha_x_prefit` and the primary modality's `alpha_y_prefit` from
-   the shared run, instead of calling `fit_ntc()` again.
-
-**Validate this once before trusting the full sweep**: compare one of the 5
-primary genes' `alpha_x_prefit`/fit_cis results (via this shared-NTC path)
-against what you'd get fitting that gene completely standalone. They should
-be close (not identical -- the shared run's NTC cell composition differs
-slightly per-gene after `exclude_guides` filtering). If they diverge
-substantially, this workaround's assumptions don't hold and `add_cis_gene()`
-needs an actual upstream fix for high-MOI -- a bayesDREAM core change
-needing sign-off first, not something to silently work around further.
+**KNOWN PRE-EXISTING ISSUE** (unrelated to any of the above, not something
+this pipeline can work around): `fit_cis()` in high-MOI mode currently
+raises `RuntimeError: expected scalar type Float but found Double` from a
+dtype mismatch in `bayesDREAM/fitting/cis.py`'s `_model_x`. Reproduces
+identically whether `cis_gene` is set eagerly at construction or via
+`add_cis_gene()` -- it's a bug in that fitting code, not a config/pipeline
+issue. See `CLAUDE.md`/`docs/HIGH_MOI_GUIDE.md`. If every `02_cis_<gene>.sh`
+job in this pipeline fails with that exact error, this is why -- it needs an
+upstream bayesDREAM fix, not a change here.
 
 ## Cis-gene list and SNP exclusion
 
@@ -91,6 +76,18 @@ high-MOI modelling) -- this exclusion is deliberately narrow, not a blanket
 `.str.contains()` convention -- see `snp_exclusion.py`'s docstring for the
 one collision edge case this implies.
 
+**Consistency requirement**: `exclude_guides` is a bayesDREAM CONSTRUCTOR-time
+filter, and every stage (`cis`, `compensation`, `trans`, `permutation`,
+`recapitulation`) builds its OWN fresh model for a given gene (the `cis`
+stage via deferred+`add_cis_gene()`, the rest via `cis_gene` set directly at
+construction). All of them MUST use the identical per-gene `exclude_guides`
+list, or their cell/guide composition diverges from what `fit_cis()` actually
+saved, and `load_cis_fit()`/`load_trans_fit()` would be aligning against a
+mismatched cell set. `generate_slurm.py` computes each gene's
+`exclude_guides` (global list + that gene's SNP exclusions) exactly once per
+gene and threads it through every one of that gene's rendered configs --
+don't add a new per-gene stage without doing the same.
+
 ## Compensation: padj-based exclude_cells
 
 `check_systematic_shift()` is restricted to NTC cells + cells targeting the
@@ -103,9 +100,9 @@ rule was GFI1B-specific and isn't part of the production pipeline).
 
 ## sum_factor: scran is per-cell-subset, not shared
 
-Unlike `alpha_x_prefit`/`alpha_y_prefit` (shared via the workaround above),
-Morris's sum factor is recomputed **separately for every gene**, on that
-gene's OWN NTC+target cell subset — this is genuinely per-subset, not
+Unlike `alpha_x_prefit`/`alpha_y_prefit` (shared via `add_cis_gene()`,
+above), Morris's sum factor is recomputed **separately for every gene**, on
+that gene's OWN NTC+target cell subset — this is genuinely per-subset, not
 something the shared `ntc_shared` run's own sum factor can stand in for.
 `common/compute_scran_sum_factor.py` wraps the exact rpy2
 (`quickCluster`+`computeSumFactors`, batched by `lane`) block from the
@@ -123,8 +120,9 @@ throughout, matching the reference GFI1B script exactly. `generate_slurm.py`
 disables `refit_sumfactor` outright rather than compute a column nothing
 reads.
 
-## exclude_low_ntc_genes
+## exclude_trans_genes
 
 Every trans-derived stage (trans/permutation/recapitulation) drops genes
-with `log2(mu_ntc) < -4` before fitting, via `common/exclude_low_ntc_genes.py`
-(config.yaml's `trans.exclude_low_ntc_genes_threshold`) -- same as Domingo.
+with `log2(mu_ntc) < -4` before fitting, via bayesDREAM's own
+`model.exclude_trans_genes(min_log2_mu_ntc=...)` (config.yaml's
+`trans.exclude_trans_genes`) -- same as Domingo.

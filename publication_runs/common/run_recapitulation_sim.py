@@ -59,7 +59,6 @@ from config_utils import (  # noqa: E402
     apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
-from exclude_low_ntc_genes import exclude_low_ntc_genes  # noqa: E402
 
 from bayesDREAM.simulation import simulate_from_trans_summary  # noqa: E402
 
@@ -125,9 +124,9 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     # (trans_summary.csv, read below) only has rows for genes that survived
     # this same filter originally; skipping it here would make the later
     # reindex-to-modality-features step fail (or worse, silently misalign).
-    excl_cfg = cfg.get("exclude_low_ntc_genes") or {}
+    excl_cfg = cfg.get("exclude_trans_genes") or {}
     if is_enabled(excl_cfg, default=False):
-        exclude_low_ntc_genes(model, **normalize_stage_args(excl_cfg))
+        model.exclude_trans_genes(**normalize_stage_args(excl_cfg))
 
     modality_name = sim_cfg.get("modality_name") or model.primary_modality
     group_col = sim_cfg.get("group_col", "technical_group_code")

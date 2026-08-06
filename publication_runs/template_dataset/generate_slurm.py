@@ -3,13 +3,14 @@ Template generate_slurm.py -- low-MOI, one shared fit_ntc, per-gene
 cis -> compensation -> trans -> permutation -> recapitulation. Copy this
 whole directory to publication_runs/<new_name>/, rename it, and adapt:
 
-- If your dataset is high-MOI: swap `run_cis_deferred` for
-  `cis_high_moi_shared_ntc`, add guide_assignment/guide_meta/guide_target to
-  `data_block`, and build the shared ntc via
-  `common/build_ntc_shared_high_moi.py` instead of the plain `fit-ntc` CLI
-  stage -- see morris/generate_slurm.py for the worked example (also read
-  morris/README.md's high-MOI caveat before assuming this pattern is safe
-  for a NEW high-MOI dataset without validating it there first).
+- If your dataset is high-MOI: `run_cis_deferred.py`/`run_ntc.py` already
+  work unchanged (bayesDREAM's high-MOI mode supports deferred `cis_gene` +
+  `add_cis_gene()` natively) -- just add `guide_assignment`/`guide_meta`/
+  `guide_target` to `data_block`. See morris/generate_slurm.py for the
+  worked example, including its per-gene `exclude_guides` handling (a
+  bayesDREAM constructor-time filter that has to be threaded consistently
+  through every one of a gene's stages -- see morris/README.md) and its
+  note on a pre-existing `fit_cis()` dtype bug in high-MOI mode.
 - If genes DON'T share one fit_ntc: drop the ntc_shared step and give each
   gene its own `model.cis_gene` set directly + a plain `fit-ntc` stage
   (cis_gene set at construction skips the deferred-workflow machinery
@@ -116,7 +117,7 @@ def main() -> None:
     ntc_step = SbatchStep(
         job_name=f"{dataset}_ntc_shared", account=account, log_dir=str(logs_dir),
         time_hours=ntc_shared_cfg["resources"]["time_hours"], cpus=ntc_shared_cfg["resources"]["cores"],
-        partition=partition_cpu, repo_dir=repo_dir, commands=[bd_cmd("fit-ntc", ntc_cfg_path)],
+        partition=partition_cpu, repo_dir=repo_dir, commands=[bd_cmd("ntc", ntc_cfg_path)],
     )
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
 

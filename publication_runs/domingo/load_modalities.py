@@ -1,83 +1,311 @@
 """
-Domingo-specific hook: attach the extra (non-primary) modalities listed in
-config_modalities.yaml to an already-cis-fit model, using your existing
-custom splicing-loading functions.
+Domingo-specific hook: attach the extra (non-primary) splicing/velocity
+modalities listed in config_modalities.yaml to an already-cis-fit model,
+then fit that modality's OWN fit_ntc() (a SEPARATE technical fit per
+modality -- not reused from the primary 'gene' modality) followed by
+fit_trans(). Based on real, working loader code for six modality types
+(sj/exon_skip/intron_retention/gene_velocity/mxe [binomial],
+donor_choice [multinomial]) -- see config_modalities.yaml's comments for
+what's confirmed vs. inferred-by-symmetry (acceptor_choice).
 
-TODO: replace `_load_one_modality` below with your actual loader(s). Per
-your description, each takes (data_dir: str, modality_name: str) and is the
-same function for every modality -- swap in that import/call here. If
-different modality types (sj/ir/es/mxe/velocity vs donor/acceptor
-usage-vs-efficiency) actually need different loader functions, dispatch on
-`spec['distribution']` or `spec['name']` inside `_load_one_modality` instead.
+Directory layout: `data_dir` (config.yaml's `modalities.data_dir`) is ONE
+shared directory used for EVERY cis gene -- NOT a per-gene subdirectory.
+Each modality lives at `<data_dir>/<stype>/{cell_meta.tsv.gz,
+feature_meta.tsv.gz, counts.npz[, denominator.npz]}`, covering the FULL
+cell population; per-gene cell subsetting happens inside the loader by
+aligning against that gene's own `model.meta['L_cell_barcode']` (missing
+cells zero-filled, matching `add_custom_modality()`'s own internal
+intersection-based re-alignment against `model.meta['cell']` -- both work
+together correctly because Domingo's preprocessing sets
+`meta['cell'] = meta['L_cell_barcode']`, see domingo/README.md).
 
-Contract this module needs to satisfy: `attach_modality(model, spec,
-data_dir)` must leave `model.get_modality(spec['name'])` populated and ready
-for `fit_trans(modality_name=spec['name'], ...)` -- i.e. it must end by
-calling one of `model.add_custom_modality(...)` /
-`model.add_splicing_modality(...)` (see CLAUDE.md's Multi-Modal Architecture
-section for both signatures).
+Contract: `attach_modality(model, spec, data_dir)` attaches the modality via
+`model.add_custom_modality(...)` and returns the resulting modality name
+(`f'{name_prefix}_{stype}'`), ready for `fit_ntc(modality_name=...)` /
+`fit_trans(modality_name=...)`.
 """
 
-from typing import Dict
+import os
+import warnings
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import scipy.sparse
 
 
-def _load_one_modality(data_dir: str, modality_name: str):
-    """TODO: call your real loader here.
+# ---------------------------------------------------------------------- #
+# Low-level loaders (shared across every modality type)                    #
+# ---------------------------------------------------------------------- #
 
-    Expected to return whatever your loader currently returns -- adjust the
-    unpacking in `attach_modality` below to match. Sketched here as
-    returning (counts, feature_meta, denominator) since binomial dominates
-    this dataset's modality list; multinomial loaders presumably return a
-    3-D counts array instead of (counts, denominator).
+def _load_npz_dense(path: str) -> np.ndarray:
+    """Load a .npz file as a dense 2-D numpy array."""
+    try:
+        return scipy.sparse.load_npz(path).toarray()
+    except Exception:
+        pass
+    data = np.load(path, allow_pickle=False)
+    keys = list(data.keys())
+    for key in ("data", "arr_0", "matrix", "counts"):
+        if key in keys:
+            return data[key]
+    return data[keys[0]]
 
-    Example (replace with your actual import):
 
-        from my_splicing_lib import load_modality_data
-        return load_modality_data(data_dir, modality_name)
-    """
-    raise NotImplementedError(
-        f"Plug in your real splicing/velocity loader for modality={modality_name!r}, "
-        f"data_dir={data_dir!r}."
+def _align_cells(counts: np.ndarray, file_cells: list, model_cells: list) -> np.ndarray:
+    """Reorder/subset the cell axis (axis 1) of counts to match model_cells.
+    Cells in model_cells but absent from file_cells are filled with zeros."""
+    file_idx = {c: i for i, c in enumerate(file_cells)}
+    n_missing = sum(1 for c in model_cells if c not in file_idx)
+    if n_missing:
+        warnings.warn(
+            f"{n_missing}/{len(model_cells)} model cells not found in file; "
+            "filling missing cells with zeros."
+        )
+    out_shape = list(counts.shape)
+    out_shape[1] = len(model_cells)
+    out = np.zeros(out_shape, dtype=counts.dtype)
+    for j, cell in enumerate(model_cells):
+        if cell in file_idx:
+            if counts.ndim == 2:
+                out[:, j] = counts[:, file_idx[cell]]
+            elif counts.ndim == 3:
+                out[:, j, :] = counts[:, file_idx[cell], :]
+    return out
+
+
+def _reconstruct_multinomial_3d(counts_2d: np.ndarray, feature_meta: pd.DataFrame) -> np.ndarray:
+    """Reshape a flat 2-D counts matrix (total_rows x n_cells) into a 3-D
+    multinomial array (n_features x n_cells x max_categories) using
+    row_start/row_end columns in feature_meta -- rows row_start:row_end
+    belong to feature i."""
+    n_features = len(feature_meta)
+    n_cells = counts_2d.shape[1]
+    max_cats = int(feature_meta["n_categories"].max())
+    counts_3d = np.zeros((n_features, n_cells, max_cats), dtype=counts_2d.dtype)
+    for i, (_, row) in enumerate(feature_meta.iterrows()):
+        s, e = int(row["row_start"]), int(row["row_end"])
+        n_cat = e - s
+        counts_3d[i, :, :n_cat] = counts_2d[s:e, :].T
+    return counts_3d
+
+
+def _read_type_meta(type_dir: str) -> Tuple[list, pd.DataFrame]:
+    cell_meta = pd.read_csv(os.path.join(type_dir, "cell_meta.tsv.gz"), sep="\t")
+    feature_meta = pd.read_csv(os.path.join(type_dir, "feature_meta.tsv.gz"), sep="\t")
+    return cell_meta["cell_barcode"].tolist(), feature_meta
+
+
+def _to_dense(counts) -> np.ndarray:
+    return counts.toarray() if scipy.sparse.issparse(counts) else np.asarray(counts)
+
+
+def _plot_counts_vs_denominator(counts, denominator, feature_meta=None, gene_col="gene",
+                                 n_worst_genes=20, max_points=200_000, seed=0):
+    """Diagnostic scatter + per-gene violation breakdown for counts >
+    denominator entries (SJ's gene-expression-derived denominator only).
+    Returns (fig, axes); caller is responsible for saving/closing."""
+    import matplotlib.pyplot as plt
+
+    c = _to_dense(counts)
+    d = _to_dense(denominator)
+
+    viol = c > d
+    n_viol = int(viol.sum())
+    n_total = c.size
+    print(f"Violations: {n_viol} / {n_total} entries ({100 * n_viol / max(n_total, 1):.4f}%)")
+
+    keep = (c > 0) | (d > 0)
+    cf, df, vf = c[keep], d[keep], viol[keep]
+
+    rng = np.random.default_rng(seed)
+    ok_idx = np.flatnonzero(~vf)
+    if len(ok_idx) > max_points:
+        ok_idx = rng.choice(ok_idx, size=max_points, replace=False)
+    viol_idx = np.flatnonzero(vf)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax = axes[0]
+    ax.scatter(df[ok_idx] + 1, cf[ok_idx] + 1, s=4, alpha=0.15, color="#4C72B0", linewidths=0, label="valid")
+    ax.scatter(df[viol_idx] + 1, cf[viol_idx] + 1, s=8, alpha=0.6, color="#C44E52", linewidths=0, label="counts > denom")
+    lims = [1, max(cf.max(), df.max()) + 1]
+    ax.plot(lims, lims, color="gray", lw=1, ls="--", label="y = x")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("denominator (+1)")
+    ax.set_ylabel("SJ counts (+1)")
+    ax.set_title(f"Counts vs denominator ({n_viol} violations)")
+    ax.legend(frameon=False, markerscale=3)
+
+    ax2 = axes[1]
+    if feature_meta is not None and gene_col in feature_meta.columns:
+        genes = feature_meta[gene_col].to_numpy()
+        viol_counts_per_feature = viol.sum(axis=1)
+        df_g = pd.DataFrame({"gene": genes, "n_viol_entries": viol_counts_per_feature})
+        top = (df_g.groupby("gene")["n_viol_entries"].sum().sort_values(ascending=False).head(n_worst_genes))
+        ax2.barh(top.index[::-1], top.values[::-1], color="#C44E52")
+        ax2.set_xlabel("# violating entries")
+        ax2.set_xscale("log")
+        ax2.set_title(f"Top {n_worst_genes} genes by violation count")
+    else:
+        viol_counts_per_feature = viol.sum(axis=1)
+        top_idx = np.argsort(viol_counts_per_feature)[::-1][:n_worst_genes]
+        ax2.barh([str(i) for i in top_idx[::-1]], viol_counts_per_feature[top_idx][::-1], color="#C44E52")
+        ax2.set_xlabel("# violating entries")
+        ax2.set_xscale("log")
+        ax2.set_title(f"Top {n_worst_genes} features (rows) by violation count")
+
+    fig.tight_layout()
+    return fig, axes
+
+
+# ---------------------------------------------------------------------- #
+# Per-distribution modality loaders                                        #
+# ---------------------------------------------------------------------- #
+
+def load_binomial_modality(
+    model, base_dir: str, stype: str,
+    name_prefix: str = "splicing",
+    gene_alias_col: str = "gene_name",
+    denominator_mode: str = "file",
+    clip_violations: bool = False,
+    diagnostic_plot_path: Optional[str] = None,
+    overwrite: bool = False,
+) -> str:
+    """denominator_mode: 'file' (separate denominator.npz) or
+    'gene_expression' (SJ-style: denominator from the primary+cis modality's
+    gene counts, features filtered to genes present in the model,
+    optionally clipping counts>denominator violations)."""
+    type_dir = os.path.join(base_dir, stype)
+    model_cells = model.meta["L_cell_barcode"].tolist()
+    file_cells, feature_meta = _read_type_meta(type_dir)
+
+    if gene_alias_col and "gene" not in feature_meta.columns and gene_alias_col in feature_meta.columns:
+        feature_meta = feature_meta.assign(gene=feature_meta[gene_alias_col])
+
+    counts = _load_npz_dense(os.path.join(type_dir, "counts.npz"))
+
+    if denominator_mode == "file":
+        denominator = _load_npz_dense(os.path.join(type_dir, "denominator.npz"))
+        counts = _align_cells(counts, file_cells, model_cells)
+        denominator = _align_cells(denominator, file_cells, model_cells)
+
+    elif denominator_mode == "gene_expression":
+        gene_mod = model.get_modality(model.primary_modality)
+        gene_counts = _to_dense(gene_mod.counts)
+        gene_names = list(gene_mod.feature_names)
+        cell_index = {c: i for i, c in enumerate(gene_mod.cell_names)}
+
+        # add_cis_gene() extracts the cis gene out of the primary modality into
+        # its own 'cis' modality, so it's no longer in gene_mod above -- add it
+        # back so features belonging to the cis gene aren't dropped below.
+        if "cis" in model.modalities:
+            cis_mod = model.get_modality("cis")
+            cis_counts = _to_dense(cis_mod.counts)
+            gene_counts = np.vstack([gene_counts, cis_counts])
+            gene_names = gene_names + [cis_mod.feature_meta["gene_name"].iloc[0]]
+
+        gene_index = {g: i for i, g in enumerate(gene_names)}
+        feature_keep_idx = feature_meta["gene"].isin(gene_index)
+        feature_meta = feature_meta[feature_keep_idx]
+
+        counts = _align_cells(counts, file_cells, model_cells)
+        counts = counts[feature_keep_idx.values, :]
+
+        denom_gene_col = "gene_for_denominator" if "gene_for_denominator" in feature_meta.columns else "gene"
+        genes = feature_meta[denom_gene_col].tolist()
+        gene_rows = [gene_index[g] for g in genes]
+        cell_cols = [cell_index[c] for c in model_cells]
+        denominator = gene_counts[np.ix_(gene_rows, cell_cols)]
+
+        if diagnostic_plot_path:
+            import matplotlib.pyplot as plt
+            fig, _ = _plot_counts_vs_denominator(counts, denominator, feature_meta, gene_col="gene")
+            os.makedirs(os.path.dirname(diagnostic_plot_path), exist_ok=True)
+            fig.savefig(diagnostic_plot_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[diagnostic] wrote {diagnostic_plot_path}")
+
+        violations = counts > denominator
+        if clip_violations and violations.sum() > 0:
+            print(f"Clipping {int(violations.sum())} entries where {stype} counts > gene denominator")
+            counts = np.minimum(counts, denominator)
+    else:
+        raise ValueError(f"load_binomial_modality: unknown denominator_mode {denominator_mode!r}")
+
+    modality_name = f"{name_prefix}_{stype}"
+    model.add_custom_modality(
+        name=modality_name, counts=counts, feature_meta=feature_meta.reset_index(drop=True),
+        distribution="binomial", denominator=denominator, cell_names=model_cells, overwrite=overwrite,
     )
+    print(f"Added '{modality_name}': {counts.shape[0]} features")
+    return modality_name
 
 
-def attach_modality(model, spec: Dict, data_dir: str) -> None:
-    """Load and attach one modality (per config_modalities.yaml `spec`) to `model`.
+def load_multinomial_modality(
+    model, base_dir: str, stype: str, name_prefix: str = "splicing", overwrite: bool = False,
+) -> str:
+    type_dir = os.path.join(base_dir, stype)
+    model_cells = model.meta["L_cell_barcode"].tolist()
+    file_cells, feature_meta = _read_type_meta(type_dir)
 
-    Called once per (cis_gene, modality) by generate_slurm.py's per-task
-    invocation (see domingo/generate_slurm.py's `modality_task_command`).
-    """
-    name = spec["name"]
+    counts_2d = _load_npz_dense(os.path.join(type_dir, "counts.npz"))
+    counts_2d = _align_cells(counts_2d, file_cells, model_cells)
+    counts_3d = _reconstruct_multinomial_3d(counts_2d, feature_meta)
+    print(f"  shape: {counts_3d.shape}  (features x cells x max_categories={counts_3d.shape[2]})")
+
+    modality_name = f"{name_prefix}_{stype}"
+    model.add_custom_modality(
+        name=modality_name, counts=counts_3d, feature_meta=feature_meta.reset_index(drop=True),
+        distribution="multinomial", cell_names=model_cells, overwrite=overwrite,
+    )
+    # bayesDREAM/utils.py's resolve_feature_names should already pick
+    # 'feature_id' automatically when present; set it explicitly too, matching
+    # the reference notebook code (defensive, not redundant if that ever
+    # changes upstream).
+    if "feature_id" in feature_meta.columns:
+        model.get_modality(modality_name).feature_names = list(feature_meta["feature_id"].values)
+    print(f"Added '{modality_name}': {counts_3d.shape[0]} features")
+    return modality_name
+
+
+def attach_modality(model, spec: Dict, base_dir: str, diagnostic_plot_path: Optional[str] = None) -> str:
+    """Load and attach one modality (per config_modalities.yaml `spec`) to
+    `model`. Returns the resulting bayesDREAM modality name."""
+    stype = spec["stype"]
+    name_prefix = spec.get("name_prefix", "splicing")
     distribution = spec["distribution"]
 
-    loaded = _load_one_modality(data_dir, name)
-
     if distribution == "multinomial":
-        counts, feature_meta, cell_names = loaded
-        model.add_custom_modality(
-            name=name, counts=counts, feature_meta=feature_meta,
-            distribution="multinomial", cell_names=cell_names,
-        )
+        return load_multinomial_modality(model, base_dir, stype, name_prefix=name_prefix)
     elif distribution == "binomial":
-        counts, feature_meta, denominator = loaded
-        model.add_custom_modality(
-            name=name, counts=counts, feature_meta=feature_meta,
-            distribution="binomial", denominator=denominator,
+        return load_binomial_modality(
+            model, base_dir, stype, name_prefix=name_prefix,
+            gene_alias_col=spec.get("gene_alias_col", "gene_name"),
+            denominator_mode=spec.get("denominator_mode", "file"),
+            clip_violations=spec.get("clip_violations", False),
+            diagnostic_plot_path=diagnostic_plot_path if spec.get("save_diagnostic_plot") else None,
         )
     else:
-        raise ValueError(f"load_modalities.attach_modality: unsupported distribution {distribution!r} for {name!r}")
+        raise ValueError(f"attach_modality: unsupported distribution {distribution!r} for stype={stype!r}")
 
 
 def main() -> None:
-    """CLI entry point for one (gene, modality) attach-and-fit-trans task.
+    """CLI entry point for one (gene, modality) attach + fit_ntc + fit_trans task.
+
+    Fits a SEPARATE fit_ntc() for this modality (not reused from the primary
+    'gene' modality's ntc fit -- matches the reference notebook pattern of
+    one fit_ntc(modality_name=...) call per custom modality) before
+    fit_trans(). Both use the same load-if-exists-else-fit-and-save pattern
+    as every other stage script in this pipeline.
 
     Usage:
         python load_modalities.py --config <gene_cis_stage_config.yaml> \\
             --modality-name sj --modality-spec config_modalities.yaml \\
-            --data-dir <modalities.data_dir>/<gene>
+            --data-dir <modalities.data_dir>   # shared across all genes, NOT per-gene
     """
     import argparse
-    import os
     import sys
     from pathlib import Path
 
@@ -90,14 +318,14 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", "-c", required=True, help="Gene's cis-stage bayesdream config (needs cis already fit and saved).")
-    parser.add_argument("--modality-name", required=True)
+    parser.add_argument("--modality-name", required=True, help="stype key in config_modalities.yaml, e.g. 'sj'.")
     parser.add_argument("--modality-spec", required=True, help="Path to config_modalities.yaml")
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--data-dir", required=True, help="Shared loader_inputs/ dir (same for every gene).")
     args = parser.parse_args()
 
     cfg = load_bayesdream_yaml(Path(args.config))
     with open(args.modality_spec) as f:
-        specs = {m["name"]: m for m in yaml.safe_load(f)["modalities"]}
+        specs = {m["stype"]: m for m in yaml.safe_load(f)["modalities"]}
     spec = specs[args.modality_name]
 
     model = build_model_from_config(cfg)
@@ -111,18 +339,40 @@ def main() -> None:
         if covariates:
             model.set_technical_groups(covariates)
 
-    attach_modality(model, spec, args.data_dir)
-
-    model.fit_trans(modality_name=args.modality_name, function_type=spec["function_type"])
-
     model_cfg = cfg.get("model") or {}
     output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
-    model.save_trans_fit(output_dir=output_dir, modalities=[args.modality_name])
-    model.save_trans_summary(output_dir=output_dir, modality_name=args.modality_name)
+
+    diagnostic_plot_path = os.path.join(output_dir, f"diagnostic_{args.modality_name}_counts_vs_denominator.png")
+    modality_name = attach_modality(model, spec, args.data_dir, diagnostic_plot_path=diagnostic_plot_path)
+
+    # --- modality-specific NTC fit: load if exists, otherwise fit and save ---
+    ntc_fit_path = os.path.join(output_dir, f"posterior_samples_ntc_{modality_name}.pt")
+    if os.path.exists(ntc_fit_path):
+        print("[INFO] Loading existing ntc fit for modality...")
+        model.load_ntc_fit(output_dir, modalities=[modality_name])
+    else:
+        print("[INFO] Running ntc fit for modality (this may take a while)...")
+        model.fit_ntc(modality_name=modality_name, tolerance=0)
+        model.save_ntc_fit()
+
+    # --- modality-specific trans fit: load if exists, otherwise fit and save ---
+    trans_fit_path = os.path.join(output_dir, f"posterior_samples_trans_{modality_name}.pt")
+    if os.path.exists(trans_fit_path):
+        print("[INFO] Loading existing trans fit...")
+        model.load_trans_fit(modalities=[modality_name])
+    else:
+        print("[INFO] Running trans fit (this may take a while)...")
+        model.fit_trans(
+            modality_name=modality_name, tolerance=0, function_type=spec["function_type"],
+            min_denominator=spec.get("min_denominator", 0),
+        )
+        model.save_trans_fit(modalities=[modality_name])
+
+    model.save_trans_summary(output_dir=output_dir, modality_name=modality_name)
 
     save_provenance_json(
-        os.path.join(output_dir, f"provenance_trans_{args.modality_name}.json"),
-        extra={"stage": "trans_modality", "modality": args.modality_name, "label": model_cfg.get("label")},
+        os.path.join(output_dir, f"provenance_trans_{modality_name}.json"),
+        extra={"stage": "trans_modality", "modality": modality_name, "label": model_cfg.get("label")},
     )
 
 

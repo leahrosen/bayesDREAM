@@ -1,11 +1,12 @@
 """
 Generate SLURM scripts + configs for the Morris dataset: high-MOI, one
-shared fit_ntc (over the full panel minus a placeholder cis gene -- see
-morris/README.md), the full pipeline (cis -> compensation -> trans ->
-permutation -> recapitulation) for config.yaml's `primary_genes`, and a
-fit_cis-ONLY sweep over every OTHER gene with padj<0.05 in
-Morris_gRNA2target_stats.csv, all reusing the one shared fit_ntc via
-apply_shared_ntc_high_moi.py's workaround.
+shared fit_ntc (full panel, cis_gene deferred), the full pipeline (cis ->
+compensation -> trans -> permutation -> recapitulation) for config.yaml's
+`primary_genes`, and a fit_cis-ONLY sweep over every OTHER gene with
+padj<0.05 in Morris_gRNA2target_stats.csv, all reusing the one shared
+fit_ntc via the SAME deferred-cis_gene + add_cis_gene() mechanism Domingo
+uses (bayesDREAM's high-MOI mode now supports this natively -- no more
+placeholder-gene/manual-alpha-extraction workaround, see morris/README.md).
 
 Assumes morris/preprocess.py has already been run once (writes the aligned
 meta.csv/gene_counts.npz/gene_meta.csv/guide_assignment.npy/guide_meta.csv/
@@ -20,6 +21,15 @@ required CUDA). Only trans/permutation/recapitulation auto-resubmit on
 timeout (fit_trans has its own checkpoint/resume) -- ntc_shared/cis/
 compensation/cis_sweep failures are left for manual review via
 common/slurm/list_job_status.py.
+
+Correctness note: `exclude_guides` is a bayesDREAM CONSTRUCTOR-time filter,
+so every stage that constructs its OWN fresh model for a given gene (cis via
+deferred+add_cis_gene, compensation/trans/permutation/recapitulation via
+cis_gene-at-init) must use the IDENTICAL per-gene exclude_guides list, or
+their cell/guide composition diverges and load_cis_fit()/load_trans_fit()
+would be aligning against a model whose cells don't match what was actually
+saved. `_per_gene_exclude_guides()` below is computed once per gene and
+threaded through every stage's rendered config for consistency.
 
 Usage
 -----
@@ -123,6 +133,7 @@ def main() -> None:
 
     label_prefix = cfg["label_prefix"]
     model_defaults = cfg["model_defaults"]
+    global_exclude_guides = cfg.get("global_exclude_guides") or []
     sf_cfg = cfg["sum_factor"]
     gene_sel_cfg = cfg["gene_selection"]
     ntc_shared_cfg = cfg["ntc_shared"]
@@ -138,6 +149,9 @@ def main() -> None:
         feature_meta_path=paths["feature_meta"], primary_genes=primary_genes,
     )
     all_guide_names = pd.read_csv(paths["guide_meta"])["guide"].tolist()
+
+    def per_gene_exclude_guides(gene: str) -> list:
+        return sorted(set(global_exclude_guides) | set(exclude_guides_for_cis_gene(all_guide_names, gene)))
 
     data_block = {
         "meta": paths["meta"], "counts": paths["counts"],
@@ -174,49 +188,42 @@ def main() -> None:
     submitted_rows = []  # (stage, label, script_placeholder) -- jobids filled in by submit_all.sh
 
     # ---------------------------------------------------------------- #
-    # 1. Shared fit_ntc (high-MOI workaround, GPU, own config schema)    #
+    # 1. Shared fit_ntc: cis_gene deferred, full gene panel, GPU.        #
+    #    Only global_exclude_guides applied here -- per-gene SNP         #
+    #    exclusion happens later, per gene (see module docstring).       #
     # ---------------------------------------------------------------- #
     label_ntc = f"{label_prefix}_ntc_shared"
     ntc_shared_dir = f"{output_dir}/{label_ntc}"
-    placeholder_gene = ntc_shared_cfg["placeholder_cis_gene"]
-    ntc_own_cfg = {
-        "data": data_block,
-        "model": {
-            "placeholder_cis_gene": placeholder_gene,
-            "exclude_guides": exclude_guides_for_cis_gene(all_guide_names, placeholder_gene),
-            "guide_covariates": model_defaults["guide_covariates"],
-            "guide_covariates_ntc": model_defaults["guide_covariates_ntc"],
-            "min_count": model_defaults["min_count"],
-            "output_dir": output_dir,
-            "label": label_ntc,
-        },
-        "ntc": {"set_technical_groups": ntc_shared_cfg["set_technical_groups"], "fit": {}, "save": True},
-        "sum_factor": {"compute_scran": {"enabled": True, "args": {"batch_col": sf_cfg["batch_col"]}}},
-    }
+    ntc_bd_cfg = render_bayesdream_config(base_cfg, {
+        "model": {"label": label_ntc, "exclude_guides": global_exclude_guides},
+        "ntc": {"fit": {}, "save": True},
+    })
     ntc_cfg_path = configs_dir / f"{label_ntc}.yaml"
-    write_yaml(ntc_cfg_path, ntc_own_cfg)
+    write_yaml(ntc_cfg_path, ntc_bd_cfg)
 
     ntc_step = SbatchStep(
         job_name="morris_ntc_shared", account=account, log_dir=str(logs_dir),
         time_hours=TIME_HOURS, cpus=ntc_shared_cfg["resources"]["cores"],
         partition=partition_gpu, repo_dir=repo_dir,
-        commands=[
-            f'"{python_env_gpu}" "{repo_dir}/publication_runs/common/build_ntc_shared_high_moi.py" --config "{ntc_cfg_path}"'
-        ],
+        commands=[bd_cmd("ntc", ntc_cfg_path, python_env_gpu)],
     )
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
     submitted_rows.append(("ntc_shared", label_ntc, "01_ntc_shared.sh"))
 
-    def render_gene_cfg(gene: str, label: str, device: str, extra: dict) -> dict:
+    def render_gene_cfg(gene: str, label: str, device: str, exclude_guides: list, extra: dict) -> dict:
         overrides = {
-            "model": {"label": label, "cis_gene": gene, "device": device},
+            "model": {"label": label, "cis_gene": gene, "device": device, "exclude_guides": exclude_guides},
             **extra,
         }
         return render_bayesdream_config(base_cfg, overrides)
 
-    def render_cis_config(gene: str, label: str) -> Path:
-        cis_bd_cfg = render_gene_cfg(gene, label, "cpu", {
-            "model": {"exclude_guides": exclude_guides_for_cis_gene(all_guide_names, gene)},
+    def render_cis_config(gene: str, label: str, exclude_guides: list) -> Path:
+        # Deferred (cis_gene NOT in model:) -- run_cis_deferred.py commits via
+        # add_cis_gene(), same mechanism as Domingo, now that bayesDREAM's
+        # high-MOI mode supports it directly.
+        cis_bd_cfg = render_bayesdream_config(base_cfg, {
+            "model": {"label": label, "device": "cpu", "exclude_guides": exclude_guides},
+            "cis_gene": gene,
             "ntc_shared_dir": ntc_shared_dir,
             "sum_factor": sum_factor_cis_block,
             "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
@@ -230,7 +237,7 @@ def main() -> None:
             job_name=f"morris_cis_{gene}", account=account, log_dir=str(logs_dir),
             time_hours=TIME_HOURS, cpus=cis_cfg["resources"]["cores"],
             partition=partition_cpu, repo_dir=repo_dir,
-            commands=[bd_cmd("cis_high_moi_shared_ntc", cis_cfg_path, python_env_cpu)],
+            commands=[bd_cmd("cis_deferred", cis_cfg_path, python_env_cpu)],
         )
 
     # ---------------------------------------------------------------- #
@@ -239,14 +246,15 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     for gene in primary_genes:
         label = f"{label_prefix}_{gene}"
+        exclude_guides = per_gene_exclude_guides(gene)
 
-        cis_cfg_path = render_cis_config(gene, label)
+        cis_cfg_path = render_cis_config(gene, label, exclude_guides)
         cis_step = cis_sbatch_step(gene, cis_cfg_path)
         scripts.append((f"02_cis_{gene}.sh", cis_step.render()))
         submitted_rows.append(("cis", label, f"02_cis_{gene}.sh"))
 
         cis_gene_ensembl_id = name_to_id.get(gene)
-        comp_bd_cfg = render_gene_cfg(gene, label, "cpu", {
+        comp_bd_cfg = render_gene_cfg(gene, label, "cpu", exclude_guides, {
             "compensation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -279,9 +287,9 @@ def main() -> None:
             "adjust_ntc_sum_factor": sum_factor_cis_block["adjust_ntc_sum_factor"],
             "refit_sumfactor": {"enabled": False},  # vestigial for Morris -- fit_trans uses sum_factor_adj
         }
-        trans_bd_cfg = render_gene_cfg(gene, label, None, {
+        trans_bd_cfg = render_gene_cfg(gene, label, None, exclude_guides, {
             "sum_factor": sum_factor_trans_block,
-            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
+            "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "trans": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -301,9 +309,9 @@ def main() -> None:
         scripts.append((f"04_trans_{gene}.sh", trans_step.render()))
         submitted_rows.append(("trans", label, f"04_trans_{gene}.sh"))
 
-        perm_bd_cfg = render_gene_cfg(gene, label, None, {
+        perm_bd_cfg = render_gene_cfg(gene, label, None, exclude_guides, {
             "sum_factor": sum_factor_trans_block,
-            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
+            "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "permutation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -326,9 +334,9 @@ def main() -> None:
         scripts.append((f"05_permutation_{gene}.sh", perm_step.render()))
         submitted_rows.append(("permutation", label, f"05_permutation_{gene}.sh"))
 
-        sim_bd_cfg = render_gene_cfg(gene, label, None, {
+        sim_bd_cfg = render_gene_cfg(gene, label, None, exclude_guides, {
             "sum_factor": sum_factor_trans_block,
-            "exclude_low_ntc_genes": {"enabled": True, "args": {"threshold": trans_cfg["exclude_low_ntc_genes_threshold"]}},
+            "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "simulation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True}, "load_trans": {"enabled": True},
@@ -357,13 +365,13 @@ def main() -> None:
     config_paths = []
     for gene in sweep_genes:
         label = f"{label_prefix}_{gene}"
-        cis_cfg_path = render_cis_config(gene, label)
+        cis_cfg_path = render_cis_config(gene, label, per_gene_exclude_guides(gene))
         config_paths.append(str(cis_cfg_path))
     sweep_configs_list.write_text("\n".join(config_paths) + "\n")
 
     array_commands = [
         f'CONFIG=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_configs_list}")',
-        bd_cmd("cis_high_moi_shared_ntc", "$CONFIG", python_env_cpu),
+        bd_cmd("cis_deferred", "$CONFIG", python_env_cpu),
     ]
     sweep_step = SbatchArray(
         job_name="morris_cis_sweep", account=account, log_dir=str(logs_dir),

@@ -18,8 +18,10 @@ splicing/velocity/efficiency modalities. Runs entirely on CPU
         ├── trans(GFI1B)               fit_trans(additive_hill), sum_factor_refit
         │     ├── permutation reps ×20  (array, auto-resubmits on timeout)
         │     └── recapitulation reps ×10 (array, auto-resubmits on timeout)
-        └── modality(GFI1B, sj/ir/es/mxe/velocity/donor_*/acceptor_*)
-              (one job per modality, additive_hill except *_usage: single_hill)
+        └── modality(GFI1B, sj/exon_skip/intron_retention/mxe/gene_velocity/
+              donor_efficiency/acceptor_efficiency/donor_choice/acceptor_choice)
+              (one job per modality: own fit_ntc() + fit_trans(),
+               additive_hill except donor/acceptor_choice: single_hill)
 ```
 
 Same for MYB, NFE2, TET2. `generate_slurm.py` writes one sbatch script per
@@ -36,12 +38,52 @@ job; permutation/recapitulation depend on trans) and writes
    written by the R preprocessing script below via relative `fwrite()`
    calls, so confirm the exact output location once it's been (re-)run;
    the filenames themselves should be stable.
-2. Plug your real splicing/velocity/efficiency loader into
-   `load_modalities.py`'s `_load_one_modality` (currently raises
-   `NotImplementedError` -- see that file's docstring for the contract),
-   and confirm `config.yaml`'s `modalities.data_dir`.
+2. Confirm `config.yaml`'s `modalities.data_dir` (one shared directory
+   containing `sj/`, `exon_skip/`, ..., `donor_choice/` subdirectories —
+   see `load_modalities.py`'s module docstring for the exact per-stype file
+   layout) and `config_modalities.yaml`'s `acceptor_choice` entry (added by
+   symmetry with `donor_choice`, not yet confirmed against a real
+   `loader_inputs/acceptor_choice/` directory).
 3. Run `python generate_slurm.py`, inspect `slurm/`, then on Dardel:
    `bash slurm/submit_all.sh`.
+
+## Modality loading (`load_modalities.py`)
+
+Based on real, working loader code (six confirmed modality types; two more
+-- `donor_efficiency`/`acceptor_efficiency` -- added per explicit
+confirmation that they're binomial, analogous to exon_skip/intron_retention/
+mxe/gene_velocity, but not independently verified against real files).
+Two loaders, dispatched by `distribution` in `config_modalities.yaml`:
+
+- **`load_binomial_modality`** (sj, exon_skip, intron_retention, mxe,
+  gene_velocity, donor_efficiency, acceptor_efficiency): counts +
+  denominator, aligned to the gene's own model cells. Denominator comes from
+  one of two places (`config_modalities.yaml`'s `denominator_mode`):
+  - `file`: a separate `denominator.npz` in the same stype directory
+    (exon_skip/intron_retention/mxe/gene_velocity/donor_efficiency/
+    acceptor_efficiency).
+  - `gene_expression`: the primary (+`cis`, since `add_cis_gene()` carves the
+    cis gene OUT of the primary modality) modality's own gene counts,
+    features filtered to genes present in the model, with a saved
+    counts-vs-denominator diagnostic plot and optional violation clipping
+    (`sj` only — SJ counts can occasionally exceed the gene-expression
+    denominator).
+- **`load_multinomial_modality`** (donor_choice, acceptor_choice): a flat
+  2-D `counts.npz` reshaped into `(features, cells, categories)` using
+  `row_start`/`row_end` columns in `feature_meta.tsv.gz`.
+
+Each modality then gets its OWN `fit_ntc()` call (a genuinely separate
+technical fit — NOT reused from the primary 'gene' modality's ntc fit)
+before `fit_trans()`, both with the usual load-if-exists-else-fit-and-save
+pattern.
+
+**`data_dir` is ONE shared directory, not per-gene.** Every cis gene's job
+reads from the SAME `<stype>/` directories (covering the full cell
+population); per-gene subsetting happens inside the loader by aligning
+against that gene's own `model.meta['L_cell_barcode']` (Domingo's
+preprocessed meta sets `cell == L_cell_barcode`, so this lines up with
+`add_custom_modality()`'s own internal alignment against `model.meta['cell']`
+— see `load_modalities.py`'s module docstring).
 
 ## R preprocessing (runs once, upstream, NOT part of this SLURM pipeline)
 
@@ -94,8 +136,9 @@ read from `sum_factor_adj`, matching the reference GFI1B script exactly
 override). See `common/config_utils.apply_sum_factor_adjustments`'s
 docstring if this looks redundant; it isn't.
 
-## exclude_low_ntc_genes
+## exclude_trans_genes
 
 Every trans-derived stage (trans/permutation/recapitulation) drops genes
-with `log2(mu_ntc) < -4` before fitting, via `common/exclude_low_ntc_genes.py`
-(config.yaml's `trans.exclude_low_ntc_genes_threshold`).
+with `log2(mu_ntc) < -4` before fitting, via bayesDREAM's own
+`model.exclude_trans_genes(min_log2_mu_ntc=...)` (config.yaml's
+`trans.exclude_trans_genes`).

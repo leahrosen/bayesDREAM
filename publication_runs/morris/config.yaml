@@ -1,8 +1,9 @@
 # Morris dataset -- orchestration config, consumed by generate_slurm.py.
 # High-MOI. NOT the bayesdream-CLI-schema config -- see
 # publication_runs/README.md and morris/README.md (the latter explains the
-# high-MOI shared-fit_ntc workaround this dataset relies on, and the
-# preprocessing this config assumes has already been run -- see
+# shared-fit_ntc deferred-cis_gene pattern this dataset relies on -- now
+# built directly into bayesDREAM's add_cis_gene(), no workaround needed --
+# and the preprocessing this config assumes has already been run, see
 # morris/preprocess.py).
 
 dataset: morris
@@ -47,6 +48,14 @@ model_defaults:
   guide_covariates_ntc: [lane]
   min_count: 10
 
+# Guides to drop everywhere, regardless of cis gene (e.g. a known-bad
+# guide/batch) -- distinct from the per-cis-gene SNP exclusion table below.
+# Applied both at the shared ntc build AND at every per-gene cis build
+# (exclude_guides is a bayesDREAM CONSTRUCTOR-time filter, so it has to be
+# reapplied on every fresh model construction -- see
+# common/run_cis_deferred.py's module docstring).
+global_exclude_guides: []   # TODO: e.g. [sgFOO_1, sgFOO_2]
+
 sum_factor:
   batch_col: lane           # compute_scran_sum_factor's quickCluster block
   covariates: [lane]         # adjust_ntc_sum_factor's covariates
@@ -63,18 +72,19 @@ gene_selection:
   padj_threshold: 0.05
   primary_genes: [GFI1B, NFE2, IKZF1, HHEX, RUNX1]
 
-# Shared fit_ntc over the (near-)full gene panel. High-MOI requires cis_gene
-# at construction (see morris/README.md) -- placeholder_cis_gene must be a
-# real gene NOT in gene_selection's cis-gene list (primary or swept), since
-# it gets carved out of the panel like any other cis gene.
+# Shared fit_ntc over the full gene panel, cis_gene deferred (add_cis_gene()
+# now supports high-MOI directly -- no placeholder gene needed).
 ntc_shared:
-  placeholder_cis_gene: "<pick a gene not in the padj<0.05 list>"   # TODO
   set_technical_groups: [lane]
   resources: {cores: 16}
 
 cis:
   resources: {cores: 8}
   # independent_mu_sigma=True per the reference GFI1B fit_cis() call.
+  # KNOWN PRE-EXISTING ISSUE: fit_cis() in high-MOI mode currently raises
+  # "RuntimeError: expected scalar type Float but found Double" (dtype
+  # mismatch in bayesDREAM/fitting/cis.py's _model_x) -- see morris/README.md.
+  # Not something this config or run_cis_deferred.py can work around.
 
 compensation:
   resources: {cores: 4}
@@ -83,7 +93,8 @@ compensation:
 trans:
   resources: {cores: 16}
   function_type: additive_hill
-  exclude_low_ntc_genes_threshold: -4.0   # log2(mu_ntc) < this -> excluded, all datasets
+  # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
+  exclude_trans_genes: {min_log2_mu_ntc: -4.0}
 
   permutation:
     n_reps: 20
