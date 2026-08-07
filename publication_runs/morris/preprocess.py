@@ -13,7 +13,17 @@ Cell order in the written meta.csv is authoritative: every other output
 file is explicitly reordered to match it (rather than trusting the raw
 inputs' own row order, which the original script only spot-checked with a
 commented-out assertion -- this script checks for real and raises if
-anything doesn't line up).
+anything doesn't line up), with ONE exception: guide_assignment.npz's
+columns are reordered to meta.csv's cell order POSITIONALLY, not by looking
+up guide_assignment_cells.npy's own cell-name labels -- those labels are
+confirmed unreliable/garbled (see the validated GFI1B reference script,
+which discovers this same thing and discards them for cell_meta's own names
+instead, calling it "hacky because the cell names are messed up"). The only
+check possible here is that guide_assignment.npz's column count matches
+meta.csv's row count exactly (raises if not) -- there's no independent join
+key to verify the ORDER beyond that, so this is a trusted assumption, not a
+proven one; gene_counts_cells.npy's labels, by contrast, ARE reliable and
+gene_counts.npz is aligned by real name-based lookup.
 
 Usage
 -----
@@ -65,6 +75,14 @@ def preprocess(indir: str, outdir: str) -> None:
 
     guide_assignment_sp = sparse.load_npz(os.path.join(indir, "guide_assignment.npz"))
     guide_assignment_guides = np.load(os.path.join(indir, "guide_assignment_guides.npy"), allow_pickle=True)
+    # guide_assignment_cells.npy is loaded ONLY to fail loudly if its length
+    # doesn't match -- its actual string labels are known-unreliable ("cell
+    # names are messed up", confirmed against the validated GFI1B reference
+    # script), so we deliberately do NOT use them for a by-name lookup like
+    # gene_counts_cells.npy below. guide_assignment_sp's raw column order is
+    # trusted to already match cell_meta's row order positionally (confirmed:
+    # shape is (n_guides x 94075), exactly cell_meta's row count, and the
+    # reference script relies on this same positional assumption).
     guide_assignment_cells = np.load(os.path.join(indir, "guide_assignment_cells.npy"), allow_pickle=True)
 
     if not np.array_equal(gene_counts_genes, gene_meta["V1"].values):
@@ -89,14 +107,15 @@ def preprocess(indir: str, outdir: str) -> None:
     gc_col_order = np.array([gc_cell_to_idx[c] for c in cell_order])
     gene_counts_aligned = gene_counts_sp[:, gc_col_order].tocsr()
 
-    ga_cell_to_idx = {c: i for i, c in enumerate(guide_assignment_cells)}
-    missing_ga = [c for c in cell_order if c not in ga_cell_to_idx]
-    if missing_ga:
+    # Positional identity, NOT a by-name lookup -- see the load comment above.
+    if guide_assignment_sp.shape[1] != len(cell_order):
         raise ValueError(
-            f"{len(missing_ga)} cell(s) in cellmeta_wSF.csv missing from "
-            f"guide_assignment_cells.npy, e.g. {missing_ga[:5]}"
+            f"guide_assignment.npz has {guide_assignment_sp.shape[1]} columns, "
+            f"but cellmeta_wSF.csv has {len(cell_order)} cells -- positional "
+            f"alignment assumption doesn't hold, can't proceed without a real "
+            f"cell-name join key (guide_assignment_cells.npy's labels are known-unreliable)."
         )
-    ga_col_order = np.array([ga_cell_to_idx[c] for c in cell_order])
+    ga_col_order = np.arange(len(cell_order))
     guide_assign = (
         guide_assignment_sp[:, ga_col_order]
         .T
