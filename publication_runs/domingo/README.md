@@ -4,6 +4,10 @@ Low-MOI, 4 cis genes (GFI1B, MYB, NFE2, TET2), primary (gene) modality plus
 splicing/velocity/efficiency modalities. Runs entirely on CPU
 (`bayesdream_cpu` env, `-p shared`) — no GPU stage anywhere in this dataset.
 
+**Before submitting a real run, see `../VERIFICATION.md`** for the general
+checklist, plus the Domingo-specific risk items it lists (unconfirmed
+modality directories).
+
 ## Pipeline
 
 ```

@@ -7,6 +7,10 @@ pipeline, plus a fit_cis-ONLY sweep over every OTHER gene with padj<0.05 in
 `ntc_shared`/`trans`/`permutation`/`recapitulation` run on GPU
 (`bayesdream_rocm`, `-p gpu`).
 
+**Before submitting a real run, see `../VERIFICATION.md`** for the general
+checklist, plus the Morris-specific risk items it lists (`rpy2`/R
+availability, the known `fit_cis()` high-MOI dtype bug).
+
 ## Before running
 
 1. **Preprocess once.** `python preprocess.py --indir <raw dir> --outdir

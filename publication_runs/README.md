@@ -14,6 +14,11 @@ simulation) or gets subtly wrong for this pipeline's needs (`run_trans.py`
 adds `adjust_ntc_sum_factor()`/`refit_sumfactor()`, which the CLI's
 `fit-trans` never calls).
 
+**Before your first real submission for a dataset, read `VERIFICATION.md`**
+— a staged checklist (static checks → dry run → dataset-specific risk
+checks → resource sizing → actual submit → output sanity checks) for
+confirming the pipeline is actually correct, not just that it renders.
+
 ## Layout
 
 ```
@@ -38,7 +43,8 @@ publication_runs/
 ├── domingo/                         # dataset: 4 cis genes, primary + splicing/velocity modalities
 ├── morris/                          # dataset: high-MOI, 5 primary + padj-derived cis-only sweep
 ├── template_dataset/                # copy this to start a new dataset
-└── README.md                        # this file
+├── README.md                         # this file
+└── VERIFICATION.md                   # checklist: how to verify/test/run a dataset's pipeline
 ```
 
 ## Conventions
