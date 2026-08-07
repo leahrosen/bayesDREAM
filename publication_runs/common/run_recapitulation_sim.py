@@ -8,13 +8,25 @@ truth priors) to test recovery under controlled conditions; this stage
 starts FROM an already-completed real fit.
 
 Not a bayesDREAM CLI subcommand. Requires ntc + cis + trans already fit and
-saved for this gene (needs x_true, sum_factors, alpha_y_prefit, and the
-saved trans_summary.csv as ground truth). Deep-copies the loaded model and
-swaps in simulated counts for the primary/trans modality, so x_true,
+saved for this gene/modality (needs x_true, sum_factors, alpha_y_prefit, and
+the saved trans_feature_summary.csv as ground truth). Deep-copies the loaded
+model and swaps in simulated counts for the TARGET modality, so x_true,
 sum_factors, technical_group_code and alpha_y_prefit are IDENTICAL to the
 real fit -- only the observed counts fit_trans regresses against are
 simulated. This is deliberate: the point is to test recovery of the
 dose-response curve itself, not re-derive the whole pipeline.
+
+Works on the PRIMARY modality by default, or on any custom modality (e.g.
+Domingo's binomial splicing modalities) via an ``attach_modality:`` config
+block, resolved and called before anything else -- same mechanism as
+run_permutation_null.py, see that module's docstring.
+
+Distribution-aware: negbinom passes `sim_sum_factor`, binomial passes
+`sim_denominator` (the modality's own aligned denominator array) to
+`simulate_from_trans_summary()` -- binomial has no sum factor concept.
+Multinomial is NOT supported here by design (dict-shaped return handled
+separately, but no caller in this pipeline currently requests it for
+recapitulation).
 
 CHECK BEFORE TRUSTING AT SCALE: simulate_from_trans_summary's returned
 DataFrame is reindexed here to match the modality's feature_names/cell_names
@@ -30,20 +42,32 @@ Usage
 
 Expects a top-level ``simulation:`` block, e.g.::
 
+    attach_modality:            # optional; omit for the primary modality
+      module: load_modalities
+      function: attach_modality
+      kwargs:
+        spec: {stype: sj, distribution: binomial, ...}
+        base_dir: /path/to/loader_inputs
+
     simulation:
+      modality_name: splicing_sj   # only needed if NOT using attach_modality
       load_ntc: {enabled: true}
       load_cis: {enabled: true}
       load_trans: {enabled: true}
       trans_summary_csv: null    # optional explicit path; default <output_dir>/<label>/trans_feature_summary_<modality>.csv
-      sum_factor_col: sum_factor_refit
+      sum_factor_col: sum_factor_refit    # negbinom only; ignored for binomial
       group_col: technical_group_code
       fit:                       # passed to fit_trans() on the simulated data; defaults to trans.fit if omitted
         sum_factor_col: sum_factor_refit
         function_type: additive_hill
-      output_dir: null           # optional; defaults to <output_dir>/<label>/recapitulation/rep_<rep>
+        min_denominator: 0       # required by fit_trans() for binomial/multinomial
+      output_dir: null           # optional; defaults to
+                                  # <output_dir>/<label>/recapitulation/[<modality_name>/]rep_<rep>
+                                  # (no modality_name subfolder for the primary modality)
 """
 
 import argparse
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -57,14 +81,35 @@ from config_utils import (  # noqa: E402
     normalize_stage_args,
     is_enabled,
     apply_sum_factor_adjustments,
+    ensure_dataset_dir_on_syspath,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 
 from bayesDREAM.simulation import simulate_from_trans_summary  # noqa: E402
 
+# Real save_trans_summary() column names (bayesDREAM/io/summary.py) for the
+# additive_hill/single_hill dose-response parameters -- components are 'a'/
+# 'b', NOT 'pos'/'neg'. (This list previously used the wrong names, which
+# meant _compare_summaries silently produced a 0-row comparison CSV for
+# every past recapitulation run -- see git history.)
+_HILL_KEY_COLS = [
+    "A_median", "alpha_median", "Vmax_a_median", "K_a_median", "n_a_median",
+    "beta_median", "Vmax_b_median", "K_b_median", "n_b_median",
+]
+
 
 def _seed_for(label: str, rep: int) -> int:
     return abs(hash(f"{label}__recapitulation__rep{rep}")) % (2**32)
+
+
+def _attach_modality_if_configured(model, cfg: dict):
+    spec = cfg.get("attach_modality")
+    if not spec:
+        return None
+    ensure_dataset_dir_on_syspath(cfg)
+    mod = importlib.import_module(spec["module"])
+    fn = getattr(mod, spec["function"])
+    return fn(model, **spec.get("kwargs", {}))
 
 
 def _compare_summaries(ground_truth: "object", recovered: "object", key_cols):
@@ -104,6 +149,9 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     model = build_model_from_config(cfg)
 
     sim_cfg = cfg.get("simulation") or {}
+    attached_modality = _attach_modality_if_configured(model, cfg)
+    modality_name = attached_modality or sim_cfg.get("modality_name") or model.primary_modality
+
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
 
     if is_enabled(sim_cfg.get("load_ntc", sim_cfg.get("load_technical")), default=True):
@@ -111,7 +159,9 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     if is_enabled(sim_cfg.get("load_cis"), default=True):
         model.load_cis_fit(**normalize_stage_args(sim_cfg.get("load_cis")))
     if is_enabled(sim_cfg.get("load_trans"), default=True):
-        model.load_trans_fit(**normalize_stage_args(sim_cfg.get("load_trans")))
+        load_trans_args = normalize_stage_args(sim_cfg.get("load_trans"))
+        load_trans_args.setdefault("modalities", [modality_name])
+        model.load_trans_fit(**load_trans_args)
 
     if "technical_group_code" not in model.meta.columns:
         covariates = ntc_cfg.get("set_technical_groups")
@@ -128,7 +178,6 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     if is_enabled(excl_cfg, default=False):
         model.exclude_trans_genes(**normalize_stage_args(excl_cfg))
 
-    modality_name = sim_cfg.get("modality_name") or model.primary_modality
     group_col = sim_cfg.get("group_col", "technical_group_code")
     sum_factor_col = sim_cfg.get("sum_factor_col", "sum_factor_refit")
 
@@ -137,53 +186,48 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     trans_summary_path = sim_cfg.get("trans_summary_csv") or default_summary
     ground_truth = pd.read_csv(trans_summary_path)
 
-    primary_mod = model.get_modality(modality_name)
+    target_mod = model.get_modality(modality_name)
     cis_mod = model.get_modality("cis")
 
     x_true = np.asarray(model.x_true)
     x_counts = np.asarray(cis_mod.counts).reshape(-1)
-    sim_sum_factor = primary_mod.sum_factors[sum_factor_col].values
 
-    simulated = simulate_from_trans_summary(
-        trans_summary_df=ground_truth,
-        meta=model.meta,
-        x_true=x_true,
-        x_counts=x_counts,
-        cis_gene=model.cis_gene,
-        sim_sum_factor=sim_sum_factor,
-        group_col=group_col,
-        seed=seed,
+    sim_kwargs = dict(
+        trans_summary_df=ground_truth, meta=model.meta, x_true=x_true, x_counts=x_counts,
+        cis_gene=model.cis_gene, group_col=group_col, seed=seed,
     )
+    if target_mod.distribution == "negbinom":
+        sim_kwargs["sim_sum_factor"] = target_mod.sum_factors[sum_factor_col].values
+    elif target_mod.distribution == "binomial":
+        # No sum-factor concept for binomial -- simulate_from_trans_summary
+        # instead needs the modality's own (already model-aligned) denominator.
+        sim_kwargs["sim_denominator"] = target_mod.denominator
+    else:
+        raise ValueError(
+            f"run_recapitulation_sim: modality '{modality_name}' has distribution "
+            f"{target_mod.distribution!r}, not supported here (negbinom/binomial only; "
+            f"multinomial's dict-shaped return isn't wired into this script)."
+        )
+
+    simulated = simulate_from_trans_summary(**sim_kwargs)
 
     sim_model = copy.deepcopy(model)
 
-    if isinstance(simulated, dict):
-        # multinomial: add as a new modality per simulate_from_trans_summary's own
-        # docstring example, rather than mutating the 3-D counts in place.
-        sim_modality_name = f"{modality_name}_sim"
-        sim_model.add_custom_modality(
-            name=sim_modality_name,
-            counts=simulated["counts"],
-            feature_meta=simulated["feature_meta"],
-            distribution="multinomial",
-            cell_names=simulated["cells"],
+    # negbinom/binomial: DataFrame with an extra cis-gene row (multinomial's
+    # dict return isn't reached here -- see the distribution check above).
+    sim_counts = simulated.drop(index=model.cis_gene, errors="ignore")
+    sim_mod = sim_model.get_modality(modality_name)
+    # Defensive reindex -- see module docstring's "CHECK BEFORE TRUSTING" note.
+    sim_counts = sim_counts.reindex(index=sim_mod.feature_names, columns=sim_mod.cell_names)
+    if sim_counts.isna().any().any():
+        raise ValueError(
+            "Reindexing simulate_from_trans_summary()'s output to the modality's "
+            "feature_names/cell_names produced NaNs -- the returned frame's row/"
+            "column labels don't fully match the modality. Inspect `simulated` "
+            "directly before proceeding."
         )
-        fit_modality_name = sim_modality_name
-    else:
-        # negbinom/normal/studentt/binomial: DataFrame with an extra cis-gene row.
-        sim_counts = simulated.drop(index=model.cis_gene, errors="ignore")
-        sim_mod = sim_model.get_modality(modality_name)
-        # Defensive reindex -- see module docstring's "CHECK BEFORE TRUSTING" note.
-        sim_counts = sim_counts.reindex(index=sim_mod.feature_names, columns=sim_mod.cell_names)
-        if sim_counts.isna().any().any():
-            raise ValueError(
-                "Reindexing simulate_from_trans_summary()'s output to the modality's "
-                "feature_names/cell_names produced NaNs -- the returned frame's row/"
-                "column labels don't fully match the modality. Inspect `simulated` "
-                "directly before proceeding."
-            )
-        sim_mod.counts = sim_counts.values
-        fit_modality_name = modality_name
+    sim_mod.counts = sim_counts.values
+    fit_modality_name = modality_name
 
     fit_args = normalize_stage_args(sim_cfg.get("fit") or (cfg.get("trans") or {}).get("fit"))
     fit_args["modality_name"] = fit_modality_name
@@ -191,25 +235,25 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
 
     rec_output_dir = sim_cfg.get("output_dir")
     if not rec_output_dir:
-        rec_output_dir = os.path.join(output_dir, label, "recapitulation", f"rep_{rep}")
+        if modality_name == model.primary_modality:
+            rec_output_dir = os.path.join(output_dir, label, "recapitulation", f"rep_{rep}")
+        else:
+            rec_output_dir = os.path.join(output_dir, label, "recapitulation", modality_name, f"rep_{rep}")
     os.makedirs(rec_output_dir, exist_ok=True)
 
-    sim_model.save_trans_fit(output_dir=rec_output_dir)
+    sim_model.save_trans_fit(output_dir=rec_output_dir, modalities=[fit_modality_name])
     sim_model.save_trans_summary(output_dir=rec_output_dir, modality_name=fit_modality_name)
 
     recovered = pd.read_csv(os.path.join(rec_output_dir, f"trans_feature_summary_{fit_modality_name}.csv"))
-    key_cols = [c for c in [
-        "Vmax_pos_median", "K_pos_median", "n_pos_median",
-        "Vmax_neg_median", "K_neg_median", "n_neg_median",
-    ] if c in ground_truth.columns]
+    key_cols = [c for c in _HILL_KEY_COLS if c in ground_truth.columns]
     comparison = _compare_summaries(ground_truth, recovered, key_cols)
     comparison_path = os.path.join(rec_output_dir, "recapitulation_comparison.csv")
     comparison.to_csv(comparison_path, index=False)
 
-    print(f"[recapitulation] rep={rep} seed={seed} -> {rec_output_dir}")
+    print(f"[recapitulation] modality={modality_name} rep={rep} seed={seed} -> {rec_output_dir}")
     save_provenance_json(
         os.path.join(rec_output_dir, "provenance.json"),
-        extra={"stage": "recapitulation", "label": label, "rep": rep, "seed": seed},
+        extra={"stage": "recapitulation", "label": label, "modality": modality_name, "rep": rep, "seed": seed},
     )
 
 
@@ -220,6 +264,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_bayesdream_yaml(Path(args.config))
+    cfg["_dataset_dir"] = cfg.get("_dataset_dir") or str(Path(args.config).resolve().parents[2])
     run_recapitulation_sim(cfg, args.rep)
 
 

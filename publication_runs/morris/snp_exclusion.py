@@ -69,3 +69,22 @@ def exclude_guides_for_cis_gene(guide_names: Iterable[str], cis_gene: str, snp_t
     for snp_id in snps_to_exclude:
         excluded.update(g for g in guide_names if snp_id in g)
     return sorted(excluded)
+
+
+def exclude_all_snp_guides(guide_names: Iterable[str], snp_table=SNP_TABLE) -> List[str]:
+    """Every guide matching ANY SNP_TABLE entry, with no per-gene exception --
+    for `ntc_shared`, which isn't "for" any one cis gene (cis_gene is
+    deferred there), so there's no gene to be lenient toward the way
+    `exclude_guides_for_cis_gene` is for a specific downstream cis-gene fit.
+    Cells carrying these guides have extensive trans effects (see this
+    module's docstring) and would otherwise confound the ONE shared
+    alpha_y_prefit every cis gene's add_cis_gene() later extracts from --
+    used because high-MOI's deferred-cis_gene fit_ntc() defaults to
+    use_all_cells=True (see bayesDREAM/fitting/ntc.py), so without this,
+    these cells are included in ntc_shared with no filtering at all.
+    """
+    guide_names = list(guide_names)
+    excluded = set()
+    for snp_id, _feature in snp_table:
+        excluded.update(g for g in guide_names if snp_id in g)
+    return sorted(excluded)

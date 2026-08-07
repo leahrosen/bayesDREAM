@@ -1,8 +1,11 @@
 # Domingo dataset
 
 Low-MOI, 4 cis genes (GFI1B, MYB, NFE2, TET2), primary (gene) modality plus
-splicing/velocity/efficiency modalities. Runs entirely on CPU
-(`bayesdream_cpu` env, `-p shared`) — no GPU stage anywhere in this dataset.
+splicing/velocity/efficiency modalities. Runs on CPU (`bayesdream_cpu` env,
+`-p shared`) EXCEPT the two multinomial modalities (donor_choice/
+acceptor_choice), which run on GPU (`bayesdream_rocm` env, `-p gpu`) and are
+packed together across ALL 4 genes into ONE job -- see "GPU-packed
+multinomial modalities" below.
 
 **Before submitting a real run, see `../VERIFICATION.md`** for the general
 checklist, plus the Domingo-specific risk items it lists (unconfirmed
@@ -17,23 +20,67 @@ modality directories).
         ┌────────┬──────┼──────┬────────┐
         ▼        ▼      ▼      ▼        ▼
      cis(GFI1B) cis(MYB) cis(NFE2) cis(TET2)   -- add_cis_gene() per gene, reusing ntc_shared
+        │              │             │            │
+        │              └─────────────┴────────────┴──── donor_choice/acceptor_choice (GPU, ALL 4 genes
+        │                                                packed into ONE node-queue job -- 4 genes x 2
+        │                                                modalities = 8 tasks, 8 GPUs/node)
         │
         ├── compensation(GFI1B)        check_systematic_shift(), raw sum_factor
         ├── trans(GFI1B)               fit_trans(additive_hill), sum_factor_refit
-        │     ├── permutation reps ×20  (array, auto-resubmits on timeout)
-        │     └── recapitulation reps ×10 (array, auto-resubmits on timeout)
+        │     ├── permutation reps ×5  (array, auto-resubmits on timeout)
+        │     └── recapitulation reps ×5 (array, auto-resubmits on timeout)
         └── modality(GFI1B, sj/exon_skip/intron_retention/mxe/gene_velocity/
-              donor_efficiency/acceptor_efficiency/donor_choice/acceptor_choice)
-              (one job per modality: own fit_ntc() + fit_trans(),
-               additive_hill except donor/acceptor_choice: single_hill)
+              donor_efficiency/acceptor_efficiency)  -- BINOMIAL only, one CPU job each
+              (own fit_ntc() + fit_trans(additive_hill))
+              ├── modality permutation reps ×5   (array, auto-resubmit)
+              └── modality recapitulation reps ×5 (array, auto-resubmit)
 ```
 
 Same for MYB, NFE2, TET2. `generate_slurm.py` writes one sbatch script per
-box above (57 scripts total for 4 genes × 9 modalities + the shared/per-gene
-stages) plus `submit_all.sh`, which chains them with `--dependency=afterok`
-per the diagram (compensation/trans/modalities all depend on that gene's cis
-job; permutation/recapitulation depend on trans) and writes
-`submitted_jobs.tsv` for `common/slurm/list_job_status.py`.
+box above (106 scripts total: 4 genes × [3 gene-level stages + 2 gene-level
+array stages + 7 binomial modality-fit jobs + 7 binomial modalities × 2 more
+array stages] + the shared ntc job + ONE packed multinomial-modality job
+covering all 4 genes) plus `submit_all.sh`, which chains them with
+`--dependency=afterok`
+per the diagram (compensation/trans/binomial-modalities all depend on that
+gene's cis job; gene-level permutation/recapitulation depend on gene-level
+trans; modality-level permutation/recapitulation depend on THAT modality's
+own fit job, not just cis -- see "Modality-level permutation/recapitulation"
+below; the packed multinomial job depends on ALL 4 genes' cis jobs) and
+writes `submitted_jobs.tsv` for `common/slurm/list_job_status.py`.
+
+## GPU-packed multinomial modalities (donor_choice/acceptor_choice)
+
+Unlike every other Domingo stage, these two run on GPU: `fit_ntc()`'s own
+`niters` default is 2x higher for multinomial than negbinom/binomial (see
+`bayesDREAM/fitting/ntc.py`), and these modalities empirically need GPU.
+4 cis genes x 2 modalities = 8 tasks, which happens to be exactly one Dardel
+GPU node's worth (8 GPUs/node) -- so `generate_slurm.py` packs all 8 into
+ONE `SbatchGpuNodeQueue` job (`07_modality_multinomial_packed.sh`, `-N 1
+--gpus=8`, concurrency=8) instead of 8 separate per-(gene, modality) jobs,
+using the same `common/slurm/run_node_queue.sh` mechanism as
+`morris/generate_slurm.py`'s packed trans/permutation/recapitulation jobs.
+Each of the 8 tasklist lines is individually prefixed with its own thread
+pins (`OMP_NUM_THREADS=...` etc., from `modalities.resources.cores`) and GPU
+device assignment (`HIP_VISIBLE_DEVICES=<task index>` + `ROCR_VISIBLE_DEVICES=`
+as a fallback for older ROCm builds) -- `run_node_queue.sh` runs concurrent
+tasks as separate subshells, so a whole-job-level export wouldn't reach them
+individually, and without per-task device assignment every concurrent task
+would default to the same GPU instead of spreading across the node's 8.
+
+There is no permutation/recapitulation for these two modalities (multinomial
+is excluded from that everywhere in this pipeline, same as the per-gene
+gene-level path), so the packed job's tasklist is just the 8 modality-fit
+calls themselves -- the same `load_modalities.py` script the binomial CPU
+jobs use, just on `python_env_gpu`/`device: cuda` instead of `python_env`/
+`device: cpu`.
+
+**Not verified**: (a) that `HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` is
+the env var Dardel's actual ROCm build/driver honors for device isolation --
+confirm with `rocm-smi` inside two concurrently-launched tasks on a real GPU
+node; (b) that `concurrency (8) * modalities.resources.cores` fits within
+one real Dardel GPU node's CPU core count -- confirm via `sinfo -p gpu -o
+"%P %G %c %N"`.
 
 ## Before running
 
@@ -88,6 +135,34 @@ against that gene's own `model.meta['L_cell_barcode']` (Domingo's
 preprocessed meta sets `cell == L_cell_barcode`, so this lines up with
 `add_custom_modality()`'s own internal alignment against `model.meta['cell']`
 — see `load_modalities.py`'s module docstring).
+
+## Modality-level permutation/recapitulation
+
+Only for BINOMIAL modalities (sj, exon_skip, intron_retention, mxe,
+gene_velocity, donor_efficiency, acceptor_efficiency) -- NOT the multinomial
+donor_choice/acceptor_choice. `n_reps` reused from `config.yaml`'s
+`modalities.trans.permutation.n_reps`/`modalities.trans.simulation.n_reps`.
+
+Mechanically these are the same `common/run_permutation_null.py`/
+`common/run_recapitulation_sim.py` scripts the gene-level jobs use, made
+modality-aware via a `modality_name` parameter (previously hardcoded to the
+primary modality) plus a new `attach_modality:` config block -- a dynamic
+import/call of `load_modalities.attach_modality()`, resolved at runtime via
+`config_utils.ensure_dataset_dir_on_syspath()` (put `domingo/` on
+`sys.path` using the `_dataset_dir` value `generate_slurm.py` stamps into
+every rendered config). Since a custom modality only exists on a freshly
+built model after `attach_modality()` re-attaches it, this happens FIRST,
+before `load_ntc_fit()`/`load_cis_fit()` -- which then pick up that
+modality's OWN saved ntc/trans fit automatically (default `modalities=None`
+loads whatever exists). Binomial's `simulate_from_trans_summary()` call
+passes `sim_denominator` (the modality's own aligned denominator) instead of
+`sim_sum_factor` -- binomial has no sum-factor concept.
+
+Each modality-level permutation/recapitulation array job depends on that
+SAME modality's own `07_modality_<gene>_<modality>.sh` job (not just cis) --
+it needs that job's saved ntc fit (`alpha_y_prefit` prior for `fit_trans()`)
+and, for recapitulation, its saved `trans_feature_summary_<modality>.csv` as
+ground truth.
 
 ## R preprocessing (runs once, upstream, NOT part of this SLURM pipeline)
 

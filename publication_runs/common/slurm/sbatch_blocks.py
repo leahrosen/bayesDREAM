@@ -201,6 +201,18 @@ class SbatchGpuNodeQueue:
     `gpu_partition` and `gpu_sbatch_lines` are deliberately left for the
     caller to fill in -- see this module's docstring for why they can't be
     guessed here.
+
+    auto_requeue_on_timeout: same `--signal=B:USR1@120` + trap + `scontrol
+    requeue` idiom as SbatchStep/SbatchArray, but requeues the WHOLE packed
+    job, not an individual task -- run_node_queue.sh has no "skip tasks that
+    already finished" logic, so a requeue re-runs every task in the tasklist,
+    including ones that already succeeded. This is safe but wasteful for
+    trans (each individual fit_trans call still resumes close to where it
+    left off via its own internal checkpoint -- see this module's docstring
+    -- so a redundant re-run is a few cheap iterations, not a cold restart),
+    and unconditionally correct either way since every run_*.py stage here
+    is idempotent (overwrites the same saved output). Set True for packed
+    trans/permutation/recapitulation jobs, same rule as SbatchStep/SbatchArray.
     """
 
     job_name: str
@@ -212,7 +224,8 @@ class SbatchGpuNodeQueue:
     gpu_partition: str
     node_queue_script: str  # path to common/slurm/run_node_queue.sh
     repo_dir: Optional[str] = None
-    gpu_sbatch_lines: List[str] = field(default_factory=list)  # e.g. ["#SBATCH --gpus=1", "#SBATCH -N 1"]
+    gpu_sbatch_lines: List[str] = field(default_factory=list)  # e.g. ["#SBATCH --gpus=8", "#SBATCH -N 1"]
+    auto_requeue_on_timeout: bool = False
 
     def render(self) -> str:
         lines = [
@@ -224,6 +237,11 @@ class SbatchGpuNodeQueue:
             f"#SBATCH --time={hours_to_slurm_time(self.time_hours)}",
             f"#SBATCH --partition={self.gpu_partition}",
             *self.gpu_sbatch_lines,
+        ]
+        if self.auto_requeue_on_timeout:
+            lines.append(f"#SBATCH --signal=B:USR1@{_REQUEUE_SIGNAL_LEAD_SECONDS}")
+            lines.append("#SBATCH --requeue")
+        lines += [
             "",
             "set -euo pipefail",
             "",
@@ -231,5 +249,10 @@ class SbatchGpuNodeQueue:
         if self.repo_dir:
             lines.append(_provenance_echo(self.repo_dir))
         lines.append("")
-        lines.append(f'bash "{self.node_queue_script}" "{self.tasklist_path}" {self.concurrency}')
+        queue_cmd = f'bash "{self.node_queue_script}" "{self.tasklist_path}" {self.concurrency}'
+        if self.auto_requeue_on_timeout:
+            lines.append(_requeue_trap(is_array=False))
+            lines.extend(_run_in_background_and_wait([queue_cmd]))
+        else:
+            lines.append(queue_cmd)
         return "\n".join(lines) + "\n"

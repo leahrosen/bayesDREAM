@@ -5,7 +5,10 @@ pipeline, plus a fit_cis-ONLY sweep over every OTHER gene with padj<0.05 in
 `Morris_gRNA2target_stats.csv`, reusing the same shared `fit_ntc()`.
 `fit_cis`/`compensation` always run on CPU (`bayesdream_cpu`, `-p shared`);
 `ntc_shared`/`trans`/`permutation`/`recapitulation` run on GPU
-(`bayesdream_rocm`, `-p gpu`).
+(`bayesdream_rocm`, `-p gpu`). `trans`/`permutation`/`recapitulation` are each
+ONE packed GPU-node submission covering all 5 primary genes (and, for
+permutation/recapitulation, all reps) rather than one job per gene -- see
+"GPU node packing" below.
 
 **Before submitting a real run, see `../VERIFICATION.md`** for the general
 checklist, plus the Morris-specific risk items it lists (`rpy2`/R
@@ -80,6 +83,18 @@ high-MOI modelling) -- this exclusion is deliberately narrow, not a blanket
 `.str.contains()` convention -- see `snp_exclusion.py`'s docstring for the
 one collision edge case this implies.
 
+**`ntc_shared` gets the FULL table, unconditionally** (`exclude_all_snp_guides()`,
+no per-gene exception), not the per-gene subset above. This matters because
+`ntc_shared` defers `cis_gene`, and `fit_ntc()` defaults `use_all_cells=True`
+whenever high-MOI + `cis_gene` is unset (see `bayesDREAM/fitting/ntc.py`) --
+so without this, cells carrying these "extensive trans effects" guides would
+have been included, completely unfiltered, in the ONE shared
+`alpha_y_prefit` every primary and sweep gene's `add_cis_gene()` extracts
+from. This asymmetry (broader exclusion at `ntc_shared` than at any
+per-gene stage) is safe: `add_cis_gene()`'s alpha extraction is indexed by
+FEATURE (gene), not by cell, so it doesn't create the cell-alignment
+mismatch the "identical exclude_guides per gene" rule below is about.
+
 **Consistency requirement**: `exclude_guides` is a bayesDREAM CONSTRUCTOR-time
 filter, and every stage (`cis`, `compensation`, `trans`, `permutation`,
 `recapitulation`) builds its OWN fresh model for a given gene (the `cis`
@@ -130,3 +145,70 @@ Every trans-derived stage (trans/permutation/recapitulation) drops genes
 with `log2(mu_ntc) < -4` before fitting, via bayesDREAM's own
 `model.exclude_trans_genes(min_log2_mu_ntc=...)` (config.yaml's
 `trans.exclude_trans_genes`) -- same as Domingo.
+
+## GPU node packing (trans/permutation/recapitulation)
+
+A Dardel GPU node has 8 GPUs. Running one job per (primary gene [x rep])
+for trans/permutation/recapitulation would waste most of a node's GPUs per
+job, so these three stages are each ONE `SbatchGpuNodeQueue` submission
+(`common/slurm/sbatch_blocks.py`) instead of N per-gene `SbatchStep`/
+`SbatchArray` submissions:
+
+- **`04_trans_packed.sh`**: 5 tasks (one per `primary_genes` entry),
+  concurrency 5.
+- **`05_permutation_packed.sh`** / **`06_recapitulation_packed.sh`**: 5 x
+  `trans.permutation.n_reps` / `trans.simulation.n_reps` tasks (25 with the
+  current n_reps=5), concurrency `min(n_tasks, 8)`.
+
+Each is a plain-text task list of literal shell commands (`configs/
+04_trans_packed_tasklist.txt`, etc. -- one `run_trans.py`/
+`run_permutation_null.py --rep N`/`run_recapitulation_sim.py --rep N`
+invocation per line, generated inside the same per-gene loop that renders
+each gene's config YAML) run via `common/slurm/run_node_queue.sh` inside
+ONE whole-node `sbatch` allocation (`cluster.gpu_node_sbatch_lines` in
+config.yaml, default `-N 1 --gpus=8`). Unlike SbatchStep/SbatchArray (whole-
+job export), each tasklist line is individually prefixed with its own `env
+...` (`generate_slurm.py`'s `_pinned()`) for TWO reasons -- `run_node_queue.sh`
+runs concurrent tasks as separate subshells within the same job, so a
+whole-job-level export wouldn't reach them individually:
+1. **Thread pinning** (`OMP_NUM_THREADS=...` etc., sized from that stage's
+   `resources.cores`) -- otherwise every concurrent task's BLAS/torch
+   threadpool would try to claim the whole node's cores.
+2. **GPU device assignment** (`HIP_VISIBLE_DEVICES=<i %% concurrency>` +
+   `ROCR_VISIBLE_DEVICES=` as a fallback) -- a whole-node `-N 1 --gpus=8`
+   allocation exposes all 8 GPUs to every process by default, so without
+   this every concurrent task would default to the same device (GPU 0)
+   instead of spreading across the node. Round-robins task index modulo
+   concurrency, so this is a clean 1:1 mapping onto distinct GPUs for every
+   stage here (trans concurrency=5, permutation/recapitulation
+   concurrency=min(n_tasks, 8) -- never exceeds `GPUS_PER_NODE=8`).
+
+**Not verified**: (a) that `concurrency * resources.cores` actually fits
+within one real Dardel GPU node's core count -- confirm via `sinfo -p gpu -o
+"%P %G %c %N"` and reduce a stage's `resources.cores` if it doesn't fit; (b)
+that `HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` is the env var Dardel's
+actual ROCm build/driver honors for device isolation -- confirm with
+`rocm-smi` inside two concurrently-launched tasks on a real GPU node before
+trusting it.
+
+`ntc_shared` is NOT packed alongside trans: it already IS "fit_ntc for the 5
+primary genes" (the shared/deferred design means one fit serves all of
+them -- there's no separate per-primary-gene fit_ntc stage to combine it
+with), and packing it into the same node allocation as trans isn't possible
+anyway -- CPU-only `cis`/`compensation` sit on the dependency chain between
+them (trans needs that gene's saved cis fit), which would leave an expensive
+reserved GPU node idle for however long those CPU stages take. `ntc_shared`
+stays its own single-task GPU job (`01_ntc_shared.sh`, `--gpus=1`).
+
+Packed jobs still auto-resubmit on timeout (`SbatchGpuNodeQueue`'s
+`auto_requeue_on_timeout=True`, same `--signal=B:USR1@120` idiom as before),
+but note the granularity changed: a timeout now requeues the WHOLE packed
+job, re-running every task in its list, not just the unfinished ones (
+`run_node_queue.sh` has no "skip if already done" logic). This is wasteful
+but not incorrect -- every `run_*.py` stage here overwrites the same saved
+output idempotently, and an individual re-run of an already-finished gene's
+`fit_trans` still resumes quickly via its own internal Pyro-level
+checkpoint. `submit_all.sh`'s dependency chain also collapsed accordingly:
+`04_trans_packed.sh` depends on ALL 5 primary genes' `02_cis_<gene>.sh` jobs
+(`--dependency=afterok:$CIS_GFI1B:$CIS_NFE2:...`), and `05`/`06` each depend
+on just `$TRANS_PACKED` (one dependency instead of one per gene).

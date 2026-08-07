@@ -8,6 +8,10 @@ label_prefix: domingo_20260806   # -> bayesdream label = <label_prefix>_<gene>
 paths:
   repo_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/CRISPRmodelling/BayesianModelling/bayesDREAM_forClaude
   python_env: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_cpu/bin/python
+  # GPU env, used ONLY for the two multinomial modalities (donor_choice/
+  # acceptor_choice) -- see modalities below. Everything else in Domingo
+  # runs on python_env (CPU).
+  python_env_gpu: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_rocm/bin/python
 
   # Written by the R preprocessing script (see domingo/README.md) --
   # confirm these are the actual filenames/location once the script has
@@ -21,7 +25,17 @@ paths:
 
 cluster:
   account: naiss2025-5-479
-  partition_cpu: shared   # Domingo always runs on CPU -- no GPU partition needed.
+  # Domingo runs on CPU everywhere EXCEPT the two multinomial modalities
+  # (donor_choice/acceptor_choice -- fit_ntc's own niters default is 2x
+  # higher for multinomial than negbinom/binomial, and empirically these
+  # need GPU). partition_gpu/gpu_node_sbatch_lines: NOT confirmed against
+  # your account -- check `sinfo -p gpu -o "%P %G %c %N"` before submitting.
+  partition_cpu: shared
+  partition_gpu: gpu
+  # 4 cis_genes x 2 multinomial modalities = 8 tasks -- exactly one Dardel
+  # GPU node's worth (8 GPUs/node), packed via SbatchGpuNodeQueue (see
+  # generate_slurm.py's "GPU-packed multinomial modalities" section).
+  gpu_node_sbatch_lines: ["#SBATCH -N 1", "#SBATCH --gpus=8"]
 
 model_defaults:
   modality_name: gene
@@ -69,12 +83,14 @@ trans:
   # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
   exclude_trans_genes: {min_log2_mu_ntc: -4.0}
 
+  # n_reps below are arbitrary placeholders (not derived from a power
+  # calculation or benchmark) -- set when scaffolding, never revisited.
   permutation:
-    n_reps: 20
+    n_reps: 5
     resources: {cores: 16}
 
   simulation:
-    n_reps: 10
+    n_reps: 5
     resources: {cores: 8}
 
 # Further modalities (splicing/velocity/donor-acceptor choice), fit per
@@ -87,6 +103,12 @@ modalities:
   config: config_modalities.yaml
   data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/20260328_splicing/loader_inputs
   resources: {cores: 8}
+  # Permutation + recapitulation reps for BINOMIAL modalities only (sj,
+  # exon_skip, intron_retention, mxe, gene_velocity, donor_efficiency,
+  # acceptor_efficiency) -- NOT multinomial (donor_choice/acceptor_choice),
+  # per instruction. Same arbitrary-default caveat as trans.permutation/
+  # trans.simulation above: not derived from anything, just numbers picked
+  # when scaffolding.
   trans:
-    permutation: {n_reps: 20}
-    simulation: {n_reps: 10}
+    permutation: {n_reps: 5}
+    simulation: {n_reps: 5}

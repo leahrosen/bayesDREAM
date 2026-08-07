@@ -30,10 +30,24 @@ paths:
 cluster:
   account: naiss2025-5-479
   partition_cpu: shared
-  # GPU steps (ntc_shared, trans, permutation, recapitulation): --gpus=1 is a
-  # reasonable guess for Dardel's AMD/ROCm GPU nodes but NOT confirmed against
-  # your account -- check `sinfo -p gpu -o "%P %G %N"` before submitting.
+  # GPU steps (ntc_shared, trans, permutation, recapitulation): NOT confirmed
+  # against your account -- check `sinfo -p gpu -o "%P %G %c %N"` before
+  # submitting.
   partition_gpu: gpu
+  # Each Dardel GPU node has 8 GPUs (per project instruction) -- used for two
+  # different things below, both currently unconfirmed against real Dardel
+  # syntax/limits:
+  #   gpu_single_sbatch_lines: standalone single-task GPU jobs (ntc_shared).
+  #   gpu_node_sbatch_lines: packed jobs (04_trans_packed.sh,
+  #     05_permutation_packed.sh, 06_recapitulation_packed.sh -- see
+  #     generate_slurm.py's "GPU node packing" docstring section) that run
+  #     several primary_genes' fits concurrently on ONE whole node via
+  #     common/slurm/run_node_queue.sh, so they request the FULL node's 8
+  #     GPUs rather than 1. concurrency for those jobs is min(n_tasks, 8) --
+  #     also confirm the node's CPU core count covers concurrency *
+  #     resources.cores for each packed stage (see generate_slurm.py).
+  gpu_single_sbatch_lines: ["#SBATCH --gpus=1"]
+  gpu_node_sbatch_lines: ["#SBATCH -N 1", "#SBATCH --gpus=8"]
 
 model_defaults:
   modality_name: gene
@@ -96,12 +110,14 @@ trans:
   # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
   exclude_trans_genes: {min_log2_mu_ntc: -4.0}
 
+  # n_reps below are arbitrary placeholders (not derived from a power
+  # calculation or benchmark) -- set when scaffolding, never revisited.
   permutation:
-    n_reps: 20
+    n_reps: 5
     resources: {cores: 16}
 
   simulation:
-    n_reps: 10
+    n_reps: 5
     resources: {cores: 8}
 
 # fit_cis ONLY (no compensation/trans) for every padj-significant gene that

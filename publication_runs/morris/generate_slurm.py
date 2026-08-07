@@ -22,14 +22,41 @@ timeout (fit_trans has its own checkpoint/resume) -- ntc_shared/cis/
 compensation/cis_sweep failures are left for manual review via
 common/slurm/list_job_status.py.
 
+GPU node packing (primary_genes only): a Dardel GPU node has 8 GPUs
+(cluster.gpu_node_sbatch_lines below), and none of ntc_shared/a single
+gene's trans/permutation/recapitulation needs a whole node to itself, so:
+- `04_trans_packed.sh`: one SbatchGpuNodeQueue job running all 5
+  primary_genes' trans fits concurrently (one node, concurrency=5).
+- `05_permutation_packed.sh` / `06_recapitulation_packed.sh`: one
+  SbatchGpuNodeQueue job each, running all 5 genes x n_reps tasks
+  (25 with n_reps=5) at concurrency=min(n_tasks, 8).
+ntc_shared stays its OWN single-task GPU job (`01_ntc_shared.sh`) rather
+than being packed with trans: it IS "fit_ntc for the 5 primary genes" (the
+whole point of the deferred-cis-gene design is that one shared fit serves
+all of them -- there is no separate per-primary-gene fit_ntc stage to pack
+alongside it), and it can't be packed into the SAME node allocation as trans
+either way -- cis(CPU)+compensation(CPU) sit on the dependency chain between
+them, which would leave a reserved GPU node idle for however long those take.
+Packed jobs still auto-resubmit on timeout (SbatchGpuNodeQueue's
+auto_requeue_on_timeout=True) -- see its docstring in sbatch_blocks.py for
+the "re-runs already-finished tasks too" caveat this implies for a packed
+job specifically (individual per-gene jobs didn't have this caveat).
+
 Correctness note: `exclude_guides` is a bayesDREAM CONSTRUCTOR-time filter,
 so every stage that constructs its OWN fresh model for a given gene (cis via
 deferred+add_cis_gene, compensation/trans/permutation/recapitulation via
 cis_gene-at-init) must use the IDENTICAL per-gene exclude_guides list, or
 their cell/guide composition diverges and load_cis_fit()/load_trans_fit()
 would be aligning against a model whose cells don't match what was actually
-saved. `_per_gene_exclude_guides()` below is computed once per gene and
-threaded through every stage's rendered config for consistency.
+saved. `per_gene_exclude_guides()` below is computed once per gene and
+threaded through every stage's rendered config for consistency. This does
+NOT apply to `ntc_shared` itself, which deliberately uses a BROADER
+exclude_guides (global_exclude_guides + the full SNP table, unconditionally
+-- see `exclude_all_snp_guides`) than any per-gene stage: `add_cis_gene()`
+extracts `alpha_y_prefit` per FEATURE (gene), not per cell, from the shared
+ntc posteriors, so a wider guide exclusion at that one shared-fit stage
+doesn't create a cell-alignment mismatch with the (narrower, per-gene)
+exclude_guides used everywhere downstream.
 
 Usage
 -----
@@ -51,8 +78,8 @@ sys.path.insert(0, str(THIS_DIR))
 
 from config_utils import load_yaml, write_yaml, render_bayesdream_config  # noqa: E402
 from git_provenance import create_stable_snapshot_tag  # noqa: E402
-from sbatch_blocks import SbatchStep, SbatchArray  # noqa: E402
-from snp_exclusion import exclude_guides_for_cis_gene  # noqa: E402
+from sbatch_blocks import SbatchStep, SbatchArray, SbatchGpuNodeQueue  # noqa: E402
+from snp_exclusion import exclude_guides_for_cis_gene, exclude_all_snp_guides  # noqa: E402
 
 TIME_HOURS = 24.0  # fixed everywhere, per project convention
 
@@ -130,6 +157,14 @@ def main() -> None:
     account = cluster["account"]
     partition_cpu = cluster.get("partition_cpu", "shared")
     partition_gpu = cluster.get("partition_gpu", "gpu")
+    # Whole-node request for packed GPU jobs (see module docstring's "GPU
+    # node packing" section) vs. a single-GPU request for standalone
+    # single-task GPU jobs (currently just ntc_shared). Both unconfirmed
+    # against the real account/partition -- see config.yaml's comment.
+    gpu_node_sbatch_lines = cluster.get("gpu_node_sbatch_lines", ["#SBATCH -N 1", "#SBATCH --gpus=8"])
+    gpu_single_sbatch_lines = cluster.get("gpu_single_sbatch_lines", ["#SBATCH --gpus=1"])
+    node_queue_script = str(REPO_DIR_LOCAL / "publication_runs" / "common" / "slurm" / "run_node_queue.sh")
+    GPUS_PER_NODE = 8
 
     label_prefix = cfg["label_prefix"]
     model_defaults = cfg["model_defaults"]
@@ -160,6 +195,15 @@ def main() -> None:
         "guide_meta": paths["guide_meta"], "guide_target": paths["guide_target"],
     }
     base_cfg = {
+        # Lets common/run_compensation.py's exclude_cells dynamic-import
+        # hook (morris/compensation_exclude_cells.py) actually find that
+        # module at runtime -- see
+        # config_utils.ensure_dataset_dir_on_syspath's docstring. Previously
+        # missing: the hook's own sys.path candidates never included
+        # morris/, so this import would have failed at runtime the first
+        # time it was actually exercised (never caught by dry-run testing,
+        # which only exercises config *generation*, not execution).
+        "_dataset_dir": str(THIS_DIR),
         "data": data_block,
         "model": {
             "modality_name": model_defaults["modality_name"],
@@ -189,13 +233,25 @@ def main() -> None:
 
     # ---------------------------------------------------------------- #
     # 1. Shared fit_ntc: cis_gene deferred, full gene panel, GPU.        #
-    #    Only global_exclude_guides applied here -- per-gene SNP         #
-    #    exclusion happens later, per gene (see module docstring).       #
+    #    global_exclude_guides + the FULL SNP table (unconditionally,    #
+    #    no per-gene exception -- see exclude_all_snp_guides) applied    #
+    #    here. Per-gene SNP exclusion (SNP table minus that gene's own   #
+    #    exception) happens separately, later, per gene.                 #
     # ---------------------------------------------------------------- #
     label_ntc = f"{label_prefix}_ntc_shared"
     ntc_shared_dir = f"{output_dir}/{label_ntc}"
+    # ntc_shared isn't "for" any one cis gene (cis_gene is deferred here) --
+    # so unlike every per-gene stage below (which excludes the SNP table
+    # MINUS that gene's own exception), ntc_shared excludes the SNP table's
+    # guides UNCONDITIONALLY (no exception). This matters because high-MOI's
+    # deferred-cis_gene fit_ntc() defaults to use_all_cells=True (see
+    # bayesDREAM/fitting/ntc.py) -- without this, cells carrying these
+    # "extensive trans effects" guides would be included, unfiltered, in the
+    # ONE shared alpha_y_prefit every cis gene's add_cis_gene() later
+    # extracts from.
+    ntc_exclude_guides = sorted(set(global_exclude_guides) | set(exclude_all_snp_guides(all_guide_names)))
     ntc_bd_cfg = render_bayesdream_config(base_cfg, {
-        "model": {"label": label_ntc, "exclude_guides": global_exclude_guides},
+        "model": {"label": label_ntc, "exclude_guides": ntc_exclude_guides},
         "ntc": {"fit": {}, "save": True},
     })
     ntc_cfg_path = configs_dir / f"{label_ntc}.yaml"
@@ -205,6 +261,7 @@ def main() -> None:
         job_name="morris_ntc_shared", account=account, log_dir=str(logs_dir),
         time_hours=TIME_HOURS, cpus=ntc_shared_cfg["resources"]["cores"],
         partition=partition_gpu, repo_dir=repo_dir,
+        extra_sbatch_lines=gpu_single_sbatch_lines,
         commands=[bd_cmd("ntc", ntc_cfg_path, python_env_gpu)],
     )
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
@@ -241,9 +298,14 @@ def main() -> None:
         )
 
     # ---------------------------------------------------------------- #
-    # 2. Primary genes: cis(CPU) -> compensation(CPU) -> trans(GPU) ->   #
-    #    permutation(GPU array) -> recapitulation(GPU array)             #
+    # 2. Primary genes: cis(CPU) -> compensation(CPU) -> trans/          #
+    #    permutation/recapitulation (GPU, packed onto one node each      #
+    #    across all 5 primary genes -- see module docstring's "GPU node  #
+    #    packing" section).                                              #
     # ---------------------------------------------------------------- #
+    trans_commands = []
+    perm_commands = []
+    sim_commands = []
     for gene in primary_genes:
         label = f"{label_prefix}_{gene}"
         exclude_guides = per_gene_exclude_guides(gene)
@@ -299,15 +361,7 @@ def main() -> None:
         })
         trans_cfg_path = configs_dir / f"{label}_trans.yaml"
         write_yaml(trans_cfg_path, trans_bd_cfg)
-        trans_step = SbatchStep(
-            job_name=f"morris_trans_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=TIME_HOURS, cpus=trans_cfg["resources"]["cores"],
-            partition=partition_gpu, repo_dir=repo_dir,
-            commands=[bd_cmd("trans", trans_cfg_path, python_env_gpu)],
-            auto_requeue_on_timeout=True,
-        )
-        scripts.append((f"04_trans_{gene}.sh", trans_step.render()))
-        submitted_rows.append(("trans", label, f"04_trans_{gene}.sh"))
+        trans_commands.append(bd_cmd("trans", trans_cfg_path, python_env_gpu))
 
         perm_bd_cfg = render_gene_cfg(gene, label, None, exclude_guides, {
             "sum_factor": sum_factor_trans_block,
@@ -323,16 +377,8 @@ def main() -> None:
         perm_cfg_path = configs_dir / f"{label}_permutation.yaml"
         write_yaml(perm_cfg_path, perm_bd_cfg)
         n_perm = trans_cfg["permutation"]["n_reps"]
-        perm_step = SbatchArray(
-            job_name=f"morris_perm_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=TIME_HOURS, cpus=trans_cfg["permutation"]["resources"]["cores"],
-            max_index=n_perm - 1, max_concurrent=min(n_perm, 50),
-            partition=partition_gpu, repo_dir=repo_dir,
-            commands=[bd_cmd("permutation_null", perm_cfg_path, python_env_gpu, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
-            auto_requeue_on_timeout=True,
-        )
-        scripts.append((f"05_permutation_{gene}.sh", perm_step.render()))
-        submitted_rows.append(("permutation", label, f"05_permutation_{gene}.sh"))
+        for rep in range(n_perm):
+            perm_commands.append(bd_cmd("permutation_null", perm_cfg_path, python_env_gpu, extra_args=f" --rep {rep}"))
 
         sim_bd_cfg = render_gene_cfg(gene, label, None, exclude_guides, {
             "sum_factor": sum_factor_trans_block,
@@ -347,16 +393,84 @@ def main() -> None:
         sim_cfg_path = configs_dir / f"{label}_simulation.yaml"
         write_yaml(sim_cfg_path, sim_bd_cfg)
         n_sim = trans_cfg["simulation"]["n_reps"]
-        sim_step = SbatchArray(
-            job_name=f"morris_sim_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=TIME_HOURS, cpus=trans_cfg["simulation"]["resources"]["cores"],
-            max_index=n_sim - 1, max_concurrent=min(n_sim, 50),
-            partition=partition_gpu, repo_dir=repo_dir,
-            commands=[bd_cmd("recapitulation_sim", sim_cfg_path, python_env_gpu, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
-            auto_requeue_on_timeout=True,
+        for rep in range(n_sim):
+            sim_commands.append(bd_cmd("recapitulation_sim", sim_cfg_path, python_env_gpu, extra_args=f" --rep {rep}"))
+
+    # ---------------------------------------------------------------- #
+    # 2b. Packed GPU-node jobs: one submission each for trans/           #
+    #    permutation/recapitulation across all 5 primary_genes, sharing  #
+    #    one node (see module docstring's "GPU node packing" section).   #
+    #    cpus-per-task below sizes EACH concurrent task's own thread     #
+    #    pool (trans_cfg["resources"]["cores"], as before) -- packing    #
+    #    does not change how many cores an individual fit uses, only     #
+    #    how many fits share one node's GPUs at once.                    #
+    # ---------------------------------------------------------------- #
+    def _pinned(cmd: str, cpus: int, gpu_idx: int) -> str:
+        # run_node_queue.sh runs each tasklist line via `eval` in its own
+        # subshell -- unlike SbatchStep/SbatchArray (whole-job export), each
+        # packed task needs its OWN per-command prefix for two separate
+        # reasons:
+        # 1. Thread pinning: without it every concurrent task's BLAS/torch
+        #    threadpool would try to claim the WHOLE node's cores.
+        # 2. GPU device assignment: a whole-node allocation (-N 1 --gpus=8)
+        #    exposes ALL 8 GPUs to every process by default -- torch/ROCm
+        #    picks device 0 unless told otherwise, so without this EVERY
+        #    concurrent task would pile onto the same physical GPU instead
+        #    of spreading across the node's 8. HIP_VISIBLE_DEVICES is the
+        #    ROCm analogue of CUDA_VISIBLE_DEVICES (python_env_gpu is
+        #    bayesdream_rocm); ROCR_VISIBLE_DEVICES set alongside it as a
+        #    fallback for older ROCm builds that don't honor the HIP_ name.
+        #    Round-robins gpu_idx = task_index % GPUS_PER_NODE across the
+        #    tasklist, so this only actually spreads tasks 1:1 across
+        #    distinct GPUs when concurrency <= GPUS_PER_NODE (true for every
+        #    stage here: trans concurrency=5, permutation/recapitulation
+        #    concurrency=min(n_tasks, 8)).
+        exports = (
+            f"OMP_NUM_THREADS={cpus} OPENBLAS_NUM_THREADS={cpus} MKL_NUM_THREADS={cpus} "
+            f"VECLIB_MAXIMUM_THREADS={cpus} NUMEXPR_NUM_THREADS={cpus} "
+            f"HIP_VISIBLE_DEVICES={gpu_idx} ROCR_VISIBLE_DEVICES={gpu_idx}"
         )
-        scripts.append((f"06_recapitulation_{gene}.sh", sim_step.render()))
-        submitted_rows.append(("recapitulation", label, f"06_recapitulation_{gene}.sh"))
+        return f"env {exports} {cmd}"
+
+    def write_packed_gpu_job(step_name: str, job_name: str, commands: list, cpus: int) -> str:
+        # NOT verified against the real Dardel GPU node's CPU count:
+        # concurrency * cpus must fit within one node's cores (e.g. 5 trans
+        # tasks * 16 cores = 80; up to 8 permutation/recapitulation tasks *
+        # their own cores -- see trans.permutation/simulation.resources.cores
+        # in config.yaml). Confirm via `sinfo -p gpu -o "%P %c %N"` before
+        # submitting; lower resources.cores per stage if it doesn't fit.
+        # NOT verified: that HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES is
+        # actually the right env var for Dardel's ROCm build/driver version
+        # -- confirm on a real GPU node (e.g. `rocm-smi` inside two
+        # concurrently-launched tasks) before trusting device isolation.
+        concurrency = min(len(commands), GPUS_PER_NODE)
+        pinned_commands = [_pinned(cmd, cpus, i % concurrency) for i, cmd in enumerate(commands)]
+        tasklist_path = configs_dir / f"{step_name}_tasklist.txt"
+        tasklist_path.write_text("\n".join(pinned_commands) + "\n")
+        step = SbatchGpuNodeQueue(
+            job_name=job_name, account=account, log_dir=str(logs_dir),
+            time_hours=TIME_HOURS, tasklist_path=str(tasklist_path), concurrency=concurrency,
+            gpu_partition=partition_gpu, node_queue_script=node_queue_script, repo_dir=repo_dir,
+            gpu_sbatch_lines=gpu_node_sbatch_lines, auto_requeue_on_timeout=True,
+        )
+        filename = f"{step_name}.sh"
+        scripts.append((filename, step.render()))
+        return filename
+
+    trans_script = write_packed_gpu_job(
+        "04_trans_packed", "morris_trans_packed", trans_commands, trans_cfg["resources"]["cores"],
+    )
+    submitted_rows.append(("trans", f"{len(primary_genes)} primary genes (packed)", trans_script))
+
+    perm_script = write_packed_gpu_job(
+        "05_permutation_packed", "morris_perm_packed", perm_commands, trans_cfg["permutation"]["resources"]["cores"],
+    )
+    submitted_rows.append(("permutation", f"{len(primary_genes)} genes x {trans_cfg['permutation']['n_reps']} reps (packed)", perm_script))
+
+    sim_script = write_packed_gpu_job(
+        "06_recapitulation_packed", "morris_sim_packed", sim_commands, trans_cfg["simulation"]["resources"]["cores"],
+    )
+    submitted_rows.append(("recapitulation", f"{len(primary_genes)} genes x {trans_cfg['simulation']['n_reps']} reps (packed)", sim_script))
 
     # ---------------------------------------------------------------- #
     # 3. cis-ONLY sweep (CPU array, one array submission for all genes)  #
@@ -406,15 +520,21 @@ def main() -> None:
             f'echo -e "cis\\t{gene}\\t$CIS_{gene}\\t02_cis_{gene}.sh" >> "$TSV"',
             f'COMP_{gene}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 03_compensation_{gene}.sh)',
             f'echo -e "compensation\\t{gene}\\t$COMP_{gene}\\t03_compensation_{gene}.sh" >> "$TSV"',
-            f'TRANS_{gene}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 04_trans_{gene}.sh)',
-            f'echo -e "trans\\t{gene}\\t$TRANS_{gene}\\t04_trans_{gene}.sh" >> "$TSV"',
-            f'PERM_{gene}=$(sbatch --parsable --dependency=afterok:$TRANS_{gene} 05_permutation_{gene}.sh)',
-            f'echo -e "permutation\\t{gene}\\t$PERM_{gene}\\t05_permutation_{gene}.sh" >> "$TSV"',
-            f'SIM_{gene}=$(sbatch --parsable --dependency=afterok:$TRANS_{gene} 06_recapitulation_{gene}.sh)',
-            f'echo -e "recapitulation\\t{gene}\\t$SIM_{gene}\\t06_recapitulation_{gene}.sh" >> "$TSV"',
             "",
         ]
+    # Packed trans/permutation/recapitulation (see module docstring's "GPU
+    # node packing" section): one job each, covering all primary_genes, so
+    # they must wait for EVERY gene's cis job (trans reads that gene's own
+    # saved cis fit -- see render_gene_cfg's "load_cis": {"enabled": True}).
+    cis_dep = ":".join(f"$CIS_{gene}" for gene in primary_genes)
     submit_lines += [
+        f'TRANS_PACKED=$(sbatch --parsable --dependency=afterok:{cis_dep} 04_trans_packed.sh)',
+        'echo -e "trans\\tall_primary\\t$TRANS_PACKED\\t04_trans_packed.sh" >> "$TSV"',
+        'PERM_PACKED=$(sbatch --parsable --dependency=afterok:$TRANS_PACKED 05_permutation_packed.sh)',
+        'echo -e "permutation\\tall_primary\\t$PERM_PACKED\\t05_permutation_packed.sh" >> "$TSV"',
+        'SIM_PACKED=$(sbatch --parsable --dependency=afterok:$TRANS_PACKED 06_recapitulation_packed.sh)',
+        'echo -e "recapitulation\\tall_primary\\t$SIM_PACKED\\t06_recapitulation_packed.sh" >> "$TSV"',
+        "",
         'SWEEP_JOB=$(sbatch --parsable --dependency=afterok:$NTC_JOB 07_cis_sweep.sh)',
         'echo -e "cis_sweep\\tall\\t$SWEEP_JOB\\t07_cis_sweep.sh" >> "$TSV"',
     ]

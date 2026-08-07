@@ -79,6 +79,23 @@ allow-list) and support for sparse `.npz` counts (the CLI only reads counts
 via `pd.read_csv`; Morris's counts matrix is far too large to be dense CSV).
 See `config_utils.py`'s module docstring.
 
+**Dynamic dataset-module hooks (`attach_modality`, `exclude_cells`).**
+`run_compensation.py`, `run_permutation_null.py`, and `run_recapitulation_sim.py`
+can call into a dataset-specific Python module at runtime via a config block
+shaped `{module, function, kwargs}` (e.g. Morris's padj-based
+`compensation_exclude_cells.py`, Domingo's `load_modalities.attach_modality`
+for modality-level permutation/recapitulation). This only works if the
+dataset's own directory (`domingo/`, `morris/`) is on `sys.path` in that
+job's process — `generate_slurm.py` stamps `_dataset_dir` into every
+rendered config for exactly this, and `config_utils.ensure_dataset_dir_on_syspath()`
+reads it before the `importlib.import_module()` call. (This was previously
+broken for Morris's compensation hook — the old sys.path candidates never
+included `morris/`, so the import would have failed the first time it
+actually ran; never caught because dry-run testing only exercises config
+*generation*, not execution. Fixed now, and any new dynamic hook must go
+through `ensure_dataset_dir_on_syspath()` too, not reinvent its own
+candidate list.)
+
 **sum_factor recomputation.** `sum_factor_adj`/`sum_factor_refit`/Morris's
 `sum_factor_new` are never persisted by `save_cis_fit()`/`save_trans_fit()`
 or restored by `load_cis_fit()` — every stage after `fit_cis` that needs one
@@ -142,11 +159,26 @@ don't request one node per task. Instead write a plain-text task list (one
 CLI invocation per line) and submit a single `sbatch` that requests one node
 and runs `common/slurm/run_node_queue.sh <tasklist> <concurrency>`, which
 runs up to `<concurrency>` tasks at a time via a bash job-pool (`wait -n`,
-requires bash >=4.3). Neither current dataset actually needs this today
-(Domingo is CPU-only; Morris's `fit_cis` is CPU-only and its other GPU
-stages are one-model-per-job already) — it's available in
-`common/slurm/sbatch_blocks.py`'s `SbatchGpuNodeQueue` for whenever a future
-dataset does.
+requires bash >=4.3). `common/slurm/sbatch_blocks.py`'s `SbatchGpuNodeQueue`
+implements the sbatch header for this (`gpu_sbatch_lines` for the whole-node
+request, `auto_requeue_on_timeout` for the same signal-trap idiom as
+`SbatchStep`/`SbatchArray` — see its docstring for the "requeues the whole
+packed job, not just the unfinished tasks" caveat this implies). Domingo
+runs on CPU everywhere except its two multinomial modalities (donor_choice/
+acceptor_choice, which empirically need GPU) — 4 cis genes x 2 modalities =
+8 tasks, packed into ONE job across ALL genes (exactly one Dardel node's 8
+GPUs) — see `domingo/README.md`'s "GPU-packed multinomial modalities"
+section. Morris packs its 5 `primary_genes`' trans/permutation/
+recapitulation jobs the same way (one submission each, instead of one per
+gene) — see `morris/README.md`'s "GPU node packing" section; its
+`ntc_shared`/`fit_cis` stages stay unpacked (one shared job / CPU-only,
+respectively). Both datasets' packed tasklists individually prefix each line
+with `HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` (round-robinned over
+concurrency) so concurrent tasks land on distinct GPUs instead of all
+defaulting to device 0 — a whole-node allocation exposes every GPU to every
+process by default, and `run_node_queue.sh` runs tasks as separate
+subshells, so this can't be a single whole-job export the way thread-pinning
+is for `SbatchStep`/`SbatchArray`.
 
 **Dardel's MaxSubmitJobs gotcha.** `sbatch` array tasks count against your
 account's `MaxSubmitJobs` quota the instant they're submitted, regardless of

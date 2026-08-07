@@ -48,6 +48,7 @@ from config_utils import (  # noqa: E402
     load_bayesdream_yaml,
     normalize_stage_args,
     is_enabled,
+    ensure_dataset_dir_on_syspath,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 
@@ -69,11 +70,14 @@ def _resolve_exclude_cells(spec, model, cfg):
     if isinstance(spec, str):
         return _load_exclude_cells_file(spec)
     if isinstance(spec, dict):
-        module_name = spec["module"]
-        # Make dataset directories (morris/, domingo/, ...) importable regardless of CWD.
-        for candidate in (Path(cfg.get("_config_dir", ".")), Path(__file__).resolve().parents[1]):
-            sys.path.insert(0, str(candidate))
-        mod = importlib.import_module(module_name)
+        # BUG FIX: this used to try (config file's own directory, common/'s
+        # parent) as sys.path candidates -- neither is where a dataset's own
+        # module (e.g. morris/compensation_exclude_cells.py) actually lives,
+        # so this import silently could never have succeeded at runtime.
+        # generate_slurm.py now stamps `_dataset_dir` into every rendered
+        # config for exactly this.
+        ensure_dataset_dir_on_syspath(cfg)
+        mod = importlib.import_module(spec["module"])
         fn = getattr(mod, spec["function"])
         return fn(model, cfg, **spec.get("kwargs", {}))
     raise ValueError(f"run_compensation: unsupported exclude_cells spec type: {type(spec)}")

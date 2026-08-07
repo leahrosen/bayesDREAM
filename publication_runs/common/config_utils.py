@@ -31,6 +31,7 @@ upstream, ``_EXTENDED_MODEL_KEYS`` should be reconciled with it.
 """
 
 import copy
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -137,7 +138,28 @@ __all__ = [
     "deep_merge",
     "render_bayesdream_config",
     "apply_sum_factor_adjustments",
+    "ensure_dataset_dir_on_syspath",
 ]
+
+
+def ensure_dataset_dir_on_syspath(cfg: Dict[str, Any]) -> None:
+    """Put a rendered config's ``_dataset_dir`` (set by generate_slurm.py --
+    e.g. .../publication_runs/domingo -- NOT the same as the directory the
+    rendered YAML itself lives in, which is .../slurm/configs/) onto
+    sys.path, so dataset-specific modules referenced by dynamic-import
+    config blocks (e.g. domingo/load_modalities.py, morris/
+    compensation_exclude_cells.py) are actually importable at runtime.
+
+    Without this, `import <dataset_module>` in a freshly-started SLURM job
+    process has no reason to find a module living in domingo/ or morris/ --
+    generate_slurm.py's own sys.path.insert() calls only affect the
+    config-GENERATION process, not the separate process that later runs the
+    rendered config. Call this before any `importlib.import_module(...)`
+    driven by a config value.
+    """
+    dataset_dir = cfg.get("_dataset_dir")
+    if dataset_dir and dataset_dir not in sys.path:
+        sys.path.insert(0, dataset_dir)
 
 
 def load_yaml(path) -> Dict[str, Any]:

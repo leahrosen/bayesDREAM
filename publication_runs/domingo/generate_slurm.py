@@ -3,15 +3,31 @@ Generate SLURM scripts + per-gene bayesdream-CLI configs for the Domingo
 dataset: one shared fit_ntc, then per cis-gene (GFI1B/MYB/NFE2/TET2)
 fit_cis -> compensation -> fit_trans -> permutation reps -> recapitulation
 reps, plus the extra (splicing/velocity/efficiency) modalities per gene
-after its cis fit. See publication_runs/README.md for the general
-conventions, domingo/README.md for the reference pipeline this mirrors, and
-domingo/config.yaml for all dataset-specific settings.
+after its cis fit -- and, for BINOMIAL modalities only (not multinomial),
+their own permutation + recapitulation reps too. See publication_runs/README.md
+for the general conventions, domingo/README.md for the reference pipeline
+this mirrors, and domingo/config.yaml for all dataset-specific settings.
 
-Domingo runs entirely on CPU (device='cpu' everywhere -- no GPU env/
-partition needed). Only trans/permutation/recapitulation auto-resubmit on
-timeout (fit_trans has its own checkpoint/resume) -- ntc_shared/cis/
-compensation/modality failures are left for manual review via
+Domingo runs on CPU everywhere EXCEPT the two multinomial modalities
+(donor_choice/acceptor_choice), which run on GPU, packed together across
+ALL genes into ONE SbatchGpuNodeQueue job (len(cis_genes) x 2 = 8 tasks --
+exactly one Dardel GPU node's worth of 8 GPUs at concurrency=8) -- see
+"GPU-packed multinomial modalities" below. Only trans/permutation/
+recapitulation (gene-level AND modality-level) auto-resubmit on timeout
+(fit_trans has its own checkpoint/resume) -- ntc_shared/cis/compensation/
+modality-fit failures are left for manual review via
 common/slurm/list_job_status.py.
+
+GPU-packed multinomial modalities: fit_ntc's own niters default is 2x higher
+for multinomial than negbinom/binomial (see bayesDREAM/fitting/ntc.py), and
+these two modalities empirically need GPU. Since there's no per-gene
+permutation/recapitulation for multinomial (excluded per project
+convention, same as the per-gene cis/trans path), the packed job's
+tasklist is just the len(cis_genes) x 2 modality-fit calls themselves
+(load_modalities.py, same script the per-gene binomial CPU jobs use) --
+each individually prefixed with thread-pin + HIP_VISIBLE_DEVICES/
+ROCR_VISIBLE_DEVICES env vars (round-robin over concurrency), same pattern
+as morris/generate_slurm.py's packed trans/permutation/recapitulation jobs.
 
 Usage
 -----
@@ -26,7 +42,10 @@ Writes:
     <outdir>/04_trans_<gene>.sh
     <outdir>/05_permutation_<gene>.sh    (array over reps)
     <outdir>/06_recapitulation_<gene>.sh (array over reps)
-    <outdir>/07_modality_<gene>_<modality>.sh
+    <outdir>/07_modality_<gene>_<modality>.sh          (binomial only, one CPU job each)
+    <outdir>/07_modality_multinomial_packed.sh         (multinomial only, ONE GPU-node-packed job, all genes)
+    <outdir>/08_modality_permutation_<gene>_<modality>.sh    (binomial only, array over reps)
+    <outdir>/09_modality_recapitulation_<gene>_<modality>.sh (binomial only, array over reps)
     <outdir>/submit_all.sh           dependency-chained submission,
                                      writes submitted_jobs.tsv for
                                      common/slurm/list_job_status.py
@@ -44,7 +63,7 @@ sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common" / "slurm")
 
 from config_utils import load_yaml, write_yaml, render_bayesdream_config  # noqa: E402
 from git_provenance import create_stable_snapshot_tag  # noqa: E402
-from sbatch_blocks import SbatchStep, SbatchArray  # noqa: E402
+from sbatch_blocks import SbatchStep, SbatchArray, SbatchGpuNodeQueue  # noqa: E402
 
 TIME_HOURS = 24.0  # fixed everywhere, per project convention
 
@@ -78,10 +97,15 @@ def main() -> None:
     output_dir = paths["output_dir"]
     repo_dir = paths["repo_dir"]
     python_env = paths["python_env"]
+    python_env_gpu = paths["python_env_gpu"]
 
     cluster = cfg["cluster"]
     account = cluster["account"]
     partition_cpu = cluster.get("partition_cpu", "shared")
+    partition_gpu = cluster.get("partition_gpu", "gpu")
+    gpu_node_sbatch_lines = cluster.get("gpu_node_sbatch_lines", ["#SBATCH -N 1", "#SBATCH --gpus=8"])
+    node_queue_script = str(REPO_DIR_LOCAL / "publication_runs" / "common" / "slurm" / "run_node_queue.sh")
+    GPUS_PER_NODE = 8
 
     label_prefix = cfg["label_prefix"]
     model_defaults = cfg["model_defaults"]
@@ -93,6 +117,11 @@ def main() -> None:
     modalities_dataset_cfg = cfg["modalities"]
 
     base_cfg = {
+        # Lets common/run_*.py scripts' dynamic-import config blocks (e.g.
+        # attach_modality below, or a compensation exclude_cells hook)
+        # actually find domingo/-local modules at runtime -- see
+        # config_utils.ensure_dataset_dir_on_syspath's docstring.
+        "_dataset_dir": str(THIS_DIR),
         "data": {"meta": meta_path, "counts": counts_path},
         "model": {
             "modality_name": model_defaults["modality_name"],
@@ -127,8 +156,25 @@ def main() -> None:
         script = f"{repo_dir}/publication_runs/common/run_{kind}.py"
         return f'"{python_env}" "{script}" --config "{config_path}"{extra_args}'
 
+    def _pinned(cmd: str, cpus: int, gpu_idx: int) -> str:
+        # Same rationale as morris/generate_slurm.py's _pinned(): run_node_queue.sh
+        # runs each tasklist line as a separate subshell, so each needs its
+        # OWN thread cap (else every concurrent task's BLAS/torch threadpool
+        # fights over the whole node's cores) and its OWN GPU device
+        # assignment (else every concurrent task defaults to GPU 0 instead
+        # of spreading across the node's 8). HIP_VISIBLE_DEVICES is the ROCm
+        # analogue of CUDA_VISIBLE_DEVICES; ROCR_VISIBLE_DEVICES set
+        # alongside as a fallback for older ROCm builds.
+        exports = (
+            f"OMP_NUM_THREADS={cpus} OPENBLAS_NUM_THREADS={cpus} MKL_NUM_THREADS={cpus} "
+            f"VECLIB_MAXIMUM_THREADS={cpus} NUMEXPR_NUM_THREADS={cpus} "
+            f"HIP_VISIBLE_DEVICES={gpu_idx} ROCR_VISIBLE_DEVICES={gpu_idx}"
+        )
+        return f"env {exports} {cmd}"
+
     scripts = []  # (filename, rendered sbatch text) in submission order
     submitted_rows = []  # (stage, label, script) for submit_all.sh's submitted_jobs.tsv
+    multinomial_commands = []  # collected across all (gene, multinomial-modality) pairs, packed after the loop
 
     # ---------------------------------------------------------------- #
     # 1. Shared fit_ntc (deferred cis_gene -- all genes in one fit)      #
@@ -285,35 +331,144 @@ def main() -> None:
         scripts.append((f"06_recapitulation_{gene}.sh", sim_step.render()))
         submitted_rows.append(("recapitulation", label, f"06_recapitulation_{gene}.sh"))
 
-        # -- 7. extra modalities (one job per modality, after cis) --
+        # -- 7. extra modalities, after cis --
         # data_dir is ONE shared directory for every gene (not per-gene) --
         # per-gene cell subsetting happens inside load_modalities.py by
         # aligning against that gene's own model.meta -- see its docstring.
+        # BINOMIAL modalities: one CPU job each, as before. MULTINOMIAL
+        # (donor_choice/acceptor_choice): GPU, and packed together across
+        # all genes -- see "GPU-packed multinomial modalities" below.
         for spec in modalities_cfg:
             mod_name = spec["stype"]
+            is_multinomial = spec["distribution"] == "multinomial"
             mod_data_dir = modalities_dataset_cfg["data_dir"]
             mod_cfg = render_bayesdream_config(base_cfg, {
-                "model": {"label": label, "cis_gene": gene},
+                "model": {"label": label, "cis_gene": gene, "device": "cuda" if is_multinomial else "cpu"},
                 "cis": {"load_cis": {"enabled": True}},
             })
             mod_cfg_path = configs_dir / f"{label}_modality_{mod_name}.yaml"
             write_yaml(mod_cfg_path, mod_cfg)
 
+            mod_env = python_env_gpu if is_multinomial else python_env
             mod_cmd = (
-                f'cd "{repo_dir}" && "{python_env}" "{repo_dir}/publication_runs/domingo/load_modalities.py" '
+                f'cd "{repo_dir}" && "{mod_env}" "{repo_dir}/publication_runs/domingo/load_modalities.py" '
                 f'--config "{mod_cfg_path}" --modality-name {mod_name} '
                 f'--modality-spec "{repo_dir}/publication_runs/domingo/config_modalities.yaml" '
                 f'--data-dir "{mod_data_dir}"'
             )
-            mod_step = SbatchStep(
-                job_name=f"domingo_mod_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                time_hours=TIME_HOURS,
-                cpus=modalities_dataset_cfg["resources"]["cores"],
-                partition=partition_cpu, repo_dir=repo_dir,
-                commands=[mod_cmd],
-            )
-            scripts.append((f"07_modality_{gene}_{mod_name}.sh", mod_step.render()))
-            submitted_rows.append((f"modality_{mod_name}", label, f"07_modality_{gene}_{mod_name}.sh"))
+
+            if is_multinomial:
+                multinomial_commands.append(mod_cmd)
+            else:
+                mod_step = SbatchStep(
+                    job_name=f"domingo_mod_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
+                    time_hours=TIME_HOURS,
+                    cpus=modalities_dataset_cfg["resources"]["cores"],
+                    partition=partition_cpu, repo_dir=repo_dir,
+                    commands=[mod_cmd],
+                )
+                scripts.append((f"07_modality_{gene}_{mod_name}.sh", mod_step.render()))
+                submitted_rows.append((f"modality_{mod_name}", label, f"07_modality_{gene}_{mod_name}.sh"))
+
+            # -- 7b. permutation + recapitulation for BINOMIAL modalities   --
+            # only (not multinomial, per instruction). Both depend on THIS
+            # modality's own job above (07_modality_...), not just cis --
+            # they need that job's saved ntc fit (alpha_y_prefit prior for
+            # fit_trans) and, for recapitulation, its saved
+            # trans_feature_summary.csv as ground truth.
+            if spec["distribution"] == "binomial":
+                attach_block = {
+                    "attach_modality": {
+                        "module": "load_modalities",
+                        "function": "attach_modality",
+                        "kwargs": {"spec": spec, "base_dir": mod_data_dir},
+                    },
+                }
+                mod_fit_args = {
+                    "function_type": spec["function_type"],
+                    "min_denominator": spec.get("min_denominator", 0),
+                }
+
+                mod_perm_cfg = render_bayesdream_config(base_cfg, {
+                    "model": {"label": label, "cis_gene": gene},
+                    **attach_block,
+                    "sum_factor": sum_factor_block,
+                    "permutation": {
+                        "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                        "load_cis": {"enabled": True},
+                        "covariates": sf_cfg["covariates"],
+                        "sum_factor_col": "sum_factor_adj",
+                        "fit": mod_fit_args,
+                    },
+                })
+                mod_perm_cfg_path = configs_dir / f"{label}_modality_{mod_name}_permutation.yaml"
+                write_yaml(mod_perm_cfg_path, mod_perm_cfg)
+
+                n_mod_perm = modalities_dataset_cfg["trans"]["permutation"]["n_reps"]
+                mod_perm_step = SbatchArray(
+                    job_name=f"domingo_modperm_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
+                    time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["resources"]["cores"],
+                    max_index=n_mod_perm - 1, max_concurrent=min(n_mod_perm, 50),
+                    partition=partition_cpu, repo_dir=repo_dir,
+                    commands=[bd_cmd("permutation_null", mod_perm_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
+                    auto_requeue_on_timeout=True,
+                )
+                scripts.append((f"08_modality_permutation_{gene}_{mod_name}.sh", mod_perm_step.render()))
+                submitted_rows.append((f"modality_permutation_{mod_name}", label,
+                                       f"08_modality_permutation_{gene}_{mod_name}.sh"))
+
+                mod_sim_cfg = render_bayesdream_config(base_cfg, {
+                    "model": {"label": label, "cis_gene": gene},
+                    **attach_block,
+                    "sum_factor": sum_factor_block,
+                    "simulation": {
+                        "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                        "load_cis": {"enabled": True},
+                        "load_trans": {"enabled": True},
+                        "fit": mod_fit_args,
+                    },
+                })
+                mod_sim_cfg_path = configs_dir / f"{label}_modality_{mod_name}_simulation.yaml"
+                write_yaml(mod_sim_cfg_path, mod_sim_cfg)
+
+                n_mod_sim = modalities_dataset_cfg["trans"]["simulation"]["n_reps"]
+                mod_sim_step = SbatchArray(
+                    job_name=f"domingo_modsim_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
+                    time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["resources"]["cores"],
+                    max_index=n_mod_sim - 1, max_concurrent=min(n_mod_sim, 50),
+                    partition=partition_cpu, repo_dir=repo_dir,
+                    commands=[bd_cmd("recapitulation_sim", mod_sim_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
+                    auto_requeue_on_timeout=True,
+                )
+                scripts.append((f"09_modality_recapitulation_{gene}_{mod_name}.sh", mod_sim_step.render()))
+                submitted_rows.append((f"modality_recapitulation_{mod_name}", label,
+                                       f"09_modality_recapitulation_{gene}_{mod_name}.sh"))
+
+    # ---------------------------------------------------------------- #
+    # 7c. GPU-packed multinomial modalities (donor_choice/acceptor_choice) #
+    #    across ALL genes: len(cis_genes) x 2 = 8 tasks -- exactly one     #
+    #    Dardel GPU node's worth (8 GPUs/node) at concurrency=8, so this   #
+    #    is ONE SbatchGpuNodeQueue submission, not one job per (gene,      #
+    #    modality) pair. No permutation/recapitulation counterpart        #
+    #    (multinomial is excluded from those, same as the per-gene path). #
+    # ---------------------------------------------------------------- #
+    multinomial_script = None
+    if multinomial_commands:
+        cpus = modalities_dataset_cfg["resources"]["cores"]
+        concurrency = min(len(multinomial_commands), GPUS_PER_NODE)
+        pinned_commands = [_pinned(cmd, cpus, i % concurrency) for i, cmd in enumerate(multinomial_commands)]
+        tasklist_path = configs_dir / "07_modality_multinomial_packed_tasklist.txt"
+        tasklist_path.write_text("\n".join(pinned_commands) + "\n")
+        mod_multi_step = SbatchGpuNodeQueue(
+            job_name="domingo_mod_multinomial_packed", account=account, log_dir=str(logs_dir),
+            time_hours=TIME_HOURS, tasklist_path=str(tasklist_path), concurrency=concurrency,
+            gpu_partition=partition_gpu, node_queue_script=node_queue_script, repo_dir=repo_dir,
+            gpu_sbatch_lines=gpu_node_sbatch_lines, auto_requeue_on_timeout=True,
+        )
+        multinomial_script = "07_modality_multinomial_packed.sh"
+        scripts.append((multinomial_script, mod_multi_step.render()))
+        submitted_rows.append(("modality_multinomial_packed", f"{len(cfg['cis_genes'])} genes x 2 modalities (packed)",
+                                multinomial_script))
 
     for filename, text in scripts:
         (outdir / filename).write_text(text)
@@ -353,11 +508,28 @@ def main() -> None:
         ]
         for spec in modalities_cfg:
             mod_name = spec["stype"]
+            if spec["distribution"] == "multinomial":
+                continue  # packed separately below, one job for ALL genes
             submit_lines += [
                 f'MOD_{gene}_{mod_name}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 07_modality_{gene}_{mod_name}.sh)',
                 f'echo -e "modality_{mod_name}\\t{gene}\\t$MOD_{gene}_{mod_name}\\t07_modality_{gene}_{mod_name}.sh" >> "$TSV"',
             ]
+            if spec["distribution"] == "binomial":
+                submit_lines += [
+                    f'sbatch --dependency=afterok:$MOD_{gene}_{mod_name} 08_modality_permutation_{gene}_{mod_name}.sh',
+                    f'sbatch --dependency=afterok:$MOD_{gene}_{mod_name} 09_modality_recapitulation_{gene}_{mod_name}.sh',
+                ]
         submit_lines.append("")
+
+    if multinomial_script:
+        # Packed job needs EVERY gene's cis fit done (it runs all 4 genes x
+        # 2 modalities' worth of tasks) -- multi-job afterok dependency.
+        cis_dep = ":".join(f"$CIS_{gene}" for gene in cfg["cis_genes"])
+        submit_lines += [
+            f'MOD_MULTI=$(sbatch --parsable --dependency=afterok:{cis_dep} {multinomial_script})',
+            f'echo -e "modality_multinomial_packed\\tall_genes\\t$MOD_MULTI\\t{multinomial_script}" >> "$TSV"',
+            "",
+        ]
 
     (outdir / "submit_all.sh").write_text("\n".join(submit_lines) + "\n")
     os.chmod(outdir / "submit_all.sh", 0o755)
