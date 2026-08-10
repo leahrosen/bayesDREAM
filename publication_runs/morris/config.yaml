@@ -110,14 +110,14 @@ trans:
   # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
   exclude_trans_genes: {min_log2_mu_ntc: -4.0}
 
-  # n_reps below are arbitrary placeholders (not derived from a power
-  # calculation or benchmark) -- set when scaffolding, never revisited.
+  # n_reps: 1 each per explicit instruction (was 5, an arbitrary
+  # placeholder not derived from a power calculation or benchmark).
   permutation:
-    n_reps: 5
+    n_reps: 1
     resources: {cores: 16}
 
   simulation:
-    n_reps: 5
+    n_reps: 1
     resources: {cores: 8}
 
 # fit_cis ONLY (no compensation/trans) for every padj-significant gene that
