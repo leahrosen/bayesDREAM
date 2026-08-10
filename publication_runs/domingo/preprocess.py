@@ -43,15 +43,23 @@ Inputs (in --indir), confirmed via header/content inspection on Dardel
                               index_col=0 handles this.
 
 Writes to --outdir:
-    cell_meta.csv    all raw columns + clustered.sum.factor/cell/target/
-                     sum_factor/guide
-    gene_counts.csv  genes x cells, CRISPRi/CRISPRa dropped, CCDC173
-                     renamed CFAP210, 'gene' column header (matches
-                     toydata/gene_counts.csv's existing, working format)
-    gene_meta.csv    attr, chr, start, end, strand, gene_id,
-                     gene_id.version, gene_name, gene_type -- filtered to
-                     genes present in gene_counts.csv (matches
-                     toydata/gene_meta.csv's existing schema exactly)
+    cell_meta.csv       all raw columns + clustered.sum.factor/cell/target/
+                        sum_factor/guide
+    gene_counts.csv     genes x cells, CRISPRi/CRISPRa dropped, CCDC173
+                        renamed CFAP210, 'gene' column header (matches
+                        toydata/gene_counts.csv's existing, working format)
+    gene_meta.csv       attr, chr, start, end, strand, gene_id,
+                        gene_id.version, gene_name, gene_type -- filtered to
+                        genes present in gene_counts.csv (matches
+                        toydata/gene_meta.csv's existing schema exactly)
+    cell_meta_ntc.csv       NTC-only subset of cell_meta.csv (target=='ntc')
+    gene_counts_ntc.npz     NTC-only subset of gene_counts.csv, sparse --
+                            for ntc_shared, which only ever fits on NTC
+                            cells (use_all_cells=False, the low-MOI
+                            default) but previously still had to load+
+                            classify the full 20001-cell dataset to get
+                            there. No per-gene reduction here (ntc_shared
+                            estimates alpha_y for every gene) -- cells only.
 
 What's different from the original R script
 ---------------------------------------------
@@ -81,6 +89,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 _DEFAULT_GTF = (
     "/cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/refdata/"
@@ -176,13 +185,21 @@ def preprocess(indir: str, outdir: str, gtf_path: str) -> None:
 
     gene_meta = _build_gene_meta(gtf_path, gene_counts.index)
 
+    # ---- NTC-only subset, for ntc_shared (which only ever fits on NTC cells) ----
+    ntc_mask = (cell_meta["target"] == "ntc").to_numpy()
+    cell_meta_ntc = cell_meta.loc[ntc_mask].reset_index(drop=True)
+    gene_counts_ntc = sparse.csr_matrix(gene_counts.loc[:, ntc_mask].values)
+
     # ---- write ----
     cell_meta.to_csv(os.path.join(outdir, "cell_meta.csv"), index=False)
     gene_counts.to_csv(os.path.join(outdir, "gene_counts.csv"), index_label="gene")
     gene_meta.to_csv(os.path.join(outdir, "gene_meta.csv"), index=False)
+    cell_meta_ntc.to_csv(os.path.join(outdir, "cell_meta_ntc.csv"), index=False)
+    sparse.save_npz(os.path.join(outdir, "gene_counts_ntc.npz"), gene_counts_ntc)
 
     print(f"[preprocess] {len(cell_meta)} cells x {len(gene_counts)} genes "
           f"({len(gene_counts_raw) - len(gene_counts)} CRISPRi/CRISPRa row(s) dropped) -> {outdir}")
+    print(f"[preprocess] NTC-only subset: {len(cell_meta_ntc)} cells x {gene_counts_ntc.shape[0]} genes")
 
 
 def main() -> None:

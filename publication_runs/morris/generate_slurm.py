@@ -1,11 +1,18 @@
 """
-Generate SLURM scripts + configs for the Morris dataset: high-MOI, one
-shared fit_ntc (full panel, cis_gene deferred), the full pipeline (cis ->
-compensation -> trans -> permutation -> recapitulation) for config.yaml's
-`primary_genes`, and a fit_cis-ONLY sweep over every OTHER gene with
-padj<0.05 in Morris_gRNA2target_stats.csv, all reusing the one shared
-fit_ntc via the SAME deferred-cis_gene + add_cis_gene() mechanism Domingo
-uses (bayesDREAM's high-MOI mode now supports this natively -- no more
+Generate SLURM scripts + configs for the Morris dataset: high-MOI. Two
+different regimes, chosen so every stage loads the smallest data it can:
+
+- **primary_genes** (5, config.yaml) get the FULL pipeline (fit_ntc -> cis ->
+  compensation -> trans -> permutation -> recapitulation), and each gets its
+  OWN fit_ntc -- fit on just that gene's own NTC+cis-cells subset (full
+  trans panel), not the whole dataset. No shared ntc_shared for these.
+- **sweep_genes** (~116, every OTHER padj<0.05 gene) get fit_cis ONLY, and
+  DO share one fit_ntc (`01_ntc_shared.sh`, full dataset, cis_gene deferred)
+  -- with ~116 of them and no trans-modeling need, one shared fit is cheaper
+  in aggregate than 116 separate ones, unlike the primary genes' case.
+
+Both regimes reuse the SAME deferred-cis_gene + add_cis_gene() mechanism
+Domingo uses (bayesDREAM's high-MOI mode supports it natively -- no more
 placeholder-gene/manual-alpha-extraction workaround, see morris/README.md).
 
 Assumes morris/preprocess.py has already been run once (writes the aligned
@@ -13,50 +20,71 @@ meta.csv/gene_counts.npz/gene_meta.csv/guide_assignment.npy/guide_meta.csv/
 guide_target.csv this script's paths.data_dir points at).
 
 Placement: cis and compensation always run on CPU (bayesdream_cpu env,
-`-p shared`); ntc_shared/trans/permutation/recapitulation run on GPU
+`-p shared`); fit_ntc/trans/permutation/recapitulation run on GPU
 (bayesdream_rocm env, `-p gpu`) -- per project convention (Domingo is
 CPU-only everywhere; Morris's fit_cis specifically is CPU-only regardless of
 dataset; everything else in Morris follows its own reference scripts, which
 required CUDA). Only trans/permutation/recapitulation auto-resubmit on
-timeout (fit_trans has its own checkpoint/resume) -- ntc_shared/cis/
-compensation/cis_sweep failures are left for manual review via
-common/slurm/list_job_status.py.
+timeout (fit_trans has its own checkpoint/resume) -- ntc/cis/compensation/
+cis_sweep failures are left for manual review via common/slurm/list_job_status.py.
 
-GPU node packing (primary_genes only): a Dardel GPU node has 8 GPUs
-(cluster.gpu_node_sbatch_lines below), and none of ntc_shared/a single
-gene's trans/permutation/recapitulation needs a whole node to itself, so:
-- `04_trans_packed.sh`: one SbatchGpuNodeQueue job running all 5
-  primary_genes' trans fits concurrently (one node, concurrency=5).
-- `05_permutation_packed.sh` / `06_recapitulation_packed.sh`: one
-  SbatchGpuNodeQueue job each, running all 5 genes x n_reps tasks
-  (25 with n_reps=5) at concurrency=min(n_tasks, 8).
-ntc_shared stays its OWN single-task GPU job (`01_ntc_shared.sh`) rather
-than being packed with trans: it IS "fit_ntc for the 5 primary genes" (the
-whole point of the deferred-cis-gene design is that one shared fit serves
-all of them -- there is no separate per-primary-gene fit_ntc stage to pack
-alongside it), and it can't be packed into the SAME node allocation as trans
-either way -- cis(CPU)+compensation(CPU) sit on the dependency chain between
-them, which would leave a reserved GPU node idle for however long those take.
+GPU node packing: a Dardel GPU node has 8 GPUs (cluster.gpu_node_sbatch_lines
+below), and none of a single gene's fit_ntc/trans/permutation/recapitulation
+needs a whole node to itself, so each of these is ONE SbatchGpuNodeQueue job
+across all 5 primary_genes instead of 5 separate node requests:
+- `01d_ntc_packed.sh`: 5 tasks, concurrency=5.
+- `04_trans_packed.sh`: 5 tasks, concurrency=5.
+- `05_permutation_packed.sh` / `06_recapitulation_packed.sh`: 5 genes x
+  n_reps tasks (25 with n_reps=5) at concurrency=min(n_tasks, 8).
 Packed jobs still auto-resubmit on timeout (SbatchGpuNodeQueue's
 auto_requeue_on_timeout=True) -- see its docstring in sbatch_blocks.py for
 the "re-runs already-finished tasks too" caveat this implies for a packed
 job specifically (individual per-gene jobs didn't have this caveat).
 
+Per-gene data subsetting (01b_subset_<gene>.sh / 01c_subset_sweep.sh):
+real profiling found bayesDREAM.__init__ itself dominating per-gene job cost
+(38.7s / 21GB for ONE gene's compensation config -- full 31468-gene x
+52852-cell load + high-MOI classification against 1871 guides, THEN
+discarding ~40k of those cells). common/subset_per_gene.py pays this cost
+ONCE per gene (builds the SAME deferred+add_cis_gene() model construction
+fit_cis itself uses, then writes the result to disk instead of proceeding to
+fit_cis()) and writes BOTH subsetting modes in that ONE pass (add_cis_gene()
+already separates 'cis' from the trans panel internally -- both pieces are
+in memory regardless of which mode(s) are requested):
+- `full/` (primary_genes' 01b_subset_<gene>.sh): entire trans-gene panel,
+  cis gene's row included -- used by that gene's own fit_ntc, compensation,
+  trans, permutation, recapitulation (all of which need the whole panel).
+- `cis_only/` (both primary_genes' 01b_subset_<gene>.sh AND sweep_genes'
+  01c_subset_sweep.sh): ONLY the cis gene's row -- used by 02_cis_<gene>.sh
+  and 07_cis_sweep.sh, neither of which touch the trans panel at all. Both
+  use the DEFERRED add_cis_gene() pattern, which tolerates a 1-gene starting
+  panel with zero code changes (confirmed by direct test -- no equivalent to
+  the eager-construction path's "No genes left after filtering!" raise), so
+  bayesDREAM's cis_only=True flag isn't needed here; it exists for eager
+  construction in general (see bayesDREAM/model.py's cis_only docstring).
+subset_per_gene.py itself no longer touches ntc_shared_dir/load_ntc_fit() at
+all -- it never needed it for the subsetting itself, and now that primary
+genes don't have a shared ntc to load from, requiring one here would be
+actively wrong.
+
 Correctness note: `exclude_guides` is a bayesDREAM CONSTRUCTOR-time filter,
 so every stage that constructs its OWN fresh model for a given gene (cis via
-deferred+add_cis_gene, compensation/trans/permutation/recapitulation via
-cis_gene-at-init) must use the IDENTICAL per-gene exclude_guides list, or
-their cell/guide composition diverges and load_cis_fit()/load_trans_fit()
-would be aligning against a model whose cells don't match what was actually
-saved. `per_gene_exclude_guides()` below is computed once per gene and
-threaded through every stage's rendered config for consistency. This does
-NOT apply to `ntc_shared` itself, which deliberately uses a BROADER
+deferred+add_cis_gene, fit_ntc/compensation/trans/permutation/recapitulation
+via cis_gene-at-init or reading the gene's own subset) must use the
+IDENTICAL per-gene exclude_guides list, or their cell/guide composition
+diverges and load_cis_fit()/load_trans_fit() would be aligning against a
+model whose cells don't match what was actually saved.
+`per_gene_exclude_guides()` below is computed once per gene and threaded
+through every one of that gene's stages -- including its own fit_ntc now,
+since that's just another per-gene stage reading the SAME `full` subset the
+subsetting step built with this exact list. This does NOT apply to the
+sweep genes' SHARED `01_ntc_shared.sh`, which deliberately uses a BROADER
 exclude_guides (global_exclude_guides + the full SNP table, unconditionally
 -- see `exclude_all_snp_guides`) than any per-gene stage: `add_cis_gene()`
 extracts `alpha_y_prefit` per FEATURE (gene), not per cell, from the shared
 ntc posteriors, so a wider guide exclusion at that one shared-fit stage
 doesn't create a cell-alignment mismatch with the (narrower, per-gene)
-exclude_guides used everywhere downstream.
+exclude_guides used for the sweep genes' own cis-only subset/fit.
 
 Usage
 -----
@@ -249,27 +277,63 @@ def main() -> None:
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
     submitted_rows.append(("ntc_shared", label_ntc, "01_ntc_shared.sh"))
 
+    def gene_output_dir(label: str) -> str:
+        # Every per-gene stage's own output_dir (cis/compensation/trans/etc
+        # all already save here) -- also where that gene's OWN fit_ntc now
+        # saves to, so it doubles as that gene's "ntc dir" for load_ntc_fit()
+        # calls below. No separate directory needed.
+        return f"{output_dir}/{label}"
+
     def render_gene_cfg(gene: str, label: str, device: str, exclude_guides: list, extra: dict) -> dict:
         overrides = {
             "model": {"label": label, "cis_gene": gene, "device": device, "exclude_guides": exclude_guides},
+            "data": subset_data_block(label, "full"),
             **extra,
         }
         return render_bayesdream_config(base_cfg, overrides)
 
-    def render_cis_config(gene: str, label: str, exclude_guides: list) -> Path:
-        # Deferred (cis_gene NOT in model:) -- run_cis_deferred.py commits via
-        # add_cis_gene(), same mechanism as Domingo, now that bayesDREAM's
-        # high-MOI mode supports it directly.
-        cis_bd_cfg = render_bayesdream_config(base_cfg, {
+    def subset_dir_for(label: str) -> str:
+        return f"{output_dir}/{label}_subset"
+
+    def subset_data_block(label: str, mode: str) -> dict:
+        # Per-gene precomputed subset (see module docstring's "Per-gene data
+        # subsetting" section) -- guide_target is the only file NOT written
+        # per-gene by subset_per_gene.py (small lookup table; the ALREADY-
+        # pruned guide_meta.csv it's paired with restricts which of its rows
+        # are actually relevant, so reusing the global one is harmless).
+        d = f"{subset_dir_for(label)}/{mode}"
+        return {
+            "meta": f"{d}/meta.csv", "counts": f"{d}/gene_counts.npz",
+            "feature_meta": f"{d}/gene_meta.csv", "feature_meta_read_csv_kwargs": {},
+            "guide_assignment": f"{d}/guide_assignment.npy", "guide_meta": f"{d}/guide_meta.csv",
+            "guide_target": paths["guide_target"],
+        }
+
+    def render_cis_stage_config(gene: str, label: str, exclude_guides: list, data_block_override: dict, ntc_dir, filename_suffix: str) -> Path:
+        # Deferred (cis_gene NOT in model:) -- add_cis_gene() commits, same
+        # mechanism as Domingo, now that bayesDREAM's high-MOI mode supports
+        # it directly. Shared by three callers with different
+        # data_block_override/ntc_dir: the subsetting step itself (full
+        # dataset in, no ntc_dir at all -- subset_per_gene.py ignores it),
+        # the real 02_cis_<gene>.sh stage (cis_only subset in, THAT GENE's
+        # own ntc dir), and cis_sweep's per-gene task (cis_only subset in,
+        # the GLOBAL shared ntc dir).
+        overrides = {
             "model": {"label": label, "device": "cpu", "exclude_guides": exclude_guides},
+            "data": data_block_override,
             "cis_gene": gene,
-            "ntc_shared_dir": ntc_shared_dir,
             "sum_factor": sum_factor_cis_block,
             "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
-        })
-        cis_cfg_path = configs_dir / f"{label}_cis.yaml"
+        }
+        if ntc_dir:
+            overrides["ntc_shared_dir"] = ntc_dir
+        cis_bd_cfg = render_bayesdream_config(base_cfg, overrides)
+        cis_cfg_path = configs_dir / f"{label}_{filename_suffix}.yaml"
         write_yaml(cis_cfg_path, cis_bd_cfg)
         return cis_cfg_path
+
+    def render_cis_config(gene: str, label: str, exclude_guides: list, ntc_dir: str) -> Path:
+        return render_cis_stage_config(gene, label, exclude_guides, subset_data_block(label, "cis_only"), ntc_dir, "cis")
 
     def cis_sbatch_step(gene: str, cis_cfg_path: Path) -> SbatchStep:
         return SbatchStep(
@@ -279,20 +343,55 @@ def main() -> None:
             commands=[bd_cmd("cis_deferred", cis_cfg_path, python_env_cpu)],
         )
 
+    def subset_cmd(config_path, outdir_arg: str, modes: str) -> str:
+        script = f"{repo_dir}/publication_runs/common/subset_per_gene.py"
+        return f'"{python_env_cpu}" "{script}" --config "{config_path}" --outdir "{outdir_arg}" --modes {modes}'
+
+    def write_subset_step(gene: str, label: str, exclude_guides: list, modes: str) -> str:
+        subset_input_cfg_path = render_cis_stage_config(gene, label, exclude_guides, data_block, None, "subset_input")
+        cmd = subset_cmd(subset_input_cfg_path, subset_dir_for(label), modes)
+        step = SbatchStep(
+            job_name=f"morris_subset_{gene}", account=account, log_dir=str(logs_dir),
+            time_hours=TIME_HOURS, cpus=cis_cfg["resources"]["cores"],
+            partition=partition_cpu, repo_dir=repo_dir, commands=[cmd],
+        )
+        filename = f"01b_subset_{gene}.sh"
+        scripts.append((filename, step.render()))
+        return filename
+
     # ---------------------------------------------------------------- #
     # 2. Primary genes: cis(CPU) -> compensation(CPU) -> trans/          #
     #    permutation/recapitulation (GPU, packed onto one node each      #
     #    across all 5 primary genes -- see module docstring's "GPU node  #
     #    packing" section).                                              #
     # ---------------------------------------------------------------- #
+    ntc_commands = []
     trans_commands = []
     perm_commands = []
     sim_commands = []
     for gene in primary_genes:
         label = f"{label_prefix}_{gene}"
         exclude_guides = per_gene_exclude_guides(gene)
+        this_gene_ntc_dir = gene_output_dir(label)
 
-        cis_cfg_path = render_cis_config(gene, label, exclude_guides)
+        subset_script = write_subset_step(gene, label, exclude_guides, "full,cis_only")
+        submitted_rows.append(("subset", label, subset_script))
+
+        # -- own fit_ntc, packed with the other 4 primary genes below --
+        # Fit on the SAME `full` subset (NTC+gene cells, whole trans panel)
+        # trans/compensation/etc. use -- fit_ntc still needs to estimate
+        # alpha_y for every trans gene fit_trans will model, just on a
+        # smaller, gene-specific cell population than the old shared fit.
+        ntc_gene_bd_cfg = render_bayesdream_config(base_cfg, {
+            "model": {"label": label, "exclude_guides": exclude_guides},
+            "data": subset_data_block(label, "full"),
+            "ntc": {"fit": {}, "save": True},
+        })
+        ntc_gene_cfg_path = configs_dir / f"{label}_ntc.yaml"
+        write_yaml(ntc_gene_cfg_path, ntc_gene_bd_cfg)
+        ntc_commands.append(bd_cmd("ntc", ntc_gene_cfg_path, python_env_gpu))
+
+        cis_cfg_path = render_cis_config(gene, label, exclude_guides, this_gene_ntc_dir)
         cis_step = cis_sbatch_step(gene, cis_cfg_path)
         scripts.append((f"02_cis_{gene}.sh", cis_step.render()))
         submitted_rows.append(("cis", label, f"02_cis_{gene}.sh"))
@@ -300,7 +399,7 @@ def main() -> None:
         cis_gene_ensembl_id = name_to_id.get(gene)
         comp_bd_cfg = render_gene_cfg(gene, label, "cpu", exclude_guides, {
             "compensation": {
-                "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                "load_ntc": {"args": {"input_dir": this_gene_ntc_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
                 "args": {
                     "exclude_cells": {
@@ -335,7 +434,7 @@ def main() -> None:
             "sum_factor": sum_factor_trans_block,
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "trans": {
-                "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                "load_ntc": {"args": {"input_dir": this_gene_ntc_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
                 "fit": {"sum_factor_col": "sum_factor_adj", "function_type": trans_cfg["function_type"]},
                 "save": True,
@@ -349,7 +448,7 @@ def main() -> None:
             "sum_factor": sum_factor_trans_block,
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "permutation": {
-                "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                "load_ntc": {"args": {"input_dir": this_gene_ntc_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
                 "covariates": sf_cfg["covariates"],
                 "sum_factor_col": "sum_factor_adj",
@@ -366,7 +465,7 @@ def main() -> None:
             "sum_factor": sum_factor_trans_block,
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "simulation": {
-                "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                "load_ntc": {"args": {"input_dir": this_gene_ntc_dir, "mask_features": True}},
                 "load_cis": {"enabled": True}, "load_trans": {"enabled": True},
                 "sum_factor_col": "sum_factor_adj",
                 "fit": {"sum_factor_col": "sum_factor_adj", "function_type": trans_cfg["function_type"]},
@@ -439,6 +538,15 @@ def main() -> None:
         scripts.append((filename, step.render()))
         return filename
 
+    # NOT separately profiled yet: reuses trans_cfg's cores as the closest
+    # available analog (same data shape -- full trans panel, NTC+gene cells
+    # -- as fit_ntc will see here) until common/profile_memory.py --stage
+    # ntc is run against one of these per-gene configs directly.
+    ntc_packed_script = write_packed_gpu_job(
+        "01d_ntc_packed", "morris_ntc_packed", ntc_commands, trans_cfg["resources"]["cores"],
+    )
+    submitted_rows.append(("ntc", f"{len(primary_genes)} primary genes (packed)", ntc_packed_script))
+
     trans_script = write_packed_gpu_job(
         "04_trans_packed", "morris_trans_packed", trans_commands, trans_cfg["resources"]["cores"],
     )
@@ -455,13 +563,47 @@ def main() -> None:
     submitted_rows.append(("recapitulation", f"{len(primary_genes)} genes x {trans_cfg['simulation']['n_reps']} reps (packed)", sim_script))
 
     # ---------------------------------------------------------------- #
-    # 3. cis-ONLY sweep (CPU array, one array submission for all genes)  #
+    # 3a. cis-ONLY sweep: per-gene data subsetting, ONE array job         #
+    #    (mode=cis_only -- see module docstring's "Per-gene data          #
+    #    subsetting" section). Same gene order as 3b below, so             #
+    #    $SLURM_ARRAY_TASK_ID lines up between the two arrays.             #
+    # ---------------------------------------------------------------- #
+    sweep_subset_input_list = configs_dir / "cis_sweep_subset_input_configs.txt"
+    sweep_subset_outdirs_list = configs_dir / "cis_sweep_subset_outdirs.txt"
+    sweep_exclude_guides = {gene: per_gene_exclude_guides(gene) for gene in sweep_genes}
+    subset_input_paths = []
+    subset_outdirs = []
+    for gene in sweep_genes:
+        label = f"{label_prefix}_{gene}"
+        subset_input_cfg_path = render_cis_stage_config(gene, label, sweep_exclude_guides[gene], data_block, None, "subset_input")
+        subset_input_paths.append(str(subset_input_cfg_path))
+        subset_outdirs.append(subset_dir_for(label))
+    sweep_subset_input_list.write_text("\n".join(subset_input_paths) + "\n")
+    sweep_subset_outdirs_list.write_text("\n".join(subset_outdirs) + "\n")
+
+    subset_sweep_array_commands = [
+        f'CONFIG=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_subset_input_list}")',
+        f'OUTDIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_subset_outdirs_list}")',
+        subset_cmd("$CONFIG", "$OUTDIR", "cis_only"),
+    ]
+    subset_sweep_step = SbatchArray(
+        job_name="morris_subset_sweep", account=account, log_dir=str(logs_dir),
+        time_hours=TIME_HOURS, cpus=cis_sweep_cfg["resources"]["cores"],
+        max_index=len(sweep_genes) - 1, max_concurrent=cis_sweep_cfg["array_max_concurrent"],
+        partition=partition_cpu, repo_dir=repo_dir, commands=subset_sweep_array_commands,
+    )
+    scripts.append(("01c_subset_sweep.sh", subset_sweep_step.render()))
+    submitted_rows.append(("subset_sweep", f"{len(sweep_genes)} genes", "01c_subset_sweep.sh"))
+
+    # ---------------------------------------------------------------- #
+    # 3b. cis-ONLY sweep (CPU array, one array submission for all genes) #
+    #    -- reads each gene's mode=cis_only subset from 3a, same order.  #
     # ---------------------------------------------------------------- #
     sweep_configs_list = configs_dir / "cis_sweep_configs.txt"
     config_paths = []
     for gene in sweep_genes:
         label = f"{label_prefix}_{gene}"
-        cis_cfg_path = render_cis_config(gene, label, per_gene_exclude_guides(gene))
+        cis_cfg_path = render_cis_config(gene, label, sweep_exclude_guides[gene], ntc_shared_dir)
         config_paths.append(str(cis_cfg_path))
     sweep_configs_list.write_text("\n".join(config_paths) + "\n")
 
@@ -492,13 +634,33 @@ def main() -> None:
         'TSV="submitted_jobs.tsv"',
         'echo -e "stage\\tlabel\\tjobid\\tscript" > "$TSV"',
         "",
+        # Shared, sweep-genes-only fit_ntc -- no dependency, runs immediately.
         'NTC_JOB=$(sbatch --parsable 01_ntc_shared.sh)',
         'echo -e "ntc_shared\\tntc_shared\\t$NTC_JOB\\t01_ntc_shared.sh" >> "$TSV"',
         "",
     ]
+    # Primary genes' subsetting -- no dependency either (subset_per_gene.py
+    # doesn't touch any ntc fit), so these also start immediately, in
+    # parallel with ntc_shared.
     for gene in primary_genes:
         submit_lines += [
-            f'CIS_{gene}=$(sbatch --parsable --dependency=afterok:$NTC_JOB 02_cis_{gene}.sh)',
+            f'SUBSET_{gene}=$(sbatch --parsable 01b_subset_{gene}.sh)',
+            f'echo -e "subset\\t{gene}\\t$SUBSET_{gene}\\t01b_subset_{gene}.sh" >> "$TSV"',
+        ]
+    submit_lines.append("")
+
+    # Packed per-primary-gene fit_ntc: needs every gene's own `full` subset
+    # ready first (each packed task reads a different gene's subset).
+    subset_dep = ":".join(f"$SUBSET_{gene}" for gene in primary_genes)
+    submit_lines += [
+        f'NTC_PACKED=$(sbatch --parsable --dependency=afterok:{subset_dep} 01d_ntc_packed.sh)',
+        'echo -e "ntc\\tall_primary\\t$NTC_PACKED\\t01d_ntc_packed.sh" >> "$TSV"',
+        "",
+    ]
+
+    for gene in primary_genes:
+        submit_lines += [
+            f'CIS_{gene}=$(sbatch --parsable --dependency=afterok:$SUBSET_{gene}:$NTC_PACKED 02_cis_{gene}.sh)',
             f'echo -e "cis\\t{gene}\\t$CIS_{gene}\\t02_cis_{gene}.sh" >> "$TSV"',
             f'COMP_{gene}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 03_compensation_{gene}.sh)',
             f'echo -e "compensation\\t{gene}\\t$COMP_{gene}\\t03_compensation_{gene}.sh" >> "$TSV"',
@@ -507,7 +669,8 @@ def main() -> None:
     # Packed trans/permutation/recapitulation (see module docstring's "GPU
     # node packing" section): one job each, covering all primary_genes, so
     # they must wait for EVERY gene's cis job (trans reads that gene's own
-    # saved cis fit -- see render_gene_cfg's "load_cis": {"enabled": True}).
+    # saved cis fit -- see render_gene_cfg's "load_cis": {"enabled": True})
+    # -- and, transitively via CIS_<gene>, on NTC_PACKED too.
     cis_dep = ":".join(f"$CIS_{gene}" for gene in primary_genes)
     submit_lines += [
         f'TRANS_PACKED=$(sbatch --parsable --dependency=afterok:{cis_dep} 04_trans_packed.sh)',
@@ -517,7 +680,11 @@ def main() -> None:
         'SIM_PACKED=$(sbatch --parsable --dependency=afterok:$TRANS_PACKED 06_recapitulation_packed.sh)',
         'echo -e "recapitulation\\tall_primary\\t$SIM_PACKED\\t06_recapitulation_packed.sh" >> "$TSV"',
         "",
-        'SWEEP_JOB=$(sbatch --parsable --dependency=afterok:$NTC_JOB 07_cis_sweep.sh)',
+        # Sweep genes' subsetting also has no dependency (same reason as
+        # primary genes' above).
+        'SUBSET_SWEEP_JOB=$(sbatch --parsable 01c_subset_sweep.sh)',
+        'echo -e "subset_sweep\\tall\\t$SUBSET_SWEEP_JOB\\t01c_subset_sweep.sh" >> "$TSV"',
+        'SWEEP_JOB=$(sbatch --parsable --dependency=afterok:$NTC_JOB:$SUBSET_SWEEP_JOB 07_cis_sweep.sh)',
         'echo -e "cis_sweep\\tall\\t$SWEEP_JOB\\t07_cis_sweep.sh" >> "$TSV"',
     ]
     (outdir / "submit_all.sh").write_text("\n".join(submit_lines) + "\n")

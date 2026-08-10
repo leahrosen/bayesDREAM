@@ -24,6 +24,12 @@ paths:
   data_dir: "{raw_data_dir}/preprocessed"
   meta: "{data_dir}/cell_meta.csv"
   counts: "{data_dir}/gene_counts.csv"
+  # NTC-only subset (also written by preprocess.py) -- used ONLY by
+  # ntc_shared, which never fits on non-NTC cells anyway (use_all_cells=False,
+  # the low-MOI default) but previously still had to load+classify the full
+  # 20001-cell dataset to get there.
+  meta_ntc: "{data_dir}/cell_meta_ntc.csv"
+  counts_ntc: "{data_dir}/gene_counts_ntc.npz"
 
   output_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/BayesianModel_outs
 

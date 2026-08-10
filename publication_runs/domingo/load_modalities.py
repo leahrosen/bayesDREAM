@@ -23,6 +23,19 @@ Contract: `attach_modality(model, spec, data_dir)` attaches the modality via
 `model.add_custom_modality(...)` and returns the resulting modality name
 (`f'{name_prefix}_{stype}'`), ready for `fit_ntc(modality_name=...)` /
 `fit_trans(modality_name=...)`.
+
+`attach_modality_precomputed(model, spec, precomputed_dir)`: same contract,
+but reads a directory ALREADY subsetted to this model's own cells (written
+by subset_modality_per_gene.py, which calls attach_modality() itself and
+saves the result) instead of the raw shared `data_dir` -- no cell alignment
+or (for SJ) gene-expression-denominator computation needed here, both
+already done when the precomputed file was written. This is what
+07_modality_<gene>_<mod>.sh actually uses now; attach_modality() itself is
+only still called by subset_modality_per_gene.py and (via the
+attach_modality: config block) run_permutation_null.py/
+run_recapitulation_sim.py -- those also switched to
+attach_modality_precomputed, since permutation/recapitulation reruns don't
+need to re-read the raw splicing directory either.
 """
 
 import os
@@ -291,6 +304,42 @@ def attach_modality(model, spec: Dict, base_dir: str, diagnostic_plot_path: Opti
         raise ValueError(f"attach_modality: unsupported distribution {distribution!r} for stype={stype!r}")
 
 
+def attach_modality_precomputed(model, spec: Dict, precomputed_dir: str) -> str:
+    """Like attach_modality(), but reads precomputed_dir (written by
+    subset_modality_per_gene.py -- already cell-aligned to THIS model and
+    min_count-filtered) instead of the raw shared splicing directory. See
+    this module's docstring for why this is what the real pipeline uses
+    now."""
+    stype = spec["stype"]
+    name_prefix = spec.get("name_prefix", "splicing")
+    distribution = spec["distribution"]
+    modality_name = f"{name_prefix}_{stype}"
+
+    feature_meta = pd.read_csv(os.path.join(precomputed_dir, "feature_meta.csv"))
+    with open(os.path.join(precomputed_dir, "cell_names.txt")) as f:
+        cell_names = [line.rstrip("\n") for line in f if line.strip()]
+
+    if distribution == "multinomial":
+        counts = np.load(os.path.join(precomputed_dir, "counts.npy"))
+        model.add_custom_modality(
+            name=modality_name, counts=counts, feature_meta=feature_meta,
+            distribution="multinomial", cell_names=cell_names,
+        )
+        if "feature_id" in feature_meta.columns:
+            model.get_modality(modality_name).feature_names = list(feature_meta["feature_id"].values)
+    else:
+        counts = _to_dense(scipy.sparse.load_npz(os.path.join(precomputed_dir, "counts.npz")))
+        denom_path = os.path.join(precomputed_dir, "denominator.npz")
+        denominator = _to_dense(scipy.sparse.load_npz(denom_path)) if os.path.exists(denom_path) else None
+        model.add_custom_modality(
+            name=modality_name, counts=counts, feature_meta=feature_meta,
+            distribution=distribution, denominator=denominator, cell_names=cell_names,
+        )
+
+    print(f"Added '{modality_name}' (precomputed from {precomputed_dir}): {counts.shape[0]} features")
+    return modality_name
+
+
 def main() -> None:
     """CLI entry point for one (gene, modality) attach + fit_ntc + fit_trans task.
 
@@ -301,9 +350,17 @@ def main() -> None:
     as every other stage script in this pipeline.
 
     Usage:
+        # normal (precomputed) path -- see subset_modality_per_gene.py:
+        python load_modalities.py --config <gene_full_subset_config.yaml> \\
+            --modality-name sj --modality-spec config_modalities.yaml \\
+            --precomputed-dir <that gene+modality's precomputed subset dir>
+
+        # raw path -- only subset_modality_per_gene.py itself should need this:
         python load_modalities.py --config <gene_cis_stage_config.yaml> \\
             --modality-name sj --modality-spec config_modalities.yaml \\
             --data-dir <modalities.data_dir>   # shared across all genes, NOT per-gene
+
+    Exactly one of --data-dir/--precomputed-dir must be given.
     """
     import argparse
     import sys
@@ -320,8 +377,11 @@ def main() -> None:
     parser.add_argument("--config", "-c", required=True, help="Gene's cis-stage bayesdream config (needs cis already fit and saved).")
     parser.add_argument("--modality-name", required=True, help="stype key in config_modalities.yaml, e.g. 'sj'.")
     parser.add_argument("--modality-spec", required=True, help="Path to config_modalities.yaml")
-    parser.add_argument("--data-dir", required=True, help="Shared loader_inputs/ dir (same for every gene).")
+    parser.add_argument("--data-dir", default=None, help="Shared loader_inputs/ dir (same for every gene). Mutually exclusive with --precomputed-dir.")
+    parser.add_argument("--precomputed-dir", default=None, help="Per-(gene,modality) precomputed subset dir (see subset_modality_per_gene.py). Mutually exclusive with --data-dir.")
     args = parser.parse_args()
+    if bool(args.data_dir) == bool(args.precomputed_dir):
+        parser.error("exactly one of --data-dir/--precomputed-dir is required")
 
     cfg = load_bayesdream_yaml(Path(args.config))
     with open(args.modality_spec) as f:
@@ -342,8 +402,11 @@ def main() -> None:
     model_cfg = cfg.get("model") or {}
     output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
 
-    diagnostic_plot_path = os.path.join(output_dir, f"diagnostic_{args.modality_name}_counts_vs_denominator.png")
-    modality_name = attach_modality(model, spec, args.data_dir, diagnostic_plot_path=diagnostic_plot_path)
+    if args.precomputed_dir:
+        modality_name = attach_modality_precomputed(model, spec, args.precomputed_dir)
+    else:
+        diagnostic_plot_path = os.path.join(output_dir, f"diagnostic_{args.modality_name}_counts_vs_denominator.png")
+        modality_name = attach_modality(model, spec, args.data_dir, diagnostic_plot_path=diagnostic_plot_path)
 
     # --- modality-specific NTC fit: load if exists, otherwise fit and save ---
     ntc_fit_path = os.path.join(output_dir, f"posterior_samples_ntc_{modality_name}.pt")

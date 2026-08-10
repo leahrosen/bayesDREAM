@@ -29,6 +29,48 @@ each individually prefixed with thread-pin + HIP_VISIBLE_DEVICES/
 ROCR_VISIBLE_DEVICES env vars (round-robin over concurrency), same pattern
 as morris/generate_slurm.py's packed trans/permutation/recapitulation jobs.
 
+Per-gene data subsetting (01b_subset_<gene>.sh): mirrors morris/generate_slurm.py's
+own "Per-gene data subsetting" section -- real profiling found
+bayesDREAM.__init__ dominating per-gene job cost even for Domingo's much
+simpler low-MOI classification (full 20001-cell load, subsetted down to
+~4281 for one gene), and EVERY one of cis/compensation/trans/permutation/
+recapitulation/modality-fit/modality-permutation/modality-recapitulation
+independently re-paid it. Now paid ONCE per gene (common/subset_per_gene.py,
+which writes BOTH modes in that one pass -- add_cis_gene() already separates
+'cis' from the trans panel internally, so both pieces are in memory either
+way):
+- `full/`: whole trans panel, cis gene's row put back in -- used by
+  compensation/trans/permutation/recapitulation/modality stages (all
+  already eager cis_gene-at-construction and stay that way -- they never
+  used add_cis_gene()'s alpha extraction to begin with; only fit_cis()
+  reads alpha_x_prefit, and none of these call it).
+- `cis_only/`: JUST the cis gene's row -- used by 02_cis_<gene>.sh, which
+  keeps its deferred+add_cis_gene() mechanism unchanged (that pattern
+  tolerates a 1-gene starting panel with zero code changes, confirmed by
+  direct test).
+ntc_shared separately reads a precomputed NTC-only file (also written by
+preprocess.py) instead of the full dataset, since it never fits on non-NTC
+cells anyway -- this one stays a single shared fit across all 4 genes
+(unlike Morris's primary genes, Domingo has no large sweep-gene set to
+justify per-gene fit_ntc's extra jobs for a comparatively small, already-
+cheap NTC-only fit).
+
+Per-(gene, modality) subsetting (07a_modality_subset_<gene>_<mod>.sh): same
+motivation as 01b above, one level down -- every modality-fit/permutation/
+recapitulation job independently re-read+re-aligned the FULL shared raw
+splicing directory (modalities.data_dir) against its own cells. Now paid
+ONCE per (gene, modality) by domingo/subset_modality_per_gene.py, which
+calls the SAME load_modalities.attach_modality() the real jobs used to call
+directly, from that gene's OWN precomputed `full` subset (needs only
+01b_subset_<gene>.sh, NOT the cis fit -- attach_modality() only touches raw
+counts, never a fitted posterior -- so this runs in parallel with
+02_cis_<gene>.sh, not after it), and writes the resulting cell-aligned,
+already-denominator-computed modality to disk.
+07_modality_<gene>_<mod>.sh (fit) and 08/09's `attach_modality:` config
+block both switched from attach_modality/base_dir to
+attach_modality_precomputed/precomputed_dir -- see load_modalities.py's
+module docstring.
+
 Usage
 -----
     python generate_slurm.py [--config config.yaml] [--outdir slurm]
@@ -42,6 +84,7 @@ Writes:
     <outdir>/04_trans_<gene>.sh
     <outdir>/05_permutation_<gene>.sh    (array over reps)
     <outdir>/06_recapitulation_<gene>.sh (array over reps)
+    <outdir>/07a_modality_subset_<gene>_<modality>.sh  (all modalities, one CPU job each)
     <outdir>/07_modality_<gene>_<modality>.sh          (binomial only, one CPU job each)
     <outdir>/07_modality_multinomial_packed.sh         (multinomial only, ONE GPU-node-packed job, all genes)
     <outdir>/08_modality_permutation_<gene>_<modality>.sh    (binomial only, array over reps)
@@ -94,6 +137,8 @@ def main() -> None:
     paths = resolve_paths(cfg["paths"])
     meta_path = paths["meta"]
     counts_path = paths["counts"]
+    meta_ntc_path = paths["meta_ntc"]
+    counts_ntc_path = paths["counts_ntc"]
     output_dir = paths["output_dir"]
     repo_dir = paths["repo_dir"]
     python_env = paths["python_env"]
@@ -183,6 +228,7 @@ def main() -> None:
     ntc_shared_dir = f"{output_dir}/{label_ntc}"
     ntc_bd_cfg = render_bayesdream_config(base_cfg, {
         "model": {"label": label_ntc},
+        "data": {"meta": meta_ntc_path, "counts": counts_ntc_path},
         "ntc": {"fit": ntc_shared_cfg.get("fit", {}), "save": True},
     })
     ntc_cfg_path = configs_dir / f"{label_ntc}.yaml"
@@ -197,15 +243,66 @@ def main() -> None:
     scripts.append(("01_ntc_shared.sh", ntc_step.render()))
     submitted_rows.append(("ntc_shared", label_ntc, "01_ntc_shared.sh"))
 
+    def subset_dir_for(label: str) -> str:
+        return f"{output_dir}/{label}_subset"
+
+    def modality_subset_dir_for(label: str, mod_name: str) -> str:
+        return f"{output_dir}/{label}_modality_subset/{mod_name}"
+
+    def subset_data_block(label: str, mode: str) -> dict:
+        # feature_meta_read_csv_kwargs: {} is REQUIRED here, not cosmetic --
+        # subset_per_gene.py writes gene_meta.csv with to_csv(index=False)
+        # (a real gene_name column, no index column at all); without this
+        # override, config_utils.build_model_from_config's default
+        # (index_col=0, for datasets whose feature_meta genuinely has a
+        # leading unnamed index column) would consume that gene_name column
+        # AS the index, leaving zero usable columns.
+        d = f"{subset_dir_for(label)}/{mode}"
+        return {
+            "meta": f"{d}/meta.csv", "counts": f"{d}/gene_counts.npz",
+            "feature_meta": f"{d}/gene_meta.csv", "feature_meta_read_csv_kwargs": {},
+        }
+
+    def write_subset_step(gene: str, label: str) -> str:
+        # Deferred cis_gene, full dataset in -- builds the SAME model
+        # add_cis_gene() would, just to extract+write BOTH its NTC+cis-cells-
+        # only `full` (whole trans panel) and `cis_only` (just the cis gene,
+        # for 02_cis_<gene>.sh -- see module docstring's "Per-gene data
+        # subsetting" section) results in one pass, instead of proceeding to
+        # fit_cis().
+        subset_input_cfg = render_bayesdream_config(base_cfg, {
+            "model": {"label": label},
+            "cis_gene": gene,
+        })
+        subset_input_cfg_path = configs_dir / f"{label}_subset_input.yaml"
+        write_yaml(subset_input_cfg_path, subset_input_cfg)
+
+        cmd = (
+            f'"{python_env}" "{repo_dir}/publication_runs/common/subset_per_gene.py" '
+            f'--config "{subset_input_cfg_path}" --outdir "{subset_dir_for(label)}" --modes full,cis_only'
+        )
+        step = SbatchStep(
+            job_name=f"domingo_subset_{gene}", account=account, log_dir=str(logs_dir),
+            time_hours=TIME_HOURS, cpus=cis_cfg["resources"]["cores"],
+            partition=partition_cpu, repo_dir=repo_dir, commands=[cmd],
+        )
+        filename = f"01b_subset_{gene}.sh"
+        scripts.append((filename, step.render()))
+        return filename
+
     # ---------------------------------------------------------------- #
     # Per-gene stages                                                    #
     # ---------------------------------------------------------------- #
     for gene in cfg["cis_genes"]:
         label = f"{label_prefix}_{gene}"
 
+        subset_script = write_subset_step(gene, label)
+        submitted_rows.append(("subset", label, subset_script))
+
         # -- 2. cis (deferred add_cis_gene, reusing shared ntc) --
         cis_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label},
+            "data": subset_data_block(label, "cis_only"),
             "cis_gene": gene,
             "ntc_shared_dir": ntc_shared_dir,
             "sum_factor": {"adjust_ntc_sum_factor": sum_factor_block["adjust_ntc_sum_factor"]},
@@ -229,6 +326,7 @@ def main() -> None:
         # -- 3. compensation (raw sum_factor, no adjustments -- see run_compensation.py) --
         comp_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
+            "data": subset_data_block(label, "full"),
             "compensation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
@@ -250,6 +348,7 @@ def main() -> None:
         # -- 4. trans --
         trans_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
+            "data": subset_data_block(label, "full"),
             "sum_factor": sum_factor_block,
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "trans": {
@@ -276,6 +375,7 @@ def main() -> None:
         # -- 5. permutation null (array over reps) --
         perm_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
+            "data": subset_data_block(label, "full"),
             "sum_factor": sum_factor_block,
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "permutation": {
@@ -305,6 +405,7 @@ def main() -> None:
         # -- 6. recapitulation simulation (array over reps) --
         sim_bd_cfg = render_bayesdream_config(base_cfg, {
             "model": {"label": label, "cis_gene": gene},
+            "data": subset_data_block(label, "full"),
             "sum_factor": sum_factor_block,
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "simulation": {
@@ -331,19 +432,50 @@ def main() -> None:
         scripts.append((f"06_recapitulation_{gene}.sh", sim_step.render()))
         submitted_rows.append(("recapitulation", label, f"06_recapitulation_{gene}.sh"))
 
-        # -- 7. extra modalities, after cis --
-        # data_dir is ONE shared directory for every gene (not per-gene) --
-        # per-gene cell subsetting happens inside load_modalities.py by
-        # aligning against that gene's own model.meta -- see its docstring.
+        # -- 7a. per-(gene, modality) subsetting, then 7. extra modalities --
+        # Subsetting reads the ONE shared raw splicing directory
+        # (modalities.data_dir) and this gene's OWN precomputed `full`
+        # subset (needs only 01b_subset_<gene>.sh -- attach_modality() never
+        # touches a fitted posterior, so this runs in parallel with
+        # 02_cis_<gene>.sh, not after it), then writes an already
+        # cell-aligned, min_count-filtered, denominator-computed modality to
+        # modality_subset_dir_for(label, mod_name). The real fit job (and,
+        # for binomial, permutation/recapitulation's attach_modality: config
+        # block) then read THAT instead of the shared raw directory.
         # BINOMIAL modalities: one CPU job each, as before. MULTINOMIAL
         # (donor_choice/acceptor_choice): GPU, and packed together across
         # all genes -- see "GPU-packed multinomial modalities" below.
+        modality_subset_input_cfg = render_bayesdream_config(base_cfg, {
+            "model": {"label": label, "cis_gene": gene},
+            "data": subset_data_block(label, "full"),
+        })
+        modality_subset_input_cfg_path = configs_dir / f"{label}_modality_subset_input.yaml"
+        write_yaml(modality_subset_input_cfg_path, modality_subset_input_cfg)
+
         for spec in modalities_cfg:
             mod_name = spec["stype"]
             is_multinomial = spec["distribution"] == "multinomial"
             mod_data_dir = modalities_dataset_cfg["data_dir"]
+            mod_precomputed_dir = modality_subset_dir_for(label, mod_name)
+
+            subset_mod_cmd = (
+                f'"{python_env}" "{repo_dir}/publication_runs/domingo/subset_modality_per_gene.py" '
+                f'--config "{modality_subset_input_cfg_path}" --modality-name {mod_name} '
+                f'--modality-spec "{repo_dir}/publication_runs/domingo/config_modalities.yaml" '
+                f'--data-dir "{mod_data_dir}" --outdir "{mod_precomputed_dir}"'
+            )
+            subset_mod_step = SbatchStep(
+                job_name=f"domingo_modsubset_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
+                time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["resources"]["cores"],
+                partition=partition_cpu, repo_dir=repo_dir, commands=[subset_mod_cmd],
+            )
+            subset_mod_filename = f"07a_modality_subset_{gene}_{mod_name}.sh"
+            scripts.append((subset_mod_filename, subset_mod_step.render()))
+            submitted_rows.append((f"modality_subset_{mod_name}", label, subset_mod_filename))
+
             mod_cfg = render_bayesdream_config(base_cfg, {
                 "model": {"label": label, "cis_gene": gene, "device": "cuda" if is_multinomial else "cpu"},
+                "data": subset_data_block(label, "full"),
                 "cis": {"load_cis": {"enabled": True}},
             })
             mod_cfg_path = configs_dir / f"{label}_modality_{mod_name}.yaml"
@@ -354,7 +486,7 @@ def main() -> None:
                 f'cd "{repo_dir}" && "{mod_env}" "{repo_dir}/publication_runs/domingo/load_modalities.py" '
                 f'--config "{mod_cfg_path}" --modality-name {mod_name} '
                 f'--modality-spec "{repo_dir}/publication_runs/domingo/config_modalities.yaml" '
-                f'--data-dir "{mod_data_dir}"'
+                f'--precomputed-dir "{mod_precomputed_dir}"'
             )
 
             if is_multinomial:
@@ -380,8 +512,8 @@ def main() -> None:
                 attach_block = {
                     "attach_modality": {
                         "module": "load_modalities",
-                        "function": "attach_modality",
-                        "kwargs": {"spec": spec, "base_dir": mod_data_dir},
+                        "function": "attach_modality_precomputed",
+                        "kwargs": {"spec": spec, "precomputed_dir": mod_precomputed_dir},
                     },
                 }
                 mod_fit_args = {
@@ -391,6 +523,7 @@ def main() -> None:
 
                 mod_perm_cfg = render_bayesdream_config(base_cfg, {
                     "model": {"label": label, "cis_gene": gene},
+                    "data": subset_data_block(label, "full"),
                     **attach_block,
                     "sum_factor": sum_factor_block,
                     "permutation": {
@@ -419,6 +552,7 @@ def main() -> None:
 
                 mod_sim_cfg = render_bayesdream_config(base_cfg, {
                     "model": {"label": label, "cis_gene": gene},
+                    "data": subset_data_block(label, "full"),
                     **attach_block,
                     "sum_factor": sum_factor_block,
                     "simulation": {
@@ -493,9 +627,12 @@ def main() -> None:
         'echo -e "ntc_shared\\tntc_shared\\t$NTC_JOB\\t01_ntc_shared.sh" >> "$TSV"',
         "",
     ]
+    all_multinomial_modsubset_deps = []  # accumulated across genes, for the packed multinomial job below
     for gene in cfg["cis_genes"]:
         submit_lines += [
-            f'CIS_{gene}=$(sbatch --parsable --dependency=afterok:$NTC_JOB 02_cis_{gene}.sh)',
+            f'SUBSET_{gene}=$(sbatch --parsable --dependency=afterok:$NTC_JOB 01b_subset_{gene}.sh)',
+            f'echo -e "subset\\t{gene}\\t$SUBSET_{gene}\\t01b_subset_{gene}.sh" >> "$TSV"',
+            f'CIS_{gene}=$(sbatch --parsable --dependency=afterok:$NTC_JOB:$SUBSET_{gene} 02_cis_{gene}.sh)',
             f'echo -e "cis\\t{gene}\\t$CIS_{gene}\\t02_cis_{gene}.sh" >> "$TSV"',
             f'COMP_{gene}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 03_compensation_{gene}.sh)',
             f'echo -e "compensation\\t{gene}\\t$COMP_{gene}\\t03_compensation_{gene}.sh" >> "$TSV"',
@@ -508,10 +645,18 @@ def main() -> None:
         ]
         for spec in modalities_cfg:
             mod_name = spec["stype"]
-            if spec["distribution"] == "multinomial":
-                continue  # packed separately below, one job for ALL genes
+            # Subsetting only needs SUBSET_{gene} (01b) -- attach_modality()
+            # never touches a fitted posterior -- so it runs in parallel
+            # with CIS_{gene}, not after it.
             submit_lines += [
-                f'MOD_{gene}_{mod_name}=$(sbatch --parsable --dependency=afterok:$CIS_{gene} 07_modality_{gene}_{mod_name}.sh)',
+                f'MODSUBSET_{gene}_{mod_name}=$(sbatch --parsable --dependency=afterok:$SUBSET_{gene} 07a_modality_subset_{gene}_{mod_name}.sh)',
+                f'echo -e "modality_subset_{mod_name}\\t{gene}\\t$MODSUBSET_{gene}_{mod_name}\\t07a_modality_subset_{gene}_{mod_name}.sh" >> "$TSV"',
+            ]
+            if spec["distribution"] == "multinomial":
+                all_multinomial_modsubset_deps.append(f"$MODSUBSET_{gene}_{mod_name}")
+                continue  # fit packed separately below, one job for ALL genes
+            submit_lines += [
+                f'MOD_{gene}_{mod_name}=$(sbatch --parsable --dependency=afterok:$CIS_{gene}:$MODSUBSET_{gene}_{mod_name} 07_modality_{gene}_{mod_name}.sh)',
                 f'echo -e "modality_{mod_name}\\t{gene}\\t$MOD_{gene}_{mod_name}\\t07_modality_{gene}_{mod_name}.sh" >> "$TSV"',
             ]
             if spec["distribution"] == "binomial":
@@ -522,11 +667,13 @@ def main() -> None:
         submit_lines.append("")
 
     if multinomial_script:
-        # Packed job needs EVERY gene's cis fit done (it runs all 4 genes x
-        # 2 modalities' worth of tasks) -- multi-job afterok dependency.
+        # Packed job needs EVERY gene's cis fit AND every gene's multinomial
+        # modality subsetting done (it runs all 4 genes x 2 modalities'
+        # worth of tasks) -- multi-job afterok dependency.
         cis_dep = ":".join(f"$CIS_{gene}" for gene in cfg["cis_genes"])
+        modsubset_dep = ":".join(all_multinomial_modsubset_deps)
         submit_lines += [
-            f'MOD_MULTI=$(sbatch --parsable --dependency=afterok:{cis_dep} {multinomial_script})',
+            f'MOD_MULTI=$(sbatch --parsable --dependency=afterok:{cis_dep}:{modsubset_dep} {multinomial_script})',
             f'echo -e "modality_multinomial_packed\\tall_genes\\t$MOD_MULTI\\t{multinomial_script}" >> "$TSV"',
             "",
         ]
