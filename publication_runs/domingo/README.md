@@ -15,39 +15,79 @@ modality directories).
 
 ```
                  ┌─────────────┐
-                 │ ntc_shared  │  fit_ntc() once, all genes, cis_gene deferred
+                 │ ntc_shared  │  fit_ntc() once, precomputed NTC-only file, cis_gene deferred
                  └──────┬──────┘
         ┌────────┬──────┼──────┬────────┐
         ▼        ▼      ▼      ▼        ▼
-     cis(GFI1B) cis(MYB) cis(NFE2) cis(TET2)   -- add_cis_gene() per gene, reusing ntc_shared
-        │              │             │            │
+   subset(GFI1B) subset(MYB) subset(NFE2) subset(TET2)  -- one add_cis_gene() classification pass per
+        │              │             │            │        gene, writes full/ (whole trans panel + cis
+        ▼              ▼             ▼            ▼        row) and cis_only/ (just the cis row)
+     cis(GFI1B) cis(MYB) cis(NFE2) cis(TET2)   -- add_cis_gene() on that gene's cis_only/ subset,
+        │              │             │            │        reusing ntc_shared
         │              └─────────────┴────────────┴──── donor_choice/acceptor_choice (GPU, ALL 4 genes
         │                                                packed into ONE node-queue job -- 4 genes x 2
         │                                                modalities = 8 tasks, 8 GPUs/node)
         │
-        ├── compensation(GFI1B)        check_systematic_shift(), raw sum_factor
-        ├── trans(GFI1B)               fit_trans(additive_hill), sum_factor_refit
+        ├── compensation(GFI1B)        check_systematic_shift(), raw sum_factor, full/ subset
+        ├── trans(GFI1B)               fit_trans(additive_hill), sum_factor_refit, full/ subset
         │     ├── permutation reps ×5  (array, auto-resubmits on timeout)
         │     └── recapitulation reps ×5 (array, auto-resubmits on timeout)
-        └── modality(GFI1B, sj/exon_skip/intron_retention/mxe/gene_velocity/
-              donor_efficiency/acceptor_efficiency)  -- BINOMIAL only, one CPU job each
-              (own fit_ntc() + fit_trans(additive_hill))
-              ├── modality permutation reps ×5   (array, auto-resubmit)
-              └── modality recapitulation reps ×5 (array, auto-resubmit)
+        └── modality_subset(GFI1B, <mod>)  -- one per (gene, modality), full/ subset + raw splicing dir
+              └── modality(GFI1B, sj/exon_skip/intron_retention/mxe/gene_velocity/
+                    donor_efficiency/acceptor_efficiency)  -- BINOMIAL only, one CPU job each
+                    (own fit_ntc() + fit_trans(additive_hill), reads the precomputed modality subset)
+                    ├── modality permutation reps ×5   (array, auto-resubmit)
+                    └── modality recapitulation reps ×5 (array, auto-resubmit)
 ```
 
 Same for MYB, NFE2, TET2. `generate_slurm.py` writes one sbatch script per
-box above (106 scripts total: 4 genes × [3 gene-level stages + 2 gene-level
-array stages + 7 binomial modality-fit jobs + 7 binomial modalities × 2 more
-array stages] + the shared ntc job + ONE packed multinomial-modality job
-covering all 4 genes) plus `submit_all.sh`, which chains them with
+box above (146 scripts total: 4 genes × [1 gene-data-subset job + 3
+gene-level stages + 2 gene-level array stages + 9 per-modality subset jobs
++ 7 binomial modality-fit jobs + 7 binomial modalities × 2 more array
+stages] + the shared ntc job + ONE packed multinomial-modality job covering
+all 4 genes) plus `submit_all.sh`, which chains them with
 `--dependency=afterok`
-per the diagram (compensation/trans/binomial-modalities all depend on that
-gene's cis job; gene-level permutation/recapitulation depend on gene-level
-trans; modality-level permutation/recapitulation depend on THAT modality's
-own fit job, not just cis -- see "Modality-level permutation/recapitulation"
-below; the packed multinomial job depends on ALL 4 genes' cis jobs) and
-writes `submitted_jobs.tsv` for `common/slurm/list_job_status.py`.
+per the diagram (each gene's subset job depends only on `ntc_shared`, not
+on that gene's own cis fit -- `01b_subset_<gene>.sh` never touches a fitted
+posterior; cis depends on `ntc_shared` + that gene's subset job;
+compensation/trans/modality-subset all depend on that gene's cis job (they
+read the `full/` subset, but still need the cis fit result); each modality's
+own fit job depends on BOTH that gene's cis job and its OWN modality-subset
+job (`--dependency=afterok:$CIS_<gene>:$MODSUBSET_<gene>_<mod>`); gene-level
+permutation/recapitulation depend on gene-level trans; modality-level
+permutation/recapitulation depend on THAT modality's own fit job, not just
+cis -- see "Modality-level permutation/recapitulation" below; the packed
+multinomial job depends on ALL 4 genes' cis jobs AND all 4 genes' multinomial
+modality-subset jobs) and writes `submitted_jobs.tsv` for
+`common/slurm/list_job_status.py`.
+
+**Per-gene data subsetting (`01b_subset_<gene>.sh`).** Every downstream
+stage used to independently re-load and re-classify the FULL 20001-cell
+dataset just to subset it down to ~4281 cells for one gene. Now paid ONCE
+per gene by `common/subset_per_gene.py`, which builds the SAME deferred
+`add_cis_gene()` model construction `02_cis_<gene>.sh` itself uses, then
+writes BOTH resulting subsets (`add_cis_gene()` already separates `cis` from
+the trans panel internally, so both are in memory regardless of which
+mode(s) are requested) instead of proceeding to `fit_cis()`: `full/` (whole
+trans panel with the cis gene's row put back in -- used by compensation/
+trans/permutation/recapitulation/the per-(gene,modality) subsetting step,
+all of which stay eager `cis_gene`-at-construction) and `cis_only/` (just
+the cis gene's row -- used by `02_cis_<gene>.sh`, which keeps its deferred
+`add_cis_gene()` mechanism unchanged). `ntc_shared` itself reads a separate
+precomputed NTC-only file (also written by `preprocess.py`), since it never
+fits on non-NTC cells anyway.
+
+**Per-(gene, modality) subsetting (`07a_modality_subset_<gene>_<mod>.sh`).**
+Same motivation one level down: every modality-fit/permutation/
+recapitulation job independently re-read and re-aligned the FULL shared raw
+splicing directory (`modalities.data_dir`) against its own cells. Now paid
+ONCE per (gene, modality) by `domingo/subset_modality_per_gene.py`, which
+calls the SAME `load_modalities.attach_modality()` the real jobs used to
+call directly, from that gene's own precomputed `full/` subset (needs only
+`01b_subset_<gene>.sh`, NOT the cis fit -- `attach_modality()` only touches
+raw counts, never a fitted posterior), and writes the resulting
+cell-aligned, already-denominator-computed modality to disk. See "Modality
+loading" below for what the real fit job reads instead.
 
 ## GPU-packed multinomial modalities (donor_choice/acceptor_choice)
 
@@ -87,10 +127,13 @@ one real Dardel GPU node's CPU core count -- confirm via `sinfo -p gpu -o
 1. **Preprocess once.** `python preprocess.py --indir <dir with
    domingo_cellmeta.txt.gz + domingo_GEXcounts.csv> --outdir <clean output
    dir>` — turns the raw exports into the `cell_meta.csv`/`gene_counts.csv`/
-   `gene_meta.csv` `config.yaml`'s `paths.meta`/`paths.counts` expect. Run
-   once, manually, NOT part of the SLURM pipeline (like Morris's
-   `preprocess.py`). See "Preprocessing" below for what it does and why it's
-   Python+rpy2 now rather than a separate R script.
+   `gene_meta.csv` `config.yaml`'s `paths.meta`/`paths.counts` expect, plus
+   an NTC-only subset (`cell_meta_ntc.csv`/`gene_counts_ntc.npz`,
+   `paths.meta_ntc`/`paths.counts_ntc`) that `01_ntc_shared.sh` reads
+   instead of the full dataset. Run once, manually, NOT part of the SLURM
+   pipeline (like Morris's `preprocess.py`). See "Preprocessing" below for
+   what it does and why it's Python+rpy2 now rather than a separate R
+   script.
 2. Confirm `config.yaml`'s `modalities.data_dir` (one shared directory
    containing `sj/`, `exon_skip/`, ..., `donor_choice/` subdirectories —
    see `load_modalities.py`'s module docstring for the exact per-stype file
@@ -130,13 +173,21 @@ technical fit — NOT reused from the primary 'gene' modality's ntc fit)
 before `fit_trans()`, both with the usual load-if-exists-else-fit-and-save
 pattern.
 
-**`data_dir` is ONE shared directory, not per-gene.** Every cis gene's job
-reads from the SAME `<stype>/` directories (covering the full cell
-population); per-gene subsetting happens inside the loader by aligning
-against that gene's own `model.meta['L_cell_barcode']` (Domingo's
-preprocessed meta sets `cell == L_cell_barcode`, so this lines up with
-`add_custom_modality()`'s own internal alignment against `model.meta['cell']`
-— see `load_modalities.py`'s module docstring).
+**`data_dir` is ONE shared directory, not per-gene -- but only
+`07a_modality_subset_<gene>_<mod>.sh` reads it directly now.** Every cis
+gene's subsetting job reads from the SAME `<stype>/` directories (covering
+the full cell population) via `attach_modality()`, aligning against that
+gene's own `model.meta['L_cell_barcode']` (Domingo's preprocessed meta sets
+`cell == L_cell_barcode`, so this lines up with `add_custom_modality()`'s
+own internal alignment against `model.meta['cell']`), and writes the result
+to `<output_dir>/<label>_modality_subset/<mod>/`. The real
+`07_modality_<gene>_<mod>.sh` fit job (and, for binomial modalities, the
+permutation/recapitulation `attach_modality:` config block -- see below)
+then reads THAT precomputed directory via `attach_modality_precomputed()`
+instead -- no re-alignment or (for `sj`) gene-expression-denominator
+recomputation needed, both already done when the precomputed file was
+written. See `load_modalities.py`'s module docstring for the exact
+contract of each function.
 
 ## Modality-level permutation/recapitulation
 
@@ -149,11 +200,14 @@ Mechanically these are the same `common/run_permutation_null.py`/
 `common/run_recapitulation_sim.py` scripts the gene-level jobs use, made
 modality-aware via a `modality_name` parameter (previously hardcoded to the
 primary modality) plus a new `attach_modality:` config block -- a dynamic
-import/call of `load_modalities.attach_modality()`, resolved at runtime via
+import/call of `load_modalities.attach_modality_precomputed()` (reads that
+(gene, modality)'s precomputed subset written by
+`07a_modality_subset_<gene>_<mod>.sh`, NOT the raw shared `data_dir` --
+see "Modality loading" above), resolved at runtime via
 `config_utils.ensure_dataset_dir_on_syspath()` (put `domingo/` on
 `sys.path` using the `_dataset_dir` value `generate_slurm.py` stamps into
 every rendered config). Since a custom modality only exists on a freshly
-built model after `attach_modality()` re-attaches it, this happens FIRST,
+built model after `attach_modality_precomputed()` re-attaches it, this happens FIRST,
 before `load_ntc_fit()`/`load_cis_fit()` -- which then pick up that
 modality's OWN saved ntc/trans fit automatically (default `modalities=None`
 loads whatever exists). Binomial's `simulate_from_trans_summary()` call

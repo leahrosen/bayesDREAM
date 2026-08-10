@@ -73,10 +73,10 @@ renders correctly.
   with the expected `cell_meta.tsv.gz`/`feature_meta.tsv.gz`/`counts.npz`
   (+`denominator.npz` for binomial) layout before running that modality's
   job, or remove the entry.
-- **High-MOI shared-ntc sanity check** — now real library code
-  (`add_cis_gene()`), not a workaround, but still worth one cheap check the
-  first time: fit one primary gene, sanity-check its `alpha_x_prefit`/cis
-  results aren't obviously wrong (e.g. wildly different scale from what
+- **High-MOI `add_cis_gene()` sanity check** — now real library code, not a
+  workaround, but still worth one cheap check the first time: fit one
+  primary gene, sanity-check its `alpha_x_prefit`/cis results aren't
+  obviously wrong (e.g. wildly different scale from what
   `check_systematic_shift()` or a rough manual estimate would suggest).
 
 ## 4. Size the jobs

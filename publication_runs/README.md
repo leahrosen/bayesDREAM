@@ -28,6 +28,7 @@ publication_runs/
 │   ├── git_provenance.py            # commit/branch/dirty capture + optional stable tag
 │   ├── profile_memory.py            # real peak-RSS measurement -> cores needed (see "Memory")
 │   ├── compute_scran_sum_factor.py  # rpy2 scran sum factors, per-cell-subset (Morris only)
+│   ├── subset_per_gene.py           # precompute per-gene full/cis_only data subsets (see "Per-gene data subsetting")
 │   ├── run_ntc.py                   # standalone shared/deferred fit_ntc stage (extended model builder)
 │   ├── run_cis_deferred.py          # shared-ntc cis stage (add_cis_gene) -- both low-MOI and high-MOI
 │   ├── run_compensation.py          # standalone: model.check_systematic_shift() (always raw sum_factor)
@@ -52,8 +53,27 @@ publication_runs/
 **Stages.** Every dataset run is composed of independently-runnable stages:
 `ntc` -> `cis` -> `compensation` -> `trans` -> (`permutation`, `recapitulation`).
 Some datasets skip stages or share one stage's output across many runs of
-another (e.g. Domingo shares one `ntc` fit across 4 cis genes; Morris shares
-one `ntc` fit across 5+hundreds of cis genes).
+another (e.g. Domingo shares one `ntc` fit across all 4 cis genes; Morris's
+~116 cis-only sweep genes share one `ntc` fit, but each of its 5 primary
+genes -- which get the full pipeline -- gets its OWN `ntc` fit instead,
+packed into one GPU job -- see `morris/README.md`'s "Two fit_ntc regimes"
+section for why).
+
+**Per-gene data subsetting.** `bayesDREAM.__init__` itself dominated
+per-gene job cost when every stage independently loaded and classified the
+FULL raw dataset just to subset it down to one gene's cells (real
+profiling: 38.7s / 21GB for ONE gene's Morris compensation config). Both
+datasets now pay this cost ONCE per gene via `common/subset_per_gene.py`
+(builds the same deferred `cis_gene=None` + `add_cis_gene()` model
+construction the `cis` stage itself uses, then writes the result to disk
+instead of proceeding to `fit_cis()`), producing two on-disk subsets from
+one classification pass: `full/` (whole trans panel, cis gene's row
+included -- for stages that need the panel: `compensation`/`trans`/
+`permutation`/`recapitulation`/modality stages) and `cis_only/` (just the
+cis gene's row -- for the `cis` stage itself). Domingo additionally
+precomputes a per-(gene, modality) subset of its splicing/velocity data
+(`domingo/subset_modality_per_gene.py`) the same way, one level down — see
+`domingo/README.md`'s "Per-(gene, modality) subsetting" section.
 
 **Config layering.** Two YAML layers, deliberately kept separate:
 
@@ -83,8 +103,11 @@ See `config_utils.py`'s module docstring.
 `run_compensation.py`, `run_permutation_null.py`, and `run_recapitulation_sim.py`
 can call into a dataset-specific Python module at runtime via a config block
 shaped `{module, function, kwargs}` (e.g. Morris's padj-based
-`compensation_exclude_cells.py`, Domingo's `load_modalities.attach_modality`
-for modality-level permutation/recapitulation). This only works if the
+`compensation_exclude_cells.py`, Domingo's
+`load_modalities.attach_modality_precomputed` for modality-level
+permutation/recapitulation -- reads that (gene, modality)'s already-
+subsetted file rather than re-reading the shared raw splicing directory,
+see domingo/README.md's "Modality loading" section). This only works if the
 dataset's own directory (`domingo/`, `morris/`) is on `sys.path` in that
 job's process — `generate_slurm.py` stamps `_dataset_dir` into every
 rendered config for exactly this, and `config_utils.ensure_dataset_dir_on_syspath()`
@@ -168,11 +191,12 @@ runs on CPU everywhere except its two multinomial modalities (donor_choice/
 acceptor_choice, which empirically need GPU) — 4 cis genes x 2 modalities =
 8 tasks, packed into ONE job across ALL genes (exactly one Dardel node's 8
 GPUs) — see `domingo/README.md`'s "GPU-packed multinomial modalities"
-section. Morris packs its 5 `primary_genes`' trans/permutation/
+section. Morris packs its 5 `primary_genes`' fit_ntc/trans/permutation/
 recapitulation jobs the same way (one submission each, instead of one per
-gene) — see `morris/README.md`'s "GPU node packing" section; its
-`ntc_shared`/`fit_cis` stages stay unpacked (one shared job / CPU-only,
-respectively). Both datasets' packed tasklists individually prefix each line
+gene) — see `morris/README.md`'s "GPU node packing" section; its ~116
+sweep genes' shared `ntc_shared` and every gene's `fit_cis` stay unpacked
+(one single-task job / CPU-only, respectively). Both datasets' packed
+tasklists individually prefix each line
 with `HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` (round-robinned over
 concurrency) so concurrent tasks land on distinct GPUs instead of all
 defaulting to device 0 — a whole-node allocation exposes every GPU to every

@@ -35,7 +35,7 @@ across all 5 primary_genes instead of 5 separate node requests:
 - `01d_ntc_packed.sh`: 5 tasks, concurrency=5.
 - `04_trans_packed.sh`: 5 tasks, concurrency=5.
 - `05_permutation_packed.sh` / `06_recapitulation_packed.sh`: 5 genes x
-  n_reps tasks (25 with n_reps=5) at concurrency=min(n_tasks, 8).
+  n_reps tasks (5 with n_reps=1) at concurrency=min(n_tasks, 8).
 Packed jobs still auto-resubmit on timeout (SbatchGpuNodeQueue's
 auto_requeue_on_timeout=True) -- see its docstring in sbatch_blocks.py for
 the "re-runs already-finished tasks too" caveat this implies for a packed
