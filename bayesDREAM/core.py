@@ -1058,7 +1058,8 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         Parameters
         ----------
         sum_factor_col_old : str
-            Name of existing sum factor column (typically from adjust_ntc_sum_factor)
+            Name of an existing column in the primary modality's sum_factors
+            DataFrame (typically from adjust_ntc_sum_factor) -- NOT self.meta.
         sum_factor_col_refit : str
             Name for refitted sum factor column to create (default: 'sum_factor_refit')
         covariates : list of str, optional
@@ -1107,19 +1108,19 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 
         primary_mod = self.get_modality(self.primary_modality)
 
-        # Read sum factor from modality sum_factors, falling back to meta for the
-        # initial 'sum_factor' column that was present at model initialisation.
-        if (primary_mod.sum_factors is not None
-                and sum_factor_col_old in primary_mod.sum_factors.columns):
-            sum_factor_data = primary_mod.sum_factors.loc[
-                self.meta['cell'].values, sum_factor_col_old
-            ].values.astype(float)  # shape (N,)
-        elif sum_factor_col_old in self.meta.columns:
-            sum_factor_data = self.meta[sum_factor_col_old].values.astype(float)
-        else:
+        # sum_factor_col_old always comes from the modality's own sum_factors,
+        # never from self.meta (same fix, same reason as adjust_ntc_sum_factor:
+        # _init_sum_factors() already copies every *sum_factor* column out of
+        # meta into modality.sum_factors at __init__/add_cis_gene() time, so
+        # meta is never the authoritative source here).
+        if primary_mod.sum_factors is None or sum_factor_col_old not in primary_mod.sum_factors.columns:
             raise ValueError(
-                f"No column '{sum_factor_col_old}' found in modality sum_factors or meta."
+                f"No column '{sum_factor_col_old}' found in modality "
+                f"'{self.primary_modality}''s sum_factors."
             )
+        sum_factor_data = primary_mod.sum_factors.loc[
+            self.meta['cell'].values, sum_factor_col_old
+        ].values.astype(float)  # shape (N,)
 
         if covariates is None:
             covariates = []
