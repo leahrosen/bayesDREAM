@@ -52,6 +52,22 @@ here would be actively wrong once callers stop assuming a single shared
 ntc_shared serves every gene (see morris/README.md's per-primary-gene
 fit_ntc section).
 
+DOES run compute_scran (via apply_sum_factor_adjustments, steps=
+("compute_scran",)) if the config's sum_factor: block enables it -- right
+here, right after add_cis_gene(), while the primary modality still holds
+the FULL trans panel. This is the ONLY place scran should ever run for a
+per-gene subset: it's a pooling-based normalisation across many genes, so
+computing it on the cis_only mode's single-gene panel is meaningless, not
+merely awkward (quickCluster/computeSumFactors on 1 feature errors inside R:
+"need at least 2 points to select a bandwidth automatically"). Its output is
+written into model.meta (see compute_scran_sum_factor.py), so it lands in
+BOTH modes' meta.csv below -- every downstream per-gene stage then just
+reads that already-computed column instead of (redundantly, and for cis_only
+specifically, wrongly) recomputing it itself. See morris/generate_slurm.py's
+sum_factor_precompute_block/sum_factor_cis_block split for the config-level
+wiring. No-op for datasets whose config doesn't enable compute_scran (e.g.
+Domingo, whose sum_factor column is computed upstream, once, in preprocess.py).
+
 Output files always written as sparse .npz for gene_counts (regardless of
 whether the dataset's OWN base files are dense CSV, e.g. Domingo) --
 per-gene subsets are small either way, and config_utils._read_counts()
@@ -64,8 +80,12 @@ Usage
 
 Config: same schema as run_cis_deferred.py (model.cis_gene omitted,
 top-level cis_gene: key) -- reuse the SAME rendered config generate_slurm.py
-already writes for that gene's cis stage. A top-level ntc_shared_dir: key,
-if present, is simply ignored (see "Does NOT call load_ntc_fit()" above).
+already writes for that gene's cis stage, EXCEPT its sum_factor: block,
+which must be the subset_input-specific one (compute_scran enabled, no
+adjust_ntc_sum_factor -- see morris/generate_slurm.py's
+sum_factor_precompute_block), not the real cis stage's own (compute_scran
+disabled). A top-level ntc_shared_dir: key, if present, is simply ignored
+(see "Does NOT call load_ntc_fit()" above).
 """
 
 import argparse
@@ -80,7 +100,7 @@ from scipy import sparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from config_utils import build_model_from_config, load_bayesdream_yaml  # noqa: E402
+from config_utils import build_model_from_config, load_bayesdream_yaml, apply_sum_factor_adjustments  # noqa: E402
 
 VALID_MODES = ("full", "cis_only")
 
@@ -107,6 +127,21 @@ def subset_per_gene(cfg: dict, outdir: str, modes) -> None:
         model.set_technical_groups(ntc_cfg["set_technical_groups"])
 
     model.add_cis_gene(cis_gene)
+
+    # scran (compute_scran) needs the FULL gene panel to mean anything --
+    # pooling-based normalisation across many genes -- so it must run HERE,
+    # right after add_cis_gene() and before the mode-specific subsetting
+    # below strips the primary modality down to the cis-only single-gene
+    # panel. compute_scran_sum_factor() writes its output into model.meta
+    # (not just modality.sum_factors), so it survives into every mode's
+    # meta.csv written below -- downstream per-gene stages (cis/trans/
+    # permutation/recapitulation) then just read that precomputed column
+    # instead of each redundantly (and, for the cis-only-subset stage,
+    # meaninglessly) recomputing it themselves. See morris/generate_slurm.py's
+    # sum_factor_precompute_block/sum_factor_cis_block split. No-op for
+    # datasets whose config doesn't enable compute_scran (e.g. Domingo,
+    # which computes its sum_factor column upstream, once, in preprocess.py).
+    apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {}, steps=("compute_scran",))
 
     primary_mod = model.get_modality(model.primary_modality)
     cis_mod = model.get_modality("cis")

@@ -224,8 +224,27 @@ def main() -> None:
         },
         "ntc": {"set_technical_groups": ntc_shared_cfg["set_technical_groups"]},
     }
-    sum_factor_cis_block = {
+    # scran needs the FULL gene panel to mean anything (pooling-based
+    # normalisation across many genes) -- computing it on a single-gene
+    # cis_only subset is meaningless, not just an empty-modality technicality
+    # (quickCluster/computeSumFactors on 1 feature errors inside R: "need at
+    # least 2 points to select a bandwidth automatically"). So it's computed
+    # exactly ONCE per gene, in subset_per_gene.py, on the full-panel model
+    # right after add_cis_gene() and before mode-specific subsetting --
+    # sum_factor_precompute_block below, used ONLY for that "subset_input"
+    # config. compute_scran_sum_factor() writes its output into model.meta
+    # (not just modality.sum_factors -- see compute_scran_sum_factor.py), so
+    # it lands in BOTH full/meta.csv and cis_only/meta.csv when
+    # subset_per_gene.py writes them. Every real per-gene stage
+    # (cis/trans/permutation/recapitulation, via sum_factor_cis_block/
+    # sum_factor_trans_block below) then just reads that already-computed
+    # 'sum_factor_new' column -- compute_scran disabled, adjust_ntc_sum_factor
+    # only.
+    sum_factor_precompute_block = {
         "compute_scran": {"enabled": True, "args": {"batch_col": sf_cfg["batch_col"]}},
+    }
+    sum_factor_cis_block = {
+        "compute_scran": {"enabled": False},
         "adjust_ntc_sum_factor": {
             "enabled": True,
             "args": {"sum_factor_col_old": "sum_factor_new", "covariates": sf_cfg["covariates"]},
@@ -318,27 +337,16 @@ def main() -> None:
         # the real 02_cis_<gene>.sh stage (cis_only subset in, THAT GENE's
         # own ntc dir), and cis_sweep's per-gene task (cis_only subset in,
         # the GLOBAL shared ntc dir).
+        # subset_input needs compute_scran (full panel still present, before
+        # mode-specific subsetting -- see sum_factor_precompute_block above);
+        # the real cis/cis_sweep fit just reads what subset_input already
+        # precomputed and saved into meta.csv (sum_factor_cis_block).
+        sum_factor_block = sum_factor_precompute_block if filename_suffix == "subset_input" else sum_factor_cis_block
         overrides = {
             "model": {"label": label, "device": "cpu", "exclude_guides": exclude_guides},
             "data": data_block_override,
             "cis_gene": gene,
-            # compute_scran must target the 'cis' modality here, not the
-            # (default) primary 'gene' modality: after add_cis_gene() on
-            # this deferred, cis_only-subset model, 'gene' has 0 features
-            # left (the cis gene was extracted INTO 'cis') -- scran on an
-            # empty matrix fails inside R ("need at least 2 points to
-            # select a bandwidth automatically"). Built as a fresh dict
-            # here, NOT by mutating sum_factor_cis_block itself --
-            # sum_factor_trans_block aliases that same compute_scran dict
-            # for the trans stage, where 'gene' (the full, non-empty trans
-            # panel) IS the right modality.
-            "sum_factor": {
-                **sum_factor_cis_block,
-                "compute_scran": {
-                    **sum_factor_cis_block["compute_scran"],
-                    "args": {**sum_factor_cis_block["compute_scran"]["args"], "modality_name": "cis"},
-                },
-            },
+            "sum_factor": sum_factor_block,
             "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
         }
         if ntc_dir:

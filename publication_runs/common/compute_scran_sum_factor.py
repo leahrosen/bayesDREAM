@@ -111,16 +111,18 @@ def compute_scran_sum_factor(
         sum_factors = np.asarray(ro.globalenv["sum_factors_out"])
 
     mod.sum_factors[sum_factor_col_out] = sum_factors
-    # ALSO write into model.meta directly, not just mod.sum_factors --
-    # adjust_ntc_sum_factor()/refit_sumfactor() (bayesDREAM/core.py) always
-    # look up sum_factor_col_old via self.get_modality(self.primary_modality),
-    # with no way to point them at a different modality. When modality_name
-    # here is 'cis' (the deferred-cis_gene, cis_only-subset pipeline's own
-    # data, needed because the primary 'gene' modality has 0 features at
-    # this point -- see morris/generate_slurm.py's render_cis_stage_config),
-    # that lookup would otherwise miss the column entirely. meta lookup is
-    # checked FIRST in adjust_ntc_sum_factor's own fallback logic, so this
-    # is a no-op risk-wise for the normal (primary-modality) case too.
+    # ALSO write into model.meta directly, not just mod.sum_factors -- this
+    # is what makes the value actually PERSIST to disk. This function is
+    # meant to be called exactly once per gene, in subset_per_gene.py, on
+    # the full gene panel (scran is meaningless on a single-gene subset --
+    # see subset_per_gene.py's module docstring); subset_per_gene.py then
+    # writes model.meta.to_csv(...) for every requested mode, which is the
+    # ONLY thing that ends up on disk (mod.sum_factors itself never gets
+    # written anywhere). Every downstream per-gene stage rebuilds a fresh
+    # model.meta from that file and re-derives modality.sum_factors from its
+    # *sum_factor* columns at __init__/add_cis_gene() time
+    # (bayesDREAM/core.py's _init_sum_factors()) -- writing here only would
+    # be silently lost the moment this process exits.
     model.meta[sum_factor_col_out] = mod.sum_factors.loc[
         model.meta["cell"].values, sum_factor_col_out
     ].values

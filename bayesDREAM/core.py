@@ -841,7 +841,9 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         Parameters
         ----------
         sum_factor_col_old : str
-            Name of existing sum factor column in meta (default: 'sum_factor')
+            Name of an existing column in the primary modality's sum_factors
+            DataFrame (default: 'sum_factor') -- NOT self.meta, even though
+            _init_sum_factors() originally populated it from a meta column.
         sum_factor_col_adj : str
             Name for adjusted sum factor column to create (default: 'sum_factor_adj')
         covariates : list of str, optional
@@ -873,18 +875,19 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         meta_out = self.meta.copy()
         meta_out["original_index"] = np.arange(len(meta_out))
 
-        # Prefer sum_factors on the modality; fall back to meta for the initial
-        # 'sum_factor' column (present in meta from initialisation).
-        if sum_factor_col_old not in meta_out.columns:
-            if (primary_mod.sum_factors is not None
-                    and sum_factor_col_old in primary_mod.sum_factors.columns):
-                meta_out[sum_factor_col_old] = primary_mod.sum_factors.loc[
-                    meta_out['cell'].values, sum_factor_col_old
-                ].values
-            else:
-                raise ValueError(
-                    f"No column '{sum_factor_col_old}' found in meta or modality sum_factors."
-                )
+        # sum_factor_col_old always comes from the modality's own sum_factors,
+        # never from self.meta (even for the initial 'sum_factor' column --
+        # _init_sum_factors() already copies every *sum_factor* column out of
+        # meta into modality.sum_factors at __init__/add_cis_gene() time, so
+        # meta is never the authoritative source here).
+        if primary_mod.sum_factors is None or sum_factor_col_old not in primary_mod.sum_factors.columns:
+            raise ValueError(
+                f"No column '{sum_factor_col_old}' found in modality "
+                f"'{self.primary_modality}''s sum_factors."
+            )
+        meta_out[sum_factor_col_old] = primary_mod.sum_factors.loc[
+            meta_out['cell'].values, sum_factor_col_old
+        ].values
 
         # Drop existing adjustment_factor column if it exists (prevents merge conflicts)
         if "adjustment_factor" in meta_out.columns:
