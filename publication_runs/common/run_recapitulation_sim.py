@@ -82,6 +82,7 @@ from config_utils import (  # noqa: E402
     is_enabled,
     apply_sum_factor_adjustments,
     ensure_dataset_dir_on_syspath,
+    load_ntc_for_stage,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 
@@ -155,7 +156,8 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
 
     if is_enabled(sim_cfg.get("load_ntc", sim_cfg.get("load_technical")), default=True):
-        model.load_ntc_fit(**normalize_stage_args(sim_cfg.get("load_ntc") or sim_cfg.get("load_technical")))
+        load_ntc_args = normalize_stage_args(sim_cfg.get("load_ntc") or sim_cfg.get("load_technical"))
+        load_ntc_for_stage(model, load_ntc_args, modality_name)
     if is_enabled(sim_cfg.get("load_cis"), default=True):
         model.load_cis_fit(**normalize_stage_args(sim_cfg.get("load_cis")))
     if is_enabled(sim_cfg.get("load_trans"), default=True):

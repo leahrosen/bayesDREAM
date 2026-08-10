@@ -208,9 +208,19 @@ see "Modality loading" above), resolved at runtime via
 `sys.path` using the `_dataset_dir` value `generate_slurm.py` stamps into
 every rendered config). Since a custom modality only exists on a freshly
 built model after `attach_modality_precomputed()` re-attaches it, this happens FIRST,
-before `load_ntc_fit()`/`load_cis_fit()` -- which then pick up that
-modality's OWN saved ntc/trans fit automatically (default `modalities=None`
-loads whatever exists). Binomial's `simulate_from_trans_summary()` call
+before `load_ntc_fit()`/`load_cis_fit()`. NOTE: a modality's own ntc fit is
+NOT saved into `ntc_shared_dir` (that directory only ever holds the primary
+'gene' modality's shared fit) -- it's saved into the gene's OWN
+`output_dir/label` by that modality's own `07_modality_<gene>_<mod>.sh` job
+(`load_modalities.py`'s `model.save_ntc_fit()` call, no explicit
+`output_dir`). A single `load_ntc_fit(input_dir=ntc_shared_dir)` call would
+therefore silently find nothing for the custom modality (`load_ntc_fit`
+skips missing files rather than erroring) and `fit_trans()` would later fail
+with "has not been fit with fit_ntc()". `config_utils.load_ntc_for_stage()`
+(used by both scripts) handles this: one `load_ntc_fit()` call restricted to
+the primary modality from `ntc_shared_dir`, plus a second one for just the
+custom modality from the default directory (`output_dir/label`) when
+`modality_name` isn't the primary modality. Binomial's `simulate_from_trans_summary()` call
 passes `sim_denominator` (the modality's own aligned denominator) instead of
 `sim_sum_factor` -- binomial has no sum-factor concept.
 

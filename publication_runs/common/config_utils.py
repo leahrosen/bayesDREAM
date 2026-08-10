@@ -165,6 +165,7 @@ __all__ = [
     "apply_sum_factor_adjustments",
     "ensure_dataset_dir_on_syspath",
     "resolve_paths",
+    "load_ntc_for_stage",
 ]
 
 
@@ -314,3 +315,43 @@ def apply_sum_factor_adjustments(model, section: Dict[str, Any], steps=("compute
 
     if "refit_sumfactor" in steps and is_enabled(section.get("refit_sumfactor"), default=False):
         model.refit_sumfactor(**normalize_stage_args(section.get("refit_sumfactor")))
+
+
+def load_ntc_for_stage(model, load_ntc_args: Dict[str, Any], modality_name: str) -> None:
+    """Load fit_ntc() results for a permutation/recapitulation stage that may
+    target a NON-primary modality (e.g. Domingo's binomial splicing
+    modalities, attached via an ``attach_modality:`` config block before this
+    is called).
+
+    A custom modality's OWN fit_ntc() result was never saved into
+    ``load_ntc_args['input_dir']`` (typically ``ntc_shared_dir``) -- that
+    directory only ever holds the PRIMARY modality's shared fit. The custom
+    modality's own ntc fit was instead saved by its
+    ``07_modality_<gene>_<mod>.sh`` job (domingo/load_modalities.py's
+    ``model.save_ntc_fit()`` call, no explicit output_dir -- defaults to
+    ``<output_dir>/<label>``, i.e. this GENE's own directory) via a
+    SEPARATE, later `fit_ntc(modality_name=...)` call, not the shared one.
+
+    Calling ``model.load_ntc_fit(input_dir=ntc_shared_dir)`` alone (the old
+    behavior) silently no-ops for that modality -- `os.path.exists()` guards
+    every per-file read in `load_ntc_fit`, so a missing
+    `posterior_samples_ntc_<modality>.pt` is skipped, not an error, right up
+    until `fit_trans(modality_name=...)` later raises "has not been fit with
+    fit_ntc()" because the modality's `alpha_y_prefit` is still `None`.
+
+    So this makes TWO calls when `modality_name` isn't the primary modality:
+    one restricted to the primary modality from the configured
+    `input_dir` (for the primary modality's own alpha_x/alpha_y, needed by
+    downstream `permute_x_true`/sum-factor plumbing), and one for JUST
+    `modality_name`, from the default directory (`<output_dir>/<label>`) --
+    exactly where its own fit_ntc job saved it. For the primary modality
+    itself, this is a single unchanged call (the pre-existing behavior).
+    """
+    if modality_name == model.primary_modality:
+        model.load_ntc_fit(**load_ntc_args)
+        return
+
+    primary_load_args = dict(load_ntc_args)
+    primary_load_args.setdefault("modalities", [model.primary_modality])
+    model.load_ntc_fit(**primary_load_args)
+    model.load_ntc_fit(modalities=[modality_name], mask_features=load_ntc_args.get("mask_features", False))

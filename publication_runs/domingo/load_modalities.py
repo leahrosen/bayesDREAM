@@ -369,7 +369,7 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-    from config_utils import build_model_from_config, load_bayesdream_yaml, normalize_stage_args, is_enabled  # noqa: E402
+    from config_utils import build_model_from_config, load_bayesdream_yaml, normalize_stage_args  # noqa: E402
     from git_provenance import save_provenance_json  # noqa: E402
     import yaml  # noqa: E402
 
@@ -391,8 +391,18 @@ def main() -> None:
     model = build_model_from_config(cfg)
     cis_cfg = cfg.get("cis") or {}
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
-    if is_enabled(cis_cfg.get("load_ntc", cis_cfg.get("load_technical")), default=True):
-        model.load_ntc_fit(**normalize_stage_args(cis_cfg.get("load_ntc") or cis_cfg.get("load_technical")))
+    # NOTE: deliberately does NOT call model.load_ntc_fit() here for the
+    # primary 'gene' modality (earlier versions of this script did, cargo-
+    # culted from bayesDREAM.cli._run_fit_cis's load-then-fit_cis pattern).
+    # It has no `input_dir` in this script's config (only `load_cis` is
+    # rendered -- see domingo/generate_slurm.py's mod_cfg), so it would
+    # default to this gene's OWN output_dir/label, where no ntc fit is ever
+    # saved (only ntc_shared_dir has one, and the cis stage here only saves
+    # via save_cis_fit(), never save_ntc_fit()) -- a silent no-op. Nothing
+    # below consumes the primary modality's alpha_x_prefit/alpha_y_prefit/
+    # posterior_samples_ntc: fit_ntc()/fit_trans() below are both scoped to
+    # THIS job's own new custom modality via modality_name=, and
+    # fitting/trans.py never reads alpha_x_prefit at all.
     model.load_cis_fit(**normalize_stage_args(cis_cfg.get("load_cis")))
     if "technical_group_code" not in model.meta.columns:
         covariates = ntc_cfg.get("set_technical_groups")

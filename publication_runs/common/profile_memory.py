@@ -42,7 +42,7 @@ Usage
     python profile_memory.py --config <gene_modality_config.yaml> --stage ntc \\
         --modality-name splicing_sj --niters 10
     python profile_memory.py --config <gene_modality_config.yaml> --stage trans \\
-        --modality-name splicing_sj --niters 10
+        --modality-name splicing_sj --modality-spec domingo/config_modalities.yaml --niters 10
     python profile_memory.py --config <label>_cis.yaml --stage cis --niters 10   # deferred
 
 Two shapes of config, auto-detected from whether `cis_gene` sits under
@@ -75,6 +75,20 @@ just its permutation/simulation configs) -- see domingo/generate_slurm.py.
 allocates less (no Adam state, no posterior draws, no checkpointing), so
 just reuse whatever core count `--stage trans` reports for that gene rather
 than profiling it separately.
+
+`--modality-spec` (required for `--stage trans --modality-name <non-primary>`):
+a non-primary modality's `function_type`/`min_denominator` are NOT read from
+the config's `trans:` block -- plain `<label>_modality_<name>.yaml` configs
+never carry one (domingo/load_modalities.py's real fit_trans() call gets
+these straight from `config_modalities.yaml`'s per-stype `spec`, not from a
+bayesdream-config `trans:` block -- see its module docstring). Point
+`--modality-spec` at that same file (e.g. domingo/config_modalities.yaml) so
+this script can look up the same two values by matching
+`f"{spec.get('name_prefix', 'splicing')}_{spec['stype']}"` against
+`--modality-name`. Omitting this for a non-primary modality raises a clear
+error here instead of the confusing "min_denominator is required for
+distribution='binomial'" ValueError several stack frames deep inside
+fit_trans().
 """
 
 import argparse
@@ -116,6 +130,20 @@ def _timed_step(name: str):
           f"-> ~{cores_needed:.1f} cores needed on Dardel's `shared` partition (888MB/core)")
 
 
+def _find_modality_spec(modality_spec_path: str, modality_name: str) -> dict:
+    """Look up modality_name's (e.g. 'splicing_sj') entry in a
+    config_modalities.yaml-shaped file, matching on
+    f"{spec.get('name_prefix', 'splicing')}_{spec['stype']}" -- same name
+    construction as load_modalities.attach_modality()/attach_modality_precomputed()."""
+    import yaml
+    with open(modality_spec_path) as f:
+        specs = yaml.safe_load(f)["modalities"]
+    for spec in specs:
+        if f"{spec.get('name_prefix', 'splicing')}_{spec['stype']}" == modality_name:
+            return spec
+    raise ValueError(f"_find_modality_spec: no entry for modality_name={modality_name!r} in {modality_spec_path}")
+
+
 def _attach_modality_if_configured(model, cfg: dict):
     """Same contract as run_permutation_null.py's helper of the same name --
     no-op if the config has no `attach_modality:` block (i.e. this run
@@ -139,6 +167,10 @@ def main() -> None:
                          help="Profile this modality's OWN fit_ntc()/fit_trans() call too (only used "
                               "with --stage ntc or --stage trans). For a custom modality, --config's "
                               "attach_modality: block must be able to attach it first.")
+    parser.add_argument("--modality-spec", default=None,
+                         help="Path to a config_modalities.yaml-shaped file (list of {stype, "
+                              "distribution, function_type, min_denominator, ...} dicts). Required for "
+                              "--stage trans on a non-primary --modality-name -- see module docstring.")
     parser.add_argument("--ntc-shared-dir", default=None,
                          help="Deferred configs only: override the config's own ntc_shared_dir, e.g. to "
                               "point at a profile_bootstrap_ntc.py scratch fit instead of editing the "
@@ -226,6 +258,23 @@ def main() -> None:
         fit_args["niters"] = args.niters
         if modality_name:
             fit_args.setdefault("modality_name", modality_name)
+            if modality_name != model.primary_modality:
+                # Plain <label>_modality_<name>.yaml configs never carry a
+                # trans: block (the real job reads function_type/
+                # min_denominator from config_modalities.yaml instead -- see
+                # module docstring's "--modality-spec" section) -- without
+                # this, fit_trans() below fails several frames deep with
+                # "min_denominator is required for distribution='binomial'".
+                if not args.modality_spec:
+                    raise ValueError(
+                        f"profile_memory: --stage trans --modality-name {modality_name!r} is a "
+                        "non-primary modality but no --modality-spec was given -- pass "
+                        "--modality-spec <dataset>/config_modalities.yaml so function_type/"
+                        "min_denominator can be looked up (see module docstring)."
+                    )
+                spec = _find_modality_spec(args.modality_spec, modality_name)
+                fit_args.setdefault("function_type", spec["function_type"])
+                fit_args.setdefault("min_denominator", spec.get("min_denominator", 0))
         model.fit_trans(**fit_args)
 
 
