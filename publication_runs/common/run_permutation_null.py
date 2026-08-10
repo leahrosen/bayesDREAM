@@ -71,6 +71,9 @@ from config_utils import (  # noqa: E402
     load_ntc_for_stage,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from resource_stats import (  # noqa: E402
+    is_cuda, new_stats_dict, load_prior_stats, timed_attempt, record_trans_step,
+)
 
 from bayesDREAM.simulation import permute_from_ntc  # noqa: E402
 
@@ -104,10 +107,30 @@ def run_permutation_null(cfg: dict, rep: int) -> None:
     np.random.seed(seed)
 
     model = build_model_from_config(cfg)
+    device_is_cuda = is_cuda(model)
 
     perm_cfg = cfg.get("permutation") or {}
     attached_modality = _attach_modality_if_configured(model, cfg)
     modality_name = attached_modality or perm_cfg.get("modality_name") or model.primary_modality
+
+    # Computed up front (not just before saving, as before) -- this rep's own
+    # checkpoint_dir MUST be unique per (gene, modality, rep), or fit_trans()
+    # below would default to <output_dir>/<label> and collide with that
+    # gene's real trans fit (or sibling reps) -- see
+    # resource_stats.py's module docstring "IMPORTANT for callers" note.
+    output_dir = perm_cfg.get("output_dir")
+    if not output_dir:
+        base = model_cfg.get("output_dir", "output")
+        if modality_name == model.primary_modality:
+            output_dir = os.path.join(base, label, "permutation", f"rep_{rep}")
+        else:
+            output_dir = os.path.join(base, label, "permutation", modality_name, f"rep_{rep}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    stats_path = os.path.join(output_dir, "stats.json")
+    prior_stats = load_prior_stats(stats_path)
+    stats = new_stats_dict(model, extra={"stage": "permutation_null", "label": label,
+                                          "modality": modality_name, "rep": rep, "seed": seed})
 
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
 
@@ -146,16 +169,14 @@ def run_permutation_null(cfg: dict, rep: int) -> None:
 
     fit_args = normalize_stage_args(perm_cfg.get("fit"))
     fit_args.setdefault("modality_name", modality_name)
-    model.fit_trans(**fit_args)
+    # See the output_dir block above -- this rep's OWN directory, not
+    # fit_trans()'s shared default, or a requeued/resumed attempt (or a
+    # sibling rep, or the real trans fit) would collide.
+    checkpoint_dir = fit_args.setdefault("checkpoint_dir", output_dir)
 
-    output_dir = perm_cfg.get("output_dir")
-    if not output_dir:
-        base = model_cfg.get("output_dir", "output")
-        if modality_name == model.primary_modality:
-            output_dir = os.path.join(base, label, "permutation", f"rep_{rep}")
-        else:
-            output_dir = os.path.join(base, label, "permutation", modality_name, f"rep_{rep}")
-    os.makedirs(output_dir, exist_ok=True)
+    with timed_attempt(device_is_cuda) as this_attempt:
+        model.fit_trans(**fit_args)
+    record_trans_step(stats, stats_path, "fit_trans", modality_name, checkpoint_dir, this_attempt, prior_stats)
 
     model.save_trans_fit(output_dir=output_dir, modalities=[modality_name])
     model.save_trans_summary(output_dir=output_dir, modality_name=modality_name)

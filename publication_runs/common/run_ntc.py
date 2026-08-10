@@ -57,6 +57,10 @@ from config_utils import (  # noqa: E402
     is_enabled,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from resource_stats import (  # noqa: E402
+    is_cuda, new_stats_dict, load_prior_stats, step_completed,
+    carry_forward_step, timed_step,
+)
 
 
 def run_ntc(cfg: dict) -> None:
@@ -69,18 +73,33 @@ def run_ntc(cfg: dict) -> None:
         )
 
     model = build_model_from_config(cfg)
+    device_is_cuda = is_cuda(model)
+
+    output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
+    stats_path = os.path.join(output_dir, "ntc_stats.json")
+    prior_stats = load_prior_stats(stats_path)
+    stats = new_stats_dict(model, extra={"stage": "ntc", "label": model_cfg.get("label")})
 
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     if ntc_cfg.get("set_technical_groups"):
         model.set_technical_groups(ntc_cfg["set_technical_groups"])
 
-    fit_args = normalize_stage_args(ntc_cfg.get("fit"))
-    model.fit_ntc(**fit_args)
+    # fit_ntc() has no internal checkpoint (see resource_stats.py's module
+    # docstring) -- a killed/timed-out attempt leaves nothing to resume mid-
+    # fit, so "restarting" this job (a manual resubmit; ntc/cis/compensation
+    # deliberately do NOT auto-requeue, see publication_runs/README.md)
+    # either finds a fully-completed prior attempt (skip, just load + reuse
+    # its recorded stats) or starts completely fresh.
+    if step_completed(prior_stats, "fit_ntc"):
+        carry_forward_step(stats, stats_path, "fit_ntc", prior_stats)
+        model.load_ntc_fit()
+    else:
+        fit_args = normalize_stage_args(ntc_cfg.get("fit"))
+        with timed_step("fit_ntc", stats, device_is_cuda, stats_path):
+            model.fit_ntc(**fit_args)
+        if is_enabled(ntc_cfg.get("save"), default=True):
+            model.save_ntc_fit(**normalize_stage_args(ntc_cfg.get("save")))
 
-    if is_enabled(ntc_cfg.get("save"), default=True):
-        model.save_ntc_fit(**normalize_stage_args(ntc_cfg.get("save")))
-
-    output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
     save_provenance_json(
         os.path.join(output_dir, "provenance_ntc.json"),
         extra={"stage": "ntc", "label": model_cfg.get("label"), "is_high_moi": model.is_high_moi},

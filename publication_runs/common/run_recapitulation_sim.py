@@ -85,6 +85,9 @@ from config_utils import (  # noqa: E402
     load_ntc_for_stage,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from resource_stats import (  # noqa: E402
+    is_cuda, new_stats_dict, load_prior_stats, timed_attempt, record_trans_step,
+)
 
 from bayesDREAM.simulation import simulate_from_trans_summary  # noqa: E402
 
@@ -148,10 +151,30 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     np.random.seed(seed)
 
     model = build_model_from_config(cfg)
+    device_is_cuda = is_cuda(model)
 
     sim_cfg = cfg.get("simulation") or {}
     attached_modality = _attach_modality_if_configured(model, cfg)
     modality_name = attached_modality or sim_cfg.get("modality_name") or model.primary_modality
+
+    # Computed up front (not just before saving, as before) -- this rep's own
+    # checkpoint_dir MUST be unique per (gene, modality, rep), or fit_trans()
+    # below would default to <output_dir>/<label> and collide with that
+    # gene's real trans fit (or sibling reps) -- see
+    # resource_stats.py's module docstring "IMPORTANT for callers" note.
+    base_output_dir = model_cfg.get("output_dir", "output")
+    rec_output_dir = sim_cfg.get("output_dir")
+    if not rec_output_dir:
+        if modality_name == model.primary_modality:
+            rec_output_dir = os.path.join(base_output_dir, label, "recapitulation", f"rep_{rep}")
+        else:
+            rec_output_dir = os.path.join(base_output_dir, label, "recapitulation", modality_name, f"rep_{rep}")
+    os.makedirs(rec_output_dir, exist_ok=True)
+
+    stats_path = os.path.join(rec_output_dir, "stats.json")
+    prior_stats = load_prior_stats(stats_path)
+    stats = new_stats_dict(model, extra={"stage": "recapitulation", "label": label,
+                                          "modality": modality_name, "rep": rep, "seed": seed})
 
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
 
@@ -183,8 +206,7 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     group_col = sim_cfg.get("group_col", "technical_group_code")
     sum_factor_col = sim_cfg.get("sum_factor_col", "sum_factor_refit")
 
-    output_dir = model_cfg.get("output_dir", "output")
-    default_summary = os.path.join(output_dir, label, f"trans_feature_summary_{modality_name}.csv")
+    default_summary = os.path.join(base_output_dir, label, f"trans_feature_summary_{modality_name}.csv")
     trans_summary_path = sim_cfg.get("trans_summary_csv") or default_summary
     ground_truth = pd.read_csv(trans_summary_path)
 
@@ -233,15 +255,14 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
 
     fit_args = normalize_stage_args(sim_cfg.get("fit") or (cfg.get("trans") or {}).get("fit"))
     fit_args["modality_name"] = fit_modality_name
-    sim_model.fit_trans(**fit_args)
+    # See the rec_output_dir block above -- this rep's OWN directory, not
+    # fit_trans()'s shared default, or a requeued/resumed attempt (or a
+    # sibling rep, or the real trans fit) would collide.
+    checkpoint_dir = fit_args.setdefault("checkpoint_dir", rec_output_dir)
 
-    rec_output_dir = sim_cfg.get("output_dir")
-    if not rec_output_dir:
-        if modality_name == model.primary_modality:
-            rec_output_dir = os.path.join(output_dir, label, "recapitulation", f"rep_{rep}")
-        else:
-            rec_output_dir = os.path.join(output_dir, label, "recapitulation", modality_name, f"rep_{rep}")
-    os.makedirs(rec_output_dir, exist_ok=True)
+    with timed_attempt(device_is_cuda) as this_attempt:
+        sim_model.fit_trans(**fit_args)
+    record_trans_step(stats, stats_path, "fit_trans", fit_modality_name, checkpoint_dir, this_attempt, prior_stats)
 
     sim_model.save_trans_fit(output_dir=rec_output_dir, modalities=[fit_modality_name])
     sim_model.save_trans_summary(output_dir=rec_output_dir, modality_name=fit_modality_name)

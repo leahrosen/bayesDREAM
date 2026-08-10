@@ -51,6 +51,7 @@ from config_utils import (  # noqa: E402
     ensure_dataset_dir_on_syspath,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from resource_stats import is_cuda, new_stats_dict, timed_step  # noqa: E402
 
 
 def _load_exclude_cells_file(path: str):
@@ -107,13 +108,22 @@ def run_compensation(cfg: dict) -> "object":
     args = normalize_stage_args(comp_cfg.get("args"))
     args["exclude_cells"] = _resolve_exclude_cells(args.get("exclude_cells"), model, cfg)
 
-    result = model.check_systematic_shift(**args)
-
     modality_name = args.get("modality_name") or model.primary_modality
     output_dir = (cfg.get("model") or {}).get("output_dir", "output")
     label = (cfg.get("model") or {}).get("label")
-    default_out = os.path.join(output_dir, label, f"compensation_{modality_name}.csv")
+    label_dir = os.path.join(output_dir, label)
+    default_out = os.path.join(label_dir, f"compensation_{modality_name}.csv")
     out_path = comp_cfg.get("output", default_out)
+
+    # No skip-if-already-done here (unlike ntc/cis): check_systematic_shift()
+    # has no Adam state/posterior draws/checkpointing (see
+    # publication_runs/README.md's "Memory" section) -- cheap enough that
+    # just always recomputing on a manual resubmit is simpler and safer than
+    # trusting a stale CSV.
+    stats_path = os.path.join(label_dir, "compensation_stats.json")
+    stats = new_stats_dict(model, extra={"stage": "compensation", "label": label, "modality": modality_name})
+    with timed_step("check_systematic_shift", stats, is_cuda(model), stats_path):
+        result = model.check_systematic_shift(**args)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     result.to_csv(out_path, index=False)

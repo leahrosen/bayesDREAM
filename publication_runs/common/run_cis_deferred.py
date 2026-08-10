@@ -84,6 +84,10 @@ from config_utils import (  # noqa: E402
     apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from resource_stats import (  # noqa: E402
+    is_cuda, new_stats_dict, load_prior_stats, step_completed,
+    carry_forward_step, timed_step,
+)
 
 
 def run_cis_deferred(cfg: dict) -> None:
@@ -101,24 +105,42 @@ def run_cis_deferred(cfg: dict) -> None:
         raise ValueError("run_cis_deferred: config needs top-level 'cis_gene' and 'ntc_shared_dir' keys.")
 
     model = build_model_from_config(cfg)
+    device_is_cuda = is_cuda(model)
+
+    output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
+    stats_path = os.path.join(output_dir, "cis_stats.json")
+    prior_stats = load_prior_stats(stats_path)
+    stats = new_stats_dict(model, extra={"stage": "cis_deferred", "label": model_cfg.get("label"),
+                                          "cis_gene": cis_gene})
 
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     if ntc_cfg.get("set_technical_groups"):
         model.set_technical_groups(ntc_cfg["set_technical_groups"])
 
+    # load_ntc_fit()/add_cis_gene() are cheap, deterministic setup (NOT the
+    # expensive SVI step) -- they always run regardless of whether fit_cis
+    # itself gets skipped below, since add_cis_gene() is what creates the
+    # 'cis' modality that load_cis_fit() (the resumed path) needs to load
+    # INTO in the first place.
     model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True)
     model.add_cis_gene(cis_gene)
 
     apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {}, steps=("compute_scran", "adjust_ntc_sum_factor"))
 
     cis_cfg = cfg.get("cis") or {}
-    fit_args = normalize_stage_args(cis_cfg.get("fit"))
-    model.fit_cis(**fit_args)
+    # fit_cis() has no internal checkpoint (see resource_stats.py's module
+    # docstring) -- see run_ntc.py's identical comment for why "restarting"
+    # this job means skip-if-already-done, not continue-mid-fit.
+    if step_completed(prior_stats, "fit_cis"):
+        carry_forward_step(stats, stats_path, "fit_cis", prior_stats)
+        model.load_cis_fit()
+    else:
+        fit_args = normalize_stage_args(cis_cfg.get("fit"))
+        with timed_step("fit_cis", stats, device_is_cuda, stats_path):
+            model.fit_cis(**fit_args)
+        if is_enabled(cis_cfg.get("save"), default=True):
+            model.save_cis_fit(**normalize_stage_args(cis_cfg.get("save")))
 
-    if is_enabled(cis_cfg.get("save"), default=True):
-        model.save_cis_fit(**normalize_stage_args(cis_cfg.get("save")))
-
-    output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
     save_provenance_json(
         os.path.join(output_dir, "provenance_cis.json"),
         extra={"stage": "cis_deferred", "label": model_cfg.get("label"), "cis_gene": cis_gene,

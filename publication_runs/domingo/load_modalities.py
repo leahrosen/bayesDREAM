@@ -371,6 +371,10 @@ def main() -> None:
 
     from config_utils import build_model_from_config, load_bayesdream_yaml, normalize_stage_args  # noqa: E402
     from git_provenance import save_provenance_json  # noqa: E402
+    from resource_stats import (  # noqa: E402
+        is_cuda, new_stats_dict, load_prior_stats, step_completed,
+        carry_forward_step, timed_step, timed_attempt, record_trans_step,
+    )
     import yaml  # noqa: E402
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -389,6 +393,7 @@ def main() -> None:
     spec = specs[args.modality_name]
 
     model = build_model_from_config(cfg)
+    device_is_cuda = is_cuda(model)
     cis_cfg = cfg.get("cis") or {}
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     # NOTE: deliberately does NOT call model.load_ntc_fit() here for the
@@ -418,28 +423,45 @@ def main() -> None:
         diagnostic_plot_path = os.path.join(output_dir, f"diagnostic_{args.modality_name}_counts_vs_denominator.png")
         modality_name = attach_modality(model, spec, args.data_dir, diagnostic_plot_path=diagnostic_plot_path)
 
+    stats_path = os.path.join(output_dir, f"stats_{modality_name}.json")
+    prior_stats = load_prior_stats(stats_path)
+    stats = new_stats_dict(model, extra={"stage": "modality_fit", "label": model_cfg.get("label"),
+                                          "modality": modality_name})
+
     # --- modality-specific NTC fit: load if exists, otherwise fit and save ---
-    ntc_fit_path = os.path.join(output_dir, f"posterior_samples_ntc_{modality_name}.pt")
-    if os.path.exists(ntc_fit_path):
-        print("[INFO] Loading existing ntc fit for modality...")
+    # fit_ntc() has no internal checkpoint (see resource_stats.py's module
+    # docstring) -- gated on stats_path (not the .pt file's mere existence,
+    # since save_ntc_fit() uses plain torch.save(), not an atomic write, so a
+    # file that exists isn't proof it's complete/uncorrupted if a prior
+    # attempt died mid-write).
+    if step_completed(prior_stats, "fit_ntc"):
+        carry_forward_step(stats, stats_path, "fit_ntc", prior_stats)
         model.load_ntc_fit(output_dir, modalities=[modality_name])
     else:
         print("[INFO] Running ntc fit for modality (this may take a while)...")
-        model.fit_ntc(modality_name=modality_name, tolerance=0)
+        with timed_step("fit_ntc", stats, device_is_cuda, stats_path):
+            model.fit_ntc(modality_name=modality_name, tolerance=0)
         model.save_ntc_fit()
 
-    # --- modality-specific trans fit: load if exists, otherwise fit and save ---
-    trans_fit_path = os.path.join(output_dir, f"posterior_samples_trans_{modality_name}.pt")
-    if os.path.exists(trans_fit_path):
-        print("[INFO] Loading existing trans fit...")
-        model.load_trans_fit(modalities=[modality_name])
-    else:
-        print("[INFO] Running trans fit (this may take a while)...")
+    # --- modality-specific trans fit ---
+    # Unlike fit_ntc above, no existence/skip check needed here: fit_trans()
+    # has its OWN internal checkpoint/resume (restart_from_checkpoint=True by
+    # default) -- if a prior attempt already completed, it detects that from
+    # its own checkpoint almost instantly rather than re-fitting, so always
+    # calling it (same as run_trans.py) is both simpler and more robust than
+    # trusting a plain torch.save()'d output file's mere existence.
+    # checkpoint_dir left at fit_trans()'s own default (output_dir, computed
+    # above) -- this is the sole writer for this (gene, modality) pair, no
+    # collision risk (unlike permutation/recapitulation reps, which must
+    # override it -- see resource_stats.py's module docstring).
+    print("[INFO] Running trans fit for modality (loads/resumes from its own checkpoint if already complete)...")
+    with timed_attempt(device_is_cuda) as this_attempt:
         model.fit_trans(
             modality_name=modality_name, tolerance=0, function_type=spec["function_type"],
-            min_denominator=spec.get("min_denominator", 0),
+            min_denominator=spec.get("min_denominator", 0), checkpoint_dir=output_dir,
         )
-        model.save_trans_fit(modalities=[modality_name])
+    record_trans_step(stats, stats_path, "fit_trans", modality_name, output_dir, this_attempt, prior_stats)
+    model.save_trans_fit(modalities=[modality_name])
 
     model.save_trans_summary(output_dir=output_dir, modality_name=modality_name)
 

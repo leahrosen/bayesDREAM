@@ -52,10 +52,20 @@ from config_utils import (  # noqa: E402
     apply_sum_factor_adjustments,
 )
 from git_provenance import save_provenance_json  # noqa: E402
+from resource_stats import (  # noqa: E402
+    is_cuda, new_stats_dict, load_prior_stats, timed_attempt, record_trans_step,
+)
 
 
 def run_trans(cfg: dict) -> None:
     model = build_model_from_config(cfg)
+    device_is_cuda = is_cuda(model)
+
+    model_cfg = cfg.get("model") or {}
+    output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
+    stats_path = os.path.join(output_dir, "trans_stats.json")
+    prior_stats = load_prior_stats(stats_path)
+    stats = new_stats_dict(model, extra={"stage": "trans", "label": model_cfg.get("label")})
 
     trans_cfg = cfg.get("trans") or {}
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
@@ -77,13 +87,19 @@ def run_trans(cfg: dict) -> None:
         model.exclude_trans_genes(**normalize_stage_args(excl_cfg))
 
     fit_args = normalize_stage_args(trans_cfg.get("fit"))
-    model.fit_trans(**fit_args)
+    modality_name = fit_args.get("modality_name") or model.primary_modality
+    # Explicit (matches fit_trans()'s own default of output_dir/label anyway)
+    # so record_trans_step below reads cumulative_elapsed_sec from the exact
+    # checkpoint file this call just wrote/resumed, not a guessed default.
+    checkpoint_dir = fit_args.setdefault("checkpoint_dir", output_dir)
+
+    with timed_attempt(device_is_cuda) as this_attempt:
+        model.fit_trans(**fit_args)
+    record_trans_step(stats, stats_path, "fit_trans", modality_name, checkpoint_dir, this_attempt, prior_stats)
 
     if is_enabled(trans_cfg.get("save"), default=True):
         model.save_trans_fit(**normalize_stage_args(trans_cfg.get("save")))
 
-    model_cfg = cfg.get("model") or {}
-    output_dir = os.path.join(model_cfg.get("output_dir", "output"), model_cfg.get("label"))
     save_provenance_json(
         os.path.join(output_dir, "provenance_trans.json"),
         extra={"stage": "trans", "label": model_cfg.get("label")},

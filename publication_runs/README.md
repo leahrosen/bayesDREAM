@@ -27,6 +27,7 @@ publication_runs/
 │   ├── config_utils.py              # YAML load/deep-merge/render + model builder (see below)
 │   ├── git_provenance.py            # commit/branch/dirty capture + optional stable tag
 │   ├── profile_memory.py            # real peak-RSS measurement -> cores needed (see "Memory")
+│   ├── resource_stats.py            # per-job time/memory tracking, resume-aware (see "Per-job resource stats")
 │   ├── compute_scran_sum_factor.py  # rpy2 scran sum factors, per-cell-subset (Morris only)
 │   ├── subset_per_gene.py           # precompute per-gene full/cis_only data subsets (see "Per-gene data subsetting")
 │   ├── run_ntc.py                   # standalone shared/deferred fit_ntc stage (extended model builder)
@@ -176,6 +177,47 @@ flag on `SbatchStep`/`SbatchArray`). Every dataset's `submit_all.sh` writes
 a `submitted_jobs.tsv` (stage, label, jobid, script); run
 `common/slurm/list_job_status.py <submitted_jobs.tsv>` to see every job's
 current `sacct` state grouped into a "NEEDS ATTENTION" list.
+
+`permutation`/`recapitulation` replicates MUST pass their own unique
+`checkpoint_dir` to `fit_trans()` (their own per-rep `output_dir` —
+`run_permutation_null.py`/`run_recapitulation_sim.py` do this automatically)
+— `fit_trans()`'s own default (`<model.output_dir>/<model.label>`) is shared
+by every replicate of a given (gene, modality) AND by that gene's own real
+`trans` fit. Since permutation/recapitulation only change cell/feature
+*values*, not the shapes `fit_trans()`'s checkpoint validation checks, a
+replicate left on the default would silently resume from — and immediately
+report as "complete" — the real fit's already-converged, non-permuted
+parameters, corrupting the null distribution. See `resource_stats.py`'s
+module docstring.
+
+**Per-job resource stats (time/memory, "add on" across restarts).**
+`common/resource_stats.py` (used by every `common/run_*.py` script and
+`domingo/load_modalities.py`) writes a `<stage>_stats.json` next to each
+stage's other output (`ntc_stats.json`, `cis_stats.json`,
+`compensation_stats.json`, `trans_stats.json`, or `stats.json` inside each
+permutation/recapitulation replicate's own directory) — wall-clock
+(`elapsed_sec`), peak CPU RSS (`peak_rss_mb`), and peak GPU memory
+(`peak_gpu_mb`, CUDA only), plus hostname/SLURM job+array-task ID for
+cross-referencing `sacct`. Written incrementally (after each step), same
+pattern as `examples/simulation_study/run_recovery_fit.py`'s
+`fit_stats.json`, which it's factored out of. Two different "restart"
+behaviors, matching which stages actually have internal checkpointing (see
+above):
+- `ntc`/`cis` (no internal checkpoint): a manual resubmit either finds a
+  fully-completed prior attempt in `<stage>_stats.json` (skips re-fitting
+  entirely — loads instead — and carries that step's recorded stats forward
+  unchanged) or starts completely fresh; there's no partial progress to add
+  onto, since a killed attempt's work was discarded, not built upon.
+- `trans`/`permutation`/`recapitulation` (real internal checkpoint): the
+  recorded `elapsed_sec` is read back from `fit_trans()`'s own
+  `cumulative_elapsed_sec` field (written into every checkpoint, summed
+  across every resume attempt) rather than timed by the stats script itself
+  — a single process's own timer can't see time spent in earlier,
+  separately-killed attempts, so this is the actual "add on when we
+  restart" behavior. Peak memory across resumes is `max(prior, this
+  attempt)`, never summed — separate process attempts were never running
+  simultaneously, so summing would overstate true peak memory pressure at
+  any single moment.
 
 **GPU node packing.** When a step only needs a fraction of a Dardel GPU node,
 don't request one node per task. Instead write a plain-text task list (one
