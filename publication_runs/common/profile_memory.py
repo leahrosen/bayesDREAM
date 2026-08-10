@@ -93,7 +93,7 @@ def _timed_step(name: str):
     yield
     elapsed = time.time() - t0
     rss_after = _peak_rss_mb()
-    cores_needed = (rss_after * 1024) / 888.0  # MB -> KB / (KB/core)
+    cores_needed = rss_after / 888.0  # both already MB (888MB/core, NOT KB/core -- see sbatch_blocks.py)
     print(f"[profile_memory] {name}: {elapsed:.1f}s, peak RSS so far {rss_after:.0f} MB "
           f"(was {rss_before:.0f} MB before this step) "
           f"-> ~{cores_needed:.1f} cores needed on Dardel's `shared` partition (888MB/core)")
