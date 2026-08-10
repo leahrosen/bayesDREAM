@@ -43,22 +43,38 @@ Usage
         --modality-name splicing_sj --niters 10
     python profile_memory.py --config <gene_modality_config.yaml> --stage trans \\
         --modality-name splicing_sj --niters 10
+    python profile_memory.py --config <label>_cis.yaml --stage cis --niters 10   # deferred
 
-Config must have `model.cis_gene` set directly (not the deferred/add_cis_gene
-pattern, e.g. Domingo's `<label>_cis.yaml`) for --stage cis/trans to work --
-point it at a config that already has cis_gene at construction time instead,
-e.g. that same gene's `<label>_compensation.yaml` or `<label>_trans.yaml`
-(memory characteristics are essentially the same either way; only cell/
-feature subsetting mechanics differ between add_cis_gene() and cis_gene-at-
-init, not what fit_cis()/fit_trans() themselves allocate). For a modality's
-own profiling run, point --config at that gene's `<label>_modality_<name>.yaml`
-(has the `attach_modality:` block already) -- see domingo/generate_slurm.py.
+Two shapes of config, auto-detected from whether `cis_gene` sits under
+`model:` (eager, cis_gene known at construction) or as a top-level key with
+no `model.cis_gene` (deferred/add_cis_gene() pattern, e.g. Domingo/Morris's
+`<label>_cis.yaml` -- see run_cis_deferred.py):
 
-Note --stage cis/trans do NOT require a real completed ntc_shared run:
-fit_cis() only requires alpha_x_prefit if you pass technical_covariates
-(the pipeline's own configs never do), so it runs fine off the tiny
-in-process fit_ntc() this script does anyway -- no manual placeholder
-needed.
+- Eager (`<label>_compensation.yaml`, `<label>_trans.yaml`, plain
+  `<label>_modality_<name>.yaml`): --stage ntc/cis/trans do their OWN tiny
+  in-process fit_ntc()/fit_cis() (niters=10) -- no real ntc_shared run
+  needed first, since fit_cis() only requires alpha_x_prefit if you pass
+  technical_covariates (the pipeline's own configs never do).
+- Deferred (`<label>_cis.yaml`): mirrors run_cis_deferred.py exactly --
+  model.load_ntc_fit(ntc_shared_dir, mask_features=True) then
+  model.add_cis_gene(cis_gene), so this DOES require a real completed
+  ntc_shared run on disk first (that's the whole point of profiling THIS
+  data path -- it measures the real memory load_ntc_fit's full-panel
+  posteriors add on top of the tiny cis_only data, which the eager path
+  above never touches). Only --stage init/cis are meaningful here --
+  ntc is shared/already-fit elsewhere and trans always uses a separate
+  eager config, so --stage ntc/trans raise on a deferred config.
+
+For a modality's own profiling run, point --config at that gene's
+`<label>_modality_<name>.yaml` (has the `attach_modality:` block --
+generate_slurm.py adds it to every modality's plain fit config now, not
+just its permutation/simulation configs) -- see domingo/generate_slurm.py.
+
+`compensation` has no dedicated profiling path here on purpose: its own
+`check_systematic_shift()` reads the same `full` data subset as `trans` but
+allocates less (no Adam state, no posterior draws, no checkpointing), so
+just reuse whatever core count `--stage trans` reports for that gene rather
+than profiling it separately.
 """
 
 import argparse
@@ -77,6 +93,7 @@ from config_utils import (  # noqa: E402
     load_bayesdream_yaml,
     normalize_stage_args,
     ensure_dataset_dir_on_syspath,
+    apply_sum_factor_adjustments,
 )
 
 
@@ -122,10 +139,17 @@ def main() -> None:
                          help="Profile this modality's OWN fit_ntc()/fit_trans() call too (only used "
                               "with --stage ntc or --stage trans). For a custom modality, --config's "
                               "attach_modality: block must be able to attach it first.")
+    parser.add_argument("--ntc-shared-dir", default=None,
+                         help="Deferred configs only: override the config's own ntc_shared_dir, e.g. to "
+                              "point at a profile_bootstrap_ntc.py scratch fit instead of editing the "
+                              "real rendered config (which the actual pipeline run will also use).")
     args = parser.parse_args()
 
     cfg = load_bayesdream_yaml(Path(args.config))
     cfg["_dataset_dir"] = cfg.get("_dataset_dir") or str(Path(args.config).resolve().parents[2])
+    if args.ntc_shared_dir:
+        cfg["ntc_shared_dir"] = args.ntc_shared_dir
+    is_deferred = bool(cfg.get("cis_gene")) and not (cfg.get("model") or {}).get("cis_gene")
 
     with _timed_step("model construction (bayesDREAM.__init__)"):
         model = build_model_from_config(cfg)
@@ -138,6 +162,38 @@ def main() -> None:
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     if ntc_cfg.get("set_technical_groups"):
         model.set_technical_groups(ntc_cfg["set_technical_groups"])
+
+    if is_deferred:
+        # Mirrors run_cis_deferred.py exactly -- see module docstring's
+        # "Two shapes of config" section for why ntc/trans don't apply here.
+        if args.stage != "cis":
+            raise ValueError(
+                f"profile_memory: --stage {args.stage} doesn't apply to a deferred cis_gene config "
+                f"({args.config}). ntc is already fit in a separate ntc_shared job -- profile that "
+                "config directly with --stage ntc. trans always runs off a separate eager "
+                "(cis_gene-at-construction) config, e.g. <label>_trans.yaml -- profile that instead."
+            )
+        ntc_shared_dir = cfg.get("ntc_shared_dir")
+        if not ntc_shared_dir:
+            raise ValueError(
+                "profile_memory: deferred config needs a top-level 'ntc_shared_dir' key (same as "
+                "run_cis_deferred.py), pointing at a REAL, already-completed ntc_shared output "
+                "directory -- that's the whole point of profiling this path: it measures the real "
+                "memory load_ntc_fit()'s full-panel posteriors add on top of the tiny cis_only data."
+            )
+        with _timed_step("load_ntc_fit + add_cis_gene"):
+            model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True)
+            model.add_cis_gene(cfg["cis_gene"])
+
+        apply_sum_factor_adjustments(
+            model, cfg.get("sum_factor") or {}, steps=("compute_scran", "adjust_ntc_sum_factor"))
+
+        cis_cfg = cfg.get("cis") or {}
+        with _timed_step(f"fit_cis(niters={args.niters})"):
+            fit_args = dict(normalize_stage_args(cis_cfg.get("fit")))
+            fit_args["niters"] = args.niters
+            model.fit_cis(**fit_args)
+        return
 
     with _timed_step(f"fit_ntc(primary, niters={args.niters})"):
         fit_args = dict(normalize_stage_args(ntc_cfg.get("fit")))

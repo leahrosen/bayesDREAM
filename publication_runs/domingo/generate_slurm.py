@@ -457,6 +457,18 @@ def main() -> None:
             is_multinomial = spec["distribution"] == "multinomial"
             mod_data_dir = modalities_dataset_cfg["data_dir"]
             mod_precomputed_dir = modality_subset_dir_for(label, mod_name)
+            # Computed once, reused both below (mod_cfg, so plain
+            # `<label>_modality_<mod>.yaml` is directly usable by
+            # common/profile_memory.py's --modality-name, matching that
+            # script's own docstring) and further down for permutation/
+            # recapitulation configs.
+            attach_block = {
+                "attach_modality": {
+                    "module": "load_modalities",
+                    "function": "attach_modality_precomputed",
+                    "kwargs": {"spec": spec, "precomputed_dir": mod_precomputed_dir},
+                },
+            }
 
             subset_mod_cmd = (
                 f'"{python_env}" "{repo_dir}/publication_runs/domingo/subset_modality_per_gene.py" '
@@ -477,6 +489,7 @@ def main() -> None:
                 "model": {"label": label, "cis_gene": gene, "device": "cuda" if is_multinomial else "cpu"},
                 "data": subset_data_block(label, "full"),
                 "cis": {"load_cis": {"enabled": True}},
+                **attach_block,
             })
             mod_cfg_path = configs_dir / f"{label}_modality_{mod_name}.yaml"
             write_yaml(mod_cfg_path, mod_cfg)
@@ -509,13 +522,7 @@ def main() -> None:
             # fit_trans) and, for recapitulation, its saved
             # trans_feature_summary.csv as ground truth.
             if spec["distribution"] == "binomial":
-                attach_block = {
-                    "attach_modality": {
-                        "module": "load_modalities",
-                        "function": "attach_modality_precomputed",
-                        "kwargs": {"spec": spec, "precomputed_dir": mod_precomputed_dir},
-                    },
-                }
+                # attach_block computed once above, reused here.
                 mod_fit_args = {
                     "function_type": spec["function_type"],
                     "min_denominator": spec.get("min_denominator", 0),
