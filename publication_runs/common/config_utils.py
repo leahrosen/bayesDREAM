@@ -68,12 +68,25 @@ def _read_counts(path, read_csv_kwargs):
     unchecked). The `.npz` file's columns MUST already be in the exact same
     order as the `data.meta` CSV's rows -- see morris/preprocess.py, which
     guarantees this by construction.
+
+    read_csv_kwargs defaults to {"index_col": 0} only when the caller
+    passes None (key absent from the rendered config entirely) -- NOT via
+    `read_csv_kwargs or {"index_col": 0}`, which would also catch an
+    EXPLICIT {} (a dataset deliberately opting out of index_col, e.g. a
+    plain gene_id/gene_name CSV with no leading unnamed index column) and
+    silently override it, since {} is falsy in Python. See
+    build_model_from_config's feature_meta loading for the real bug this
+    exact pattern caused (Morris's feature_meta_read_csv_kwargs: {} was
+    silently ignored, index_col=0 applied anyway, turning feature_meta's
+    index into gene_id strings instead of integer row positions).
     """
     path = str(path)
     if path.endswith(".npz"):
         from scipy import sparse
         return sparse.load_npz(path)
-    return read_table(path, read_csv_kwargs or {"index_col": 0})
+    if read_csv_kwargs is None:
+        read_csv_kwargs = {"index_col": 0}
+    return read_table(path, read_csv_kwargs)
 
 
 def build_model_from_config(cfg: Dict[str, Any]) -> "bayesDREAM":
@@ -96,10 +109,22 @@ def build_model_from_config(cfg: Dict[str, Any]) -> "bayesDREAM":
 
     feature_meta = None
     if data_cfg.get("feature_meta"):
-        feature_meta = read_table(
-            data_cfg["feature_meta"],
-            data_cfg.get("feature_meta_read_csv_kwargs") or {"index_col": 0},
-        )
+        # NOT `data_cfg.get(...) or {"index_col": 0}` -- an explicit {} (a
+        # dataset opting OUT of index_col, e.g. Morris's plain
+        # gene_id/gene_name gene_meta.csv with no leading unnamed index
+        # column) is falsy in Python and would be silently overridden by
+        # that `or`, applying index_col=0 anyway. .get(key, default) only
+        # substitutes when the key is truly ABSENT, which is what we want:
+        # feature_meta.index becomes gene_id (a string) instead of an
+        # integer row position, and _extract_cis_from_gene's
+        # feature_meta[...].index[0] lookup (used for positional sparse-
+        # matrix indexing) silently gets a gene-id string instead of an
+        # int -- this is exactly what caused Morris's high-MOI
+        # "IndexError: Index dimension must be 1 or 2" crash inside
+        # bayesDREAM.__init__ for every stage using cis_gene-at-construction
+        # (compensation/trans/permutation/recapitulation).
+        feature_meta_kwargs = data_cfg.get("feature_meta_read_csv_kwargs", {"index_col": 0})
+        feature_meta = read_table(data_cfg["feature_meta"], feature_meta_kwargs)
 
     guide_assignment = None
     if data_cfg.get("guide_assignment"):
