@@ -90,6 +90,7 @@ class bayesDREAM(
         require_ntc: bool = True,
         min_count: int = 1,
         color_scheme: 'ColorScheme' = None,
+        cis_only: bool = False,
     ):
         """
         Initialize bayesDREAM.
@@ -198,6 +199,24 @@ class bayesDREAM(
             Color scheme for visualizations. If None, auto-built from model
             metadata via ``ColorScheme.from_model(self)`` after initialization.
             Can also be set later via ``set_color_scheme()``.
+        cis_only : bool, default=False
+            Allow the primary modality to end up with ZERO trans genes after
+            cis-gene extraction (e.g. counts pre-subsetted upstream to just the
+            one cis gene, for a cheap cis-only fit). Without this, providing
+            counts containing only the cis gene raises ``ValueError: No genes
+            left after filtering!`` — this flag opts in to that instead of
+            treating it as an error. Sets ``self.cis_only = True``, which
+            ``fit_ntc()`` checks to warn that fitting overdispersion fresh
+            from a single gene's NTC expression is very unstable; prefer
+            ``load_ntc_fit()`` from a fuller-panel run's saved output instead
+            (this still works normally — feature-alignment when loading
+            doesn't require the current and saved panels to match in size).
+            The deferred cis_gene workflow (``cis_gene=None`` at construction,
+            ``add_cis_gene()`` later) already tolerates this same "zero trans
+            genes left" outcome without needing this flag — it has no
+            equivalent raise — and ``add_cis_gene()`` sets ``self.cis_only``
+            automatically when it detects the same outcome, so the fit_ntc()
+            warning fires there too.
 
         Raises
         ------
@@ -280,6 +299,11 @@ class bayesDREAM(
         # Store min_count for use in modality creation
         self.min_count = min_count
 
+        # See __init__'s cis_only docstring entry. add_cis_gene() also sets
+        # this automatically when it independently arrives at the same
+        # zero-trans-genes outcome via the deferred workflow.
+        self.cis_only = cis_only
+
         # Store original counts for base class initialization
         counts_for_base = counts
 
@@ -302,7 +326,7 @@ class bayesDREAM(
             if modality_name == 'gene':
                 # Use gene-specific creation (with gene_meta handling)
                 # Pass both the name and numeric index for exclusion
-                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta, min_count=min_count)
+                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta, min_count=min_count, cis_only=cis_only)
             else:
                 # Generic negbinom modality creation
                 self._create_negbinom_modality(counts, modality_name, cis_feature, cis_numeric_idx, feature_meta, meta, min_count=min_count)
@@ -565,6 +589,14 @@ class bayesDREAM(
 
         self.modalities[self.primary_modality] = new_primary_mod
         self.cis_gene = cis_gene
+
+        # See bayesDREAM.__init__'s cis_only docstring entry: the deferred
+        # workflow has no equivalent "no genes left" raise (a 1-gene starting
+        # panel is fine here), but should still be flagged the same way the
+        # eager cis_only=True path is, so fit_ntc()'s instability warning
+        # fires regardless of which path arrived at zero trans genes.
+        if new_primary_mod.dims['n_features'] == 0:
+            self.cis_only = True
 
         # ----------------------------------------------------------------
         # Step 5a (high-MOI only): reclassify cells carrying a cis_gene guide.
@@ -1862,6 +1894,7 @@ class bayesDREAM(
         gene_meta: Optional[pd.DataFrame] = None,
         meta: Optional[pd.DataFrame] = None,
         min_count: int = 1,
+        cis_only: bool = False,
     ):
         """
         Create 'gene' modality from gene counts (excluding cis gene if specified).
@@ -1977,8 +2010,12 @@ class bayesDREAM(
 
             features_to_keep.append(i)
 
-        if len(features_to_keep) == 0:
-            raise ValueError("No genes left after filtering!")
+        if len(features_to_keep) == 0 and not cis_only:
+            raise ValueError(
+                "No genes left after filtering! (Pass cis_only=True to bayesDREAM's "
+                "constructor if this is intentional -- e.g. counts pre-subsetted "
+                "upstream to just the cis gene for a cheap cis-only fit.)"
+            )
 
         # Filter counts and metadata
         counts_trans, gene_feature_meta = self._filter_features(counts, gene_meta, features_to_keep)

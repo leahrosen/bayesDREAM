@@ -758,6 +758,22 @@ class NTCFitter:
         if distribution is None:
             distribution = modality.distribution
 
+        # cis_only models (see bayesDREAM.__init__'s cis_only docstring
+        # entry) have ~0 trans genes in the primary modality by design --
+        # fitting fit_ntc() FRESH here estimates per-gene overdispersion
+        # from a single gene's NTC expression, which is very unstable.
+        # Prefer load_ntc_fit() from a fuller-panel run's saved output
+        # instead (works fine regardless of the current panel's size --
+        # feature alignment on load doesn't require matching shapes).
+        if modality_name == self.model.primary_modality and getattr(self.model, 'cis_only', False):
+            warnings.warn(
+                "fit_ntc() called on a cis_only model (primary modality has ~0 trans "
+                "genes) -- per-gene overdispersion estimation from a single gene's NTC "
+                "expression is very unstable. Prefer load_ntc_fit() from a fuller-panel "
+                "run's saved output instead of fitting fresh here.",
+                UserWarning,
+            )
+
         # ---------------------------
         # Set conditional default for niters
         # ---------------------------
