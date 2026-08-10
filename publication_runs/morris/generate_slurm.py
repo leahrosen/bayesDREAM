@@ -322,7 +322,23 @@ def main() -> None:
             "model": {"label": label, "device": "cpu", "exclude_guides": exclude_guides},
             "data": data_block_override,
             "cis_gene": gene,
-            "sum_factor": sum_factor_cis_block,
+            # compute_scran must target the 'cis' modality here, not the
+            # (default) primary 'gene' modality: after add_cis_gene() on
+            # this deferred, cis_only-subset model, 'gene' has 0 features
+            # left (the cis gene was extracted INTO 'cis') -- scran on an
+            # empty matrix fails inside R ("need at least 2 points to
+            # select a bandwidth automatically"). Built as a fresh dict
+            # here, NOT by mutating sum_factor_cis_block itself --
+            # sum_factor_trans_block aliases that same compute_scran dict
+            # for the trans stage, where 'gene' (the full, non-empty trans
+            # panel) IS the right modality.
+            "sum_factor": {
+                **sum_factor_cis_block,
+                "compute_scran": {
+                    **sum_factor_cis_block["compute_scran"],
+                    "args": {**sum_factor_cis_block["compute_scran"]["args"], "modality_name": "cis"},
+                },
+            },
             "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
         }
         if ntc_dir:

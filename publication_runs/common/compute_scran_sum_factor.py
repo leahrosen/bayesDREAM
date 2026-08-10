@@ -111,6 +111,19 @@ def compute_scran_sum_factor(
         sum_factors = np.asarray(ro.globalenv["sum_factors_out"])
 
     mod.sum_factors[sum_factor_col_out] = sum_factors
+    # ALSO write into model.meta directly, not just mod.sum_factors --
+    # adjust_ntc_sum_factor()/refit_sumfactor() (bayesDREAM/core.py) always
+    # look up sum_factor_col_old via self.get_modality(self.primary_modality),
+    # with no way to point them at a different modality. When modality_name
+    # here is 'cis' (the deferred-cis_gene, cis_only-subset pipeline's own
+    # data, needed because the primary 'gene' modality has 0 features at
+    # this point -- see morris/generate_slurm.py's render_cis_stage_config),
+    # that lookup would otherwise miss the column entirely. meta lookup is
+    # checked FIRST in adjust_ntc_sum_factor's own fallback logic, so this
+    # is a no-op risk-wise for the normal (primary-modality) case too.
+    model.meta[sum_factor_col_out] = mod.sum_factors.loc[
+        model.meta["cell"].values, sum_factor_col_out
+    ].values
     if verbose:
         print(f"[compute_scran_sum_factor] {modality_name}: wrote '{sum_factor_col_out}' "
               f"for {len(sum_factors)} cells (batch_col={batch_col!r})")
