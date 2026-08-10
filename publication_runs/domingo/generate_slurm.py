@@ -137,6 +137,7 @@ def main() -> None:
     paths = resolve_paths(cfg["paths"])
     meta_path = paths["meta"]
     counts_path = paths["counts"]
+    gene_meta_path = paths["gene_meta"]
     meta_ntc_path = paths["meta_ntc"]
     counts_ntc_path = paths["counts_ntc"]
     output_dir = paths["output_dir"]
@@ -228,7 +229,13 @@ def main() -> None:
     ntc_shared_dir = f"{output_dir}/{label_ntc}"
     ntc_bd_cfg = render_bayesdream_config(base_cfg, {
         "model": {"label": label_ntc},
-        "data": {"meta": meta_ntc_path, "counts": counts_ntc_path},
+        # counts_ntc_path is sparse .npz (no row labels) -- feature_meta
+        # required, same reason subset_data_block() passes it for every
+        # per-gene subset. gene_meta.csv is index=False (see preprocess.py),
+        # hence feature_meta_read_csv_kwargs: {} to stop the default
+        # index_col=0 from eating its first real column.
+        "data": {"meta": meta_ntc_path, "counts": counts_ntc_path,
+                  "feature_meta": gene_meta_path, "feature_meta_read_csv_kwargs": {}},
         "ntc": {"fit": ntc_shared_cfg.get("fit", {}), "save": True},
     })
     ntc_cfg_path = configs_dir / f"{label_ntc}.yaml"

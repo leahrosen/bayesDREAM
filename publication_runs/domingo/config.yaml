@@ -24,6 +24,11 @@ paths:
   data_dir: "{raw_data_dir}/preprocessed"
   meta: "{data_dir}/cell_meta.csv"
   counts: "{data_dir}/gene_counts.csv"
+  # gene_counts.csv is a plain CSV DataFrame (index_label="gene"), so most
+  # stages never need this explicitly -- ONLY counts_ntc below (sparse
+  # .npz, no row labels) requires it, same reason subset_data_block()
+  # passes feature_meta for every per-gene subset.
+  gene_meta: "{data_dir}/gene_meta.csv"
   # NTC-only subset (also written by preprocess.py) -- used ONLY by
   # ntc_shared, which never fits on non-NTC cells anyway (use_all_cells=False,
   # the low-MOI default) but previously still had to load+classify the full
