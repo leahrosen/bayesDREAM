@@ -84,11 +84,13 @@ one real Dardel GPU node's CPU core count -- confirm via `sinfo -p gpu -o
 
 ## Before running
 
-1. **Data paths.** `config.yaml`'s `paths.meta`/`paths.counts` point at
-   `cell_meta.csv`/`gene_counts.csv` under `processed_Leah/` — these are
-   written by the R preprocessing script below via relative `fwrite()`
-   calls, so confirm the exact output location once it's been (re-)run;
-   the filenames themselves should be stable.
+1. **Preprocess once.** `python preprocess.py --indir <dir with
+   domingo_cellmeta.txt.gz + domingo_GEXcounts.csv> --outdir <clean output
+   dir>` — turns the raw exports into the `cell_meta.csv`/`gene_counts.csv`/
+   `gene_meta.csv` `config.yaml`'s `paths.meta`/`paths.counts` expect. Run
+   once, manually, NOT part of the SLURM pipeline (like Morris's
+   `preprocess.py`). See "Preprocessing" below for what it does and why it's
+   Python+rpy2 now rather than a separate R script.
 2. Confirm `config.yaml`'s `modalities.data_dir` (one shared directory
    containing `sj/`, `exon_skip/`, ..., `donor_choice/` subdirectories —
    see `load_modalities.py`'s module docstring for the exact per-stype file
@@ -164,23 +166,56 @@ it needs that job's saved ntc fit (`alpha_y_prefit` prior for `fit_trans()`)
 and, for recapitulation, its saved `trans_feature_summary_<modality>.csv` as
 ground truth.
 
-## R preprocessing (runs once, upstream, NOT part of this SLURM pipeline)
+## Preprocessing (`preprocess.py`, runs once, upstream, NOT part of this SLURM pipeline)
 
-`cell_meta.csv`/`gene_counts.csv` are produced by an R script (outside this
-repo) that, starting from `domingo_sce.rds`:
+Ports what used to be a separate R script into `domingo/preprocess.py`
+(Python + rpy2 for the one R-only step, `scran::calculateSumFactors`) so
+the whole pipeline runs from one language/environment, matching Morris's
+own `preprocess.py`. Reads two raw exports (confirmed via header/content
+inspection on Dardel, NOT the original `domingo_sce.rds` — see the
+script's own docstring for exactly what was checked):
 
-- drops the `CRISPRi`/`CRISPRa` pseudo-gene rows and renames `CCDC173` ->
-  `CFAP210`;
+- `domingo_cellmeta.txt.gz` — raw `colData(sce)` (comma-separated despite
+  the `.txt` extension); has `lane` already derived but not
+  `cell`/`target`/`guide`/`sum_factor`.
+- `domingo_GEXcounts.csv` — raw `counts(sce)` (genes x cells),
+  **unfiltered** (still has the `CRISPRi`/`CRISPRa` pseudo-gene rows and
+  un-renamed `CCDC173`) — exactly what `calculateSumFactors()` needs, since
+  the original script computes sum factors BEFORE dropping those rows.
+
+`preprocess.py`:
+
+- aligns `domingo_GEXcounts.csv`'s columns to `domingo_cellmeta.txt.gz`'s
+  row order by real name-based lookup (its cell-barcode column headers are
+  reliable, unlike Morris's `guide_assignment_cells.npy` — see
+  `morris/README.md`'s SNP/alignment notes for that contrast), raising if
+  any cell is missing;
 - computes a **clustered sum factor** via `scran::calculateSumFactors(counts,
-  clusters=guide_crispr, ref.clust='NTC')` (clusters = guide identity, NOT
+  clusters=guide_crispr [any name containing "NTC" collapsed to a single
+  'NTC' cluster], ref.clust='NTC')` (clusters = guide identity, NOT
   `quickCluster` -- different from Morris's per-cell-subset scran step, see
   `morris/README.md`) — this becomes the `sum_factor` column, computed ONCE
-  for the whole dataset;
-- also computes a guide-level **`adjustment_factor`** (ratio of each guide's
-  mean clustered sum factor to its lane+cell_line NTC baseline) and an
-  unused `clustered.sum.factor.adj` column;
+  for the whole dataset, on the RAW (unfiltered) counts;
+- drops the `CRISPRi`/`CRISPRa` pseudo-gene rows and renames `CCDC173` ->
+  `CFAP210` in `gene_counts.csv`;
+- builds `gene_meta.csv` from the GTF (`gencode.v44.annotation.gtf.gz`),
+  filtered to genes present in the (filtered) counts;
 - renames columns to bayesDREAM's expected `cell`/`guide`/`target`/
   `sum_factor`.
+
+**Deliberately does NOT compute `adjustment_factor`/`clustered.sum.factor.adj`**
+(the guide-level mean-sum-factor-vs-NTC-baseline normalization the original
+R script also computed) — that column is always renamed to
+`adjustment_factor_old` and never read
+(`config_utils.apply_sum_factor_adjustments`'s docstring — it's provably
+redundant with `model.adjust_ntc_sum_factor()`, which recomputes an
+equivalent column itself), so `preprocess.py` skips reimplementing a step
+with no downstream use rather than replicate it for parity's sake.
+
+Requires `rpy2` + R's `scran` package in whichever conda env runs this
+(confirm separately from Morris's own rpy2 needs, even though both use
+`bayesdream_cpu` — as of 2026-08, `rpy2` was confirmed NOT installed there
+yet).
 
 **Why `apply_sum_factor_adjustments` renames `adjustment_factor` before
 calling `adjust_ntc_sum_factor()`:** the R output above ALWAYS ships a

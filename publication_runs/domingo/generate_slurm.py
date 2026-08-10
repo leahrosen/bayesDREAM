@@ -61,7 +61,7 @@ REPO_DIR_LOCAL = THIS_DIR.parents[1]  # .../bayesDREAM_forClaude, for local impo
 sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common"))
 sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common" / "slurm"))
 
-from config_utils import load_yaml, write_yaml, render_bayesdream_config  # noqa: E402
+from config_utils import load_yaml, write_yaml, render_bayesdream_config, resolve_paths  # noqa: E402
 from git_provenance import create_stable_snapshot_tag  # noqa: E402
 from sbatch_blocks import SbatchStep, SbatchArray, SbatchGpuNodeQueue  # noqa: E402
 
@@ -91,9 +91,9 @@ def main() -> None:
         tag_info = create_stable_snapshot_tag(prefix=f"{cfg['dataset']}-run", push=not args.no_push_tag)
     print(f"[generate_slurm] git tag for this batch: {tag_info.get('bayesdream_tag')}")
 
-    paths = cfg["paths"]
-    meta_path = paths["meta"].format(**paths)
-    counts_path = paths["counts"].format(**paths)
+    paths = resolve_paths(cfg["paths"])
+    meta_path = paths["meta"]
+    counts_path = paths["counts"]
     output_dir = paths["output_dir"]
     repo_dir = paths["repo_dir"]
     python_env = paths["python_env"]

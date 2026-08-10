@@ -76,30 +76,12 @@ sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common"))
 sys.path.insert(0, str(REPO_DIR_LOCAL / "publication_runs" / "common" / "slurm"))
 sys.path.insert(0, str(THIS_DIR))
 
-from config_utils import load_yaml, write_yaml, render_bayesdream_config  # noqa: E402
+from config_utils import load_yaml, write_yaml, render_bayesdream_config, resolve_paths  # noqa: E402
 from git_provenance import create_stable_snapshot_tag  # noqa: E402
 from sbatch_blocks import SbatchStep, SbatchArray, SbatchGpuNodeQueue  # noqa: E402
 from snp_exclusion import exclude_guides_for_cis_gene, exclude_all_snp_guides  # noqa: E402
 
 TIME_HOURS = 24.0  # fixed everywhere, per project convention
-
-
-def _resolve_paths(paths: dict) -> dict:
-    """Resolve {placeholder} cross-references, allowing chained references
-    (e.g. data_dir: "{raw_data_dir}/preprocessed") by repeatedly formatting
-    until nothing changes."""
-    resolved = dict(paths)
-    for _ in range(len(paths) + 1):
-        changed = False
-        for k, v in resolved.items():
-            if isinstance(v, str) and "{" in v:
-                new_v = v.format(**resolved)
-                if new_v != v:
-                    resolved[k] = new_v
-                    changed = True
-        if not changed:
-            break
-    return resolved
 
 
 def _select_cis_genes(stats_csv: str, gene_use_col: str, padj_col: str, padj_threshold: float,
@@ -147,7 +129,7 @@ def main() -> None:
         tag_info = create_stable_snapshot_tag(prefix=f"{cfg['dataset']}-run", push=not args.no_push_tag)
     print(f"[generate_slurm] git tag for this batch: {tag_info.get('bayesdream_tag')}")
 
-    paths = _resolve_paths(cfg["paths"])
+    paths = resolve_paths(cfg["paths"])
     output_dir = paths["output_dir"]
     repo_dir = paths["repo_dir"]
     python_env_cpu = paths["python_env_cpu"]

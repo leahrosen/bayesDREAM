@@ -139,7 +139,33 @@ __all__ = [
     "render_bayesdream_config",
     "apply_sum_factor_adjustments",
     "ensure_dataset_dir_on_syspath",
+    "resolve_paths",
 ]
+
+
+def resolve_paths(paths: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve {placeholder} cross-references in a dataset's `paths:` block,
+    allowing CHAINED references (e.g. data_dir: "{raw_data_dir}/preprocessed",
+    meta: "{data_dir}/cell_meta.csv") by repeatedly formatting until nothing
+    changes -- a single `.format(**paths)` pass only resolves one level deep,
+    which silently leaves a literal unresolved "{raw_data_dir}/..." in `meta`
+    if `data_dir` itself is still a template at that point. Originally lived
+    only in morris/generate_slurm.py (Morris always needed 2-level chains);
+    moved here once domingo/config.yaml grew its own raw_data_dir -> data_dir
+    -> meta/counts chain (see domingo/README.md's "Preprocessing" section).
+    """
+    resolved = dict(paths)
+    for _ in range(len(paths) + 1):
+        changed = False
+        for k, v in resolved.items():
+            if isinstance(v, str) and "{" in v:
+                new_v = v.format(**resolved)
+                if new_v != v:
+                    resolved[k] = new_v
+                    changed = True
+        if not changed:
+            break
+    return resolved
 
 
 def ensure_dataset_dir_on_syspath(cfg: Dict[str, Any]) -> None:

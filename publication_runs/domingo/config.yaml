@@ -13,11 +13,15 @@ paths:
   # runs on python_env (CPU).
   python_env_gpu: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_rocm/bin/python
 
-  # Written by the R preprocessing script (see domingo/README.md) --
-  # confirm these are the actual filenames/location once the script has
-  # been re-run; it uses relative `fwrite()` paths, so the exact directory
-  # depends on the R session's working directory when it was run.
-  data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah
+  # raw_data_dir: has domingo_cellmeta.txt.gz + domingo_GEXcounts.csv, the
+  # raw exports preprocess.py reads (confirmed present/correctly-shaped on
+  # Dardel -- see domingo/README.md's "Preprocessing" section).
+  # data_dir: preprocess.py's OUTPUT (cell_meta.csv/gene_counts.csv/
+  # gene_meta.csv) -- kept in its own subdirectory rather than mixed in with
+  # the raw exports, mirroring morris/config.yaml's raw_data_dir/data_dir
+  # split. Run preprocess.py once before generate_slurm.py.
+  raw_data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah
+  data_dir: "{raw_data_dir}/preprocessed"
   meta: "{data_dir}/cell_meta.csv"
   counts: "{data_dir}/gene_counts.csv"
 
