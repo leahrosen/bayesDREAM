@@ -72,7 +72,11 @@ logs/
 # publication_runs: generate_slurm.py's fully machine-generated output
 # (configs/, logs/, rendered sbatch scripts, submitted_jobs.tsv) -- never
 # hand-edited, regenerated per run, path-specific to whichever cluster ran it.
-publication_runs/*/slurm/
+# NOT publication_runs/*/slurm/ -- that also matches publication_runs/common/
+# slurm/, which is real tracked source (list_job_status.py, sbatch_blocks.py,
+# etc.), not generated output. List each dataset's own slurm/ explicitly.
+publication_runs/domingo/slurm/
+publication_runs/morris/slurm/
 
 # Large data files
 *.csv.gz
