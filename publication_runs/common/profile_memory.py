@@ -59,8 +59,8 @@ no `model.cis_gene` (deferred/add_cis_gene() pattern, e.g. Domingo/Morris's
   their OWN tiny in-process fit_ntc()/fit_cis() (niters=10) -- no real
   ntc_shared run needed first, since fit_cis() only requires alpha_x_prefit
   if you pass technical_covariates (the pipeline's own configs never do).
-  --stage compensation calls check_systematic_shift() straight off that
-  same tiny fit_cis() state -- see "compensation" note below.
+  --stage compensation reproduces check_systematic_shift()'s memory-dominant
+  step off that same tiny fit_cis() state -- see "compensation" note below.
 - Deferred (`<label>_cis.yaml`): mirrors run_cis_deferred.py exactly --
   model.load_ntc_fit(ntc_shared_dir, mask_features=True) then
   model.add_cis_gene(cis_gene), so this DOES require a real completed
@@ -76,13 +76,23 @@ For a modality's own profiling run, point --config at that gene's
 generate_slurm.py adds it to every modality's plain fit config now, not
 just its permutation/simulation configs) -- see domingo/generate_slurm.py.
 
-`--stage compensation` profiles `check_systematic_shift()` directly (reads
-the same `full` data subset as `trans`, but allocates less -- no Adam state,
-no posterior draws, no checkpointing). It reuses `run_compensation.py`'s own
-`exclude_cells` resolution, including dataset-specific dynamic-import hooks
-(e.g. Morris' padj-based rule, `morris/compensation_exclude_cells.py`) --
-point `--config` at the same `<label>_compensation.yaml` the real pipeline
-uses.
+`--stage compensation` does NOT call the real `check_systematic_shift()` --
+that function's peak memory is set ENTIRELY by one fixed allocation right at
+the top of the call (densifying `modality.counts`, and for binomial
+`modality.denominator`, to a dense `[T_features, N_cells]` array covering
+the WHOLE panel -- `exclude_cells` is applied later, per-cell, inside the
+loop, and does NOT shrink this array). Everything after that is a per-
+feature loop that only appends small dicts to a list (negligible memory) but
+runs a real statsmodels GAM fit per (feature, technical group) -- on a full
+~20k-feature trans panel that's over an hour of wall clock for zero
+additional memory signal. So this stage calls the same two internal
+densification helpers `check_systematic_shift()` itself calls
+(`model._get_counts_array(modality)` / `model._get_dense_array(modality.
+denominator)`) directly, reproducing the identical peak RSS in seconds
+instead of hours -- same shape-not-convergence principle as `--niters`
+everywhere else in this script. Point `--config` at the same
+`<label>_compensation.yaml` the real pipeline uses (only `compensation.args.
+modality_name` is read from it, if set -- defaults to the primary modality).
 
 `--modality-spec` (required for `--stage trans --modality-name <non-primary>`):
 a non-primary modality's `function_type`/`min_denominator` are NOT read from
@@ -117,7 +127,6 @@ from config_utils import (  # noqa: E402
     ensure_dataset_dir_on_syspath,
     apply_sum_factor_adjustments,
 )
-from run_compensation import _resolve_exclude_cells  # noqa: E402
 
 
 def _peak_rss_mb() -> float:
@@ -264,17 +273,30 @@ def main() -> None:
         return
 
     if args.stage == "compensation":
-        # check_systematic_shift() has no Adam state/posterior draws/
-        # checkpointing (see run_compensation.py) -- the tiny in-process
-        # fit_cis() above already gives it correctly-shaped x_true/alpha_x,
-        # same shape-not-convergence principle as every other stage here.
-        # No real completed ntc/cis fit on disk needed, unlike the deferred
-        # cis path -- see module docstring.
+        # check_systematic_shift()'s peak memory is set ENTIRELY by one
+        # fixed allocation right at the start of the call -- densifying
+        # modality.counts (and, for binomial, modality.denominator) to a
+        # dense [T_features, N_cells] float64 array covering the WHOLE
+        # panel (bayesDREAM/diagnostics.py's check_systematic_shift calls
+        # self._get_counts_array(modality)/self._get_dense_array(...) before
+        # its per-feature loop even starts; exclude_cells is applied later,
+        # per-cell, inside that loop -- it does NOT shrink this array).
+        # The per-feature loop after that only appends small per-feature
+        # dicts to a list (negligible memory) but runs a real statsmodels
+        # GAM fit per (feature, technical group) -- on a full ~20k-feature
+        # trans panel that's ~1.5 HOURS of wall clock for zero additional
+        # memory signal. So: reproduce just the densification directly
+        # instead of waiting for the real loop to finish -- same peak RSS,
+        # seconds instead of hours (same shape-not-convergence principle as
+        # every other stage here, e.g. --niters).
         comp_cfg = cfg.get("compensation") or {}
         comp_args = dict(normalize_stage_args(comp_cfg.get("args")))
-        comp_args["exclude_cells"] = _resolve_exclude_cells(comp_args.get("exclude_cells"), model, cfg)
-        with _timed_step("check_systematic_shift"):
-            model.check_systematic_shift(**comp_args)
+        modality_name = comp_args.get("modality_name") or model.primary_modality
+        modality = model.get_modality(modality_name)
+        with _timed_step("check_systematic_shift (densification only -- see module docstring)"):
+            model._get_counts_array(modality)
+            if modality.distribution == "binomial":
+                model._get_dense_array(modality.denominator)
         return
 
     trans_cfg = cfg.get("trans") or {}
