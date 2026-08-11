@@ -614,7 +614,12 @@ def main() -> None:
     ]
     subset_sweep_step = SbatchArray(
         job_name="morris_subset_sweep", account=account, log_dir=str(logs_dir),
-        time_hours=TIME_HOURS, cpus=cis_sweep_cfg["resources"]["cores"],
+        # Same full-dataset-load + high-MOI-classification cost as
+        # 01b_subset_<gene>.sh (reads data_block, the raw full dataset, not a
+        # precomputed subset) -- reuses subset.resources.cores, NOT
+        # cis_sweep.resources.cores (that's sized for 07_cis_sweep.sh's
+        # actual cheap fit_cis call on the already-subsetted data instead).
+        time_hours=TIME_HOURS, cpus=subset_cfg["resources"]["cores"],
         max_index=len(sweep_genes) - 1, max_concurrent=cis_sweep_cfg["array_max_concurrent"],
         partition=partition_cpu, repo_dir=repo_dir, commands=subset_sweep_array_commands,
     )
