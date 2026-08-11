@@ -10,6 +10,9 @@ to be re-saved as if they were a full fit.
 
 from __future__ import annotations
 
+import os
+import shutil
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -73,6 +76,112 @@ def _fresh_model(fitted_and_saved):
     )
     model.set_technical_groups(["cell_line"])
     return model
+
+
+def _run_dir(fitted_and_saved):
+    return os.path.join(fitted_and_saved["outdir"], fitted_and_saved["label"])
+
+
+# ---------------------------------------------------------------------------
+# Lean companion files: save_ntc_fit/save_cis_fit must write a small
+# precomputed *_lean.pt file automatically, and load_*_fit(lean=True) must
+# actually use it (not just fall back to full-load-then-reduce) whenever it's
+# present — that's what avoids materializing the full multi-sample tensors
+# in memory at all during a lean load, not just afterward.
+# ---------------------------------------------------------------------------
+
+def test_save_writes_lean_companion_files(fitted_and_saved):
+    run_dir = _run_dir(fitted_and_saved)
+    assert os.path.exists(os.path.join(run_dir, "posterior_samples_ntc_gene_lean.pt"))
+    assert os.path.exists(os.path.join(run_dir, "posterior_samples_cis_lean.pt"))
+    # NOT asserting lean_size < full_size here: at this fixture's toy scale
+    # (nsamples=20, 2 features, 2 groups) the lean file adds 2 extra keys
+    # (_lower/_upper) per tensor, and that per-tensor storage/pickle overhead
+    # outweighs the savings from dropping 19 of 20 samples — it can come out
+    # LARGER than the full file. See test_lean_reduction_shrinks_at_realistic_scale
+    # for the actual size claim at a scale where it holds (real fits have
+    # nsamples~1000 and thousands of features, where the savings dominate).
+
+
+def test_lean_reduction_shrinks_at_realistic_scale():
+    """Direct, fast check of the actual memory/disk claim, independent of a
+    slow full model fit: at realistic posterior sizes (nsamples=1000, many
+    features), _reduce_posterior_samples should produce a torch.save()
+    payload far smaller than the raw dict — this is the entire premise of
+    lean loading."""
+    import io
+    import torch
+    from bayesDREAM.io.load import _reduce_posterior_samples
+
+    S, C, T = 1000, 5, 2000
+    raw = {
+        'alpha_y_mult': torch.rand(S, C, T),
+        'log2_alpha_y': torch.randn(S, C, T),
+        'mu_ntc': torch.rand(S, T) * 10,
+        'o_y': torch.rand(S, T),
+    }
+
+    def _saved_size(d):
+        buf = io.BytesIO()
+        torch.save(d, buf)
+        return buf.tell()
+
+    full_size = _saved_size(raw)
+    lean_size = _saved_size(_reduce_posterior_samples(raw))
+    assert lean_size < full_size / 50  # ~1000 samples -> ~3 stats: >300x smaller, minus overhead
+
+
+def test_lean_load_does_not_need_the_full_file(fitted_and_saved, tmp_path):
+    """The real point of the companion file: lean loading must succeed even
+    when the full multi-sample file is entirely absent, proving load_ntc_fit/
+    load_cis_fit(lean=True) never opens it."""
+    src_dir = _run_dir(fitted_and_saved)
+    dst_root = tmp_path / "no_full_file"
+    dst_dir = dst_root / fitted_and_saved["label"]
+    shutil.copytree(src_dir, dst_dir)
+    os.remove(dst_dir / "posterior_samples_ntc_gene.pt")
+    os.remove(dst_dir / "posterior_samples_cis.pt")
+
+    model = bayesDREAM(
+        meta=fitted_and_saved["meta"], counts=fitted_and_saved["counts"],
+        cis_gene="GFI1B", output_dir=str(dst_root),
+        label=fitted_and_saved["label"], device="cpu",
+    )
+    model.set_technical_groups(["cell_line"])
+    model.load_ntc_fit(lean=True)
+    model.load_cis_fit(lean=True)
+
+    assert model.get_modality("gene").is_ntc_lean is True
+    assert model.is_cis_lean is True
+    # And the resulting summary still works end-to-end.
+    guide_df, cell_df = model.save_cis_summary()
+    assert len(cell_df) > 0
+
+
+def test_lean_load_falls_back_when_companion_file_missing(fitted_and_saved, tmp_path, capsys):
+    """Older saved runs (or a companion file the user deleted) must still
+    lean-load correctly via the full-load-then-reduce fallback, with a
+    printed note explaining why it was slower."""
+    src_dir = _run_dir(fitted_and_saved)
+    dst_root = tmp_path / "no_lean_file"
+    dst_dir = dst_root / fitted_and_saved["label"]
+    shutil.copytree(src_dir, dst_dir)
+    os.remove(dst_dir / "posterior_samples_ntc_gene_lean.pt")
+    os.remove(dst_dir / "posterior_samples_cis_lean.pt")
+
+    model = bayesDREAM(
+        meta=fitted_and_saved["meta"], counts=fitted_and_saved["counts"],
+        cis_gene="GFI1B", output_dir=str(dst_root),
+        label=fitted_and_saved["label"], device="cpu",
+    )
+    model.set_technical_groups(["cell_line"])
+    model.load_ntc_fit(lean=True)
+    model.load_cis_fit(lean=True)
+
+    out = capsys.readouterr().out
+    assert "no precomputed lean file found" in out
+    assert model.get_modality("gene").is_ntc_lean is True
+    assert model.is_cis_lean is True
 
 
 def test_lean_ntc_matches_full_summary(fitted_and_saved):

@@ -6,6 +6,7 @@ import os
 import torch
 
 from ..utils import is_lean_posterior
+from .load import _reduce_posterior_samples
 
 class ModelSaver:
     """Handles saving fitted parameters."""
@@ -176,6 +177,19 @@ class ModelSaver:
                 if verbose:
                     print(f"[SAVE] {mod_name}.posterior_samples_ntc ({n_features} features) → {path}")
 
+                # Also save a small lean companion file (point estimates + 95% CI
+                # only, see io.load._reduce_posterior_samples) so that
+                # load_ntc_fit(lean=True) can read this directly instead of the
+                # full multi-sample file above — cuts both disk I/O and peak
+                # memory during loading, not just the steady-state footprint.
+                lean_path = os.path.join(output_dir, f'posterior_samples_ntc_{mod_name}_lean.pt')
+                lean_posterior_with_meta = dict(posterior_with_meta)
+                lean_posterior_with_meta['posterior_samples'] = _reduce_posterior_samples(posterior_clean)
+                torch.save(lean_posterior_with_meta, lean_path)
+                saved_files[f'posterior_samples_ntc_{mod_name}_lean'] = lean_path
+                if verbose:
+                    print(f"[SAVE] {mod_name}.posterior_samples_ntc (lean) → {lean_path}")
+
             if mod_saved:
                 saved_summary.append(f"{mod_name}: {', '.join(mod_saved)}")
 
@@ -268,6 +282,19 @@ class ModelSaver:
             saved_summary.append(f'posterior_cis ({self.model.cis_gene})')
             if verbose:
                 print(f"[SAVE] posterior_samples_cis (cis_gene: {self.model.cis_gene}) → {path}")
+
+            # Also save a small lean companion file (point estimates + 95% CI
+            # only, see io.load._reduce_posterior_samples) so that
+            # load_cis_fit(lean=True) can read this directly instead of the
+            # full multi-sample file above — cuts both disk I/O and peak
+            # memory during loading, not just the steady-state footprint.
+            lean_path = os.path.join(output_dir, 'posterior_samples_cis_lean.pt')
+            lean_posterior_with_meta = dict(posterior_with_meta)
+            lean_posterior_with_meta['posterior_samples'] = _reduce_posterior_samples(posterior_clean)
+            torch.save(lean_posterior_with_meta, lean_path)
+            saved_files['posterior_samples_cis_lean'] = lean_path
+            if verbose:
+                print(f"[SAVE] posterior_samples_cis (lean) → {lean_path}")
 
         # Print summary
         print(f"[SAVE] Cis fit to {output_dir}")

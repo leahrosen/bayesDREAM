@@ -397,6 +397,12 @@ class ModelLoader:
             of bayesDREAM.plotting, which reads raw per-draw samples for
             uncertainty bands — those will silently see zero-width intervals.
             See `bayesDREAM.io.load._reduce_posterior_samples` for details.
+            If save_ntc_fit() wrote a `posterior_samples_ntc_<modality>_lean.pt`
+            companion file (automatic since it started doing so), that small
+            file is read directly instead of the full multi-sample file —
+            cutting peak memory/disk I/O during this call too, not just the
+            steady-state footprint afterward. Falls back to loading the full
+            file and reducing in-memory for fits saved before that existed.
             Default False (full load, unchanged behavior).
 
         Returns
@@ -475,6 +481,22 @@ class ModelLoader:
                 legacy_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
                 if os.path.exists(legacy_path):
                     posterior_path = legacy_path
+
+            # lean=True: prefer the small precomputed companion file (written
+            # automatically by save_ntc_fit) so we never have to deserialize
+            # the full multi-sample file at all — this is what actually cuts
+            # peak memory/disk I/O during loading, not just the steady-state
+            # footprint (see io.save.ModelSaver.save_ntc_fit). Falls back to
+            # loading the full file and reducing in-memory (old behavior) for
+            # fits saved before this existed.
+            _used_precomputed_lean = False
+            if lean:
+                lean_posterior_path = os.path.join(
+                    input_dir, f'posterior_samples_ntc_{mod_name}_lean.pt')
+                if os.path.exists(lean_posterior_path):
+                    posterior_path = lean_posterior_path
+                    _used_precomputed_lean = True
+
             if os.path.exists(posterior_path):
                 loaded_data = _torch_load(posterior_path, map_location=self.model.device)
                 n_features = None
@@ -485,7 +507,12 @@ class ModelLoader:
                     saved_feature_names = loaded_data.get('feature_names')
                     n_features_saved = n_features
 
-                    # Align posteriors to current modality's feature set
+                    # Align posteriors to current modality's feature set. Works
+                    # unchanged on precomputed-lean tensors: _detect_feature_dim
+                    # locates the feature axis by size, not by assuming a
+                    # leading sample dim, so it's correct whether or not one
+                    # is present (point estimates keep a singleton; the
+                    # <key>_lower/<key>_upper siblings don't have one at all).
                     if (current_feature_names is not None and saved_feature_names is not None
                             and current_feature_names != saved_feature_names):
                         posterior_raw, feat_mask = _align_posterior_features(
@@ -506,7 +533,13 @@ class ModelLoader:
                                 n_missing = int((~feat_mask).sum())
                                 print(f"[LOAD] {mod_name}: {n_missing} missing feature(s) filled "
                                       f"with baseline alpha_y (mask_features=True).")
-                    if lean:
+                    if lean and not _used_precomputed_lean:
+                        print(f"[LOAD] {mod_name}: no precomputed lean file found "
+                              f"(posterior_samples_ntc_{mod_name}_lean.pt) — this fit was saved "
+                              f"before automatic lean-file writing was added. Falling back to a "
+                              f"full load + in-memory reduction (same steady-state result, but "
+                              f"does not reduce peak memory/disk I/O during this load). Re-run "
+                              f"save_ntc_fit() to write the lean file for next time.")
                         posterior_raw = _reduce_posterior_samples(posterior_raw)
                     mod.posterior_samples_ntc = posterior_raw
 
@@ -659,6 +692,12 @@ class ModelLoader:
             summary export (save_cis_summary) and pipeline continuation. NOT
             safe for most of bayesDREAM.plotting. See
             `bayesDREAM.io.load._reduce_posterior_samples` for details.
+            If save_cis_fit() wrote a `posterior_samples_cis_lean.pt` companion
+            file (automatic since it started doing so), that small file is read
+            directly instead of the full multi-sample file — cutting peak
+            memory/disk I/O during this call too, not just the steady-state
+            footprint afterward. Falls back to loading the full file and
+            reducing in-memory for fits saved before that existed.
             Default False (full load, unchanged behavior).
 
         Returns
@@ -681,6 +720,16 @@ class ModelLoader:
         cis_gene = None
 
         posterior_path = os.path.join(input_dir, 'posterior_samples_cis.pt')
+
+        # lean=True: prefer the small precomputed companion file (written
+        # automatically by save_cis_fit), same rationale as load_ntc_fit above.
+        _used_precomputed_lean = False
+        if lean:
+            lean_posterior_path = os.path.join(input_dir, 'posterior_samples_cis_lean.pt')
+            if os.path.exists(lean_posterior_path):
+                posterior_path = lean_posterior_path
+                _used_precomputed_lean = True
+
         if os.path.exists(posterior_path):
             loaded_data = _torch_load(posterior_path, map_location=self.model.device)
 
@@ -724,7 +773,13 @@ class ModelLoader:
                                               saved_cell_names, current_cell_names, cell_mask)
                             self.model.fitted_cell_mask = cell_mask
 
-                if lean:
+                if lean and not _used_precomputed_lean:
+                    print("[LOAD] posterior_samples_cis: no precomputed lean file found "
+                          "(posterior_samples_cis_lean.pt) — this fit was saved before "
+                          "automatic lean-file writing was added. Falling back to a full "
+                          "load + in-memory reduction (same steady-state result, but does "
+                          "not reduce peak memory/disk I/O during this load). Re-run "
+                          "save_cis_fit() to write the lean file for next time.")
                     posterior_raw = _reduce_posterior_samples(posterior_raw)
                 self.model.posterior_samples_cis = posterior_raw
 
