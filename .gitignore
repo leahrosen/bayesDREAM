@@ -34,6 +34,9 @@ env/
 *.ipynb
 !examples/simulation_study/plot_evaluation.ipynb
 
+# Local scratch scripts
+examples/simulation_study/setup.sh
+
 # IDEs
 .vscode/
 .idea/
@@ -65,6 +68,11 @@ test_unit/
 test_xy_plotting/
 testing/
 logs/
+
+# publication_runs: generate_slurm.py's fully machine-generated output
+# (configs/, logs/, rendered sbatch scripts, submitted_jobs.tsv) -- never
+# hand-edited, regenerated per run, path-specific to whichever cluster ran it.
+publication_runs/*/slurm/
 
 # Large data files
 *.csv.gz
