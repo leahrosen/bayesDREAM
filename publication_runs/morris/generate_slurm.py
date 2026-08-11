@@ -539,7 +539,8 @@ def main() -> None:
         )
         return f"env {exports} {cmd}"
 
-    def write_packed_gpu_job(step_name: str, job_name: str, commands: list, cpus: int) -> str:
+    def write_packed_gpu_job(step_name: str, job_name: str, commands: list, cpus: int,
+                              auto_requeue_on_timeout: bool = True) -> str:
         # NOT verified against the real Dardel GPU node's CPU count:
         # concurrency * cpus must fit within one node's cores (e.g. 5 trans
         # tasks * 16 cores = 80; permutation/recapitulation now reuse this
@@ -558,7 +559,7 @@ def main() -> None:
             job_name=job_name, account=account, log_dir=str(logs_dir),
             time_hours=TIME_HOURS, tasklist_path=str(tasklist_path), concurrency=concurrency,
             gpu_partition=partition_gpu, node_queue_script=node_queue_script, repo_dir=repo_dir,
-            gpu_sbatch_lines=gpu_node_sbatch_lines, auto_requeue_on_timeout=True,
+            gpu_sbatch_lines=gpu_node_sbatch_lines, auto_requeue_on_timeout=auto_requeue_on_timeout,
         )
         filename = f"{step_name}.sh"
         scripts.append((filename, step.render()))
@@ -568,8 +569,15 @@ def main() -> None:
     # available analog (same data shape -- full trans panel, NTC+gene cells
     # -- as fit_ntc will see here) until common/profile_memory.py --stage
     # ntc is run against one of these per-gene configs directly.
+    # auto_requeue_on_timeout=False: fit_ntc has NO internal checkpoint (see
+    # sbatch_blocks.py's module docstring) -- a requeue would just restart
+    # every task in the packed tasklist from scratch, same reason
+    # SbatchStep/SbatchArray never set this for ntc/cis/compensation. Only
+    # trans/permutation/recapitulation (fit_trans's own checkpoint/resume)
+    # get the default True below.
     ntc_packed_script = write_packed_gpu_job(
         "01d_ntc_packed", "morris_ntc_packed", ntc_commands, trans_cfg["resources"]["cores"],
+        auto_requeue_on_timeout=False,
     )
     submitted_rows.append(("ntc", f"{len(primary_genes)} primary genes (packed)", ntc_packed_script))
 
