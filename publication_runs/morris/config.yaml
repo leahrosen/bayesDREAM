@@ -118,7 +118,7 @@ cis:
   # Not something this config or run_cis_deferred.py can work around.
 
 compensation:
-  resources: {cores: 4}
+  resources: {cores: 20}   # from real profiling, 2026-08-11
   padj_threshold: 0.05   # NTC + cells whose targeting guide's padj < this, for that gene
 
 trans:
