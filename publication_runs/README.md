@@ -120,14 +120,28 @@ actually ran; never caught because dry-run testing only exercises config
 through `ensure_dataset_dir_on_syspath()` too, not reinvent its own
 candidate list.)
 
-**sum_factor recomputation.** `sum_factor_adj`/`sum_factor_refit`/Morris's
-`sum_factor_new` are never persisted by `save_cis_fit()`/`save_trans_fit()`
-or restored by `load_cis_fit()` — every stage after `fit_cis` that needs one
-recomputes it itself, in-process, from the same `sum_factor:` config block
+**sum_factor recomputation.** `sum_factor_adj`/`sum_factor_refit` are never
+persisted by `save_cis_fit()`/`save_trans_fit()` or restored by
+`load_cis_fit()` — every stage after `fit_cis` that needs one recomputes it
+itself, in-process, from the same `sum_factor:` config block
 (`config_utils.apply_sum_factor_adjustments`). `compensation` is the one
 exception: `check_systematic_shift()` always uses the raw `sum_factor`
 column, by design (both datasets' reference pipelines call it with no
-override).
+override). Unlike `sum_factor_adj`/`sum_factor_refit`, the raw `sum_factor`
+column itself IS persisted (it's just a plain column in `meta.csv`/every
+saved subset) — for both datasets it's computed exactly once, upstream
+(Domingo: `domingo/preprocess.py`; Morris: `morris/preprocess.py`, scran on
+the full dataset — see `morris/README.md`'s "sum_factor: scran, computed
+once, shared everywhere"), and every stage downstream (including `fit_ntc`)
+reads that SAME column, never a separately-recomputed one. This matters
+because `alpha_y_mult`/`alpha_x_prefit` (from `fit_ntc`) and `sum_factor`
+are composed multiplicatively inside bayesDREAM
+(`mu_final = mu_y * alpha_y * sum_factor`) — calibrating `alpha_y`/`alpha_x`
+against one normalization and then using a differently-normalized
+`sum_factor` downstream would silently miscalibrate the batch correction
+(this was a real bug in Morris until 2026-08: `fit_ntc` used to read an
+externally-provided `sizeFactor` column while `fit_cis`/`fit_trans` used a
+separately, per-gene recomputed scran factor).
 
 **exclude_trans_genes.** Per project convention, genes with
 `log2(mu_ntc) < -4` are excluded from trans fitting in every dataset — wired

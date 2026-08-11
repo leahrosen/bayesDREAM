@@ -224,30 +224,30 @@ def main() -> None:
         },
         "ntc": {"set_technical_groups": ntc_shared_cfg["set_technical_groups"]},
     }
-    # scran needs the FULL gene panel to mean anything (pooling-based
-    # normalisation across many genes) -- computing it on a single-gene
-    # cis_only subset is meaningless, not just an empty-modality technicality
-    # (quickCluster/computeSumFactors on 1 feature errors inside R: "need at
-    # least 2 points to select a bandwidth automatically"). So it's computed
-    # exactly ONCE per gene, in subset_per_gene.py, on the full-panel model
-    # right after add_cis_gene() and before mode-specific subsetting --
-    # sum_factor_precompute_block below, used ONLY for that "subset_input"
-    # config. compute_scran_sum_factor() writes its output into model.meta
-    # (not just modality.sum_factors -- see compute_scran_sum_factor.py), so
-    # it lands in BOTH full/meta.csv and cis_only/meta.csv when
-    # subset_per_gene.py writes them. Every real per-gene stage
-    # (cis/trans/permutation/recapitulation, via sum_factor_cis_block/
-    # sum_factor_trans_block below) then just reads that already-computed
-    # 'sum_factor_new' column -- compute_scran disabled, adjust_ntc_sum_factor
-    # only.
-    sum_factor_precompute_block = {
-        "compute_scran": {"enabled": True, "args": {"batch_col": sf_cfg["batch_col"]}},
-    }
+    # scran is computed ONCE, up front, on the FULL dataset -- morris/
+    # preprocess.py writes it straight into meta.csv's 'sum_factor' column
+    # (via common/compute_scran_sum_factor.py's _compute_scran_sizefactors),
+    # not recomputed per-gene here anymore. This used to be per-gene (via
+    # compute_scran, right after add_cis_gene() in subset_per_gene.py,
+    # writing 'sum_factor_new') because scran needs the full gene panel to
+    # mean anything and can't run on a single-gene cis_only subset -- but
+    # that meant fit_ntc's alpha_y_mult/alpha_x_prefit (estimated once,
+    # against the shared ntc_shared/each primary gene's OWN 'sum_factor') and
+    # fit_cis/fit_trans's sum_factor_adj (derived from a separately, later
+    # recomputed 'sum_factor_new') were calibrated against two DIFFERENT
+    # normalizations, composed multiplicatively inside bayesDREAM
+    # (mu_final = mu_y * alpha_y * sum_factor) -- see
+    # compute_scran_sum_factor.py's module docstring for the full rationale.
+    # Now every stage -- ntc_shared, each primary gene's own fit_ntc, and
+    # every cis/trans/permutation/recapitulation stage's adjust_ntc_sum_factor
+    # -- reads the SAME 'sum_factor' column, mirroring Domingo's design
+    # (one shared sum_factor, only ever adjusted, never independently
+    # recomputed downstream).
     sum_factor_cis_block = {
         "compute_scran": {"enabled": False},
         "adjust_ntc_sum_factor": {
             "enabled": True,
-            "args": {"sum_factor_col_old": "sum_factor_new", "covariates": sf_cfg["covariates"]},
+            "args": {"sum_factor_col_old": "sum_factor", "covariates": sf_cfg["covariates"]},
         },
     }
 
@@ -337,18 +337,19 @@ def main() -> None:
         # the real 02_cis_<gene>.sh stage (cis_only subset in, THAT GENE's
         # own ntc dir), and cis_sweep's per-gene task (cis_only subset in,
         # the GLOBAL shared ntc dir).
-        # subset_input needs compute_scran (full panel still present, before
-        # mode-specific subsetting -- see sum_factor_precompute_block above);
-        # the real cis/cis_sweep fit just reads what subset_input already
-        # precomputed and saved into meta.csv (sum_factor_cis_block).
-        sum_factor_block = sum_factor_precompute_block if filename_suffix == "subset_input" else sum_factor_cis_block
+        # subset_input no longer needs a sum_factor block at all -- 'sum_factor'
+        # already exists in data.meta, written once by morris/preprocess.py (see
+        # sum_factor_cis_block's comment above); subset_per_gene.py just carries
+        # it through unchanged into full/meta.csv and cis_only/meta.csv. The real
+        # cis/cis_sweep fit applies adjust_ntc_sum_factor (sum_factor_cis_block).
         overrides = {
             "model": {"label": label, "device": "cpu", "exclude_guides": exclude_guides},
             "data": data_block_override,
             "cis_gene": gene,
-            "sum_factor": sum_factor_block,
             "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
         }
+        if filename_suffix != "subset_input":
+            overrides["sum_factor"] = sum_factor_cis_block
         if ntc_dir:
             overrides["ntc_shared_dir"] = ntc_dir
         cis_bd_cfg = render_bayesdream_config(base_cfg, overrides)

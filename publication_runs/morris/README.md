@@ -30,10 +30,12 @@ availability, the known `fit_cis()` high-MOI dtype bug).
 
 1. **Preprocess once.** `python preprocess.py --indir <raw dir> --outdir
    <raw dir>/preprocessed` -- turns the raw `.npy`/`.npz` files (gene-name
-   mapping, guide_assignment alignment+transpose, `sum_factor=sizeFactor`)
-   into the clean, positionally-aligned inputs `generate_slurm.py` expects.
-   Run once, manually, NOT part of the SLURM pipeline (like Domingo's R
-   preprocessing).
+   mapping, guide_assignment alignment+transpose, `sum_factor` computed
+   ONCE via scran on the full dataset -- see "sum_factor" below) into the
+   clean, positionally-aligned inputs `generate_slurm.py` expects. Run
+   once, manually, NOT part of the SLURM pipeline (like Domingo's R
+   preprocessing). Requires `rpy2` + R (`scran`/`Matrix`/
+   `SingleCellExperiment`/`S4Vectors`) in whichever env runs it.
 2. Fill in `config.yaml`'s `paths:` (repo/env paths, `raw_data_dir`,
    `stats_csv`) and `global_exclude_guides` if any (distinct from the
    per-cis-gene SNP exclusion table, which is computed automatically -- see
@@ -180,21 +182,46 @@ resolver). This REPLACES an earlier exploratory version of the pipeline that
 excluded cells whose only targeting guide was SNP-499/500 specifically (that
 rule was GFI1B-specific and isn't part of the production pipeline).
 
-## sum_factor: scran is per-cell-subset, not shared
+## sum_factor: scran, computed once, shared everywhere
 
-Unlike `alpha_x_prefit`/`alpha_y_prefit` (shared via `add_cis_gene()`,
-above), Morris's sum factor is recomputed **separately for every gene**, on
-that gene's OWN NTC+target cell subset — this is genuinely per-subset, not
-something the shared `ntc_shared` run's own sum factor can stand in for.
-`common/compute_scran_sum_factor.py` wraps the exact rpy2
-(`quickCluster`+`computeSumFactors`, batched by `lane`) block from the
-reference scripts; `config_utils.apply_sum_factor_adjustments`'s
-`compute_scran` step calls it wherever needed (`cis`, `trans`,
-`permutation`, `recapitulation` — NOT `compensation`, which always uses the
-raw `sum_factor` column). Requires `rpy2` + R (`scran`/`Matrix`/
-`SingleCellExperiment`/`S4Vectors`) available in whichever conda env runs
-these stages — confirm this is installed in `bayesdream_cpu`/
-`bayesdream_rocm` before relying on it.
+As of 2026-08, `sum_factor` is scran (`quickCluster`+`computeSumFactors`,
+blocked by `lane`), computed **once** on the FULL dataset in
+`preprocess.py` (via `common/compute_scran_sum_factor.py`'s
+`_compute_scran_sizefactors` — the same R logic, not a reimplementation)
+and written straight into `meta.csv`. Every stage downstream — the shared
+`ntc_shared` fit, each primary gene's own `fit_ntc()`, and every
+`cis`/`trans`/`permutation`/`recapitulation` stage's `adjust_ntc_sum_factor`
+— reads this SAME column, mirroring Domingo's design (one shared
+`sum_factor`, only ever adjusted downstream via `adjust_ntc_sum_factor()`,
+never independently recomputed).
+
+Previously (before 2026-08) this was recomputed **separately for every
+gene**, on that gene's own NTC+target cell subset, writing a fresh
+`sum_factor_new` per gene. That meant `fit_ntc`'s `alpha_y_mult`/
+`alpha_x_prefit` (estimated once, against whichever `sum_factor` existed at
+fit time — for the shared `ntc_shared` fit and each primary gene's own
+`fit_ntc`, that was `sizeFactor`, an externally-provided factor from the
+original Morris 2023 dataset's own processing, not scran) and
+`fit_cis`/`fit_trans`'s `sum_factor_adj` (derived from the separately
+recomputed `sum_factor_new`) were calibrated against two *different*
+normalizations — composed multiplicatively inside bayesDREAM
+(`mu_final = mu_y * alpha_y * sum_factor`, `bayesDREAM/fitting/trans.py`;
+`mu_obs = alpha_x * x_true * sum_factor`, `bayesDREAM/fitting/cis.py`), so
+`alpha_y_mult`/`alpha_x_prefit`'s per-lane correction wasn't necessarily
+valid once composed with a differently-normalized `sum_factor_adj`. Not
+NTC-referenced either way (`quickCluster` is unsupervised, blocked only by
+`batch_col` — unlike Domingo's `calculateSumFactors(..., clusters=myclusts,
+ref.clust='NTC')`), but that's orthogonal to the consistency issue this
+change fixes.
+
+`config_utils.apply_sum_factor_adjustments`'s `compute_scran` step is now
+disabled everywhere in Morris's own generated configs (`compute_scran:
+{enabled: false}` throughout `generate_slurm.py`) — `subset_per_gene.py`
+just carries the already-computed `sum_factor` column through into
+`full/meta.csv`/`cis_only/meta.csv` unchanged. `adjust_ntc_sum_factor` still
+runs per (cis, trans, permutation, recapitulation) stage — NOT
+`compensation`, which always uses the raw `sum_factor` column, same as
+before.
 
 `refit_sumfactor()` is called (creates `sum_factor_refit`) but its output is
 **never actually used** -- `fit_trans()`/`fit_cis()` use `sum_factor_adj`

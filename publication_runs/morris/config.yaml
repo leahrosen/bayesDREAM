@@ -71,7 +71,12 @@ model_defaults:
 global_exclude_guides: []   # TODO: e.g. [sgFOO_1, sgFOO_2]
 
 sum_factor:
-  batch_col: lane           # compute_scran_sum_factor's quickCluster block
+  # batch_col is NOT read by generate_slurm.py -- scran now runs ONCE, in
+  # preprocess.py (its own --batch-col flag, also defaulting to 'lane'; keep
+  # the two in sync manually), not per-gene here anymore. See morris/README.md's
+  # "sum_factor: scran, computed once, shared everywhere" section. Left here
+  # for reference/documentation only.
+  batch_col: lane
   covariates: [lane]         # adjust_ntc_sum_factor's covariates
 
 # Cis-gene selection, from Morris_gRNA2target_stats.csv: cis_genes = every

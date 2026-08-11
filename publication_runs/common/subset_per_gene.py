@@ -52,21 +52,25 @@ here would be actively wrong once callers stop assuming a single shared
 ntc_shared serves every gene (see morris/README.md's per-primary-gene
 fit_ntc section).
 
-DOES run compute_scran (via apply_sum_factor_adjustments, steps=
+CAN run compute_scran (via apply_sum_factor_adjustments, steps=
 ("compute_scran",)) if the config's sum_factor: block enables it -- right
 here, right after add_cis_gene(), while the primary modality still holds
-the FULL trans panel. This is the ONLY place scran should ever run for a
-per-gene subset: it's a pooling-based normalisation across many genes, so
-computing it on the cis_only mode's single-gene panel is meaningless, not
-merely awkward (quickCluster/computeSumFactors on 1 feature errors inside R:
-"need at least 2 points to select a bandwidth automatically"). Its output is
-written into model.meta (see compute_scran_sum_factor.py), so it lands in
-BOTH modes' meta.csv below -- every downstream per-gene stage then just
-reads that already-computed column instead of (redundantly, and for cis_only
-specifically, wrongly) recomputing it itself. See morris/generate_slurm.py's
-sum_factor_precompute_block/sum_factor_cis_block split for the config-level
-wiring. No-op for datasets whose config doesn't enable compute_scran (e.g.
-Domingo, whose sum_factor column is computed upstream, once, in preprocess.py).
+the FULL trans panel (a pooling-based normalisation across many genes, so
+running it on the cis_only mode's single-gene panel would be meaningless,
+not merely awkward -- quickCluster/computeSumFactors on 1 feature errors
+inside R: "need at least 2 points to select a bandwidth automatically").
+NEITHER dataset's config actually enables this anymore as of 2026-08:
+Domingo never did (its sum_factor column is computed upstream, once, in
+domingo/preprocess.py); Morris used to (recomputed scran separately per
+gene here, writing 'sum_factor_new') but now also computes scran ONCE,
+upstream, in morris/preprocess.py, on the full dataset -- see
+morris/README.md's "sum_factor: scran, computed once, shared everywhere"
+for why per-gene recomputation was actually a correctness problem (fit_ntc's
+alpha_y_mult/alpha_x_prefit calibrated against a different sum_factor than
+fit_cis/fit_trans composed it with). This code path is kept only as
+generic, dataset-agnostic infrastructure for a hypothetical future dataset
+that genuinely needs per-gene-subset scran; it is currently unused by both
+datasets' own generated configs.
 
 Output files always written as sparse .npz for gene_counts (regardless of
 whether the dataset's OWN base files are dense CSV, e.g. Domingo) --
@@ -80,12 +84,13 @@ Usage
 
 Config: same schema as run_cis_deferred.py (model.cis_gene omitted,
 top-level cis_gene: key) -- reuse the SAME rendered config generate_slurm.py
-already writes for that gene's cis stage, EXCEPT its sum_factor: block,
-which must be the subset_input-specific one (compute_scran enabled, no
-adjust_ntc_sum_factor -- see morris/generate_slurm.py's
-sum_factor_precompute_block), not the real cis stage's own (compute_scran
-disabled). A top-level ntc_shared_dir: key, if present, is simply ignored
-(see "Does NOT call load_ntc_fit()" above).
+already writes for that gene's cis stage, EXCEPT its sum_factor: block
+(omitted entirely for Morris now -- see "DOES run compute_scran" above; a
+dataset that DID want per-gene scran here would need a subset_input-specific
+block with compute_scran enabled and no adjust_ntc_sum_factor, distinct from
+the real cis stage's own compute_scran-disabled block). A top-level
+ntc_shared_dir: key, if present, is simply ignored (see "Does NOT call
+load_ntc_fit()" above).
 """
 
 import argparse
