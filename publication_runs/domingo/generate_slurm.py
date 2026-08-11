@@ -156,6 +156,7 @@ def main() -> None:
     label_prefix = cfg["label_prefix"]
     model_defaults = cfg["model_defaults"]
     ntc_shared_cfg = cfg["ntc_shared"]
+    subset_cfg = cfg["subset"]
     sf_cfg = cfg["sum_factor"]
     cis_cfg = cfg["cis"]
     comp_cfg = cfg["compensation"]
@@ -290,7 +291,7 @@ def main() -> None:
         )
         step = SbatchStep(
             job_name=f"domingo_subset_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=TIME_HOURS, cpus=cis_cfg["resources"]["cores"],
+            time_hours=TIME_HOURS, cpus=subset_cfg["resources"]["cores"],
             partition=partition_cpu, repo_dir=repo_dir, commands=[cmd],
         )
         filename = f"01b_subset_{gene}.sh"
@@ -400,7 +401,7 @@ def main() -> None:
         perm_step = SbatchArray(
             job_name=f"domingo_perm_{gene}", account=account, log_dir=str(logs_dir),
             time_hours=TIME_HOURS,
-            cpus=trans_cfg["permutation"]["resources"]["cores"],
+            cpus=trans_cfg["resources"]["cores"],  # same fit, matches trans's own cores
             max_index=n_perm - 1, max_concurrent=min(n_perm, 50),
             partition=partition_cpu, repo_dir=repo_dir,
             commands=[bd_cmd("permutation_null", perm_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
@@ -430,7 +431,7 @@ def main() -> None:
         sim_step = SbatchArray(
             job_name=f"domingo_sim_{gene}", account=account, log_dir=str(logs_dir),
             time_hours=TIME_HOURS,
-            cpus=trans_cfg["simulation"]["resources"]["cores"],
+            cpus=trans_cfg["resources"]["cores"],  # same fit, matches trans's own cores
             max_index=n_sim - 1, max_concurrent=min(n_sim, 50),
             partition=partition_cpu, repo_dir=repo_dir,
             commands=[bd_cmd("recapitulation_sim", sim_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
@@ -462,6 +463,14 @@ def main() -> None:
         for spec in modalities_cfg:
             mod_name = spec["stype"]
             is_multinomial = spec["distribution"] == "multinomial"
+            # Per-modality cores (config_modalities.yaml's `cores:`, from
+            # real profiling) -- falls back to the dataset-wide default for
+            # any modality that doesn't set its own (currently just the
+            # multinomial pair, whose GPU-packed job uses this for
+            # thread-pinning, not real per-task allocation). Reused below for
+            # this modality's fit job AND (binomial only) its permutation/
+            # recapitulation jobs -- same rationale as trans's own cores.
+            mod_cores = spec.get("cores", modalities_dataset_cfg["resources"]["cores"])
             mod_data_dir = modalities_dataset_cfg["data_dir"]
             mod_precomputed_dir = modality_subset_dir_for(label, mod_name)
             # Computed once, reused both below (mod_cfg, so plain
@@ -485,7 +494,7 @@ def main() -> None:
             )
             subset_mod_step = SbatchStep(
                 job_name=f"domingo_modsubset_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["resources"]["cores"],
+                time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["subset_resources"]["cores"],
                 partition=partition_cpu, repo_dir=repo_dir, commands=[subset_mod_cmd],
             )
             subset_mod_filename = f"07a_modality_subset_{gene}_{mod_name}.sh"
@@ -515,7 +524,7 @@ def main() -> None:
                 mod_step = SbatchStep(
                     job_name=f"domingo_mod_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
                     time_hours=TIME_HOURS,
-                    cpus=modalities_dataset_cfg["resources"]["cores"],
+                    cpus=mod_cores,
                     partition=partition_cpu, repo_dir=repo_dir,
                     commands=[mod_cmd],
                 )
@@ -554,7 +563,7 @@ def main() -> None:
                 n_mod_perm = modalities_dataset_cfg["trans"]["permutation"]["n_reps"]
                 mod_perm_step = SbatchArray(
                     job_name=f"domingo_modperm_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                    time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["resources"]["cores"],
+                    time_hours=TIME_HOURS, cpus=mod_cores,  # same fit, matches this modality's own cores
                     max_index=n_mod_perm - 1, max_concurrent=min(n_mod_perm, 50),
                     partition=partition_cpu, repo_dir=repo_dir,
                     commands=[bd_cmd("permutation_null", mod_perm_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
@@ -582,7 +591,7 @@ def main() -> None:
                 n_mod_sim = modalities_dataset_cfg["trans"]["simulation"]["n_reps"]
                 mod_sim_step = SbatchArray(
                     job_name=f"domingo_modsim_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                    time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["resources"]["cores"],
+                    time_hours=TIME_HOURS, cpus=mod_cores,  # same fit, matches this modality's own cores
                     max_index=n_mod_sim - 1, max_concurrent=min(n_mod_sim, 50),
                     partition=partition_cpu, repo_dir=repo_dir,
                     commands=[bd_cmd("recapitulation_sim", mod_sim_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],

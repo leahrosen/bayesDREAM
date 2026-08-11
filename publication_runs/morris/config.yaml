@@ -97,8 +97,16 @@ ntc_shared:
   set_technical_groups: [lane]
   resources: {cores: 16}
 
+# 01b_subset_<gene>.sh (primary_genes only -- see generate_slurm.py's
+# "Per-gene data subsetting" section): pays bayesDREAM.__init__'s full-
+# dataset-load + high-MOI-classification cost ONCE per gene, own resources,
+# decoupled from cis's. NOT the same job as 01c_subset_sweep.sh (sweep_genes),
+# which still uses cis_sweep.resources.cores below.
+subset:
+  resources: {cores: 25}   # from real profiling, 2026-08-11
+
 cis:
-  resources: {cores: 8}
+  resources: {cores: 5}   # from real profiling, 2026-08-11
   # independent_mu_sigma=True per the reference GFI1B fit_cis() call.
   # KNOWN PRE-EXISTING ISSUE: fit_cis() in high-MOI mode currently raises
   # "RuntimeError: expected scalar type Float but found Double" (dtype
@@ -117,16 +125,18 @@ trans:
 
   # n_reps: 1 each per explicit instruction (was 5, an arbitrary
   # placeholder not derived from a power calculation or benchmark).
+  # permutation/simulation no longer carry their own resources.cores --
+  # generate_slurm.py now reuses trans.resources.cores directly for both
+  # (same data/model shape as the real trans fit, just a different fit
+  # target -- no reason for them to diverge).
   permutation:
     n_reps: 1
-    resources: {cores: 16}
 
   simulation:
     n_reps: 1
-    resources: {cores: 8}
 
 # fit_cis ONLY (no compensation/trans) for every padj-significant gene that
 # is NOT in primary_genes, reusing the shared ntc fit. "fit_cis always CPU."
 cis_sweep:
-  resources: {cores: 4}
+  resources: {cores: 5}   # matches cis (same fit_cis call, just via the deferred sweep path), 2026-08-11
   array_max_concurrent: 100

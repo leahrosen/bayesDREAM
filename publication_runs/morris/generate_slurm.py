@@ -182,6 +182,7 @@ def main() -> None:
     sf_cfg = cfg["sum_factor"]
     gene_sel_cfg = cfg["gene_selection"]
     ntc_shared_cfg = cfg["ntc_shared"]
+    subset_cfg = cfg["subset"]
     cis_cfg = cfg["cis"]
     comp_cfg = cfg["compensation"]
     trans_cfg = cfg["trans"]
@@ -377,7 +378,7 @@ def main() -> None:
         cmd = subset_cmd(subset_input_cfg_path, subset_dir_for(label), modes)
         step = SbatchStep(
             job_name=f"morris_subset_{gene}", account=account, log_dir=str(logs_dir),
-            time_hours=TIME_HOURS, cpus=cis_cfg["resources"]["cores"],
+            time_hours=TIME_HOURS, cpus=subset_cfg["resources"]["cores"],
             partition=partition_cpu, repo_dir=repo_dir, commands=[cmd],
         )
         filename = f"01b_subset_{gene}.sh"
@@ -541,10 +542,10 @@ def main() -> None:
     def write_packed_gpu_job(step_name: str, job_name: str, commands: list, cpus: int) -> str:
         # NOT verified against the real Dardel GPU node's CPU count:
         # concurrency * cpus must fit within one node's cores (e.g. 5 trans
-        # tasks * 16 cores = 80; up to 8 permutation/recapitulation tasks *
-        # their own cores -- see trans.permutation/simulation.resources.cores
-        # in config.yaml). Confirm via `sinfo -p gpu -o "%P %c %N"` before
-        # submitting; lower resources.cores per stage if it doesn't fit.
+        # tasks * 16 cores = 80; permutation/recapitulation now reuse this
+        # SAME trans.resources.cores value, up to 8 concurrent tasks -- see
+        # config.yaml). Confirm via `sinfo -p gpu -o "%P %c %N"` before
+        # submitting; lower trans.resources.cores if it doesn't fit.
         # NOT verified: that HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES is
         # actually the right env var for Dardel's ROCm build/driver version
         # -- confirm on a real GPU node (e.g. `rocm-smi` inside two
@@ -578,12 +579,12 @@ def main() -> None:
     submitted_rows.append(("trans", f"{len(primary_genes)} primary genes (packed)", trans_script))
 
     perm_script = write_packed_gpu_job(
-        "05_permutation_packed", "morris_perm_packed", perm_commands, trans_cfg["permutation"]["resources"]["cores"],
+        "05_permutation_packed", "morris_perm_packed", perm_commands, trans_cfg["resources"]["cores"],
     )
     submitted_rows.append(("permutation", f"{len(primary_genes)} genes x {trans_cfg['permutation']['n_reps']} reps (packed)", perm_script))
 
     sim_script = write_packed_gpu_job(
-        "06_recapitulation_packed", "morris_sim_packed", sim_commands, trans_cfg["simulation"]["resources"]["cores"],
+        "06_recapitulation_packed", "morris_sim_packed", sim_commands, trans_cfg["resources"]["cores"],
     )
     submitted_rows.append(("recapitulation", f"{len(primary_genes)} genes x {trans_cfg['simulation']['n_reps']} reps (packed)", sim_script))
 

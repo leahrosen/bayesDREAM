@@ -64,7 +64,7 @@ cis_genes: [GFI1B, MYB, NFE2, TET2]
 # genes' fit_cis/compensation/trans depend on it.
 ntc_shared:
   set_technical_groups: [cell_line]
-  resources: {cores: 8}
+  resources: {cores: 1}   # from real profiling, 2026-08-11
   fit: {tolerance: 0, niters: 50000}
 
 sum_factor:
@@ -75,12 +75,18 @@ sum_factor:
   # sum_factor_col_old override).
   covariates: [lane, cell_line]
 
+# 01b_subset_<gene>.sh: pays bayesDREAM.__init__'s full-dataset-load +
+# subsetting cost ONCE per gene (see generate_slurm.py's "Per-gene data
+# subsetting" section) -- its own resources, decoupled from cis's.
+subset:
+  resources: {cores: 10}   # from real profiling, 2026-08-11
+
 cis:
-  resources: {cores: 8}
+  resources: {cores: 2}   # from real profiling, 2026-08-11
   fit: {tolerance: 0, niters: 100000}
 
 compensation:
-  resources: {cores: 4}
+  resources: {cores: 2}   # matches trans (same 'full' data subset) -- see trans.resources below
   # check_systematic_shift() always uses the raw 'sum_factor' column (no
   # override) -- see run_compensation.py. Per-gene exclude_cells overrides,
   # if any; leave empty for "exclude nothing" (matches the reference script,
@@ -92,7 +98,7 @@ compensation:
     TET2: []
 
 trans:
-  resources: {cores: 16}
+  resources: {cores: 2}   # from real profiling, 2026-08-11
   function_type: additive_hill
   fit: {tolerance: 0}
   # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
@@ -100,13 +106,15 @@ trans:
 
   # n_reps below are arbitrary placeholders (not derived from a power
   # calculation or benchmark) -- set when scaffolding, never revisited.
+  # permutation/simulation no longer carry their own resources.cores --
+  # generate_slurm.py now reuses trans.resources.cores directly for both
+  # (same data/model shape as the real trans fit, just a different fit
+  # target -- no reason for them to diverge).
   permutation:
     n_reps: 5
-    resources: {cores: 16}
 
   simulation:
     n_reps: 5
-    resources: {cores: 8}
 
 # Further modalities (splicing/velocity/donor-acceptor choice), fit per
 # cis gene after that gene's own cis fit. See config_modalities.yaml.
@@ -117,13 +125,28 @@ trans:
 modalities:
   config: config_modalities.yaml
   data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/20260328_splicing/loader_inputs
+  # Per-modality fit cores now live as `cores:` on each entry in
+  # config_modalities.yaml (from real profiling, 2026-08-11 -- sj/
+  # donor_efficiency/acceptor_efficiency: 4, exon_skip/intron_retention/mxe/
+  # gene_velocity: 2). `resources.cores` below is now ONLY a fallback for any
+  # modality entry that doesn't set its own `cores` -- currently just the two
+  # multinomial modalities (donor_choice/acceptor_choice), whose GPU-packed
+  # job uses this value for thread-pinning, not real per-task core
+  # allocation (see generate_slurm.py's "GPU-packed multinomial modalities").
   resources: {cores: 8}
+  # 07a_modality_subset_<gene>_<mod>.sh: reads the shared raw splicing
+  # directory once per (gene, modality) -- same cost regardless of which
+  # modality, so one fixed value for all of them (2026-08-11), not split
+  # like the fit jobs above.
+  subset_resources: {cores: 10}
   # Permutation + recapitulation reps for BINOMIAL modalities only (sj,
   # exon_skip, intron_retention, mxe, gene_velocity, donor_efficiency,
   # acceptor_efficiency) -- NOT multinomial (donor_choice/acceptor_choice),
-  # per instruction. Same arbitrary-default caveat as trans.permutation/
-  # trans.simulation above: not derived from anything, just numbers picked
-  # when scaffolding.
+  # per instruction. n_reps are arbitrary placeholders (not derived from a
+  # power calculation or benchmark) -- set when scaffolding, never revisited.
+  # Their own resources.cores was removed -- generate_slurm.py now reuses
+  # each modality's own fit cores (spec['cores'] above) for its permutation/
+  # recapitulation jobs too, same rationale as trans.permutation/simulation.
   trans:
     permutation: {n_reps: 5}
     simulation: {n_reps: 5}

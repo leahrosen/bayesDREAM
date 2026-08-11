@@ -43,6 +43,12 @@
 # what add_custom_modality() already applies.
 
 modalities:
+  # `cores:` (2026-08-11, from real profiling) sizes this modality's OWN
+  # fit job (and its permutation/recapitulation jobs, for binomial entries
+  # -- see domingo/config.yaml's modalities.trans comment) -- overrides
+  # modalities.resources.cores in config.yaml for this stype only. Absent
+  # on donor_choice/acceptor_choice (multinomial, GPU-packed) on purpose --
+  # those fall back to modalities.resources.cores for thread-pinning.
   - stype: sj
     distribution: binomial
     function_type: additive_hill
@@ -51,42 +57,49 @@ modalities:
     clip_violations: true
     save_diagnostic_plot: true
     min_denominator: 0
+    cores: 4
   - stype: exon_skip
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
+    cores: 2
   - stype: intron_retention
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
+    cores: 2
   - stype: mxe
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
+    cores: 2
   - stype: gene_velocity
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
+    cores: 2
   - stype: donor_efficiency
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
+    cores: 4
   - stype: acceptor_efficiency
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
+    cores: 4
   - stype: donor_choice
     distribution: multinomial
     function_type: single_hill
