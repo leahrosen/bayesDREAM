@@ -16,6 +16,7 @@ from .prior_posterior import (
     plot_2d_parameter
 )
 from .prior_sampling import get_prior_samples
+from ..utils import require_full_posterior
 
 __pdoc__ = {"ModelPlottingMixin": False}
 
@@ -126,6 +127,7 @@ class ModelPlottingMixin:
             raise ValueError(f"No technical fit found for modality '{modality_name}'. Run fit_ntc(modality_name='{modality_name}') first.")
 
         posterior = modality.posterior_samples_ntc
+        require_full_posterior(posterior, "plot_technical_fit")
 
         # Get feature names - will be adjusted based on alpha_y source later.
         # modality.feature_names is the single source of truth (resolved +
@@ -419,6 +421,7 @@ class ModelPlottingMixin:
             raise ValueError("No cis fit found. Run fit_cis() first.")
 
         posterior = self.posterior_samples_cis
+        require_full_posterior(posterior, "plot_cis_fit")
 
         if 'x_true' not in posterior:
             raise ValueError("x_true not found in posterior_samples_cis")

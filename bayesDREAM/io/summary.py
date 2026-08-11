@@ -22,6 +22,8 @@ from typing import Optional, Dict, Any, Tuple, List
 from scipy.optimize import brentq
 from tqdm import tqdm
 
+from ..utils import is_lean_posterior
+
 
 class ModelSummarizer:
     """
@@ -1235,7 +1237,25 @@ class ModelSummarizer:
 
         is_high_moi = getattr(self.model, 'is_high_moi', False)
 
-        # Get x_true samples — shape is [n_samples, n_cells] (cell-level)
+        cis_ps_all = getattr(self.model, 'posterior_samples_cis', None) or {}
+        is_lean_cis = is_lean_posterior(cis_ps_all)
+
+        def _lean_ci(key):
+            """Fetch precomputed (lower, upper) sibling arrays for `key` when lean-loaded."""
+            lo = cis_ps_all.get(f'{key}_lower')
+            hi = cis_ps_all.get(f'{key}_upper')
+            if lo is None or hi is None:
+                return None
+            if isinstance(lo, torch.Tensor):
+                lo = lo.cpu().numpy()
+            if isinstance(hi, torch.Tensor):
+                hi = hi.cpu().numpy()
+            return lo, hi
+
+        # Get x_true samples — shape is [n_samples, n_cells] (cell-level).
+        # When lean-loaded, this is the [1, n_cells] median singleton (see
+        # bayesDREAM.io.load._reduce_posterior_samples) — real CI width comes
+        # from the 'x_true_lower'/'x_true_upper' sibling keys via _lean_ci().
         if hasattr(self.model, 'posterior_samples_cis') and 'x_true' in self.model.posterior_samples_cis:
             x_true_cell_samples = self.model.posterior_samples_cis['x_true']
             if isinstance(x_true_cell_samples, torch.Tensor):
@@ -1289,13 +1309,23 @@ class ModelSummarizer:
                 for g in guides
             ]
 
+            # x_eff_g/sigma_eff are already guide-level (no cross-cell aggregation
+            # needed), so in lean mode the precomputed sibling keys give an exact
+            # (not approximated) CI — unlike the single-guide x_true case below.
+            _x_eff_ci = _lean_ci('x_eff_g') if is_lean_cis else None
+            if _x_eff_ci is not None:
+                x_eff_g_lower, x_eff_g_upper = _x_eff_ci
+            else:
+                x_eff_g_lower = np.quantile(x_eff_g_samples, 0.025, axis=0)
+                x_eff_g_upper = np.quantile(x_eff_g_samples, 0.975, axis=0)
+
             guide_df = pd.DataFrame({
                 'guide': guides,
                 'targets': targets_col,
                 'n_cells': n_cells_per_guide,
                 'x_eff_g_mean': x_eff_g_samples.mean(axis=0),
-                'x_eff_g_lower': np.quantile(x_eff_g_samples, 0.025, axis=0),
-                'x_eff_g_upper': np.quantile(x_eff_g_samples, 0.975, axis=0),
+                'x_eff_g_lower': x_eff_g_lower,
+                'x_eff_g_upper': x_eff_g_upper,
                 'sigma_eff_mean': sigma_eff_samples.mean(axis=0),
                 'raw_counts_mean': raw_counts_mean,
             })
@@ -1329,10 +1359,32 @@ class ModelSummarizer:
                 cell_idx = guide_to_cell_indices[g]
                 x_true_guide_samples[:, gi] = x_true_cell_samples[:, cell_idx].mean(axis=1)
 
-            # Compute mean and CI per guide
+            # Compute mean and CI per guide. Under lean loading, x_true_cell_samples
+            # holds each cell's posterior MEDIAN (not mean) as a single "sample" (see
+            # bayesDREAM.io.load._reduce_posterior_samples), so this "mean" is really
+            # the mean of per-cell medians — a standard, reasonable point-estimate
+            # substitution (matches how alpha_x_prefit/alpha_y_prefit already use the
+            # median as their stored point estimate at fit time), but not identical
+            # to the true mean of per-cell posterior means.
             x_true_mean = x_true_guide_samples.mean(axis=0)
-            x_true_lower = np.quantile(x_true_guide_samples, 0.025, axis=0)
-            x_true_upper = np.quantile(x_true_guide_samples, 0.975, axis=0)
+            _x_true_cell_ci = _lean_ci('x_true') if is_lean_cis else None
+            if _x_true_cell_ci is not None:
+                # Quantile does NOT commute with cell-averaging: the true
+                # guide-level CI needs the per-draw cross-cell average, which
+                # lean mode discarded. Approximate by averaging the per-cell
+                # lower/upper bounds within each guide instead. This is not
+                # exact (ignores cross-cell posterior correlation), but is a
+                # standard interval-averaging approximation.
+                cell_lower, cell_upper = _x_true_cell_ci
+                x_true_lower = np.array([cell_lower[guide_to_cell_indices[g]].mean() for g in guides])
+                x_true_upper = np.array([cell_upper[guide_to_cell_indices[g]].mean() for g in guides])
+                print("[SAVE] cis_guide_summary: x_true CI is lean-mode approximated "
+                      "(mean of per-cell 2.5%/97.5% bounds within each guide, not the "
+                      "true joint per-draw guide-level quantile). Reload with lean=False "
+                      "for an exact CI.")
+            else:
+                x_true_lower = np.quantile(x_true_guide_samples, 0.025, axis=0)
+                x_true_upper = np.quantile(x_true_guide_samples, 0.975, axis=0)
 
             # Compute average raw counts per guide
             guide_to_cells = self.model.meta.groupby('guide')['cell'].apply(list).to_dict()
@@ -1375,10 +1427,16 @@ class ModelSummarizer:
             if 'technical_group_code' in self.model.meta.columns:
                 cell_data['technical_group_code'] = self.model.meta['technical_group_code'].values
 
-            # Use cell-level x_true directly from posterior samples
+            # Use cell-level x_true directly from posterior samples. Cell-level
+            # CI is exact even under lean loading (no cross-cell aggregation
+            # involved), via the precomputed sibling keys.
             cell_data['x_true_mean'] = x_true_cell_samples.mean(axis=0)
-            cell_data['x_true_lower'] = np.quantile(x_true_cell_samples, 0.025, axis=0)
-            cell_data['x_true_upper'] = np.quantile(x_true_cell_samples, 0.975, axis=0)
+            _x_true_cell_ci2 = _lean_ci('x_true') if is_lean_cis else None
+            if _x_true_cell_ci2 is not None:
+                cell_data['x_true_lower'], cell_data['x_true_upper'] = _x_true_cell_ci2
+            else:
+                cell_data['x_true_lower'] = np.quantile(x_true_cell_samples, 0.025, axis=0)
+                cell_data['x_true_upper'] = np.quantile(x_true_cell_samples, 0.975, axis=0)
             cell_data['raw_counts'] = cis_counts
 
             cell_df = pd.DataFrame(cell_data)

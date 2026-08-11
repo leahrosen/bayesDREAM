@@ -507,3 +507,71 @@ def check_tensor(name, tensor):
     print(f"  min: {tensor.min().item()}, max: {tensor.max().item()}")
     print(f"  has NaN: {torch.isnan(tensor).any().item()}")
     print(f"  has Inf: {torch.isinf(tensor).any().item()}")
+
+
+########################################
+# Lean-loaded posterior detection
+########################################
+
+LEAN_POSTERIOR_KEY = '__lean__'
+
+
+def is_lean_posterior(posterior) -> bool:
+    """
+    Check whether a posterior_samples dict is lean-loaded.
+
+    Lean loading (`load_ntc_fit(lean=True)` / `load_cis_fit(lean=True)`, see
+    `bayesDREAM.io.load._reduce_posterior_samples`) collapses every tensor's
+    sample axis to a point estimate (median, kept as a singleton leading dim)
+    plus `<key>_lower`/`<key>_upper` (2.5%/97.5%) sibling keys, and discards
+    the raw per-draw samples. Code that needs genuine multi-sample structure
+    (histograms, KDE, prior/posterior comparisons, joint per-draw correlation
+    across parameters) must check this first and refuse to run — see
+    `require_full_posterior`. Code that only needs a point estimate + CI band
+    can proceed either way.
+
+    Parameters
+    ----------
+    posterior : dict or None
+        A posterior_samples_ntc / posterior_samples_cis dict (or None).
+
+    Returns
+    -------
+    bool
+        True if lean-loaded, False for None, non-dict, or full posteriors.
+    """
+    return bool(isinstance(posterior, dict) and posterior.get(LEAN_POSTERIOR_KEY, False))
+
+
+def require_full_posterior(posterior, context: str) -> None:
+    """
+    Raise a clear error if `posterior` is lean-loaded.
+
+    Use this at the top of any plotting/analysis function that reads raw
+    per-draw posterior samples for something other than a point estimate +
+    95% CI band (e.g. histograms, KDE, prior/posterior overlays, joint
+    per-draw correlation across parameters) — those silently produce a
+    degenerate or misleading result on a lean-loaded posterior (only one
+    "sample" remains) instead of erroring, which is worse than failing loudly.
+
+    Parameters
+    ----------
+    posterior : dict or None
+        A posterior_samples_ntc / posterior_samples_cis dict (or None).
+    context : str
+        Short description of what's being plotted/computed, used in the
+        error message (e.g. "plot_prior_posterior_comparison").
+
+    Raises
+    ------
+    ValueError
+        If `posterior` is lean-loaded.
+    """
+    if is_lean_posterior(posterior):
+        raise ValueError(
+            f"{context} needs the full per-draw posterior samples, but this "
+            f"model was loaded with lean=True (load_ntc_fit/load_cis_fit), "
+            f"which collapses posterior_samples_ntc/posterior_samples_cis to "
+            f"point estimates (median + 95% CI only) and discards the raw "
+            f"draws. Reload with lean=False to use this plot."
+        )

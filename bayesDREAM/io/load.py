@@ -7,7 +7,7 @@ import pickle
 import torch
 import pandas as pd
 
-from ..utils import make_names_unique
+from ..utils import make_names_unique, LEAN_POSTERIOR_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +303,57 @@ def _torch_load(path, map_location=None):
             return torch.load(path, map_location=map_location, weights_only=False)
         raise
 
+
+def _reduce_posterior_samples(posterior: dict) -> dict:
+    """
+    Collapse every leading-sample-dimension tensor in a posterior_samples dict
+    (as produced by fit_ntc/fit_cis via pyro.infer.Predictive) down to a point
+    estimate, for `lean=True` loading.
+
+    Each tensor's sample axis (dim 0) is replaced by the posterior **median**,
+    kept as a singleton dim (`keepdim=True`) rather than squeezed away. This
+    makes the reduced tensor a transparent drop-in for the `.median(dim=0)` /
+    `.mean(dim=0)` / `ndim>=3` collapsing idioms already used throughout
+    model.py, fitting/cis.py and io/summary.py to extract point estimates from
+    raw posteriors (median-of-1 == mean-of-1 == that value) — so pipeline
+    continuation (add_cis_gene, fit_cis, refit_sumfactor) and point-estimate
+    summary columns work unchanged on lean-loaded data.
+
+    For callers that need genuine uncertainty, two sibling keys are added per
+    tensor: `<key>_lower` / `<key>_upper` (2.5% / 97.5% quantiles, no leading
+    dim). These are the ONLY source of real credible-interval width once the
+    raw samples are discarded here.
+
+    IMPORTANT: this is a lossy, one-way reduction — the discarded per-draw
+    samples cannot be recovered. Any code that reads a reduced key directly
+    for per-draw uncertainty (e.g. `torch.quantile(ps['alpha_y'], ...)`) will
+    silently see a zero-width interval, since only one "sample" remains. Most
+    of `bayesDREAM.plotting` does this — lean-loaded posteriors are intended
+    for summary export (io/summary.py) and pipeline continuation, not
+    posterior visualization. Use `lean=False` for that.
+
+    Non-tensor entries and tensors without a real sample axis (shape[0] <= 1)
+    pass through unchanged.
+    """
+    reduced = {}
+    for key, v in posterior.items():
+        if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] > 1:
+            v_float = v.float()
+            # Use quantile(0.5) rather than torch's .median() for the point
+            # estimate: torch.median() picks the lower of the two middle
+            # values for an even sample count instead of averaging them,
+            # which disagrees with np.median() (used throughout io/summary.py
+            # to re-derive point estimates from posterior_samples_ntc/cis) —
+            # quantile(0.5) with linear interpolation matches np.median exactly.
+            reduced[key] = torch.quantile(v_float, 0.5, dim=0, keepdim=True)
+            reduced[f'{key}_lower'] = torch.quantile(v_float, 0.025, dim=0)
+            reduced[f'{key}_upper'] = torch.quantile(v_float, 0.975, dim=0)
+        else:
+            reduced[key] = v
+    reduced[LEAN_POSTERIOR_KEY] = True
+    return reduced
+
+
 class ModelLoader:
     """Handles loading fitted parameters."""
 
@@ -320,7 +371,8 @@ class ModelLoader:
     def load_ntc_fit(self, input_dir: str = None,
                           modalities: list = None, verbose: bool = False,
                           load_model_level: bool = None,
-                          mask_features: bool = False):
+                          mask_features: bool = False,
+                          lean: bool = False):
         """
         Load fitted technical parameters.
 
@@ -333,6 +385,19 @@ class ModelLoader:
             Example: ['gene', 'atac']
         verbose : bool
             If True, print detailed loading information. Default False (summary only).
+        lean : bool
+            If True, collapse each modality's posterior_samples_ntc to point
+            estimates (median, plus `<key>_lower`/`<key>_upper` 2.5%/97.5%
+            sibling keys) instead of keeping the full multi-sample tensors —
+            the raw samples are what makes these files huge (e.g. all 1000
+            posterior draws x every technical group x every feature). Safe for
+            summary export (save_ntc_summary) and pipeline continuation
+            (add_cis_gene, fit_cis, refit_sumfactor), which already only ever
+            read point estimates from posterior_samples_ntc. NOT safe for most
+            of bayesDREAM.plotting, which reads raw per-draw samples for
+            uncertainty bands — those will silently see zero-width intervals.
+            See `bayesDREAM.io.load._reduce_posterior_samples` for details.
+            Default False (full load, unchanged behavior).
 
         Returns
         -------
@@ -441,6 +506,8 @@ class ModelLoader:
                                 n_missing = int((~feat_mask).sum())
                                 print(f"[LOAD] {mod_name}: {n_missing} missing feature(s) filled "
                                       f"with baseline alpha_y (mask_features=True).")
+                    if lean:
+                        posterior_raw = _reduce_posterior_samples(posterior_raw)
                     mod.posterior_samples_ntc = posterior_raw
 
                     # Reconstruct feature_meta DataFrame if present
@@ -538,9 +605,14 @@ class ModelLoader:
                 loaded_summary.append(f"{mod_name}: {', '.join(mod_loaded)}")
 
         # Print summary
-        print(f"[LOAD] NTC fit from {input_dir}")
+        print(f"[LOAD] NTC fit from {input_dir}" + (" (lean=True)" if lean else ""))
         if loaded_summary:
             print(f"[LOAD] Loaded: {'; '.join(loaded_summary)}")
+        if lean:
+            print("[LOAD] lean=True: posterior_samples_ntc holds point estimates "
+                  "(median + 95% CI) only, not full posterior draws. Safe for "
+                  "save_ntc_summary() and pipeline continuation; NOT safe for most "
+                  "of bayesDREAM.plotting (will raise). Check modality.is_ntc_lean.")
 
         # Warn if alpha_y_prefit was not loaded for modalities that need it
         # Note: 'cis' modality doesn't need alpha_y_prefit (it uses alpha_x instead)
@@ -569,7 +641,7 @@ class ModelLoader:
         return loaded
 
     def load_cis_fit(self, input_dir: str = None, verbose: bool = False,
-                     subset_cells: bool = False):
+                     subset_cells: bool = False, lean: bool = False):
         """
         Load fitted cis parameters.
 
@@ -579,6 +651,15 @@ class ModelLoader:
             Directory to load from. If None, uses self.model.output_dir.
         verbose : bool
             If True, print detailed loading information. Default False (summary only).
+        lean : bool
+            If True, collapse posterior_samples_cis to point estimates (median,
+            plus `<key>_lower`/`<key>_upper` 2.5%/97.5% sibling keys) instead of
+            keeping the full multi-sample tensors (e.g. x_true is `[n_samples,
+            n_cells]` — the dominant cost for large cell counts). Safe for
+            summary export (save_cis_summary) and pipeline continuation. NOT
+            safe for most of bayesDREAM.plotting. See
+            `bayesDREAM.io.load._reduce_posterior_samples` for details.
+            Default False (full load, unchanged behavior).
 
         Returns
         -------
@@ -643,6 +724,8 @@ class ModelLoader:
                                               saved_cell_names, current_cell_names, cell_mask)
                             self.model.fitted_cell_mask = cell_mask
 
+                if lean:
+                    posterior_raw = _reduce_posterior_samples(posterior_raw)
                 self.model.posterior_samples_cis = posterior_raw
 
                 if loaded_data.get('feature_meta') is not None:
@@ -727,15 +810,20 @@ class ModelLoader:
                     print(f"[LOAD] log2_x_true ← computed from x_true")
 
         # Print summary
-        print(f"[LOAD] Cis fit from {input_dir}")
+        print(f"[LOAD] Cis fit from {input_dir}" + (" (lean=True)" if lean else ""))
         if loaded_summary:
             print(f"[LOAD] Loaded: {', '.join(loaded_summary)}")
+        if lean:
+            print("[LOAD] lean=True: posterior_samples_cis holds point estimates "
+                  "(median + 95% CI) only, not full posterior draws. Safe for "
+                  "save_cis_summary() and pipeline continuation; NOT safe for most "
+                  "of bayesDREAM.plotting (will raise). Check model.is_cis_lean.")
 
         return loaded
 
 
     def load_trans_fit(self, input_dir: str = None, modalities: list = None, verbose: bool = False,
-                       subset_features: bool = False):
+                       subset_features: bool = False, lean: bool = False):
         """
         Load fitted trans parameters.
 
@@ -753,12 +841,36 @@ class ModelLoader:
             that were not present in the saved trans fit (would introduce NaN posteriors).
             If True, subset the modality in-place to only the features present in the saved
             fit so that loading proceeds without NaNs.
+        lean : bool
+            Not yet implemented. Unlike posterior_samples_ntc/posterior_samples_cis,
+            nearly every column save_trans_summary() produces (Hill/derivative
+            evaluations, inflection points, log2fc, Bayesian FDR/q-values) is
+            computed by evaluating a nonlinear function of several Hill
+            parameters *per posterior draw* and only taking quantiles at the
+            end — collapsing alpha/Vmax/K/n/A/beta to marginal medians+CI
+            first would silently give wrong CIs and wrong FDR (they depend on
+            the joint per-draw correlation across parameters, not just their
+            marginals). A correct lean mode here would need to precompute the
+            full save_trans_summary() output at load time and keep only that
+            table, which is a larger, separate piece of work. Raises
+            NotImplementedError if True.
 
         Returns
         -------
         dict
             Loaded parameters (keys only, not full tensors)
         """
+        if lean:
+            raise NotImplementedError(
+                "load_trans_fit(lean=True) is not implemented. Nearly all "
+                "save_trans_summary() columns (Hill evaluations, derivative "
+                "roots, inflection points, log2fc, Bayesian FDR/q-values) "
+                "require the full joint per-draw posterior samples of alpha, "
+                "beta, Vmax_a, Vmax_b, K_a, K_b, n_a, n_b, A, etc. — collapsing "
+                "them to marginal medians/CI first would silently produce "
+                "incorrect CIs and FDR. Use lean=False (full load) for trans."
+            )
+
         if input_dir is None:
             input_dir = os.path.join(self.model.output_dir, self.model.label)
 

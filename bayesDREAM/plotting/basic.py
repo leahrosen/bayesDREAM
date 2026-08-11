@@ -10,14 +10,10 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 import pandas as pd
-from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior, _NTC_VARIANTS
+from .helpers import (to_np, resolve_guide_labels, _guide_ntc_mask,
+                       _xtrue_posterior_stats, _log2_safe, _NTC_VARIANTS)
 from .colors import ColorScheme
-
-
-def _log2_safe(x):
-    """log2 of x, returning NaN for non-positive values."""
-    with np.errstate(divide='ignore', invalid='ignore'):
-        return np.where(x > 0, np.log2(np.maximum(x, 1e-300)), np.nan)
+from ..utils import is_lean_posterior, require_full_posterior
 
 
 def _guide_sort_key(g):
@@ -79,13 +75,11 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
-    post = _xtrue_posterior(model)
-    if post is not None:
-        post = post[:, cell_mask]                          # [S, N_kept]
-        if log2:
-            post = np.where(post > 0, np.log2(np.maximum(post, 1e-300)), np.nan)
-        x_mean = np.nanmean(post, axis=0)                  # [N_kept]
-        x_std  = np.nanstd(post,  axis=0)                  # [N_kept]
+    x_mean, x_std, _, _ = _xtrue_posterior_stats(model, log2=log2)
+    _lean_x_true = getattr(model, 'is_cis_lean', False)
+    if x_mean is not None:
+        x_mean = x_mean[cell_mask]
+        x_std = x_std[cell_mask]
     else:
         x_vals = to_np(model.x_true)[cell_mask]
         if log2:
@@ -104,6 +98,8 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
         xlabel = f'mean x_true{" (log2)" if log2 else ""}'
 
     suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
+    if _lean_x_true:
+        suffix += ' [lean: mean→median, std≈CI/1.96]'
 
     def _draw(ax_, gl, xm, xs, title_):
         for guide in sorted(np.unique(gl), key=_guide_sort_key):
@@ -199,14 +195,16 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
-    post = _xtrue_posterior(model)
-    if post is not None:
-        post = post[:, cell_mask]                          # [S, N_kept]
-        if log2:
-            post = np.where(post > 0, np.log2(np.maximum(post, 1e-300)), np.nan)
-        x_mean = np.nanmean(post, axis=0)
-        q_lo   = np.nanpercentile(post, 2.5,  axis=0)
-        q_hi   = np.nanpercentile(post, 97.5, axis=0)
+    # Under lean loading, q_lo/q_hi come from the precomputed x_true_lower/upper
+    # sibling keys (exact — quantiles commute with the monotonic log2 transform);
+    # x_mean is the stored per-cell median rather than the true mean (see
+    # _xtrue_posterior_stats docstring). CI-width y-values are unaffected either way.
+    x_mean, _, q_lo, q_hi = _xtrue_posterior_stats(model, log2=log2)
+    _lean_x_true = getattr(model, 'is_cis_lean', False)
+    if x_mean is not None:
+        x_mean = x_mean[cell_mask]
+        q_lo = q_lo[cell_mask]
+        q_hi = q_hi[cell_mask]
     else:
         x_vals = to_np(model.x_true)[cell_mask]
         if log2:
@@ -226,6 +224,8 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
         xlabel = f'mean x_true{" (log2)" if log2 else ""}'
 
     suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
+    if _lean_x_true:
+        suffix += ' [lean: mean→median]'
     ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{" (log2)" if log2 else ""}'
 
     def _draw(ax_, gl, xm, yv, title_):
@@ -983,9 +983,10 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
 _TECHNICAL_PARAMS = frozenset({'alpha_y', 'alpha_y_mult', 'alpha_y_add', 'log2_alpha_y', 'mu_ntc', 'o_y_tech'})
 
 
-def _get_technical_param_samples(param, tech_posterior, technical_group):
+def _get_technical_param_samples(param, tech_posterior, technical_group, _suffix=''):
     """
-    Extract samples for a technical parameter from posterior_samples_ntc.
+    Extract samples (or, with ``_suffix``, the lean CI bounds) for a technical
+    parameter from posterior_samples_ntc.
 
     Handles the C (technical group) dimension and log2 conversion for multiplicative params.
 
@@ -998,81 +999,112 @@ def _get_technical_param_samples(param, tech_posterior, technical_group):
     technical_group : int
         Which technical group index to display (1 = first non-reference group).
         Index 0 is always the reference group (alpha=1 for mult, 0 for add).
+    _suffix : str, default ''
+        Internal: '' fetches the raw/point-estimate key; '_lower'/'_upper' fetch
+        the lean-mode CI sibling key instead (see
+        bayesDREAM.io.load._reduce_posterior_samples), applying the exact same
+        group-selection and log2 transform as the point estimate — exact
+        because both are monotonic and quantiles commute with monotonic
+        transforms. Returns None if the requested (possibly suffixed) key is
+        absent (e.g. not lean-loaded, or the raw dict).
 
     Returns
     -------
-    np.ndarray of shape [S, T]
+    np.ndarray of shape [S, T] (or [1, T] / [T] under lean loading), or None
+    if _suffix is set and the sibling key doesn't exist.
     """
+    # Point estimates keep a leading sample axis ([S,C,T], or [1,C,T] under lean
+    # loading via keepdim=True), so "has a group axis" shows up as ndim==3.
+    # The lean CI siblings (_lower/_upper) DROP the sample axis entirely
+    # ([C,T]), so for those "has a group axis" shows up as ndim==2 instead —
+    # one dimension slimmer, but otherwise identically laid out (T last,
+    # C second-to-last). This is the only place that distinction matters.
+    _ndim_with_group = 2 if _suffix else 3
+
+    def _get(key):
+        full_key = key + _suffix
+        if full_key not in tech_posterior:
+            return None
+        return to_np(tech_posterior[full_key])
+
+    def _select_group(raw, group_idx, bounds_check_param=None):
+        if raw.ndim != _ndim_with_group:
+            return raw
+        if bounds_check_param is not None and not (0 <= group_idx < raw.shape[-2]):
+            if _suffix:
+                return None
+            raise ValueError(
+                f"technical_group={technical_group} out of range for {bounds_check_param} with "
+                f"{raw.shape[-2]} non-reference group(s). "
+                f"Use technical_group between 1 and {raw.shape[-2]}."
+            )
+        idx = [slice(None)] * raw.ndim
+        idx[-2] = group_idx
+        return raw[tuple(idx)]
+
     if param == 'alpha_y':
         # Try multiplicative first (negbinom), then additive
-        if 'alpha_y_mult' in tech_posterior:
-            raw = to_np(tech_posterior['alpha_y_mult'])
-            if raw.ndim == 3:
-                raw = raw[:, technical_group, :]
-            return np.log2(np.maximum(raw, 1e-10))
-        elif 'alpha_y_add' in tech_posterior:
-            raw = to_np(tech_posterior['alpha_y_add'])
-            if raw.ndim == 3:
-                raw = raw[:, technical_group, :]
-            return raw
-        elif 'alpha_y' in tech_posterior:
-            raw = to_np(tech_posterior['alpha_y'])
-            if raw.ndim == 3:
-                raw = raw[:, technical_group, :]
-            return raw
+        if (key := 'alpha_y_mult') + _suffix in tech_posterior:
+            pass
+        elif (key := 'alpha_y_add') + _suffix in tech_posterior:
+            pass
+        elif (key := 'alpha_y') + _suffix in tech_posterior:
+            pass
         else:
+            if _suffix:
+                return None
             raise KeyError(
                 f"'alpha_y' not found in posterior_samples_ntc. "
                 f"Available: {list(tech_posterior.keys())}"
             )
+        raw = _get(key)
+        if raw is None:
+            return None
+        raw = _select_group(raw, technical_group)
+        return np.log2(np.maximum(raw, 1e-10)) if key in ('alpha_y_mult', 'alpha_y') else raw
 
     elif param == 'alpha_y_mult':
-        raw = to_np(tech_posterior['alpha_y_mult'])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
+        raw = _get('alpha_y_mult')
+        if raw is None:
+            return None
+        raw = _select_group(raw, technical_group)
         return np.log2(np.maximum(raw, 1e-10))
 
     elif param == 'alpha_y_add':
-        raw = to_np(tech_posterior['alpha_y_add'])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
-        return raw
+        raw = _get('alpha_y_add')
+        if raw is None:
+            return None
+        return _select_group(raw, technical_group)
 
     elif param == 'log2_alpha_y':
         # Directly sampled in log2 space, shape [S, C-1, T] (no reference group)
-        raw = to_np(tech_posterior['log2_alpha_y'])
-        if raw.ndim == 3:
-            g_idx = technical_group - 1  # 1-based group → 0-based index into C-1 groups
-            if g_idx < 0 or g_idx >= raw.shape[1]:
-                raise ValueError(
-                    f"technical_group={technical_group} out of range for log2_alpha_y with "
-                    f"{raw.shape[1]} non-reference group(s). "
-                    f"Use technical_group between 1 and {raw.shape[1]}."
-                )
-            raw = raw[:, g_idx, :]
-        return raw
+        raw = _get('log2_alpha_y')
+        if raw is None:
+            return None
+        g_idx = technical_group - 1  # 1-based group → 0-based index into C-1 groups
+        return _select_group(raw, g_idx, bounds_check_param='log2_alpha_y')
 
     elif param == 'mu_ntc':
         # mu_ntc has no C dimension ([S, T]), but handle 3D defensively
-        raw = to_np(tech_posterior['mu_ntc'])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
-        return raw
+        raw = _get('mu_ntc')
+        if raw is None:
+            return None
+        return _select_group(raw, technical_group)
 
     elif param == 'o_y_tech':
         # o_y from the technical fit (NTC-only). Use 'o_y' for the trans fit version.
         # Shape [S, T] — not group-specific. If stored as [S, 1, T], use index 0.
-        raw = to_np(tech_posterior['o_y'])
-        if raw.ndim == 3:
-            raw = raw[:, 0, :]
-        return raw
+        raw = _get('o_y')
+        if raw is None:
+            return None
+        return _select_group(raw, 0)
 
     else:
         # Generic fallback for any other key in technical posterior
-        raw = to_np(tech_posterior[param])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
-        return raw
+        raw = _get(param)
+        if raw is None:
+            return None
+        return _select_group(raw, technical_group)
 
 
 def plot_parameter_ci_panel(
@@ -1331,13 +1363,36 @@ def plot_parameter_ci_panel(
     lo_q = (100 - ci_level) / 2.0
     hi_q = 100 - lo_q
 
+    # Technical params drawn from a lean-loaded posterior_samples_ntc only have
+    # a precomputed 95% CI (2.5%/97.5%) — no raw samples to recompute an
+    # arbitrary ci_level from. Use those exact bounds when ci_level matches;
+    # error clearly for any other level rather than silently falling back to
+    # a (wrong, zero-width) percentile of the singleton point estimate.
+    _tech_lean = bool(tech_params) and is_lean_posterior(tech_posterior)
+
     stats = {}  # {param: {'median': array, 'lo': array, 'hi': array}}
     for param, samps in samples_dict.items():
-        stats[param] = {
-            'median': np.nanmedian(samps, axis=0),
-            'lo': np.nanpercentile(samps, lo_q, axis=0),
-            'hi': np.nanpercentile(samps, hi_q, axis=0),
-        }
+        if param in _TECHNICAL_PARAMS and _tech_lean:
+            if ci_level != 95.0:
+                raise ValueError(
+                    f"plot_parameter_ci_panel: technical parameter '{param}' comes from a "
+                    f"lean-loaded posterior_samples_ntc, which only has a precomputed 95% CI "
+                    f"(2.5%/97.5%). ci_level={ci_level} cannot be computed from lean-loaded "
+                    f"data. Use ci_level=95.0, or reload with lean=False for other levels."
+                )
+            lo = _get_technical_param_samples(param, tech_posterior, technical_group, _suffix='_lower')
+            hi = _get_technical_param_samples(param, tech_posterior, technical_group, _suffix='_upper')
+            stats[param] = {
+                'median': np.nanmedian(samps, axis=0),  # exact: median of the [1,T] lean singleton
+                'lo': np.atleast_1d(lo),
+                'hi': np.atleast_1d(hi),
+            }
+        else:
+            stats[param] = {
+                'median': np.nanmedian(samps, axis=0),
+                'lo': np.nanpercentile(samps, lo_q, axis=0),
+                'hi': np.nanpercentile(samps, hi_q, axis=0),
+            }
 
     # Filter to dependent features if requested
     feature_mask = np.ones(T, dtype=bool)
@@ -1346,11 +1401,8 @@ def plot_parameter_ci_panel(
         # Start with all False, then OR with each param's dependency
         feature_mask = np.zeros(T, dtype=bool)
         for param in dep_params:
-            if param in samples_dict:
-                samps = samples_dict[param]
-                lo = np.nanpercentile(samps, lo_q, axis=0)
-                hi = np.nanpercentile(samps, hi_q, axis=0)
-                param_dep = (lo > 0) | (hi < 0)
+            if param in stats:
+                param_dep = (stats[param]['lo'] > 0) | (stats[param]['hi'] < 0)
                 feature_mask = feature_mask | param_dep
 
         n_dep = feature_mask.sum()

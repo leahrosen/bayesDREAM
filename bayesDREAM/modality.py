@@ -12,7 +12,7 @@ import torch
 from typing import Literal, Optional, Union, Dict, Any
 from scipy import sparse
 
-from .utils import make_names_unique, resolve_feature_names
+from .utils import make_names_unique, resolve_feature_names, is_lean_posterior
 
 
 class Modality:
@@ -783,7 +783,17 @@ class Modality:
 
     def __repr__(self) -> str:
         exon_info = f", exon_agg='{self.exon_aggregate_method}'" if self.is_exon_skipping() else ""
-        return f"Modality(name='{self.name}', distribution='{self.distribution}', dims={self.dims}{exon_info})"
+        lean_info = ", ntc=LEAN" if self.is_ntc_lean else ""
+        return f"Modality(name='{self.name}', distribution='{self.distribution}', dims={self.dims}{exon_info}{lean_info})"
+
+    @property
+    def is_ntc_lean(self) -> bool:
+        """
+        True if posterior_samples_ntc was loaded with load_ntc_fit(lean=True) —
+        i.e. it holds point estimates (median + 95% CI) rather than full raw
+        posterior draws. See bayesDREAM.utils.is_lean_posterior.
+        """
+        return is_lean_posterior(self.posterior_samples_ntc)
 
     @property
     def alpha_y_prefit(self):

@@ -29,7 +29,8 @@ from .utils import (
     Polynomial_function,
     cutoff_sigmoid,
     sample_or_use_point,
-    check_tensor
+    check_tensor,
+    is_lean_posterior
 )
 from .modality import Modality
 from .fitting.distributions import get_observation_sampler, requires_denominator, is_3d_distribution
@@ -1813,6 +1814,16 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
     @functools.wraps(ModelLoader.load_trans_fit)
     def load_trans_fit(self, *args, **kwargs):
         return self._loader.load_trans_fit(*args, **kwargs)
+
+    @property
+    def is_cis_lean(self) -> bool:
+        """
+        True if posterior_samples_cis was loaded with load_cis_fit(lean=True) —
+        i.e. it holds point estimates (median + 95% CI) rather than full raw
+        posterior draws. See bayesDREAM.utils.is_lean_posterior. Check
+        model.get_modality(name).is_ntc_lean for the per-modality NTC equivalent.
+        """
+        return is_lean_posterior(getattr(self, 'posterior_samples_cis', None))
 
     @functools.wraps(ModelSummarizer.save_ntc_summary)
     def save_ntc_summary(self, *args, **kwargs):

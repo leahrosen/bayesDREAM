@@ -4,6 +4,8 @@ Helper utility functions for bayesDREAM plotting.
 
 import numpy as np
 
+from ..utils import is_lean_posterior
+
 # NTC target name variants recognised across the codebase
 _NTC_VARIANTS = frozenset({
     'ntc', 'NTC', 'non-targeting', 'non-targeting-control',
@@ -172,12 +174,87 @@ def _xtrue_posterior(model):
     Return posterior samples of x_true as ``np.ndarray`` shape ``[S, N_cells]``,
     or ``None`` if not available.
 
-    Reads ``model.posterior_samples_cis['x_true']``.
+    Reads ``model.posterior_samples_cis['x_true']``. If lean-loaded, this is
+    the ``[1, N_cells]`` median singleton (see
+    ``bayesDREAM.io.load._reduce_posterior_samples``) — callers that need a
+    real distribution (histograms, KDE, std) rather than a point estimate +
+    CI should use ``_xtrue_posterior_stats`` instead, or guard with
+    ``bayesDREAM.utils.require_full_posterior``.
     """
     psc = getattr(model, 'posterior_samples_cis', None)
     if psc is None or 'x_true' not in psc:
         return None
     return to_np(psc['x_true'])
+
+
+def _log2_safe(x):
+    """log2 of x, returning NaN for non-positive values."""
+    x = np.asarray(x, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(x > 0, np.log2(np.maximum(x, 1e-300)), np.nan)
+
+
+_Z_975 = 1.959963984540054  # standard normal 97.5th percentile
+
+
+def _xtrue_posterior_stats(model, log2=False):
+    """
+    Return per-cell ``(point, std, lower, upper)`` arrays for
+    ``model.posterior_samples_cis['x_true']``, shape ``[N_cells]`` each (no
+    cell subsetting — callers index the result themselves). All four are
+    ``None`` if no x_true posterior is available.
+
+    Full (non-lean) posterior: computed directly from the raw ``[S, N_cells]``
+    samples — ``point`` is the posterior mean, ``std`` the sample std,
+    ``lower``/``upper`` the 2.5%/97.5% percentiles.
+
+    Lean-loaded posterior (see ``bayesDREAM.io.load._reduce_posterior_samples``):
+    only a point estimate + CI survive, so:
+      - ``point`` is the stored per-cell posterior MEDIAN (not mean) — the
+        median/mean substitution already used throughout lean-mode summary
+        export (matches how alpha_x_prefit/alpha_y_prefit use the median as
+        their point estimate at fit time).
+      - ``lower``/``upper`` are the precomputed 2.5%/97.5% quantiles — exact,
+        not approximated (quantiles commute with the monotonic log2
+        transform, so log2(lower)/log2(upper) are still exact quantiles of
+        log2(x_true)).
+      - ``std`` is APPROXIMATED from the CI half-width assuming approximate
+        normality: ``(upper - lower) / (2 * 1.96)``. This is a standard but
+        inexact substitution — flag it in any docstring/label that surfaces it.
+
+    Parameters
+    ----------
+    model : bayesDREAM
+    log2 : bool, default False
+        Transform to log2 space (non-positive values become NaN).
+    """
+    psc = getattr(model, 'posterior_samples_cis', None)
+    if psc is None or 'x_true' not in psc:
+        return None, None, None, None
+
+    if is_lean_posterior(psc):
+        lower = psc.get('x_true_lower')
+        upper = psc.get('x_true_upper')
+        if lower is None or upper is None:
+            return None, None, None, None
+        point = to_np(psc['x_true'])[0]  # [1, N] singleton -> [N]
+        lower = to_np(lower)
+        upper = to_np(upper)
+        if log2:
+            point = _log2_safe(point)
+            lower = _log2_safe(lower)
+            upper = _log2_safe(upper)
+        std = (upper - lower) / (2 * _Z_975)
+        return point, std, lower, upper
+
+    post = to_np(psc['x_true'])  # [S, N]
+    if log2:
+        post = _log2_safe(post)
+    point = np.nanmean(post, axis=0)
+    std = np.nanstd(post, axis=0)
+    lower = np.nanpercentile(post, 2.5, axis=0)
+    upper = np.nanpercentile(post, 97.5, axis=0)
+    return point, std, lower, upper
 
 
 def per_cell_mean_std(x):

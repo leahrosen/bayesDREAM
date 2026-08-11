@@ -2304,6 +2304,15 @@ class bayesDREAM(
         n_cells = len(self.meta)
         n_modalities = len(self.modalities)
         modality_names = ', '.join(self.modalities.keys())
+        lean_mods = [name for name, mod in self.modalities.items() if mod.is_ntc_lean]
+        lean_line = ""
+        if lean_mods or self.is_cis_lean:
+            parts = []
+            if lean_mods:
+                parts.append(f"ntc=[{', '.join(lean_mods)}]")
+            if self.is_cis_lean:
+                parts.append("cis=True")
+            lean_line = f"  LEAN-LOADED ({', '.join(parts)}) — point estimates only, see is_ntc_lean/is_cis_lean,\n"
 
         return (
             f"bayesDREAM(\n"
@@ -2313,6 +2322,7 @@ class bayesDREAM(
             f"  modalities=[{modality_names}],\n"
             f"  primary_modality='{self.primary_modality}',\n"
             f"  device={self.device}\n"
+            f"{lean_line}"
             f")"
         )
 

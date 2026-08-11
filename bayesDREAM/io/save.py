@@ -5,6 +5,8 @@ Save methods for bayesDREAM fitted parameters.
 import os
 import torch
 
+from ..utils import is_lean_posterior
+
 class ModelSaver:
     """Handles saving fitted parameters."""
 
@@ -70,6 +72,21 @@ class ModelSaver:
             if invalid:
                 raise ValueError(f"Unknown modalities: {invalid}. Available: {list(self.model.modalities.keys())}")
             modalities_to_save = modalities
+
+        # Refuse to re-save lean-loaded posteriors as if they were a full fit:
+        # load_ntc_fit(lean=True) irreversibly collapses the per-draw samples
+        # to point estimates (see io.load._reduce_posterior_samples), so the
+        # resulting file would silently claim to be a full posterior archive
+        # while actually containing single-sample tensors.
+        for mod_name in modalities_to_save:
+            ps = getattr(self.model.modalities[mod_name], 'posterior_samples_ntc', None)
+            if is_lean_posterior(ps):
+                raise ValueError(
+                    f"Cannot save_ntc_fit(): modality '{mod_name}' was loaded with "
+                    f"load_ntc_fit(lean=True), so its posterior_samples_ntc only "
+                    f"contains collapsed point estimates, not the full posterior. "
+                    f"Reload with lean=False if you need to re-save a full fit."
+                )
 
         # Determine whether to save model-level parameters
         if save_model_level is None:
@@ -195,6 +212,17 @@ class ModelSaver:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
 
         os.makedirs(output_dir, exist_ok=True)
+
+        # Refuse to re-save lean-loaded posteriors as if they were a full fit
+        # (see the matching guard in save_ntc_fit for why).
+        ps_cis = getattr(self.model, 'posterior_samples_cis', None)
+        if is_lean_posterior(ps_cis):
+            raise ValueError(
+                "Cannot save_cis_fit(): posterior_samples_cis was loaded with "
+                "load_cis_fit(lean=True), so it only contains collapsed point "
+                "estimates, not the full posterior. Reload with lean=False if "
+                "you need to re-save a full fit."
+            )
 
         saved_files = {}
         saved_summary = []
