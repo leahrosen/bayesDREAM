@@ -201,6 +201,21 @@ def main() -> None:
 
     data_block = {
         "meta": paths["meta"], "counts": paths["counts"],
+        # meta_read_csv_kwargs/feature_meta_read_csv_kwargs: {} are BOTH
+        # REQUIRED, not cosmetic -- preprocess.py writes both meta.csv and
+        # gene_meta.csv with to_csv(index=False) (real columns, no leading
+        # index column at all). meta_read_csv_kwargs was missing here until
+        # 2026-08-12 (same bug as Domingo's identical gap in
+        # domingo/generate_slurm.py's base_cfg) -- without it,
+        # config_utils._read_counts's default (index_col=0) silently
+        # consumes meta.csv's first real column AS self.meta's index instead
+        # of a default 0..N-1 range. Harmless for most of the pipeline, but
+        # crashes permute_x_true() (bayesDREAM/core.py, the only place that
+        # indexes a positional numpy array via self.meta.index directly)
+        # with "IndexError: only integers, slices... are valid indices" --
+        # i.e. this would have broken 05_permutation_packed.sh the same way
+        # it broke Domingo's permutation jobs, the first time it ran.
+        "meta_read_csv_kwargs": {},
         "feature_meta": paths["feature_meta"], "feature_meta_read_csv_kwargs": {},
         "guide_assignment": paths["guide_assignment"],
         "guide_meta": paths["guide_meta"], "guide_target": paths["guide_target"],

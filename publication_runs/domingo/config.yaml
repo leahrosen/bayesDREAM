@@ -138,7 +138,7 @@ modalities:
   # directory once per (gene, modality) -- same cost regardless of which
   # modality, so one fixed value for all of them (2026-08-11), not split
   # like the fit jobs above.
-  subset_resources: {cores: 10}
+  subset_resources: {cores: 25}   # bumped from real OOM evidence, 2026-08-12 -- 10 (8.7GB) was not enough for several (gene, modality) pairs
   # Permutation + recapitulation reps for BINOMIAL modalities only (sj,
   # exon_skip, intron_retention, mxe, gene_velocity, donor_efficiency,
   # acceptor_efficiency) -- NOT multinomial (donor_choice/acceptor_choice),

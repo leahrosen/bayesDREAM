@@ -169,7 +169,21 @@ def main() -> None:
         # actually find domingo/-local modules at runtime -- see
         # config_utils.ensure_dataset_dir_on_syspath's docstring.
         "_dataset_dir": str(THIS_DIR),
-        "data": {"meta": meta_path, "counts": counts_path},
+        # meta_read_csv_kwargs: {} is REQUIRED, not cosmetic -- preprocess.py
+        # writes BOTH cell_meta.csv and cell_meta_ntc.csv with
+        # to_csv(index=False) (real columns, no leading index column at
+        # all). Set once here (deep_merge propagates it through every
+        # downstream override, including subset_data_block()'s own "data"
+        # dicts and 01_ntc_shared.sh's meta_ntc_path override, since neither
+        # sets meta_read_csv_kwargs itself) rather than duplicated at every
+        # call site. Missing this made config_utils._read_counts's default
+        # (index_col=0) silently consume each CSV's first real column AS the
+        # index instead of a default 0..N-1 range -- harmless for most of
+        # the pipeline (nothing else indexes by self.meta.index directly),
+        # but crashed permute_x_true() (bayesDREAM/core.py), the one place
+        # that does, with "IndexError: only integers, slices... are valid
+        # indices". Confirmed 2026-08-12.
+        "data": {"meta": meta_path, "counts": counts_path, "meta_read_csv_kwargs": {}},
         "model": {
             "modality_name": model_defaults["modality_name"],
             "guide_covariates": model_defaults["guide_covariates"],
@@ -264,7 +278,11 @@ def main() -> None:
         # override, config_utils.build_model_from_config's default
         # (index_col=0, for datasets whose feature_meta genuinely has a
         # leading unnamed index column) would consume that gene_name column
-        # AS the index, leaving zero usable columns.
+        # AS the index, leaving zero usable columns. meta.csv needs the same
+        # treatment (also written index=False) -- handled once, for every
+        # data block dataset-wide, via base_cfg["data"]["meta_read_csv_kwargs"]
+        # above (deep_merge propagates it here) rather than duplicated again
+        # in this function.
         d = f"{subset_dir_for(label)}/{mode}"
         return {
             "meta": f"{d}/meta.csv", "counts": f"{d}/gene_counts.npz",
