@@ -507,7 +507,17 @@ def main() -> None:
             "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
             "simulation": {
                 "load_ntc": {"args": {"input_dir": this_gene_ntc_dir, "mask_features": True}},
-                "load_cis": {"enabled": True}, "load_trans": {"enabled": True},
+                "load_cis": {"enabled": True},
+                # subset_features=True -- same rationale as Domingo's
+                # identical fix (domingo/generate_slurm.py): this config
+                # re-applies the SAME exclude_trans_genes(min_log2_mu_ntc=...)
+                # the real trans fit used, but that filter isn't perfectly
+                # reproducible run-to-run, so a strict reload can raise
+                # "N feature(s) ... not present in the saved trans fit".
+                # Recapitulation only needs to match trans's OWN fitted
+                # function, so subsetting to whatever it actually covers is
+                # correct here, not a workaround.
+                "load_trans": {"enabled": True, "args": {"subset_features": True}},
                 "sum_factor_col": "sum_factor_adj",
                 "fit": {"sum_factor_col": "sum_factor_adj", "function_type": trans_cfg["function_type"]},
             },

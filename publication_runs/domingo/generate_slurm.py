@@ -437,7 +437,19 @@ def main() -> None:
             "simulation": {
                 "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
                 "load_cis": {"enabled": True},
-                "load_trans": {"enabled": True},
+                # subset_features=True: this config re-applies the SAME
+                # exclude_trans_genes(min_log2_mu_ntc=...) call the real
+                # 04_trans_<gene>.sh config used when fit_trans() actually
+                # ran and saved its posterior -- but that filter isn't
+                # perfectly reproducible run-to-run (observed: 2 features
+                # differ between the two calls), so a strict reload raises
+                # "N feature(s) ... not present in the saved trans fit".
+                # Recapitulation only needs to reproduce trans's OWN fitted
+                # function, so subsetting to whatever it actually covers is
+                # the correct behavior here, not a workaround. NOT applied to
+                # modality-level simulation configs below (line ~602) -- they
+                # never set exclude_trans_genes at all, so can't hit this.
+                "load_trans": {"enabled": True, "args": {"subset_features": True}},
                 "sum_factor_col": "sum_factor_refit",
                 "fit": {"sum_factor_col": "sum_factor_refit", "function_type": trans_cfg["function_type"]},
             },
