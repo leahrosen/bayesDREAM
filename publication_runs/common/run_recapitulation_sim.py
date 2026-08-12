@@ -195,12 +195,27 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
 
     apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {})
 
-    # Must match the real trans run's feature set exactly -- ground_truth
-    # (trans_summary.csv, read below) only has rows for genes that survived
-    # this same filter originally; skipping it here would make the later
-    # reindex-to-modality-features step fail (or worse, silently misalign).
+    # Only needed to match the real trans run's feature set when load_trans
+    # (above) DIDN'T already do that job -- ground_truth (trans_summary.csv,
+    # read below) only has rows for genes that survived this same filter
+    # originally, so the two need to end up aligned somehow. But when
+    # load_trans is enabled (the normal case, subset_features=True), it
+    # already reconciles the modality to the SAVED trans fit's exact feature
+    # set -- calling exclude_trans_genes() again afterward doesn't skip
+    # re-doing that (which would be merely redundant), it actively breaks:
+    # it recomputes its own keep_idx from mu_ntc/NTC posteriors that are
+    # still sized to the ORIGINAL (pre-load_trans-subsetting) feature count,
+    # then applies those now-too-large indices to the modality's counts
+    # array, which load_trans_fit already shrank -- IndexError ("index 89
+    # is out of bounds for axis 0 with size 89"). exclude_trans_genes()
+    # itself detects this exact situation (mod.posterior_samples_trans
+    # already set) and warns before crashing -- confirmed 2026-08-12 via a
+    # real recapitulation traceback. Only call it here if load_trans was
+    # disabled (so there's no already-reconciled feature set to conflict
+    # with).
     excl_cfg = cfg.get("exclude_trans_genes") or {}
-    if is_enabled(excl_cfg, default=False):
+    load_trans_enabled = is_enabled(sim_cfg.get("load_trans"), default=True)
+    if is_enabled(excl_cfg, default=False) and not load_trans_enabled:
         model.exclude_trans_genes(**normalize_stage_args(excl_cfg))
 
     group_col = sim_cfg.get("group_col", "technical_group_code")
