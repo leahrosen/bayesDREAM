@@ -49,6 +49,13 @@ modalities:
   # modalities.resources.cores in config.yaml for this stype only. Absent
   # on donor_choice/acceptor_choice (multinomial, GPU-packed) on purpose --
   # those fall back to modalities.resources.cores for thread-pinning.
+  # `subset_cores:` (2026-08-12, from real OOM evidence) overrides
+  # modalities.subset_resources.cores in config.yaml for THIS stype's
+  # 07a_modality_subset_<gene>_<mod>.sh only -- intron_retention's raw
+  # loader_inputs file is bigger than the shared 25-core (21.7GB) estimate
+  # covers (OOM'd for every gene even after that bump); every other
+  # modality's subset step is fine at the shared value, so this is the only
+  # entry that needs it.
   - stype: sj
     distribution: binomial
     function_type: additive_hill
@@ -72,6 +79,7 @@ modalities:
     denominator_mode: file
     min_denominator: 0
     cores: 2
+    subset_cores: 50
   - stype: mxe
     distribution: binomial
     function_type: additive_hill

@@ -524,7 +524,11 @@ def main() -> None:
             )
             subset_mod_step = SbatchStep(
                 job_name=f"domingo_modsubset_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                time_hours=TIME_HOURS, cpus=modalities_dataset_cfg["subset_resources"]["cores"],
+                # spec['subset_cores'] overrides the shared default for this
+                # stype only (currently just intron_retention -- see
+                # config_modalities.yaml's comment).
+                time_hours=TIME_HOURS,
+                cpus=spec.get("subset_cores", modalities_dataset_cfg["subset_resources"]["cores"]),
                 partition=partition_cpu, repo_dir=repo_dir, commands=[subset_mod_cmd],
             )
             subset_mod_filename = f"07a_modality_subset_{gene}_{mod_name}.sh"

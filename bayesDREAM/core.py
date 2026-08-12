@@ -1460,7 +1460,13 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 cis_counts_work = np.asarray(cis_counts_work)
                 cis_counts_work[cis_row, ntc_col_idx] = new_cis
 
-            meta_ntc_idx = self.meta.index[self.meta['cell'].isin(ntc_cells)].tolist()
+            # Positional indices into x_true_np (aligned to self.meta's row
+            # ORDER), not self.meta.index -- low-MOI cell subsetting sets
+            # self.meta's index to cell-barcode strings, not a 0..N-1 range,
+            # so indexing x_true_np (a plain numpy array) by self.meta.index
+            # directly raised IndexError. np.where() gives positions instead
+            # of labels, correct regardless of what self.meta.index holds.
+            meta_ntc_idx = np.where(self.meta['cell'].isin(ntc_cells).values)[0]
             x_true_np[meta_ntc_idx] = x_true_np[meta_ntc_idx][perm_idx]
 
         cis_mod.counts = cis_counts_work
