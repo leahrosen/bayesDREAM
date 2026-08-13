@@ -18,6 +18,13 @@ Each <submitted_jobs.tsv> is written by a dataset's submit_all.sh
 Prints one row per job: stage, label, jobid, SLURM state, elapsed. Jobs
 whose state is not COMPLETED are grouped into a "NEEDS ATTENTION" section at
 the end, with the sbatch script path to resubmit if you decide to.
+
+--latest-only collapses rows sharing the same (stage, label) down to just
+the most recent attempt (highest jobid) before reporting -- useful once
+you've resubmitted a fix and re-run reconstruct_submitted_jobs_tsv.py,
+which pulls the FULL sacct history (every past attempt, not just the
+latest), so an old, already-fixed failure would otherwise keep showing up
+in NEEDS ATTENTION forever alongside its own successful resubmission.
 """
 
 import argparse
@@ -59,6 +66,9 @@ def _sacct_states(job_ids: list) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tsv_paths", nargs="+", help="One or more submitted_jobs.tsv files.")
+    parser.add_argument("--latest-only", action="store_true",
+                         help="Collapse (stage, label) duplicates to just the most recent attempt "
+                              "(highest jobid) -- see module docstring.")
     args = parser.parse_args()
 
     rows = []
@@ -67,6 +77,15 @@ def main() -> None:
         df["source_tsv"] = path
         rows.append(df)
     jobs = pd.concat(rows, ignore_index=True)
+
+    if args.latest_only:
+        # Base jobid (before any '_<task>' array suffix) as an int -- SLURM
+        # job IDs are monotonically increasing per cluster, so the highest
+        # base id for a given (stage, label) is the most recent submission.
+        jobs["_base_jobid"] = jobs["jobid"].astype(str).str.split("_").str[0].astype(int)
+        jobs = (jobs.sort_values("_base_jobid")
+                    .drop_duplicates(subset=["stage", "label"], keep="last")
+                    .drop(columns="_base_jobid"))
 
     states = _sacct_states(jobs["jobid"].tolist())
     jobs["state"] = jobs["jobid"].astype(str).map(lambda j: states.get(j, ("unknown", ""))[0])
