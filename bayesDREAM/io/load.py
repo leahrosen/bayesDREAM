@@ -996,6 +996,19 @@ class ModelLoader:
                                 # Subset the modality in-place to fitted features only
                                 import numpy as _np
                                 mask_np = feat_mask.numpy()
+                                # alpha_y_prefit_mult/_add and posterior_samples_ntc were
+                                # loaded earlier via load_ntc_fit() and are still sized to
+                                # the FULL (pre-subset) feature count -- without this, a
+                                # later fit_trans() call divides a [..., n_kept]-shaped
+                                # tensor by a [..., T]-shaped alpha_y_expanded and crashes
+                                # with a shape mismatch. exclude_trans_genes() already
+                                # solves this exact problem via the same helper (see
+                                # model.py's _trim_feature_axis_in_posteriors); this branch
+                                # just never called it. Confirmed via a real
+                                # "RuntimeError: The size of tensor a (89) must match the
+                                # size of tensor b (91)" traceback, 2026-08-14.
+                                self.model._trim_feature_axis_in_posteriors(
+                                    mod, _np.where(mask_np)[0], mask_np.shape[0])
                                 # Subset counts
                                 if mod.counts is not None:
                                     if hasattr(mod.counts, 'toarray'):
