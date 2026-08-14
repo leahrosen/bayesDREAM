@@ -79,7 +79,7 @@ modalities:
     denominator_mode: file
     min_denominator: 0
     cores: 2
-    subset_cores: 50
+    subset_cores: 75   # bumped again, 2026-08-14 -- still OOM'd for MYB/NFE2 at 50 cores
   - stype: mxe
     distribution: binomial
     function_type: additive_hill

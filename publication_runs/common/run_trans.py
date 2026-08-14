@@ -99,6 +99,16 @@ def run_trans(cfg: dict) -> None:
 
     if is_enabled(trans_cfg.get("save"), default=True):
         model.save_trans_fit(**normalize_stage_args(trans_cfg.get("save")))
+        # Also required: run_recapitulation_sim.py reads trans_feature_summary_
+        # <modality>.csv as its ground truth (comment there: "Must match the
+        # real trans run's feature set exactly"). run_permutation_null.py
+        # already calls both save_trans_fit AND save_trans_summary for
+        # exactly this reason -- this call was missing here, so the REAL
+        # trans fit never produced the file recapitulation depends on
+        # (confirmed via a real "FileNotFoundError: trans_feature_summary_
+        # gene.csv" traceback, 2026-08-14). output_dir/modality_name match
+        # save_trans_fit's own defaults.
+        model.save_trans_summary(output_dir=output_dir, modality_name=modality_name)
 
     save_provenance_json(
         os.path.join(output_dir, "provenance_trans.json"),

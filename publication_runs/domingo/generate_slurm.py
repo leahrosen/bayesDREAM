@@ -108,7 +108,15 @@ from config_utils import load_yaml, write_yaml, render_bayesdream_config, resolv
 from git_provenance import create_stable_snapshot_tag  # noqa: E402
 from sbatch_blocks import SbatchStep, SbatchArray, SbatchGpuNodeQueue  # noqa: E402
 
-TIME_HOURS = 24.0  # fixed everywhere, per project convention
+TIME_HOURS = 24.0  # fixed everywhere on CPU/GPU except the binomial modality jobs below
+# 48h for Domingo's binomial splicing-modality CPU jobs only (07a subset,
+# 07 fit, 08 permutation, 09 recapitulation) -- real jobs hit the 24h
+# TIMEOUT wall for several (gene, modality) pairs, some genes' successful
+# runs already took 15-24h at the current cores (2026-08-14). NOT applied to
+# the GPU-packed multinomial job (07_modality_multinomial_packed.sh) -- the
+# gpu partition's own MaxTime is 24h, unlike shared's 7 days, so it can't be
+# raised regardless.
+MODALITY_TIME_HOURS = 48.0
 
 
 def main() -> None:
@@ -527,7 +535,7 @@ def main() -> None:
                 # spec['subset_cores'] overrides the shared default for this
                 # stype only (currently just intron_retention -- see
                 # config_modalities.yaml's comment).
-                time_hours=TIME_HOURS,
+                time_hours=MODALITY_TIME_HOURS,
                 cpus=spec.get("subset_cores", modalities_dataset_cfg["subset_resources"]["cores"]),
                 partition=partition_cpu, repo_dir=repo_dir, commands=[subset_mod_cmd],
             )
@@ -557,7 +565,7 @@ def main() -> None:
             else:
                 mod_step = SbatchStep(
                     job_name=f"domingo_mod_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                    time_hours=TIME_HOURS,
+                    time_hours=MODALITY_TIME_HOURS,
                     cpus=mod_cores,
                     partition=partition_cpu, repo_dir=repo_dir,
                     commands=[mod_cmd],
@@ -597,7 +605,7 @@ def main() -> None:
                 n_mod_perm = modalities_dataset_cfg["trans"]["permutation"]["n_reps"]
                 mod_perm_step = SbatchArray(
                     job_name=f"domingo_modperm_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                    time_hours=TIME_HOURS, cpus=mod_cores,  # same fit, matches this modality's own cores
+                    time_hours=MODALITY_TIME_HOURS, cpus=mod_cores,  # same fit, matches this modality's own cores
                     max_index=n_mod_perm - 1, max_concurrent=min(n_mod_perm, 50),
                     partition=partition_cpu, repo_dir=repo_dir,
                     commands=[bd_cmd("permutation_null", mod_perm_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
@@ -625,7 +633,7 @@ def main() -> None:
                 n_mod_sim = modalities_dataset_cfg["trans"]["simulation"]["n_reps"]
                 mod_sim_step = SbatchArray(
                     job_name=f"domingo_modsim_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                    time_hours=TIME_HOURS, cpus=mod_cores,  # same fit, matches this modality's own cores
+                    time_hours=MODALITY_TIME_HOURS, cpus=mod_cores,  # same fit, matches this modality's own cores
                     max_index=n_mod_sim - 1, max_concurrent=min(n_mod_sim, 50),
                     partition=partition_cpu, repo_dir=repo_dir,
                     commands=[bd_cmd("recapitulation_sim", mod_sim_cfg_path, extra_args=" --rep $SLURM_ARRAY_TASK_ID")],
