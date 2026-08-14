@@ -79,7 +79,13 @@ modalities:
     denominator_mode: file
     min_denominator: 0
     cores: 2
-    subset_cores: 75   # bumped again, 2026-08-14 -- still OOM'd for MYB/NFE2 at 50 cores
+    subset_cores: 75   # bumped again, 2026-08-14 -- still OOM'd for MYB/NFE2 at 50 cores; GFI1B/MYB/TET2 all fine at 75
+    # NFE2 alone is STILL a confirmed genuine OOM at 75 (ReqMem=66600M, real
+    # oom_kill event) -- its raw loader_inputs file is bigger than every
+    # other gene's, so give it its own override rather than raising the
+    # shared 75 for GFI1B/MYB/TET2 too, which don't need it.
+    subset_cores_by_gene:
+      NFE2: 150
   - stype: mxe
     distribution: binomial
     function_type: additive_hill

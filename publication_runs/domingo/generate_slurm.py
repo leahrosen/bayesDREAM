@@ -530,13 +530,18 @@ def main() -> None:
                 f'--modality-spec "{repo_dir}/publication_runs/domingo/config_modalities.yaml" '
                 f'--data-dir "{mod_data_dir}" --outdir "{mod_precomputed_dir}"'
             )
+            # Precedence: spec['subset_cores_by_gene'][gene] (this one gene's
+            # own override, e.g. NFE2's intron_retention) > spec['subset_cores']
+            # (shared default for this stype, all genes) > modalities_dataset_cfg's
+            # shared default (all stypes, all genes). See config_modalities.yaml's
+            # comment on intron_retention.
+            subset_cores_by_gene = spec.get("subset_cores_by_gene") or {}
+            subset_cores = subset_cores_by_gene.get(
+                gene, spec.get("subset_cores", modalities_dataset_cfg["subset_resources"]["cores"]))
             subset_mod_step = SbatchStep(
                 job_name=f"domingo_modsubset_{gene}_{mod_name}", account=account, log_dir=str(logs_dir),
-                # spec['subset_cores'] overrides the shared default for this
-                # stype only (currently just intron_retention -- see
-                # config_modalities.yaml's comment).
                 time_hours=MODALITY_TIME_HOURS,
-                cpus=spec.get("subset_cores", modalities_dataset_cfg["subset_resources"]["cores"]),
+                cpus=subset_cores,
                 partition=partition_cpu, repo_dir=repo_dir, commands=[subset_mod_cmd],
             )
             subset_mod_filename = f"07a_modality_subset_{gene}_{mod_name}.sh"
