@@ -64,7 +64,7 @@ modalities:
     clip_violations: true
     save_diagnostic_plot: true
     min_denominator: 0
-    cores: 4
+    cores: 8   # bumped from 4, 2026-08-14 -- several fit jobs TIMEOUT'd at 24h on 4 cores
   - stype: exon_skip
     distribution: binomial
     function_type: additive_hill
@@ -100,14 +100,14 @@ modalities:
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
-    cores: 4
+    cores: 8   # bumped from 4, 2026-08-14 -- TIMEOUT (not OOM) at 24h on 4 cores
   - stype: acceptor_efficiency
     distribution: binomial
     function_type: additive_hill
     gene_alias_col: gene_name
     denominator_mode: file
     min_denominator: 0
-    cores: 4
+    cores: 8   # bumped from 4, 2026-08-14 -- TIMEOUT (not OOM) at 24h on 4 cores
   - stype: donor_choice
     distribution: multinomial
     function_type: single_hill
