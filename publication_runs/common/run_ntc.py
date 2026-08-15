@@ -55,6 +55,7 @@ from config_utils import (  # noqa: E402
     load_bayesdream_yaml,
     normalize_stage_args,
     is_enabled,
+    apply_device_override,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 from resource_stats import (  # noqa: E402
@@ -110,8 +111,11 @@ def run_ntc(cfg: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", "-c", required=True)
+    parser.add_argument("--device", default=None, help="Explicit device override, e.g. 'cuda:2' (see config_utils.apply_device_override).")
     args = parser.parse_args()
-    run_ntc(load_bayesdream_yaml(Path(args.config)))
+    cfg = load_bayesdream_yaml(Path(args.config))
+    apply_device_override(cfg, args.device)
+    run_ntc(cfg)
 
 
 if __name__ == "__main__":

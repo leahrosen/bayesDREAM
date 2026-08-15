@@ -231,15 +231,26 @@ def main() -> None:
         # OWN thread cap (else every concurrent task's BLAS/torch threadpool
         # fights over the whole node's cores) and its OWN GPU device
         # assignment (else every concurrent task defaults to GPU 0 instead
-        # of spreading across the node's 8). HIP_VISIBLE_DEVICES is the ROCm
-        # analogue of CUDA_VISIBLE_DEVICES; ROCR_VISIBLE_DEVICES set
-        # alongside as a fallback for older ROCm builds.
+        # of spreading across the node's 8).
+        # Previously done via HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES
+        # (restricting each subprocess's device *visibility*) -- confirmed
+        # BROKEN on Dardel 2026-08-15 via morris's 01d_ntc_packed.sh (see
+        # morris/generate_slurm.py's _pinned() for the full incident writeup):
+        # 4/5 masked, concurrently-launched tasks silently stalled
+        # indefinitely on one node while a manual test using explicit
+        # torch.device(f'cuda:{i}') addressing (full node GPU visibility,
+        # each process just picks its own index) parallelized cleanly.
+        # Switched to that here too, for consistency and because this
+        # dataset's own packed multinomial-modality job (never yet actually
+        # exercised in a completed run) would hit the identical bug:
+        # --device cuda:{gpu_idx} on the command line, consumed by
+        # config_utils.apply_device_override via load_modalities.py's
+        # --device flag.
         exports = (
             f"OMP_NUM_THREADS={cpus} OPENBLAS_NUM_THREADS={cpus} MKL_NUM_THREADS={cpus} "
-            f"VECLIB_MAXIMUM_THREADS={cpus} NUMEXPR_NUM_THREADS={cpus} "
-            f"HIP_VISIBLE_DEVICES={gpu_idx} ROCR_VISIBLE_DEVICES={gpu_idx}"
+            f"VECLIB_MAXIMUM_THREADS={cpus} NUMEXPR_NUM_THREADS={cpus}"
         )
-        return f"env {exports} {cmd}"
+        return f"env {exports} {cmd} --device cuda:{gpu_idx}"
 
     scripts = []  # (filename, rendered sbatch text) in submission order
     submitted_rows = []  # (stage, label, script) for submit_all.sh's submitted_jobs.tsv

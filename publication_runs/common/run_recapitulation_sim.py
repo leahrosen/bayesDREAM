@@ -83,6 +83,7 @@ from config_utils import (  # noqa: E402
     apply_sum_factor_adjustments,
     ensure_dataset_dir_on_syspath,
     load_ntc_for_stage,
+    apply_device_override,
 )
 from git_provenance import save_provenance_json  # noqa: E402
 from resource_stats import (  # noqa: E402
@@ -299,10 +300,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", "-c", required=True, help="Path to bayesdream-CLI-schema YAML config.")
     parser.add_argument("--rep", type=int, required=True, help="Replicate index (also seeds RNG).")
+    parser.add_argument("--device", default=None, help="Explicit device override, e.g. 'cuda:2' (see config_utils.apply_device_override).")
     args = parser.parse_args()
 
     cfg = load_bayesdream_yaml(Path(args.config))
     cfg["_dataset_dir"] = cfg.get("_dataset_dir") or str(Path(args.config).resolve().parents[2])
+    apply_device_override(cfg, args.device)
     run_recapitulation_sim(cfg, args.rep)
 
 

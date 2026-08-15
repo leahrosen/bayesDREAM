@@ -151,6 +151,31 @@ def build_model_from_config(cfg: Dict[str, Any]) -> "bayesDREAM":
         **model_kwargs,
     )
 
+
+def apply_device_override(cfg: Dict[str, Any], device: str) -> None:
+    """In-place override of cfg['model']['device'], if `device` is truthy.
+
+    Used by packed-GPU-node scripts (run_ntc.py/run_trans.py/
+    run_permutation_null.py/run_recapitulation_sim.py/domingo's
+    load_modalities.py) to explicitly address a single GPU (e.g. "cuda:2")
+    passed in via a --device CLI flag, rather than relying on
+    HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES to restrict device *visibility*.
+    generate_slurm.py's _pinned() used to do the latter -- confirmed on
+    Dardel 2026-08-15 that it doesn't reliably isolate concurrent tasks (4/5
+    packed morris fit_ntc tasks silently stalled indefinitely sharing one
+    node, while a manual interactive test using explicit
+    torch.device(f'cuda:{i}') addressing with full node GPU visibility
+    parallelized cleanly). bayesDREAM.__init__ already accepts any
+    torch.device-parseable string via its `device` kwarg (core.py:683's
+    `torch.device(device)`), so no bayesDREAM code change is needed --
+    "cuda:2" just needs to reach that kwarg, which this does by overriding
+    cfg['model']['device'] before build_model_from_config(cfg).
+    """
+    if not device:
+        return
+    cfg.setdefault("model", {})["device"] = device
+
+
 __all__ = [
     "build_model_from_config",
     "load_bayesdream_yaml",
@@ -166,6 +191,7 @@ __all__ = [
     "ensure_dataset_dir_on_syspath",
     "resolve_paths",
     "load_ntc_for_stage",
+    "apply_device_override",
 ]
 
 

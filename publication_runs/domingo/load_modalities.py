@@ -369,7 +369,7 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-    from config_utils import build_model_from_config, load_bayesdream_yaml, normalize_stage_args  # noqa: E402
+    from config_utils import build_model_from_config, load_bayesdream_yaml, normalize_stage_args, apply_device_override  # noqa: E402
     from git_provenance import save_provenance_json  # noqa: E402
     from resource_stats import (  # noqa: E402
         is_cuda, new_stats_dict, load_prior_stats, step_completed,
@@ -383,11 +383,13 @@ def main() -> None:
     parser.add_argument("--modality-spec", required=True, help="Path to config_modalities.yaml")
     parser.add_argument("--data-dir", default=None, help="Shared loader_inputs/ dir (same for every gene). Mutually exclusive with --precomputed-dir.")
     parser.add_argument("--precomputed-dir", default=None, help="Per-(gene,modality) precomputed subset dir (see subset_modality_per_gene.py). Mutually exclusive with --data-dir.")
+    parser.add_argument("--device", default=None, help="Explicit device override, e.g. 'cuda:2' (see config_utils.apply_device_override).")
     args = parser.parse_args()
     if bool(args.data_dir) == bool(args.precomputed_dir):
         parser.error("exactly one of --data-dir/--precomputed-dir is required")
 
     cfg = load_bayesdream_yaml(Path(args.config))
+    apply_device_override(cfg, args.device)
     with open(args.modality_spec) as f:
         specs = {m["stype"]: m for m in yaml.safe_load(f)["modalities"]}
     spec = specs[args.modality_name]

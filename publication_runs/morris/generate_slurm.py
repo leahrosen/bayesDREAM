@@ -558,21 +558,37 @@ def main() -> None:
         #    exposes ALL 8 GPUs to every process by default -- torch/ROCm
         #    picks device 0 unless told otherwise, so without this EVERY
         #    concurrent task would pile onto the same physical GPU instead
-        #    of spreading across the node's 8. HIP_VISIBLE_DEVICES is the
-        #    ROCm analogue of CUDA_VISIBLE_DEVICES (python_env_gpu is
-        #    bayesdream_rocm); ROCR_VISIBLE_DEVICES set alongside it as a
-        #    fallback for older ROCm builds that don't honor the HIP_ name.
-        #    Round-robins gpu_idx = task_index % GPUS_PER_NODE across the
-        #    tasklist, so this only actually spreads tasks 1:1 across
-        #    distinct GPUs when concurrency <= GPUS_PER_NODE (true for every
-        #    stage here: trans concurrency=5, permutation/recapitulation
-        #    concurrency=min(n_tasks, 8)).
+        #    of spreading across the node's 8.
+        #    Previously done via HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES
+        #    (restricting each subprocess's device *visibility*, so it saw
+        #    only its assigned GPU as device 0) -- confirmed BROKEN on
+        #    Dardel 2026-08-15: 01d_ntc_packed.sh's 5 masked, concurrently-
+        #    launched fit_ntc tasks left 4/5 silently stalled with ZERO
+        #    forward progress (no output past the first import warning) for
+        #    the full 24h wall-time limit, node CPU/RAM were not the
+        #    bottleneck (128 cores available, only 80 requested; node RAM
+        #    far exceeds 5x fit_ntc's footprint), and only the one task that
+        #    happened to win some device-context race ran to completion
+        #    cleanly. A manual interactive test on the same cluster using
+        #    EXPLICIT torch.device(f'cuda:{i}') addressing -- i.e. every
+        #    process keeps full visibility of all 8 GPUs and just picks its
+        #    own index -- parallelized cleanly across the node. Switched to
+        #    that: no masking env vars, instead pass --device cuda:{gpu_idx}
+        #    on each task's command line (consumed by
+        #    config_utils.apply_device_override via each run_*.py script's
+        #    --device flag, which overrides cfg['model']['device'] before
+        #    bayesDREAM construction -- no bayesDREAM code change needed,
+        #    core.py already does torch.device(device) on whatever string
+        #    it's given). Round-robins gpu_idx = task_index % GPUS_PER_NODE
+        #    across the tasklist, so this only actually spreads tasks 1:1
+        #    across distinct GPUs when concurrency <= GPUS_PER_NODE (true
+        #    for every stage here: trans concurrency=5, permutation/
+        #    recapitulation concurrency=min(n_tasks, 8)).
         exports = (
             f"OMP_NUM_THREADS={cpus} OPENBLAS_NUM_THREADS={cpus} MKL_NUM_THREADS={cpus} "
-            f"VECLIB_MAXIMUM_THREADS={cpus} NUMEXPR_NUM_THREADS={cpus} "
-            f"HIP_VISIBLE_DEVICES={gpu_idx} ROCR_VISIBLE_DEVICES={gpu_idx}"
+            f"VECLIB_MAXIMUM_THREADS={cpus} NUMEXPR_NUM_THREADS={cpus}"
         )
-        return f"env {exports} {cmd}"
+        return f"env {exports} {cmd} --device cuda:{gpu_idx}"
 
     def write_packed_gpu_job(step_name: str, job_name: str, commands: list, cpus: int,
                               auto_requeue_on_timeout: bool = True) -> str:
