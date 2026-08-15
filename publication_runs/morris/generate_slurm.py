@@ -344,7 +344,7 @@ def main() -> None:
             "guide_target": paths["guide_target"],
         }
 
-    def render_cis_stage_config(gene: str, label: str, exclude_guides: list, data_block_override: dict, ntc_dir, filename_suffix: str) -> Path:
+    def render_cis_stage_config(gene: str, label: str, exclude_guides: list, data_block_override: dict, ntc_dir, filename_suffix: str, force: bool = False) -> Path:
         # Deferred (cis_gene NOT in model:) -- add_cis_gene() commits, same
         # mechanism as Domingo, now that bayesDREAM's high-MOI mode supports
         # it directly. Shared by three callers with different
@@ -358,11 +358,21 @@ def main() -> None:
         # sum_factor_cis_block's comment above); subset_per_gene.py just carries
         # it through unchanged into full/meta.csv and cis_only/meta.csv. The real
         # cis/cis_sweep fit applies adjust_ntc_sum_factor (sum_factor_cis_block).
+        # force=True is used ONLY for a subset of sweep_genes whose cis fit hit
+        # core.py's "low NTC expression (log2 < -1)" guard on 2026-08-15 --
+        # these are secondary sweep genes (fit_cis only, no trans modeling), so
+        # we'd rather still get a point estimate and filter unreliable ones
+        # manually downstream than drop them from the sweep entirely. NOT set
+        # for primary_genes, whose cis fit feeds the full trans pipeline and
+        # should keep failing loudly on low expression.
+        cis_fit_args = {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}
+        if force:
+            cis_fit_args["force"] = True
         overrides = {
             "model": {"label": label, "device": "cpu", "exclude_guides": exclude_guides},
             "data": data_block_override,
             "cis_gene": gene,
-            "cis": {"fit": {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}, "save": True},
+            "cis": {"fit": cis_fit_args, "save": True},
         }
         if filename_suffix != "subset_input":
             overrides["sum_factor"] = sum_factor_cis_block
@@ -373,8 +383,8 @@ def main() -> None:
         write_yaml(cis_cfg_path, cis_bd_cfg)
         return cis_cfg_path
 
-    def render_cis_config(gene: str, label: str, exclude_guides: list, ntc_dir: str) -> Path:
-        return render_cis_stage_config(gene, label, exclude_guides, subset_data_block(label, "cis_only"), ntc_dir, "cis")
+    def render_cis_config(gene: str, label: str, exclude_guides: list, ntc_dir: str, force: bool = False) -> Path:
+        return render_cis_stage_config(gene, label, exclude_guides, subset_data_block(label, "cis_only"), ntc_dir, "cis", force=force)
 
     def cis_sbatch_step(gene: str, cis_cfg_path: Path) -> SbatchStep:
         return SbatchStep(
@@ -667,7 +677,7 @@ def main() -> None:
     config_paths = []
     for gene in sweep_genes:
         label = f"{label_prefix}_{gene}"
-        cis_cfg_path = render_cis_config(gene, label, sweep_exclude_guides[gene], ntc_shared_dir)
+        cis_cfg_path = render_cis_config(gene, label, sweep_exclude_guides[gene], ntc_shared_dir, force=True)
         config_paths.append(str(cis_cfg_path))
     sweep_configs_list.write_text("\n".join(config_paths) + "\n")
 
