@@ -367,8 +367,18 @@ print(f"needs force=True: {sorted(force_genes)}")
 # (loading the SHARED fit, with `mask_features=True` so a gene/feature that
 # happened to get filtered out of *this* small per-gene subset — e.g. by
 # zero-count filtering after cell subsetting — doesn't hard-error, just
-# falls back to a neutral `alpha_y`) -> `add_cis_gene()` -> sum-factor
-# adjustment -> `fit_cis()`.
+# falls back to a neutral `alpha_y`; and `lean=True`, since nothing in this
+# vignette ever reads a per-draw credible interval out of
+# `posterior_samples_ntc` — every use, here and inside the library's own
+# `plot_xy_data`, is a plain `.mean(dim=0)` point estimate. `lean=True`
+# collapses that dict to medians + `_lower`/`_upper` siblings instead of
+# keeping the full `[samples, technical_groups, features]` tensors — the
+# dominant cost of `posterior_samples_ntc_gene.pt` at real dataset sizes.
+# **Not** used below for `load_cis_fit()` — see the `fit_trans` vignette,
+# which loads a saved cis fit and calls `plot_xy_data()` on it; that plot
+# may want genuine per-cell/guide uncertainty from `posterior_samples_cis`,
+# unlike the NTC case here) -> `add_cis_gene()` -> sum-factor adjustment ->
+# `fit_cis()`.
 #
 # **Caution**: `set_technical_groups()` renumbers batches via
 # `groupby(covariates).ngroup()` on *whatever's in this subset's `meta`*.
@@ -395,7 +405,7 @@ def fit_one_cis_gene(gene: str, niters: int, force: bool = False, verbose: bool 
 
     model = bayesDREAM(**kwargs)
     model.set_technical_groups(["batch"])
-    model.load_ntc_fit(input_dir=NTC_SHARED_DIR, mask_features=True)
+    model.load_ntc_fit(input_dir=NTC_SHARED_DIR, mask_features=True, lean=True)
     model.add_cis_gene(gene)
     model.adjust_ntc_sum_factor(covariates=["batch"])
     model.fit_cis(sum_factor_col="sum_factor_adj", tolerance=0, niters=niters, force=force)
@@ -468,7 +478,7 @@ _profile_worker_src = textwrap.dedent(f"""
 
     model = bayesDREAM(**kwargs)
     model.set_technical_groups(["batch"])
-    model.load_ntc_fit(input_dir={NTC_SHARED_DIR!r}, mask_features=True)
+    model.load_ntc_fit(input_dir={NTC_SHARED_DIR!r}, mask_features=True, lean=True)
     model.add_cis_gene(gene)
     model.adjust_ntc_sum_factor(covariates=["batch"])
     model.fit_cis(sum_factor_col="sum_factor_adj", tolerance=0, niters=niters, force=force)
@@ -508,7 +518,12 @@ print(f"\nRequesting {CIS_CORES} core(s) per array task "
 # - `publication_runs/common/run_cis_deferred.py` — the per-gene driver
 #   (init without `cis_gene` -> `load_ntc_fit(mask_features=True)` ->
 #   `add_cis_gene()` -> sum-factor adjustment -> `fit_cis()` -> save; exactly
-#   the sequence `fit_one_cis_gene()` above just ran inline).
+#   the sequence `fit_one_cis_gene()` above just ran inline). Its
+#   `load_ntc_fit()` call is hard-coded (`mask_features=True`, no `lean=`
+#   passthrough) — unlike this notebook's own `fit_one_cis_gene()`, which
+#   passes `lean=True` (see its docstring above), the array job submitted
+#   through this script doesn't get that memory saving; not something this
+#   vignette can change without editing shared pipeline code.
 # - `publication_runs/common/slurm/sbatch_blocks.py`'s `SbatchArray` — the
 #   SLURM header builder (same Dardel conventions: `shared` partition sized
 #   by `--cpus-per-task` alone, `%N` throttles concurrency).

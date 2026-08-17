@@ -3670,7 +3670,7 @@ def plot_negbinom_xy(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
-    color_by: Union[str, List[str]] = 'technical_group',
+    color_by: Optional[Union[str, List[str]]] = 'technical_group',
     ntc_x_offset: Optional[float] = None,
     ntc_y_offset: Optional[float] = None,
     hill_color: str = 'black',
@@ -3689,7 +3689,7 @@ def plot_negbinom_xy(
 
     Parameters (selected)
     ---------------------
-    color_by : str or list of two str
+    color_by : str, list of two str, or None
         What to color smoothed lines by. Options:
         - ``'technical_group'`` (default): one line per cell-line / technical group
         - ``'targeting'``: two lines — NTC vs all targeting cells
@@ -3697,6 +3697,7 @@ def plot_negbinom_xy(
         - A **list of two** values (e.g. ``['technical_group', 'targeting']``): cross-product
           of two groupings. The first determines hue; the second determines shade — NTC gets
           a lighter tint of the group colour, Targeting gets the full colour.
+        - ``None``: no grouping — a single ungrouped ``'All'`` line in one colour.
 
     Parameters
     ----------
@@ -3747,7 +3748,7 @@ def plot_negbinom_xy(
 
     # Forward any extra meta columns referenced in color_by into df_data now,
     # before the DataFrame is built, so that the min_counts filter applies to them too.
-    _cb_items = [color_by] if isinstance(color_by, str) else list(color_by)
+    _cb_items = [] if color_by is None else ([color_by] if isinstance(color_by, str) else list(color_by))
     _SPECIAL_CB = {'technical_group', 'targeting'}
     for _cb in _cb_items:
         if _cb in _SPECIAL_CB or _cb in df_data:
@@ -3861,6 +3862,8 @@ def plot_negbinom_xy(
 
     def _resolve_grouping(cb):
         """Return list of (label, boolean_mask) for one color_by value, or None if not found."""
+        if cb is None:
+            return [('All', pd.Series(True, index=df.index))]
         if cb == 'technical_group':
             if 'technical_group_code' in df.columns:
                 return [(code_to_label[int(gc)], df['technical_group_code'] == gc)
@@ -3890,7 +3893,7 @@ def plot_negbinom_xy(
             return [(str(v), df[cb] == v) for v in uvals]
         return None  # not found
 
-    _cb_list = [color_by] if isinstance(color_by, str) else list(color_by)
+    _cb_list = [color_by] if (color_by is None or isinstance(color_by, str)) else list(color_by)
 
     if len(_cb_list) == 1:
         # ── Single grouping ──────────────────────────────────────────────────
@@ -5529,7 +5532,7 @@ def plot_xy_data(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
-    color_by: Union[str, List[str]] = 'technical_group',
+    color_by: Optional[Union[str, List[str]]] = 'technical_group',
     facet_by: Optional[Union[str, List[str]]] = None,
     expand_x_to_params: bool = False,
     expand_y_to_params: bool = False,
@@ -5647,7 +5650,7 @@ def plot_xy_data(
         value, proportion), since there's no natural log2FC transform for a
         bounded/non-count quantity. Only a vertical grey dotted line is drawn
         at x=0 to mark the NTC reference.
-    color_by : str or list of two str
+    color_by : str, list of two str, or None
         What to color smoothed lines by (default: ``'technical_group'``).
         - ``'technical_group'``: one line per cell-line / technical group (default)
         - ``'targeting'``: two lines — ``NTC`` vs ``Targeting``
@@ -5660,6 +5663,11 @@ def plot_xy_data(
           and targeting lines as the full colour (matching the classic "shades" style).
           Override any auto-generated colour via ``color_palette`` using the combined
           label ``"K562 / NTC"``, ``"K562 / Targeting"``, etc.
+        - ``None``: no grouping at all — every cell (NTC and targeting alike, all
+          technical groups pooled) is smoothed into a single ``'All'`` line in one
+          colour. Alpha-y correction is still applied per technical group under the
+          hood (that step is independent of ``color_by``); only the drawn line(s)
+          collapse to one.
         Alpha-y technical correction is always applied per technical group regardless
         of this setting.
     facet_by : str or list of str, optional
@@ -5808,6 +5816,9 @@ def plot_xy_data(
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj', only_dependent=True, ci_level=95.0)
     >>>
     >>> # ── color_by examples ─────────────────────────────────────────────────
+    >>> # No grouping at all — one line, one colour
+    >>> model.plot_xy_data('GFI1B', color_by=None)
+    >>>
     >>> # Color by NTC vs targeting instead of technical group
     >>> model.plot_xy_data('GFI1B', color_by='targeting')
     >>>
