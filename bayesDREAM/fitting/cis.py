@@ -177,7 +177,16 @@ class CisFitter:
         with pyro.plate("data_plate", N):
             log_x_true = pyro.sample( # use log2 of xtrue to allow small values of xtrue
                 "log_x_true",
-                dist.Normal(torch.log2(x_mean), sigma_mean)
+                # validate_args=False: Predictive()'s internal _guess_max_plate_nesting
+                # probe (pyro/infer/predictive.py) traces this model UNCONDITIONED, straight
+                # from the priors, purely to count plate dims -- the sampled values are
+                # discarded, never reaching posterior_samples_x. eps_x_eff_g's StudentT(df=3)
+                # and sigma/sigma_target's HalfCauchy priors are heavy-tailed with no upper
+                # clamp on 2.0**log2_x_eff_g (line ~124), so that throwaway trace can
+                # occasionally draw values extreme enough to overflow float32, producing
+                # inf/nan here and crashing the ENTIRE fit_cis() call on an assertion over
+                # values nobody uses. Same rationale as x_obs's NegativeBinomial below.
+                dist.Normal(torch.log2(x_mean), sigma_mean, validate_args=False)
             )
             x_true = pyro.deterministic("x_true", 2.0 ** log_x_true)
             mu_obs = alpha_x_used * x_true * sum_factor_tensor

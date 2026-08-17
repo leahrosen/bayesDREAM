@@ -113,7 +113,7 @@ TIME_HOURS = 24.0  # fixed everywhere, per project convention
 
 
 def _select_cis_genes(stats_csv: str, gene_use_col: str, padj_col: str, padj_threshold: float,
-                       feature_meta_path: str, primary_genes: list):
+                       feature_meta_path: str, primary_genes: list, guide_target_path: str):
     stats = pd.read_csv(stats_csv)
     sig_ids = stats.loc[stats[padj_col] < padj_threshold, gene_use_col].unique().tolist()
 
@@ -133,7 +133,26 @@ def _select_cis_genes(stats_csv: str, gene_use_col: str, padj_col: str, padj_thr
         print(f"[generate_slurm] WARNING: {len(unmapped)} padj<{padj_threshold} gene_use id(s) "
               f"not found in feature_meta, skipped: {unmapped[:10]}{'...' if len(unmapped) > 10 else ''}")
 
-    sweep_genes = [name for _gid, name in mapped if name not in set(primary_genes)]
+    candidates = [name for _gid, name in mapped if name not in set(primary_genes)]
+
+    # guide_target.csv only contains guides preprocess.py mapped to a target
+    # gene within its distance cutoff -- Morris_gRNA2target_stats.csv can
+    # flag a gene significant via a guide that fell outside that cutoff and
+    # was therefore dropped from guide_target.csv entirely. Selecting such a
+    # gene as a sweep gene leaves add_cis_gene() with zero guides to
+    # reclassify any cell into its 'cis' target -- every cell stays 'ntc',
+    # and fit_cis's independent_mu_sigma guard correctly refuses to fit
+    # (root cause of the 2026-08-17 AC004687.1 sweep failure -- 748 cells
+    # carried an AC004687.1-targeting guide per Morris_gRNA2target_stats.csv,
+    # but that guide wasn't in guide_target.csv, so 0 cells were reclassified).
+    genes_with_guide = set(pd.read_csv(guide_target_path)["target"].unique())
+    sweep_genes = [g for g in candidates if g in genes_with_guide]
+    no_guide = sorted(set(candidates) - genes_with_guide)
+    if no_guide:
+        print(f"[generate_slurm] WARNING: {len(no_guide)} sig gene(s) have no guide in "
+              f"guide_target.csv (likely outside the distance cutoff applied by preprocess.py), "
+              f"excluded from sweep_genes: {no_guide[:10]}{'...' if len(no_guide) > 10 else ''}")
+
     return sweep_genes, name_to_id
 
 
@@ -193,6 +212,7 @@ def main() -> None:
         stats_csv=paths["stats_csv"], gene_use_col=gene_sel_cfg["gene_use_col"],
         padj_col=gene_sel_cfg["padj_col"], padj_threshold=gene_sel_cfg["padj_threshold"],
         feature_meta_path=paths["feature_meta"], primary_genes=primary_genes,
+        guide_target_path=paths["guide_target"],
     )
     all_guide_names = pd.read_csv(paths["guide_meta"])["guide"].tolist()
 
