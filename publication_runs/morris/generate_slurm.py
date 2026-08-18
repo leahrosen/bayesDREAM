@@ -206,6 +206,11 @@ def main() -> None:
     comp_cfg = cfg["compensation"]
     trans_cfg = cfg["trans"]
     cis_sweep_cfg = cfg["cis_sweep"]
+    # Explicit, named exceptions to "primary genes should keep failing loudly
+    # on low NTC expression" (see render_cis_stage_config's force= docstring)
+    # -- confirmed case-by-case, not a blanket override. RUNX1 added 2026-08-18
+    # (log2 mu_ntc = -1.13 < -1 guard; confirmed acceptable to force past).
+    force_low_ntc_primary_genes = set(cis_cfg.get("force_low_ntc_primary_genes") or [])
 
     primary_genes = gene_sel_cfg["primary_genes"]
     sweep_genes, name_to_id = _select_cis_genes(
@@ -378,13 +383,14 @@ def main() -> None:
         # sum_factor_cis_block's comment above); subset_per_gene.py just carries
         # it through unchanged into full/meta.csv and cis_only/meta.csv. The real
         # cis/cis_sweep fit applies adjust_ntc_sum_factor (sum_factor_cis_block).
-        # force=True is used ONLY for a subset of sweep_genes whose cis fit hit
-        # core.py's "low NTC expression (log2 < -1)" guard on 2026-08-15 --
-        # these are secondary sweep genes (fit_cis only, no trans modeling), so
-        # we'd rather still get a point estimate and filter unreliable ones
-        # manually downstream than drop them from the sweep entirely. NOT set
-        # for primary_genes, whose cis fit feeds the full trans pipeline and
-        # should keep failing loudly on low expression.
+        # force=True is used for ALL sweep_genes (secondary genes, fit_cis only,
+        # no trans modeling -- we'd rather still get a point estimate and filter
+        # unreliable ones manually downstream than drop them from the sweep
+        # entirely, see core.py's "low NTC expression (log2 < -1)" guard) and,
+        # for primary_genes, ONLY for genes explicitly listed in config.yaml's
+        # cis.force_low_ntc_primary_genes (confirmed case-by-case -- these feed
+        # the full trans pipeline and should otherwise keep failing loudly on
+        # low expression; RUNX1 added 2026-08-18).
         cis_fit_args = {"sum_factor_col": "sum_factor_adj", "independent_mu_sigma": True}
         if force:
             cis_fit_args["force"] = True
@@ -462,7 +468,10 @@ def main() -> None:
         write_yaml(ntc_gene_cfg_path, ntc_gene_bd_cfg)
         ntc_commands.append(bd_cmd("ntc", ntc_gene_cfg_path, python_env_gpu))
 
-        cis_cfg_path = render_cis_config(gene, label, exclude_guides, this_gene_ntc_dir)
+        cis_cfg_path = render_cis_config(
+            gene, label, exclude_guides, this_gene_ntc_dir,
+            force=gene in force_low_ntc_primary_genes,
+        )
         cis_step = cis_sbatch_step(gene, cis_cfg_path)
         scripts.append((f"02_cis_{gene}.sh", cis_step.render()))
         submitted_rows.append(("cis", label, f"02_cis_{gene}.sh"))
@@ -730,6 +739,77 @@ def main() -> None:
     scripts.append(("07_cis_sweep.sh", sweep_step.render()))
     submitted_rows.append(("cis_sweep", f"{len(sweep_genes)} genes", "07_cis_sweep.sh"))
 
+    # ---------------------------------------------------------------- #
+    # 3c. compensation for sweep genes. Added 2026-08-18 -- NOT part of  #
+    #    the original sweep design (sweep genes were fit_cis-only, see   #
+    #    module docstring's "3." section). check_systematic_shift()      #
+    #    needs the FULL trans panel (same as primary genes' compensation #
+    #    -- see render_gene_cfg), which sweep genes never got (3a above  #
+    #    only ever wrote mode=cis_only for them) -- so this reuses 3a's  #
+    #    same per-gene subset_input config (config, not data, is shared; #
+    #    the raw full dataset load + add_cis_gene() classification is    #
+    #    paid again here, mode=full instead of mode=cis_only) via a new  #
+    #    array job, THEN one compensation array job reading each gene's  #
+    #    own already-completed 07_cis_sweep.sh fit + ntc_shared_dir (same #
+    #    shared ntc every sweep gene's cis fit already used -- sweep     #
+    #    genes never get their own fit_ntc, unlike primary genes).       #
+    # ---------------------------------------------------------------- #
+    subset_full_sweep_array_commands = [
+        f'CONFIG=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_subset_input_list}")',
+        f'OUTDIR=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_subset_outdirs_list}")',
+        subset_cmd("$CONFIG", "$OUTDIR", "full"),
+    ]
+    subset_full_sweep_step = SbatchArray(
+        job_name="morris_subset_full_sweep", account=account, log_dir=str(logs_dir),
+        # Same cost profile as 3a (01c_subset_sweep.sh) -- full-dataset-load +
+        # high-MOI-classification, just saving mode=full instead of cis_only.
+        time_hours=TIME_HOURS, cpus=subset_cfg["resources"]["cores"],
+        max_index=len(sweep_genes) - 1, max_concurrent=cis_sweep_cfg["array_max_concurrent"],
+        partition=partition_cpu, repo_dir=repo_dir, commands=subset_full_sweep_array_commands,
+    )
+    scripts.append(("07b_subset_full_sweep.sh", subset_full_sweep_step.render()))
+    submitted_rows.append(("subset_full_sweep", f"{len(sweep_genes)} genes", "07b_subset_full_sweep.sh"))
+
+    sweep_comp_configs_list = configs_dir / "cis_sweep_compensation_configs.txt"
+    comp_config_paths = []
+    for gene in sweep_genes:
+        label = f"{label_prefix}_{gene}"
+        cis_gene_ensembl_id = name_to_id.get(gene)
+        comp_bd_cfg = render_gene_cfg(gene, label, "cpu", sweep_exclude_guides[gene], {
+            "compensation": {
+                "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                "load_cis": {"enabled": True},
+                "args": {
+                    "exclude_cells": {
+                        "module": "compensation_exclude_cells",
+                        "function": "compute_padj_exclude_cells",
+                        "kwargs": {
+                            "stats_csv": paths["stats_csv"],
+                            "cis_gene_ensembl_id": cis_gene_ensembl_id,
+                            "padj_threshold": comp_cfg["padj_threshold"],
+                        },
+                    },
+                },
+            },
+        })
+        comp_cfg_path = configs_dir / f"{label}_compensation.yaml"
+        write_yaml(comp_cfg_path, comp_bd_cfg)
+        comp_config_paths.append(str(comp_cfg_path))
+    sweep_comp_configs_list.write_text("\n".join(comp_config_paths) + "\n")
+
+    comp_sweep_array_commands = [
+        f'CONFIG=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "{sweep_comp_configs_list}")',
+        bd_cmd("compensation", "$CONFIG", python_env_cpu),
+    ]
+    comp_sweep_step = SbatchArray(
+        job_name="morris_comp_sweep", account=account, log_dir=str(logs_dir),
+        time_hours=TIME_HOURS, cpus=comp_cfg["resources"]["cores"],
+        max_index=len(sweep_genes) - 1, max_concurrent=cis_sweep_cfg["array_max_concurrent"],
+        partition=partition_cpu, repo_dir=repo_dir, commands=comp_sweep_array_commands,
+    )
+    scripts.append(("07c_compensation_sweep.sh", comp_sweep_step.render()))
+    submitted_rows.append(("compensation_sweep", f"{len(sweep_genes)} genes", "07c_compensation_sweep.sh"))
+
     for filename, text in scripts:
         (outdir / filename).write_text(text)
         os.chmod(outdir / filename, 0o755)
@@ -796,6 +876,23 @@ def main() -> None:
         'echo -e "subset_sweep\\tall\\t$SUBSET_SWEEP_JOB\\t01c_subset_sweep.sh" >> "$TSV"',
         'SWEEP_JOB=$(sbatch --parsable --dependency=afterok:$NTC_JOB:$SUBSET_SWEEP_JOB 07_cis_sweep.sh)',
         'echo -e "cis_sweep\\tall\\t$SWEEP_JOB\\t07_cis_sweep.sh" >> "$TSV"',
+        "",
+        # Sweep compensation (added 2026-08-18, see generate_slurm.py's "3c."
+        # comment). subset_full_sweep has no dependency (rereads the raw full
+        # dataset directly, same as 01c_subset_sweep.sh). Compensation needs,
+        # PER GENE, both that gene's own full/ subset AND its own cis fit --
+        # uses aftercorr (task i depends on task i of each named array job),
+        # NOT afterok on the whole $SWEEP_JOB array, so one bad sweep gene's
+        # cis failure only blocks that ONE gene's compensation task, not all
+        # ~116. NOT VERIFIED: aftercorr isn't used anywhere else in this
+        # pipeline -- confirm with `scontrol show job $COMP_SWEEP_JOB` that
+        # per-task dependencies actually resolved as expected before trusting
+        # a full run of this stage; afterok on the whole array is the safer
+        # (but fully blocking) fallback if aftercorr doesn't behave as documented.
+        'SUBSET_FULL_SWEEP_JOB=$(sbatch --parsable 07b_subset_full_sweep.sh)',
+        'echo -e "subset_full_sweep\\tall\\t$SUBSET_FULL_SWEEP_JOB\\t07b_subset_full_sweep.sh" >> "$TSV"',
+        'COMP_SWEEP_JOB=$(sbatch --parsable --dependency=aftercorr:$SUBSET_FULL_SWEEP_JOB:$SWEEP_JOB 07c_compensation_sweep.sh)',
+        'echo -e "compensation_sweep\\tall\\t$COMP_SWEEP_JOB\\t07c_compensation_sweep.sh" >> "$TSV"',
     ]
     (outdir / "submit_all.sh").write_text("\n".join(submit_lines) + "\n")
     os.chmod(outdir / "submit_all.sh", 0o755)

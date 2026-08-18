@@ -40,10 +40,23 @@ SNP_TABLE = [
     ("SNP-457", "IKZF1"),
     ("SNP-44",  "HHEX"),
     ("SNP-288", "RUNX1"),
-    ("SNP-202", "miR-142"),
+    # "miR-142" is the locus's common name, but exclude_guides_for_cis_gene's
+    # exception check compares against cis_gene, which is always a gene
+    # SYMBOL from Morris_gRNA2target_stats.csv/feature_meta -- that symbol is
+    # AC004687.1 (miR-142 host gene), not "miR-142". Using "miR-142" here
+    # meant the exception never matched, so SNP-202 was wrongly excluded even
+    # when cis_gene='AC004687.1', wiping out all its targeting cells (cis_sweep
+    # task22 failure, 2026-08-18: "only 1 target type found in meta['target']").
+    ("SNP-202", "AC004687.1"),
     ("SNP-59",  "miR-144/451 (CRE-1)"),
     ("SNP-200", "miR-144/451 (CRE-2)"),
 ]
+# NOT YET VERIFIED: the miR-144/451 entries above have the same kind of
+# "common name, not gene symbol" risk as miR-142 did -- if that host gene is
+# ever selected as a sweep/primary cis_gene, confirm its actual symbol in
+# Morris_gRNA2target_stats.csv/feature_meta and update the feature strings
+# above the same way, rather than assuming "miR-144/451 (CRE-1/2)" already
+# matches.
 
 
 def _feature_gene(feature: str) -> str:

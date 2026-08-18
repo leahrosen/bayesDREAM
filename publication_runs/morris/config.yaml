@@ -116,6 +116,12 @@ cis:
   # "RuntimeError: expected scalar type Float but found Double" (dtype
   # mismatch in bayesDREAM/fitting/cis.py's _model_x) -- see morris/README.md.
   # Not something this config or run_cis_deferred.py can work around.
+  # Primary genes normally do NOT get force=True on the low-NTC-expression
+  # guard (see generate_slurm.py's render_cis_stage_config) -- they feed the
+  # full trans pipeline and should fail loudly by default. List a gene here
+  # ONLY after confirming (e.g. via plot_ntc_expression()) that proceeding
+  # past the guard is acceptable for it specifically.
+  force_low_ntc_primary_genes: [RUNX1]   # log2 mu_ntc = -1.13 < -1, confirmed 2026-08-18
 
 compensation:
   resources: {cores: 20}   # from real profiling, 2026-08-11
