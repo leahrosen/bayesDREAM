@@ -462,20 +462,24 @@ def compare_all_shared_cis_genes(
     *, out_dir: Optional[str] = None, close_figs: bool = True, **kwargs,
 ) -> Dict[str, pd.DataFrame]:
     """Run compare_cis_gene() for every cis gene with a completed fit_trans
-    run in *both* datasets (DatasetSpec.cis_genes). Returns {cis_gene: merged_df}.
+    run in *both* datasets (DatasetSpec.cis_genes).
+
+    Raises immediately (does not skip) if a listed cis gene's summary CSV is
+    actually missing -- DatasetSpec.cis_genes means "has a completed
+    fit_trans run", so that would be a real inconsistency to fix, not an
+    expected gap.
+
+    Returns {cis_gene: merged_df}.
     """
     shared = sorted(set(spec_a.cis_genes) & set(spec_b.cis_genes))
     print(f"Shared cis genes between {spec_a.name} and {spec_b.name}: {shared}")
     results = {}
     for g in shared:
-        try:
-            merged, fig_obs, fig_grid = compare_cis_gene(spec_a, spec_b, g, out_dir=out_dir, **kwargs)
-            results[g] = merged
-            if close_figs:
-                plt.close(fig_obs)
-                plt.close(fig_grid)
-        except FileNotFoundError as e:
-            print(f"[skip {g}] {e}")
+        merged, fig_obs, fig_grid = compare_cis_gene(spec_a, spec_b, g, out_dir=out_dir, **kwargs)
+        results[g] = merged
+        if close_figs:
+            plt.close(fig_obs)
+            plt.close(fig_grid)
     return results
 
 
@@ -566,3 +570,43 @@ def compare_cis_gene_grid(
             fig.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_{param}_pairwise_grid.png'),
                         dpi=150, bbox_inches='tight')
     return dfs, figs
+
+
+def compare_all_cis_genes_grid(
+    datasets: Optional[List[DatasetSpec]] = None, bounding_dataset: Optional[DatasetSpec] = None,
+    *, params: Optional[Iterable[str]] = None, out_dir: Optional[str] = None,
+    color_by_param: str = 'observed_log2fc', save: bool = True, close_figs: bool = True,
+) -> Dict[str, Tuple[Dict[str, pd.DataFrame], Dict[str, plt.Figure]]]:
+    """Automates compare_cis_gene_grid() across every cis gene in
+    `bounding_dataset.cis_genes` (default: the first of `datasets`, i.e.
+    Domingo). For each cis gene, uses whichever subset of `datasets`
+    actually lists it in their own cis_genes -- e.g. Morris drops out for
+    MYB/TET2, which it never fit -- and produces a 2-dataset pairwise grid
+    for those instead of a 3-way one. That drop is expected/structural, not
+    an error.
+
+    Raises immediately (does not skip) if a dataset that DOES list a given
+    cis gene turns out to be missing its summary CSV -- see
+    compare_all_shared_cis_genes()'s docstring for why.
+
+    Writes into `out_dir/<cis_gene>/`. Returns {cis_gene: (dfs_by_name, {param: figure})}.
+    """
+    from .datasets import DOMINGO, MORRIS, REPLOGLE
+    datasets = datasets or [DOMINGO, MORRIS, REPLOGLE]
+    bounding_dataset = bounding_dataset or datasets[0]
+
+    results = {}
+    for cis_gene in bounding_dataset.cis_genes:
+        participating = [s for s in datasets if cis_gene in s.cis_genes]
+        if len(participating) < 2:
+            print(f"=== {cis_gene}: only {[s.name for s in participating]} has a completed fit -- skipping ===")
+            continue
+        print(f"=== {cis_gene}: {[s.name for s in participating]} ===")
+        gene_out = os.path.join(out_dir, cis_gene) if out_dir else None
+        dfs, figs = compare_cis_gene_grid(participating, cis_gene, params=params,
+                                          out_dir=gene_out, color_by_param=color_by_param, save=save)
+        results[cis_gene] = (dfs, figs)
+        if close_figs:
+            for fig in figs.values():
+                plt.close(fig)
+    return results

@@ -594,28 +594,31 @@ def compare_pair(
 
 def compare_all_domingo_cis_genes(
     *, out_dir: str = './dose_response_plots', datasets: Optional[List[DatasetSpec]] = None,
-    bounding_dataset: Optional[DatasetSpec] = None, **kwargs,
+    bounding_dataset: Optional[DatasetSpec] = None, require_all_exports: bool = True, **kwargs,
 ) -> Dict[str, List[str]]:
     """Automate compare_datasets() across every cis gene, using whichever
-    subset of `datasets` (default: [DOMINGO, MORRIS, REPLOGLE]) actually has
-    BOTH (a) a completed fit_trans run for that gene (per each
-    DatasetSpec.cis_genes) AND (b) an actual save_model_for_plotting() export
-    on disk for it -- so GFI1B/NFE2 (all 3 fit) get a 2x3 panel once all
-    three are exported, but gracefully fall back to fewer datasets/columns
-    (rather than skipping the gene entirely) if, say, Replogle's export for
-    GFI1B doesn't exist yet: it's just dropped from that gene's panel, with
-    a printed note, and the rest proceed. TET2/MYB never get Morris at all
-    (Morris never fit these; see publication_runs/morris/config.yaml's
-    primary_genes), so they're Domingo-vs-Replogle from the start.
+    subset of `datasets` (default: [DOMINGO, MORRIS, REPLOGLE]) structurally
+    has a completed fit_trans run for that gene (per each DatasetSpec.cis_genes)
+    -- so GFI1B/NFE2 (all 3 fit) get a 2x3 panel, while TET2/MYB (Morris
+    never fit these; see publication_runs/morris/config.yaml's primary_genes)
+    are Domingo-vs-Replogle from the start. That drop is expected/structural,
+    not an error.
+
+    require_all_exports : bool
+        If True (default), raise immediately if a dataset that DOES list a
+        given cis gene in its own cis_genes is still missing its
+        save_model_for_plotting() export -- run
+        comparative.reconstruct_export(_replogle).reconstruct_and_export_all()
+        first. Pass False to instead silently drop that dataset from the
+        gene's panel (the old, pre-automation behavior, for partial/manual
+        adoption before every gene has been exported).
 
     The cis gene list iterated is `bounding_dataset.cis_genes` (default: the
     first dataset in `datasets`, i.e. Domingo) -- the dataset with the
     smallest/most tractable trans gene panel, since this is a full-model-reload
     per (dataset, gene) operation (see module docstring).
 
-    Writes into `out_dir/<cis_gene>/`. Returns {cis_gene: [genes plotted]}
-    (a cis gene is entirely absent from the result if fewer than 2 datasets
-    end up with a usable export for it).
+    Writes into `out_dir/<cis_gene>/`. Returns {cis_gene: [genes plotted]}.
     """
     from .datasets import DOMINGO, MORRIS, REPLOGLE
     datasets = datasets or [DOMINGO, MORRIS, REPLOGLE]
@@ -623,22 +626,30 @@ def compare_all_domingo_cis_genes(
 
     results = {}
     for cis_gene in bounding_dataset.cis_genes:
-        candidates = [s for s in datasets if cis_gene in s.cis_genes]
-        missing = _missing_exports(candidates, cis_gene)
-        missing_names = {spec.name for spec, _ in missing}
-        participating = [s for s in candidates if s.name not in missing_names]
-
-        if missing_names:
-            print(f"    ({cis_gene}: {sorted(missing_names)} has/have a completed fit_trans "
-                  f"but no save_model_for_plotting() export yet -- dropping from this panel)")
+        participating = [s for s in datasets if cis_gene in s.cis_genes]
         if len(participating) < 2:
-            print(f"=== {cis_gene}: only {[s.name for s in participating]} usable -- skipping ===")
+            print(f"=== {cis_gene}: only {[s.name for s in participating]} has a completed fit -- skipping ===")
             continue
+
+        missing = _missing_exports(participating, cis_gene)
+        if missing:
+            lines = "\n".join(f"  - {msg}" for _, msg in missing)
+            if require_all_exports:
+                raise FileNotFoundError(
+                    f"{cis_gene}: {len(missing)} dataset(s) have a completed fit_trans but no "
+                    f"save_model_for_plotting() export yet -- run "
+                    f"comparative.reconstruct_export(_replogle).reconstruct_and_export_all() "
+                    f"first, or pass require_all_exports=False to drop them instead:\n{lines}"
+                )
+            missing_names = {spec.name for spec, _ in missing}
+            participating = [s for s in participating if s.name not in missing_names]
+            print(f"    ({cis_gene}: {sorted(missing_names)} dropped -- no export yet)")
+            if len(participating) < 2:
+                print(f"=== {cis_gene}: only {[s.name for s in participating]} usable -- skipping ===")
+                continue
+
         print(f"=== {cis_gene}: {[s.name for s in participating]} ===")
-        try:
-            results[cis_gene] = compare_datasets(
-                participating, cis_gene, out_dir=os.path.join(out_dir, cis_gene), **kwargs,
-            )
-        except FileNotFoundError as e:
-            print(f"[skip {cis_gene}] {e}")
+        results[cis_gene] = compare_datasets(
+            participating, cis_gene, out_dir=os.path.join(out_dir, cis_gene), **kwargs,
+        )
     return results

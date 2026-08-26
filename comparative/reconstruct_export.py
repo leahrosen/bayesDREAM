@@ -166,8 +166,12 @@ def reconstruct_and_export_all(
 ) -> Dict[str, Dict[str, str]]:
     """Loop reconstruct_and_export() over every cis gene for each dataset
     (default: every gene in DatasetSpec.cis_genes for Domingo and Morris).
-    Skips (with a printed message) any (dataset, gene) whose rendered trans
-    config isn't found, rather than aborting the whole run.
+
+    Raises immediately (does not skip) if any (dataset, gene)'s rendered
+    trans config, or any file/column it references, is missing --
+    DatasetSpec.cis_genes is defined as "has a completed fit_trans run", so
+    a gene listed there with missing data is a real inconsistency to fix,
+    not an expected gap to silently paper over.
 
     Returns {dataset_name: {cis_gene: export_dir}}.
     """
@@ -178,8 +182,5 @@ def reconstruct_and_export_all(
     for name in datasets:
         results[name] = {}
         for gene in genes.get(name, []):
-            try:
-                results[name][gene] = reconstruct_and_export(name, gene, **kwargs)
-            except FileNotFoundError as e:
-                print(f"[skip {name}/{gene}] {e}")
+            results[name][gene] = reconstruct_and_export(name, gene, **kwargs)
     return results

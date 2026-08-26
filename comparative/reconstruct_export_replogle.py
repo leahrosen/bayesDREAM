@@ -200,14 +200,15 @@ def reconstruct_and_export(
 
 def reconstruct_and_export_all(genes: Optional[List[str]] = None, **kwargs) -> Dict[str, str]:
     """Loop reconstruct_and_export() over every Replogle cis gene (default:
-    REPLOGLE.cis_genes, i.e. all 7). Skips (with a printed message) any gene
-    whose raw inputs aren't found, rather than aborting the whole run.
+    REPLOGLE.cis_genes, i.e. all 7).
+
+    Raises immediately (does not skip) if any gene's raw inputs are missing
+    or fail an assertion -- REPLOGLE.cis_genes is defined as "has a
+    completed fit_trans run", so a gene listed there with missing/broken
+    data is a real inconsistency to fix, not an expected gap.
     """
     genes = genes or REPLOGLE.cis_genes
     results: Dict[str, str] = {}
     for g in genes:
-        try:
-            results[g] = reconstruct_and_export(g, **kwargs)
-        except (FileNotFoundError, AssertionError) as e:
-            print(f"[skip Replogle/{g}] {e}")
+        results[g] = reconstruct_and_export(g, **kwargs)
     return results
