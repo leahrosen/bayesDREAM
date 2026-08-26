@@ -33,6 +33,8 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 !examples/simulation_study/plot_evaluation.ipynb
+!comparative/notebooks/trans_param_comparison.ipynb
+!comparative/notebooks/dose_response_comparison.ipynb
 
 # Local scratch scripts
 examples/simulation_study/setup.sh
