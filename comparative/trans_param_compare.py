@@ -90,9 +90,13 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
       - canonical PARAM_ALIASES columns (see module docstring)
     Drops the cis gene's own row if present (is_cis_gene == True) -- it's
     not a trans feature and would otherwise show up as a spurious point.
+
+    Ambiguous symbols (see below) aside, low_memory=False avoids pandas'
+    chunked dtype inference spuriously flagging mixed-type columns on a
+    dataset with this many columns/rows (harmless but noisy DtypeWarning).
     """
     path = spec.trans_summary_path(cis_gene, modality_name)
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, low_memory=False)
 
     if spec.symbol_col not in df.columns:
         raise KeyError(
@@ -100,6 +104,28 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
             f"(columns: {list(df.columns)[:15]}...)"
         )
     df['gene_symbol'] = df[spec.symbol_col].astype(str)
+
+    # 'feature' is guaranteed unique within a dataset (save_trans_summary()
+    # enforces this at fit time -- see bayesDREAM/io/summary.py). 'gene_symbol'
+    # is NOT, whenever it's derived rather than being 'feature' itself: e.g.
+    # Replogle is indexed by Ensembl gene ID ('feature'), and a handful of
+    # genes (TBCE, HSPA14, ...) are annotated as two separate Ensembl IDs
+    # sharing one symbol -- a known segmental-duplication artifact, not a
+    # bug here. A symbol-only dataset (Domingo/Morris) has no Ensembl ID to
+    # disambiguate which locus it means, so there is no safe way to decide
+    # which of the ambiguous rows a cross-dataset match should use. Rather
+    # than silently pick one (wrong half the time) or let merge_pair's
+    # duplicate check crash the whole comparison, drop just the ambiguous
+    # symbols here -- using the dataset's OWN unique 'feature' id to detect
+    # them -- and keep everything else.
+    if spec.symbol_col != 'feature' and 'feature' in df.columns:
+        dupe_symbols = df.loc[df['gene_symbol'].duplicated(keep=False), 'gene_symbol'].unique()
+        if len(dupe_symbols):
+            n_before = len(df)
+            df = df[~df['gene_symbol'].isin(dupe_symbols)].copy()
+            print(f"[{spec.name}] dropped {len(dupe_symbols)} ambiguous gene_symbol value(s) that map "
+                  f"to >1 distinct 'feature' id in this dataset (e.g. {sorted(dupe_symbols)[:5]}) -- "
+                  f"{n_before - len(df)} row(s) excluded from cross-dataset comparison.")
 
     if 'is_cis_gene' in df.columns:
         df = df.loc[~df['is_cis_gene'].fillna(False).astype(bool)].copy()
