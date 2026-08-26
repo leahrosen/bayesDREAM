@@ -61,6 +61,24 @@ MIN_LOG2_MU_NTC_TRANS = -4.0
 _shared_cache: Dict = {}
 
 
+def _read_parquet(path: str) -> pd.DataFrame:
+    """pd.read_parquet(path, engine='fastparquet'), not the pyarrow default.
+
+    PyArrow 19.0.0 (confirmed on this cluster's pyroenv, 2026-08-26) fails to
+    read Replogle's parquet inputs with 'OSError: Repetition level histogram
+    size mismatch' -- a PyArrow-internal bug in its Parquet page-index
+    validation, reproduced identically via both pd.read_parquet's default
+    (Dataset/Scanner API) and the older pyarrow.parquet.ParquetFile.read()
+    path, so it isn't specific to one PyArrow entry point. fastparquet is a
+    separate, pure-Python/numba implementation with no shared code path, so
+    it isn't affected; confirmed working against the same file this session.
+    If PyArrow ever fixes this (or the file is rewritten with an older
+    PyArrow), this indirection can just be reverted to a plain
+    pd.read_parquet call.
+    """
+    return pd.read_parquet(path, engine='fastparquet')
+
+
 def _load_shared_inputs() -> Dict:
     """Load + cache the genome-wide inputs shared by every cis gene:
     cell_meta_full, gene_meta_full, technical_group_code mapping,
@@ -70,8 +88,8 @@ def _load_shared_inputs() -> Dict:
     if _shared_cache:
         return _shared_cache
 
-    cell_meta_full = pd.read_parquet(os.path.join(INDIR, "cell_meta_full.parquet"))
-    gene_meta_full = pd.read_parquet(os.path.join(INDIR, "gene_meta_full.parquet")).set_index("gene_id")
+    cell_meta_full = _read_parquet(os.path.join(INDIR, "cell_meta_full.parquet"))
+    gene_meta_full = _read_parquet(os.path.join(INDIR, "gene_meta_full.parquet")).set_index("gene_id")
     gene_meta_full["feature_id"] = gene_meta_full.index
     gene_meta_full["gene_symbol"] = gene_meta_full["gene_name"]
     gene_meta_full["gene_name"] = gene_meta_full.index
@@ -112,8 +130,8 @@ def _load_gene_model_inputs(gene_id: str, cell_meta_full: pd.DataFrame,
                               gene_meta_full: pd.DataFrame, keep_genes):
     """Ported verbatim from 10_bayesDREAM_fit_trans_MYB.ipynb's
     load_gene_model_inputs()."""
-    tgt = pd.read_parquet(f"{INDIR}/{gene_id}/counts.parquet").set_index("gene")
-    ntc = pd.read_parquet(f"{INDIR}/NTC_subset/counts_subset.parquet").set_index("gene")
+    tgt = _read_parquet(f"{INDIR}/{gene_id}/counts.parquet").set_index("gene")
+    ntc = _read_parquet(f"{INDIR}/NTC_subset/counts_subset.parquet").set_index("gene")
     assert tgt.index.equals(ntc.index), "gene order differs between files"
 
     mask = tgt.index.isin(keep_genes)
