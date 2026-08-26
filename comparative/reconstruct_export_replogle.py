@@ -7,9 +7,11 @@ papermill notebook (10_bayesDREAM_fit_trans_<GENE>.ipynb), not the
 publication_runs/ config system. This module instead re-derives the model
 directly from the raw parquet inputs, PORTED (not imported) from that
 notebook's own load_gene_model_inputs()/build_gene_to_id()/build_trans_model()
-functions -- verbatim except swapping the final model.fit_trans(...) call
-for model.load_trans_fit(...) (reload the already-completed posterior,
-don't re-fit).
+functions, with two deliberate deviations: the final model.fit_trans(...)
+call is swapped for model.load_trans_fit(...) (reload the already-completed
+posterior, don't re-fit), and load_ntc_fit() drops the notebook's own
+lean=True (save_model_for_plotting() needs the full NTC posterior to
+re-save it -- see reconstruct_model()'s comment on this).
 
 Also unlike Domingo/Morris, the backfilled trans_feature_summary_gene.csv is
 NOT written in place into OUTDIR/<label>/ -- that directory belongs to
@@ -189,7 +191,14 @@ def reconstruct_model(gene_symbol: str, *, device: Optional[str] = None):
         model_kwargs['device'] = str(device)
     model = bayesDREAM(**model_kwargs)
 
-    model.load_ntc_fit(input_dir=NTC_FIT, mask_features=True, lean=True)
+    # NOT lean=True (unlike the source notebook's own build_trans_model(),
+    # which only ever needs point estimates for its own summary/plotting use)
+    # -- save_model_for_plotting() below re-saves the NTC fit via
+    # save_ntc_fit(), which hard-requires the full posterior (raises
+    # ValueError on a lean-loaded modality; confirmed 2026-08-26). Costs more
+    # memory/time to load than the notebook's own lean=True call does -- see
+    # reconstruct_export.py's docstring on memory at this gene-panel scale.
+    model.load_ntc_fit(input_dir=NTC_FIT, mask_features=True)
     model.add_cis_gene(gene_id)
     model.load_cis_fit(input_dir=os.path.join(CIS_FIT, f"cis_{gene_id}"))
     model.adjust_ntc_sum_factor(covariates=["batch"])
