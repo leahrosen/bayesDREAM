@@ -11,6 +11,15 @@ functions -- verbatim except swapping the final model.fit_trans(...) call
 for model.load_trans_fit(...) (reload the already-completed posterior,
 don't re-fit).
 
+Also unlike Domingo/Morris, the backfilled trans_feature_summary_gene.csv is
+NOT written in place into OUTDIR/<label>/ -- that directory belongs to
+whoever ran the original Replogle fits, and you may only have read access
+there (confirmed via a real PermissionError, 2026-08-26). Everything this
+module writes (the summary CSV and the save_model_for_plotting() export)
+goes into REPLOGLE.save_for_plotting_dir_fn()'s directory instead (your own
+Comparative/input/ tree) -- see comparative/datasets.py's REPLOGLE.run_dir_fn
+for why that's also where trans_param_compare.py reads from for this dataset.
+
 ASSUMPTION -- please confirm before running reconstruct_and_export_all():
 10_bayesDREAM_fit_trans_MYB.ipynb is a papermill-parameterized template, and
 its 6 siblings (10_bayesDREAM_fit_trans_{GFI1B,NFE2,HHEX,RUNX1,TET2,IKZF1}.ipynb)
@@ -196,10 +205,18 @@ def reconstruct_and_export(
     gene_symbol: str, *, hill_log2fc_targets=HILL_LOG2FC_TARGETS, device: Optional[str] = None,
     force: bool = False,
 ) -> str:
-    """Full pipeline for one Replogle cis gene: reconstruct, backfill
-    trans_feature_summary_gene.csv with hill_eval's y_at_x_log2fc{...}
-    columns in place, and export for dose_response_panels.py via
-    save_model_for_plotting(). Returns the export directory.
+    """Full pipeline for one Replogle cis gene: reconstruct, write
+    trans_feature_summary_gene.csv (with hill_eval's y_at_x_log2fc{...}
+    columns) and the save_model_for_plotting() export into
+    REPLOGLE.save_for_plotting_dir_fn()'s directory. Returns that directory.
+
+    NOT backfilled in place into OUTDIR/<label>/ (unlike Domingo/Morris) --
+    that's your student's directory; you have read access (needed for
+    reconstruct_model()'s loads below) but confirmed NOT write access
+    (PermissionError, 2026-08-26) writing a summary CSV there. Everything
+    this function writes goes to your own Comparative/input/ tree instead --
+    see comparative/datasets.py's REPLOGLE.run_dir_fn for why that's also
+    where trans_param_compare.py reads from for this dataset.
 
     Checkpointed like comparative/reconstruct_export.py's version: if this
     gene's summary CSV already has every requested column and its export
@@ -211,23 +228,22 @@ def reconstruct_and_export(
     if gene_symbol not in REPLOGLE_GENE_TO_ID:
         raise KeyError(f"{gene_symbol!r} not in REPLOGLE_GENE_TO_ID -- add its Ensembl ID to "
                         "comparative/datasets.py first.")
-    label = f"papermill_{REPLOGLE_GENE_TO_ID[gene_symbol]}"
-    output_dir = os.path.join(OUTDIR, label)
     save_dir = REPLOGLE.save_for_plotting_dir_fn(gene_symbol)
 
-    if not force and is_already_backfilled(output_dir, "gene", save_dir, hill_log2fc_targets):
+    if not force and is_already_backfilled(save_dir, "gene", save_dir, hill_log2fc_targets):
         print(f"[Replogle/{gene_symbol}] already backfilled + exported -- skipping (force=True to redo)")
         return save_dir
 
     print(f"[Replogle/{gene_symbol}] reconstructing model...")
-    model, label, output_dir = reconstruct_model(gene_symbol, device=device)
+    model, label, _read_only_output_dir = reconstruct_model(gene_symbol, device=device)
 
     print(f"[Replogle/{gene_symbol}] computing summary + y_at_x_log2fc{{...}} columns...")
-    df = model.save_trans_summary(output_dir=output_dir, modality_name="gene")
+    os.makedirs(save_dir, exist_ok=True)
+    df = model.save_trans_summary(output_dir=save_dir, modality_name="gene")
     df = add_log2fc_at_columns(model, df, modality_name="gene", targets=hill_log2fc_targets)
-    csv_path = os.path.join(output_dir, "trans_feature_summary_gene.csv")
+    csv_path = os.path.join(save_dir, "trans_feature_summary_gene.csv")
     df.to_csv(csv_path, index=False)
-    print(f"[Replogle/{gene_symbol}] backfilled {csv_path}")
+    print(f"[Replogle/{gene_symbol}] wrote {csv_path}")
 
     print(f"[Replogle/{gene_symbol}] exporting for plotting -> {save_dir}")
     save_model_for_plotting(model, save_dir=save_dir)

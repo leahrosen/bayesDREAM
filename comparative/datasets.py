@@ -209,11 +209,17 @@ REPLOGLE = DatasetSpec(
     cell_line_palette=PALETTE_B,
     cis_genes=sorted(REPLOGLE_GENE_TO_ID),
     symbol_col='gene_symbol',
-    run_dir_fn=lambda g: os.path.join(REPLOGLE_OUTDIR, f'papermill_{REPLOGLE_GENE_TO_ID[g]}'),
-    # Not exported yet (save_model_for_plotting() hasn't been run for Replogle
-    # for any gene) -- this just registers the convention to follow, matching
-    # Domingo/Morris ("{dataset}_{gene}_GEX"), so dose_response_panels.py's
-    # automation works as soon as you run it once per gene.
+    # NOT REPLOGLE_OUTDIR/papermill_<id>/ (that's your student's directory --
+    # you have read access there, confirmed, but not write access, confirmed
+    # 2026-08-26 via a real PermissionError backfilling trans_feature_summary_gene.csv
+    # there). comparative/reconstruct_export_replogle.py writes the backfilled
+    # summary CSV into save_for_plotting_dir_fn()'s directory instead (your own
+    # Comparative/input/ tree, confirmed writable), so that's also where reads
+    # need to look -- run_dir_fn and save_for_plotting_dir_fn are the same
+    # directory for Replogle specifically (unlike Domingo/Morris, which back-
+    # fill in place in their own production output_dir and additionally export
+    # a copy here).
+    run_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Replogle_{g}_GEX'),
     save_for_plotting_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Replogle_{g}_GEX'),
     init_sum_factor_col='sum_factor',
     plot_sum_factor_col='sum_factor_adj',
