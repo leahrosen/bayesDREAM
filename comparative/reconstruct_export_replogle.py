@@ -59,7 +59,7 @@ if REPO_ROOT not in sys.path:
 from save_for_plotting import save_model_for_plotting  # noqa: E402
 
 from .datasets import REPLOGLE, REPLOGLE_GENE_TO_ID  # noqa: E402
-from .hill_eval import add_log2fc_at_columns, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
+from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 
 # ── Paths / constants, from 10_bayesDREAM_fit_trans_MYB.ipynb (see the
 # module-level ASSUMPTION note above) ────────────────────────────────────────
@@ -275,7 +275,13 @@ def reconstruct_and_export(
 
     print(f"[Replogle/{gene_symbol}] computing summary + y_at_x_log2fc{{...}} columns...")
     os.makedirs(save_dir, exist_ok=True)
-    df = model.save_trans_summary(output_dir=save_dir, modality_name="gene")
+    # x_ntc=get_x_ntc(model): normally redundant here (add_cis_gene() already
+    # populates the cis modality's own mu_ntc in this deferred workflow, so
+    # save_trans_summary()'s own auto-lookup already finds it) -- passed
+    # explicitly anyway for consistency with reconstruct_export.py (Domingo/
+    # Morris, where it's NOT redundant -- see that module for why) and as a
+    # defensive no-op if that auto-lookup ever fails for some other reason.
+    df = model.save_trans_summary(output_dir=save_dir, modality_name="gene", x_ntc=get_x_ntc(model))
     df = add_log2fc_at_columns(model, df, modality_name="gene", targets=hill_log2fc_targets)
     csv_path = os.path.join(save_dir, "trans_feature_summary_gene.csv")
     df.to_csv(csv_path, index=False)

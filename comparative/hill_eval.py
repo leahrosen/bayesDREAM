@@ -61,7 +61,14 @@ def is_already_backfilled(output_dir: str, modality_name: str, save_dir: str,
         cols = set(pd.read_csv(csv_path, nrows=0).columns)
     except Exception:
         return False
-    needed = {f'y_at_{tag_for_log2fc(t)}_median' for t in targets}
+    # 'observed_log2fc': not a hill_eval column, but save_trans_summary()'s
+    # own compute_log2fc_params gets silently auto-disabled (no error) if
+    # x_ntc isn't available -- confirmed 2026-08-26 for the eager-cis_gene
+    # reconstruction path (Domingo/Morris) before reconstruct_export.py
+    # started passing x_ntc explicitly. Checking for it here means CSVs
+    # backfilled before that fix get correctly detected as incomplete and
+    # redone, not silently skipped forever.
+    needed = {f'y_at_{tag_for_log2fc(t)}_median' for t in targets} | {'observed_log2fc'}
     if not needed.issubset(cols):
         return False
 

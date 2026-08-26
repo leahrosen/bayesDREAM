@@ -55,7 +55,7 @@ from config_utils import (  # noqa: E402
 from save_for_plotting import save_model_for_plotting  # noqa: E402
 
 from .datasets import DatasetSpec, DOMINGO, MORRIS  # noqa: E402
-from .hill_eval import add_log2fc_at_columns, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
+from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 
 _SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS}
 _DATASET_DIRNAME = {'Domingo': 'domingo', 'Morris': 'morris'}
@@ -185,7 +185,17 @@ def reconstruct_and_export(
     model, output_dir, modality_name = reconstruct_model(dataset_name, cis_gene, spec, cfg, device=device)
 
     print(f"[{dataset_name}/{cis_gene}] computing summary + y_at_x_log2fc{{...}} columns...")
-    df = model.save_trans_summary(output_dir=output_dir, modality_name=modality_name)
+    # x_ntc=get_x_ntc(model): save_trans_summary()'s own auto-lookup only
+    # tries the cis modality's posterior_samples_ntc['mu_ntc'] -- populated by
+    # add_cis_gene()'s extraction step, which never runs here (cis_gene is set
+    # EAGERLY at construction via build_model_from_config(), not deferred).
+    # Confirmed 2026-08-26: without this, x_ntc silently stays None,
+    # compute_log2fc_params gets auto-disabled, and observed_log2fc (+ every
+    # other "vs NTC" column) never gets computed at all -- no error, just a
+    # missing column discovered later at merge time. get_x_ntc() has the
+    # right fallback (median fitted x_true among NTC cells) for exactly this
+    # eager-cis_gene case.
+    df = model.save_trans_summary(output_dir=output_dir, modality_name=modality_name, x_ntc=get_x_ntc(model))
     df = add_log2fc_at_columns(model, df, modality_name=modality_name, targets=hill_log2fc_targets)
     csv_path = os.path.join(output_dir, f'trans_feature_summary_{modality_name}.csv')
     df.to_csv(csv_path, index=False)
