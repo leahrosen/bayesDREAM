@@ -210,7 +210,11 @@ REPLOGLE = DatasetSpec(
     cis_genes=sorted(REPLOGLE_GENE_TO_ID),
     symbol_col='gene_symbol',
     run_dir_fn=lambda g: os.path.join(REPLOGLE_OUTDIR, f'papermill_{REPLOGLE_GENE_TO_ID[g]}'),
-    save_for_plotting_dir_fn=None,  # not exported for plotting yet; add if/when run
+    # Not exported yet (save_model_for_plotting() hasn't been run for Replogle
+    # for any gene) -- this just registers the convention to follow, matching
+    # Domingo/Morris ("{dataset}_{gene}_GEX"), so dose_response_panels.py's
+    # automation works as soon as you run it once per gene.
+    save_for_plotting_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Replogle_{g}_GEX'),
     init_sum_factor_col='sum_factor',
     plot_sum_factor_col='sum_factor_adj',
     force_single_cell_line='CRISPRi',

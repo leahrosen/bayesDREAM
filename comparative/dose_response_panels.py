@@ -1,8 +1,15 @@
 """
-Per-gene dose-response curve panels, comparing two (or more) fitted
-bayesDREAM models -- a generalized, dataset-agnostic version of the original
+Per-gene dose-response curve panels, comparing two OR MORE fitted bayesDREAM
+models -- a generalized, dataset-agnostic version of the original
 GEX_comp_Doming_Morris.ipynb / compare_models.py (Domingo vs Morris, GFI1B
 only, hardcoded paths).
+
+Panel shape auto-adapts to however many datasets have a completed fit for a
+given cis gene: 2 datasets -> 2x2 panel, 3 datasets -> 2x3 panel, etc. Row 0
+is each dataset standalone (its own data + its own curve); row 1 is each
+dataset's own data + own curve again, with every *other* available dataset's
+curve overlaid on top (so for 3 datasets, row 1 shows up to 2 extra curves
+per subplot). See `make_panel`.
 
 Prerequisites
 -------------
@@ -17,17 +24,18 @@ Replogle is not the intended use -- see trans_param_compare.py for that).
 Quick start
 -----------
     from comparative.datasets import DOMINGO, MORRIS
-    from comparative.dose_response_panels import compare_pair
+    from comparative.dose_response_panels import compare_datasets
 
-    compare_pair(DOMINGO, MORRIS, cis_gene='GFI1B', out_dir='./dose_response_plots')
+    compare_datasets([DOMINGO, MORRIS], cis_gene='GFI1B', out_dir='./dose_response_plots')
 
-To compare all three datasets pairwise for a gene all three have exported::
+Or all three datasets in one panel per gene, for a cis gene all three have exported::
 
     from comparative.datasets import DOMINGO, MORRIS, REPLOGLE
-    from comparative.dose_response_panels import compare_pair
-    from itertools import combinations
-    for a, b in combinations([DOMINGO, MORRIS, REPLOGLE], 2):
-        compare_pair(a, b, cis_gene='GFI1B', out_dir='./dose_response_plots')
+    compare_datasets([DOMINGO, MORRIS, REPLOGLE], cis_gene='GFI1B', out_dir='./dose_response_plots')
+
+To automate this across every one of Domingo's cis genes -- using whichever
+subset of {Domingo, Morris, Replogle} actually has a completed fit for each
+one (see `DatasetSpec.cis_genes`) -- see `compare_all_domingo_cis_genes()`.
 """
 
 import os
@@ -39,6 +47,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 from bayesDREAM import bayesDREAM
+from bayesDREAM.plotting.xy_plots import predict_hill_from_summary_row
 from .datasets import DatasetSpec
 
 
@@ -167,7 +176,7 @@ def allsig_copy(summary: pd.DataFrame) -> pd.DataFrame:
 # ── Panel plotting ────────────────────────────────────────────────────────
 
 def _plot_into(model, goi, ax, spec: DatasetSpec, sum_factor_col: str,
-                mark_params, ref_df=None, ref_spec: Optional[DatasetSpec] = None,
+                mark_params, fdr_df: Optional[pd.DataFrame] = None,
                 show_hill_function: bool = True):
     kw = dict(
         show_hill_function=show_hill_function,
@@ -180,52 +189,132 @@ def _plot_into(model, goi, ax, spec: DatasetSpec, sum_factor_col: str,
         hill_color=spec.color,
         hill_label=spec.name,
     )
-    ref_kwargs = {}
-    if ref_df is not None and ref_spec is not None:
-        ref_kwargs = dict(reference_df=ref_df, ref_color=ref_spec.color, ref_label=ref_spec.name)
-    model.plot_xy_data(goi, mark_params=mark_params, ax=ax, **kw, **ref_kwargs)
+    if fdr_df is not None:
+        # fdr_df (as opposed to reference_df) only overrides which FDR values
+        # gate THIS dataset's own curve -- it does NOT trigger plot_xy_data's
+        # built-in single reference-curve overlay (that's handled separately,
+        # for any number of extra datasets, by _overlay_extra_curve below).
+        kw['fdr_df'] = fdr_df
+    model.plot_xy_data(goi, mark_params=mark_params, ax=ax, **kw)
+
+
+def _overlay_extra_curve(ax: plt.Axes, ref_row: pd.Series, spec: DatasetSpec,
+                          fdr_threshold: float = 0.05) -> bool:
+    """Draw one additional dataset's fitted Hill curve on `ax`, in log2FC
+    space, replicating plot_negbinom_xy's own 'reference curve overlay' math
+    (bayesDREAM/plotting/xy_plots.py) -- but done externally so more than one
+    extra curve can be layered onto the same ax (plot_xy_data's own
+    `reference_df` argument only accepts a single overlay per call, which
+    isn't enough once >2 datasets are being compared at once).
+
+    `ref_row` should come from an "allsig" copy of that dataset's trans
+    summary (see allsig_copy()) so the curve renders regardless of that
+    dataset's own significance -- matching the original 2-way panels' intent
+    ("show the shape even where a formal FDR call is not (yet) significant").
+
+    Returns True if a curve was actually drawn (False if the row lacked
+    x_ntc/y_ntc or all predicted y were non-positive).
+    """
+    y_ntc = float(ref_row.get('y_ntc', np.nan)) if hasattr(ref_row, 'get') else float('nan')
+    x_ntc = float(ref_row.get('x_ntc', np.nan)) if hasattr(ref_row, 'get') else float('nan')
+    if not (np.isfinite(y_ntc) and y_ntc > 0 and np.isfinite(x_ntc) and x_ntc > 0):
+        return False
+
+    x_off, y_off = np.log2(x_ntc), np.log2(y_ntc)
+    xlim = ax.get_xlim()  # current visible log2FC(x) range for this panel
+    x_abs = 2 ** (np.linspace(xlim[0], xlim[1], 2000) + x_off)
+    y_pred = predict_hill_from_summary_row(ref_row, x_abs, fdr_threshold=fdr_threshold)
+    if y_pred is None:
+        return False
+    valid = y_pred > 0
+    if not valid.any():
+        return False
+
+    ax.plot(np.log2(x_abs[valid]) - x_off, np.log2(y_pred[valid]) - y_off,
+            color=spec.color, linestyle='--', linewidth=2, alpha=0.8, label=spec.name)
+    return True
+
+
+def _lookup_row(summary_allsig: pd.DataFrame, goi: str) -> Optional[pd.Series]:
+    match = summary_allsig.loc[summary_allsig['gene_name'] == goi]
+    return match.iloc[0] if not match.empty else None
 
 
 def make_panel(
     goi: str,
-    spec_a: DatasetSpec, model_a, summary_a_allsig: pd.DataFrame, sfcol_a: str,
-    spec_b: DatasetSpec, model_b, summary_b_allsig: pd.DataFrame, sfcol_b: str,
-    *, cis_gene: str, show_param_markers: bool = True, figsize=(9, 6),
+    specs: List[DatasetSpec], models: list, summaries_allsig: List[pd.DataFrame], sfcols: List[str],
+    *, cis_gene: str, show_param_markers: bool = True, fdr_threshold: float = 0.05,
+    figsize_per: Tuple[float, float] = (3.6, 3.0),
 ) -> Tuple[plt.Figure, Tuple[float, float]]:
-    """2x2 panel: [A standalone, B standalone] / [A + B curve, B + A curve].
-    show_param_markers controls whether standalone panels draw the fitted
-    parameter markers (EC50/inflection/etc as small annotated lines) -- set
-    False if the marker lines get visually confused with the dataset-colour
-    curves (e.g. when using unfamiliar new dataset colours).
+    """2xN panel (N = len(specs)): row 0 is each dataset standalone (own data
+    + own curve, with fitted-parameter markers if show_param_markers); row 1
+    is each dataset's own data + own curve again, with every *other*
+    dataset's curve overlaid on top (so for N=3, up to 2 extra curves per
+    row-1 subplot). For N=2 this reduces to the original 2x2 design.
+
+    show_param_markers controls whether row-0 standalone panels draw the
+    fitted parameter markers (EC50/inflection/etc as small annotated lines)
+    -- set False if they read as confusing next to the dataset-colour curves.
     """
-    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
-    (ax_a, ax_b), (ax_ab, ax_ba) = axes
+    n = len(specs)
+    assert n >= 2, "make_panel needs at least 2 datasets to compare"
+    fig, axes = plt.subplots(2, n, figsize=(figsize_per[0] * n, figsize_per[1] * 2),
+                              constrained_layout=True, squeeze=False)
 
     mark = 'fit' if show_param_markers else False
-    _plot_into(model_a, goi, ax_a, spec_a, sfcol_a, mark_params=mark)
-    _plot_into(model_b, goi, ax_b, spec_b, sfcol_b, mark_params=mark)
-    _plot_into(model_a, goi, ax_ab, spec_a, sfcol_a, mark_params=False,
-               ref_df=summary_b_allsig, ref_spec=spec_b)
-    _plot_into(model_b, goi, ax_ba, spec_b, sfcol_b, mark_params=False,
-               ref_df=summary_a_allsig, ref_spec=spec_a)
 
-    # Unified axis limits, derived from the marker-free overlay panels so
-    # standalone-panel markers get clipped rather than expanding the view.
-    xlims = [ax_ab.get_xlim(), ax_ba.get_xlim()]
-    ylims = [ax_ab.get_ylim(), ax_ba.get_ylim()]
+    # Row 0: standalone (real per-dataset FDR gating, as usual).
+    for j in range(n):
+        _plot_into(models[j], goi, axes[0][j], specs[j], sfcols[j], mark_params=mark)
+        axes[0][j].set_title(specs[j].name)
+
+    # Row 1: dataset j's own data + own curve (force-rendered regardless of
+    # dataset j's own significance, via fdr_df=its own allsig summary -- same
+    # "always show the shape" intent as the original 2-way overlay panels),
+    # plus every other dataset's curve manually overlaid on top.
+    for j in range(n):
+        ax = axes[1][j]
+        _plot_into(models[j], goi, ax, specs[j], sfcols[j], mark_params=False,
+                   fdr_df=summaries_allsig[j])
+        overlaid_names = []
+        for k in range(n):
+            if k == j:
+                continue
+            row = _lookup_row(summaries_allsig[k], goi)
+            if row is not None and _overlay_extra_curve(ax, row, specs[k], fdr_threshold=fdr_threshold):
+                overlaid_names.append(specs[k].name)
+        title = specs[j].name if not overlaid_names else f"{specs[j].name} + {' + '.join(overlaid_names)}"
+        ax.set_title(title)
+        # Rebuild this ax's own legend from scratch: plot_xy_data already drew
+        # one internally, but the manually-added extra curves above were
+        # plotted afterwards and aren't in it yet. get_legend_handles_labels()
+        # picks up every labeled artist on the ax regardless, old and new.
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        handles, labels = ax.get_legend_handles_labels()
+        seen, h2, l2 = set(), [], []
+        for h, l in zip(handles, labels):
+            if l not in seen:
+                seen.add(l)
+                h2.append(h)
+                l2.append(l)
+        if h2:
+            ax.legend(h2, l2, fontsize=7, frameon=False)
+
+    # Unified axis limits, derived from the row-1 (fully-overlaid) panels so
+    # row-0's parameter markers get clipped rather than expanding the view.
+    xlims = [axes[1][j].get_xlim() for j in range(n)]
+    ylims = [axes[1][j].get_ylim() for j in range(n)]
     unified_x = (min(x[0] for x in xlims), max(x[1] for x in xlims))
     unified_y = (min(y[0] for y in ylims), max(y[1] for y in ylims))
     for ax in axes.ravel():
         ax.set_xlim(unified_x)
         ax.set_ylim(unified_y)
 
-    ax_a.set_title(spec_a.name)
-    ax_b.set_title(spec_b.name)
-    ax_ab.set_title(f'{spec_a.name} + {spec_b.name} curve')
-    ax_ba.set_title(f'{spec_b.name} + {spec_a.name} curve')
     fig.suptitle(f'{cis_gene} → {goi}', fontsize=11, fontweight='bold')
 
-    # Single shared legend (dedup across all four subplots' own legends).
+    # Single shared legend (dedup across all 2N subplots' own legends), then
+    # drop the per-subplot ones so it isn't shown twice.
     seen, handles, labels = set(), [], []
     for ax in axes.ravel():
         leg = ax.get_legend()
@@ -389,39 +478,48 @@ def make_density_panel(cis_gene: str, specs_and_models: List[Tuple[DatasetSpec, 
 
 # ── Top-level orchestrator ───────────────────────────────────────────────────
 
-def compare_pair(
-    spec_a: DatasetSpec, spec_b: DatasetSpec, cis_gene: str,
+def _tag(specs: List[DatasetSpec]) -> str:
+    return '_vs_'.join(s.name for s in specs)
+
+
+def compare_datasets(
+    specs: List[DatasetSpec], cis_gene: str,
     *, out_dir: str = './dose_response_plots', genes: Optional[List[str]] = None,
     show_param_markers: bool = True, device: Optional[str] = None,
-    panel_figsize=(9, 6),
+    panel_figsize_per: Tuple[float, float] = (3.6, 3.0),
 ) -> List[str]:
-    """Full pipeline: load both models for `cis_gene`, summarise, find
-    overlapping trans genes (or use `genes` if given), and write one
-    2x2 panel PNG per gene plus one guide-density panel to `out_dir`.
+    """Full pipeline for N (>=2) datasets: load all N models for `cis_gene`,
+    summarise each, find trans genes present in *every* dataset's summary
+    (or use `genes` if given), and write one 2xN panel PNG per gene plus one
+    guide-density panel to `out_dir`. Panel width auto-scales with N.
 
     Returns the list of trans genes actually plotted.
     """
-    print(f"[{spec_a.name}] loading model for {cis_gene}...")
-    model_a = load_model_for_plotting(spec_a, cis_gene, device=device)
-    print(f"[{spec_b.name}] loading model for {cis_gene}...")
-    model_b = load_model_for_plotting(spec_b, cis_gene, device=device)
+    assert len(specs) >= 2, "compare_datasets needs at least 2 datasets"
+    names = [s.name for s in specs]
+    tag = _tag(specs)
 
-    sfcol_a = resolve_sum_factor_col(spec_a, model_a)
-    sfcol_b = resolve_sum_factor_col(spec_b, model_b)
-    print(f"[{spec_a.name}] plotting sum_factor_col={sfcol_a!r}; [{spec_b.name}] sum_factor_col={sfcol_b!r}")
+    models = []
+    for spec in specs:
+        print(f"[{spec.name}] loading model for {cis_gene}...")
+        models.append(load_model_for_plotting(spec, cis_gene, device=device))
 
-    print(f"[{spec_a.name}] summarising trans fit...")
-    summary_a = model_a.save_trans_summary(compute_lfc_ci=False)
-    print(f"[{spec_b.name}] summarising trans fit...")
-    summary_b = model_b.save_trans_summary(compute_lfc_ci=False, compute_derivative_roots=False)
+    sfcols = [resolve_sum_factor_col(s, m) for s, m in zip(specs, models)]
+    for s, sf in zip(specs, sfcols):
+        print(f"[{s.name}] plotting sum_factor_col={sf!r}")
 
-    summary_a_allsig = allsig_copy(summary_a)
-    summary_b_allsig = allsig_copy(summary_b)
+    # compute_derivative_roots isn't needed for dose-response curve plotting
+    # (only for finding local optima elsewhere) -- skip it everywhere for speed.
+    summaries = []
+    for spec, model in zip(specs, models):
+        print(f"[{spec.name}] summarising trans fit...")
+        summaries.append(model.save_trans_summary(compute_lfc_ci=False, compute_derivative_roots=False))
+    summaries_allsig = [allsig_copy(s) for s in summaries]
 
     if genes is None:
-        genes_a, genes_b = set(summary_a['feature']), set(summary_b['feature'])
-        genes = sorted(genes_a & genes_b)
-    print(f"\n{spec_a.name} vs {spec_b.name} ({cis_gene}): {len(genes)} trans genes to plot")
+        gene_sets = [set(s['feature']) for s in summaries]
+        genes = sorted(set.intersection(*gene_sets))
+    print(f"\n{' vs '.join(names)} ({cis_gene}): {len(genes)} trans genes to plot")
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -430,11 +528,10 @@ def compare_pair(
     for i, goi in enumerate(genes, 1):
         print(f"  [{i}/{len(genes)}] {goi}", end='', flush=True)
         fig, unified_x = make_panel(
-            goi, spec_a, model_a, summary_a_allsig, sfcol_a,
-            spec_b, model_b, summary_b_allsig, sfcol_b,
-            cis_gene=cis_gene, show_param_markers=show_param_markers, figsize=panel_figsize,
+            goi, specs, models, summaries_allsig, sfcols,
+            cis_gene=cis_gene, show_param_markers=show_param_markers, figsize_per=panel_figsize_per,
         )
-        fig.savefig(os.path.join(out_dir, f'{cis_gene}_{spec_a.name}_vs_{spec_b.name}_{goi}_panel.png'),
+        fig.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_{goi}_panel.png'),
                     dpi=150, bbox_inches='tight')
         plt.close(fig)
         plotted.append(goi)
@@ -444,11 +541,59 @@ def compare_pair(
 
     if unified_x_all is not None:
         print("Plotting guide density panel...", end='', flush=True)
-        fig_density = make_density_panel(cis_gene, [(spec_a, model_a), (spec_b, model_b)], unified_x_all)
-        fig_density.savefig(os.path.join(out_dir, f'{cis_gene}_{spec_a.name}_vs_{spec_b.name}_guide_density.png'),
+        fig_density = make_density_panel(cis_gene, list(zip(specs, models)), unified_x_all)
+        fig_density.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_guide_density.png'),
                              dpi=150, bbox_inches='tight')
         plt.close(fig_density)
         print("  done")
 
     print(f"\nDone. {len(plotted)} panels + density plot written to {out_dir}/")
     return plotted
+
+
+def compare_pair(
+    spec_a: DatasetSpec, spec_b: DatasetSpec, cis_gene: str, **kwargs,
+) -> List[str]:
+    """Thin 2-dataset convenience wrapper around compare_datasets()."""
+    return compare_datasets([spec_a, spec_b], cis_gene, **kwargs)
+
+
+def compare_all_domingo_cis_genes(
+    *, out_dir: str = './dose_response_plots', datasets: Optional[List[DatasetSpec]] = None,
+    bounding_dataset: Optional[DatasetSpec] = None, **kwargs,
+) -> Dict[str, List[str]]:
+    """Automate compare_datasets() across every cis gene, using whichever
+    subset of `datasets` (default: [DOMINGO, MORRIS, REPLOGLE]) actually has
+    a completed fit for that gene (per each DatasetSpec.cis_genes) -- so
+    GFI1B/NFE2 (all 3 datasets) get a 2x3 panel, while TET2/MYB (Morris never
+    fit these; see publication_runs/morris/config.yaml's primary_genes) get a
+    2x2 Domingo-vs-Replogle panel automatically, with no manual per-gene setup.
+
+    The cis gene list iterated is `bounding_dataset.cis_genes` (default: the
+    first dataset in `datasets`, i.e. Domingo) -- the dataset with the
+    smallest/most tractable trans gene panel, since this is a full-model-reload
+    per (dataset, gene) operation (see module docstring).
+
+    Writes into `out_dir/<cis_gene>/`. Returns {cis_gene: [genes plotted]}.
+    Requires save_model_for_plotting() to already have been run for every
+    (dataset, cis_gene) pair encountered -- genes for which a dataset is
+    missing that export are skipped with a printed warning, not a crash.
+    """
+    from .datasets import DOMINGO, MORRIS, REPLOGLE
+    datasets = datasets or [DOMINGO, MORRIS, REPLOGLE]
+    bounding_dataset = bounding_dataset or datasets[0]
+
+    results = {}
+    for cis_gene in bounding_dataset.cis_genes:
+        participating = [s for s in datasets if cis_gene in s.cis_genes]
+        if len(participating) < 2:
+            print(f"=== {cis_gene}: only {[s.name for s in participating]} has a completed fit -- skipping ===")
+            continue
+        print(f"=== {cis_gene}: {[s.name for s in participating]} ===")
+        try:
+            results[cis_gene] = compare_datasets(
+                participating, cis_gene, out_dir=os.path.join(out_dir, cis_gene), **kwargs,
+            )
+        except FileNotFoundError as e:
+            print(f"[skip {cis_gene}] {e}")
+    return results
