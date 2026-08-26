@@ -42,6 +42,7 @@ Usage
 
 import gc
 import os
+import shutil
 import sys
 from typing import Dict, List, Optional
 
@@ -70,6 +71,28 @@ OUTDIR = os.path.join(WD, "output/fit_trans")
 MIN_LOG2_MU_NTC_TRANS = -4.0
 
 _shared_cache: Dict = {}
+
+# Exact filenames save_ntc_fit() writes for modality_name='gene' (see
+# bayesDREAM/io/save.py) -- what we're copying FROM NTC_FIT (the shared fit's
+# own directory, where its own save_ntc_fit() call originally wrote them) and
+# TO each gene's save_dir, instead of going through model.load_ntc_fit()
+# (full, non-lean) + model.save_ntc_fit() again for every gene. See
+# reconstruct_model()'s comment on load_ntc_fit(..., lean=True) for why.
+_NTC_FIT_FILES = ['alpha_y_prefit_gene.pt', 'posterior_samples_ntc_gene.pt']
+
+
+def _copy_ntc_fit(save_dir: str) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    for fname in _NTC_FIT_FILES:
+        src = os.path.join(NTC_FIT, fname)
+        if not os.path.exists(src):
+            raise FileNotFoundError(
+                f"Expected NTC fit file not found at {src!r} -- can't populate {save_dir!r} "
+                f"with a copy of it. (Checked instead of silently producing an incomplete "
+                f"export dose_response_panels.py would fail to load later.)"
+            )
+        shutil.copy2(src, os.path.join(save_dir, fname))
+    print(f"[Replogle] copied NTC fit ({', '.join(_NTC_FIT_FILES)}) -> {save_dir}")
 
 
 def _read_parquet(path: str) -> pd.DataFrame:
@@ -191,14 +214,18 @@ def reconstruct_model(gene_symbol: str, *, device: Optional[str] = None):
         model_kwargs['device'] = str(device)
     model = bayesDREAM(**model_kwargs)
 
-    # NOT lean=True (unlike the source notebook's own build_trans_model(),
-    # which only ever needs point estimates for its own summary/plotting use)
-    # -- save_model_for_plotting() below re-saves the NTC fit via
-    # save_ntc_fit(), which hard-requires the full posterior (raises
-    # ValueError on a lean-loaded modality; confirmed 2026-08-26). Costs more
-    # memory/time to load than the notebook's own lean=True call does -- see
-    # reconstruct_export.py's docstring on memory at this gene-panel scale.
-    model.load_ntc_fit(input_dir=NTC_FIT, mask_features=True)
+    # lean=True, matching the source notebook's own build_trans_model() --
+    # confirmed 2026-08-26 that loading the FULL (non-lean) NTC posterior
+    # here OOM-kills the kernel with no traceback: NTC_FIT is shared and
+    # identical across all 7 Replogle cis genes, spanning the full trans gene
+    # panel, so its full posterior is large and gets reloaded from scratch
+    # per gene. Nothing downstream in THIS function needs more than point
+    # estimates (add_cis_gene()'s extraction, hill_eval's get_x_ntc() -- just
+    # .mean()). save_model_for_plotting() is called with save_ntc=False below
+    # for exactly this reason; _copy_ntc_fit() supplies the NTC files it
+    # would otherwise have written, straight from NTC_FIT, without ever
+    # loading the full posterior into Python at all.
+    model.load_ntc_fit(input_dir=NTC_FIT, mask_features=True, lean=True)
     model.add_cis_gene(gene_id)
     model.load_cis_fit(input_dir=os.path.join(CIS_FIT, f"cis_{gene_id}"))
     model.adjust_ntc_sum_factor(covariates=["batch"])
@@ -255,7 +282,11 @@ def reconstruct_and_export(
     print(f"[Replogle/{gene_symbol}] wrote {csv_path}")
 
     print(f"[Replogle/{gene_symbol}] exporting for plotting -> {save_dir}")
-    save_model_for_plotting(model, save_dir=save_dir)
+    # save_ntc=False: this model's NTC posterior was loaded lean (see
+    # reconstruct_model()); _copy_ntc_fit() supplies the real files directly
+    # from NTC_FIT instead, without ever loading the full posterior.
+    save_model_for_plotting(model, save_dir=save_dir, save_ntc=False)
+    _copy_ntc_fit(save_dir)
 
     del model, df
     gc.collect()

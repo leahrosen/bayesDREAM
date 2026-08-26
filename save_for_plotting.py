@@ -19,7 +19,7 @@ import numpy as np
 from scipy import sparse
 
 
-def save_model_for_plotting(model, save_dir=None, verbose=True):
+def save_model_for_plotting(model, save_dir=None, verbose=True, save_ntc=True):
     """
     Save everything compare_models.py / comparative/dose_response_panels.py
     need to re-load this model.
@@ -39,6 +39,16 @@ def save_model_for_plotting(model, save_dir=None, verbose=True):
         Where to write the export. Defaults to model.output_dir/model.label.
     verbose : bool
         Print a summary of saved files.
+    save_ntc : bool
+        If False, skip model.save_ntc_fit() -- for callers whose model was
+        loaded with load_ntc_fit(lean=True) (point estimates only), which
+        save_ntc_fit() cannot re-save (raises ValueError: "was loaded with
+        load_ntc_fit(lean=True)..."). A lean load exists specifically to
+        avoid the memory cost of a full NTC posterior that may be shared
+        across many models (e.g. comparative/reconstruct_export_replogle.py's
+        NTC fit, shared across all 7 cis genes) -- forcing lean=False just to
+        satisfy this save defeats that. Such callers should instead copy the
+        NTC fit's files directly from wherever the shared fit already lives.
     """
     if save_dir is None:
         save_dir = os.path.join(model.output_dir, model.label)
@@ -132,7 +142,11 @@ def save_model_for_plotting(model, save_dir=None, verbose=True):
     # Explicit output_dir=save_dir -- these default to model.output_dir/
     # model.label, which is only the same as save_dir when save_dir was left
     # at its own default above.
-    model.save_ntc_fit(output_dir=save_dir)
+    if save_ntc:
+        model.save_ntc_fit(output_dir=save_dir)
+    elif verbose:
+        print("[SAVE] skipped save_ntc_fit (save_ntc=False) -- caller is responsible "
+              "for getting an NTC fit into this save_dir some other way.")
     model.save_cis_fit(output_dir=save_dir)
     model.save_trans_fit(output_dir=save_dir)
 
