@@ -30,6 +30,7 @@ Usage
     reconstruct_and_export_all()                        # every Domingo + Morris cis gene
 """
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -54,7 +55,7 @@ from config_utils import (  # noqa: E402
 from save_for_plotting import save_model_for_plotting  # noqa: E402
 
 from .datasets import DatasetSpec, DOMINGO, MORRIS  # noqa: E402
-from .hill_eval import add_log2fc_at_columns, HILL_LOG2FC_TARGETS  # noqa: E402
+from .hill_eval import add_log2fc_at_columns, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 
 _SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS}
 _DATASET_DIRNAME = {'Domingo': 'domingo', 'Morris': 'morris'}
@@ -67,15 +68,7 @@ def _trans_config_path(dataset_name: str, cis_gene: str, label_prefix: str) -> s
                          f'{label_prefix}_{cis_gene}_trans.yaml')
 
 
-def reconstruct_model(dataset_name: str, cis_gene: str, spec: DatasetSpec,
-                       *, label_prefix: Optional[str] = None, device: Optional[str] = None):
-    """Rebuild a fully-loaded bayesDREAM model (ntc+cis+trans posteriors) for
-    (dataset_name, cis_gene) by replaying its real <label>_trans.yaml config
-    -- backfill_trans_summary.py's exact recipe -- without re-fitting
-    anything.
-
-    Returns (model, output_dir, modality_name).
-    """
+def _load_trans_config(dataset_name: str, cis_gene: str, label_prefix: Optional[str] = None) -> dict:
     label_prefix = label_prefix or _LABEL_PREFIX[dataset_name]
     cfg_path = _trans_config_path(dataset_name, cis_gene, label_prefix)
     if not os.path.exists(cfg_path):
@@ -83,7 +76,35 @@ def reconstruct_model(dataset_name: str, cis_gene: str, spec: DatasetSpec,
             f"[{dataset_name}/{cis_gene}] no rendered trans config at {cfg_path!r} -- "
             f"has generate_slurm.py been run for this dataset/gene?"
         )
-    cfg = load_bayesdream_yaml(Path(cfg_path))
+    return load_bayesdream_yaml(Path(cfg_path))
+
+
+def _output_dir_and_modality(cfg: dict) -> tuple:
+    """Cheap peek at a loaded trans config for the (output_dir, modality_name)
+    reconstruct_model() will end up using -- without building the model --
+    so reconstruct_and_export() can check is_already_backfilled() before
+    paying for a full reconstruction. modality_name here approximates
+    build_model_from_config()'s own model.primary_modality (set from
+    model_cfg['modality_name'] if given, else 'gene') -- true for every
+    dataset config as of this writing (model_defaults.modality_name: gene
+    in both domingo/config.yaml and morris/config.yaml).
+    """
+    model_cfg = cfg.get('model') or {}
+    output_dir = os.path.join(model_cfg.get('output_dir', 'output'), model_cfg.get('label'))
+    fit_args = normalize_stage_args((cfg.get('trans') or {}).get('fit'))
+    modality_name = fit_args.get('modality_name') or model_cfg.get('modality_name') or 'gene'
+    return output_dir, modality_name
+
+
+def reconstruct_model(dataset_name: str, cis_gene: str, spec: DatasetSpec, cfg: dict,
+                       *, device: Optional[str] = None):
+    """Rebuild a fully-loaded bayesDREAM model (ntc+cis+trans posteriors) for
+    (dataset_name, cis_gene) from its already-loaded real <label>_trans.yaml
+    config (see _load_trans_config()) -- backfill_trans_summary.py's exact
+    recipe -- without re-fitting anything.
+
+    Returns (model, output_dir, modality_name).
+    """
     apply_device_override(cfg, device)
 
     model = build_model_from_config(cfg)
@@ -124,10 +145,16 @@ def reconstruct_model(dataset_name: str, cis_gene: str, spec: DatasetSpec,
 def reconstruct_and_export(
     dataset_name: str, cis_gene: str,
     *, label_prefix: Optional[str] = None, hill_log2fc_targets=HILL_LOG2FC_TARGETS,
-    device: Optional[str] = None,
+    device: Optional[str] = None, force: bool = False,
 ) -> str:
     """Full pipeline for one (dataset, cis_gene):
 
+    0. Checkpoint check: if trans_feature_summary_{modality}.csv already has
+       every requested y_at_x_log2fc{...} column AND the save_model_for_plotting()
+       export already exists, skip the whole reconstruction (this is a full
+       model reload -- expensive for Morris/Replogle's transcriptome-wide
+       panels) and return the existing export dir. Pass force=True to redo
+       it anyway (e.g. after a fit was re-run with different results).
     1. Reconstruct the model from its real trans config (see reconstruct_model()).
     2. Regenerate trans_feature_summary_{modality}.csv, add hill_eval's
        y_at_x_log2fc{...} columns, and backfill it IN PLACE into the real
@@ -137,14 +164,25 @@ def reconstruct_and_export(
        save_for_plotting_dir_fn() location (Comparative/input/<Dataset>_<gene>_GEX/),
        so comparative/dose_response_panels.py can reload it for full curve panels.
 
+    Explicitly frees the reconstructed model (del + gc.collect()) before
+    returning -- model.load_trans_fit() loads FULL posterior samples (not
+    lean point estimates) for every trans gene, which for Morris/Replogle's
+    ~20k-gene panels is large enough that leaving several of these alive
+    across a reconstruct_and_export_all() loop risks real memory pressure.
+
     Returns the save_model_for_plotting() export directory.
     """
     spec = _SPEC_BY_NAME[dataset_name]
+    cfg = _load_trans_config(dataset_name, cis_gene, label_prefix)
+    output_dir, modality_name = _output_dir_and_modality(cfg)
+    save_dir = spec.save_for_plotting_dir_fn(cis_gene)
+
+    if not force and is_already_backfilled(output_dir, modality_name, save_dir, hill_log2fc_targets):
+        print(f"[{dataset_name}/{cis_gene}] already backfilled + exported -- skipping (force=True to redo)")
+        return save_dir
 
     print(f"[{dataset_name}/{cis_gene}] reconstructing model from real trans config...")
-    model, output_dir, modality_name = reconstruct_model(
-        dataset_name, cis_gene, spec, label_prefix=label_prefix, device=device,
-    )
+    model, output_dir, modality_name = reconstruct_model(dataset_name, cis_gene, spec, cfg, device=device)
 
     print(f"[{dataset_name}/{cis_gene}] computing summary + y_at_x_log2fc{{...}} columns...")
     df = model.save_trans_summary(output_dir=output_dir, modality_name=modality_name)
@@ -153,9 +191,11 @@ def reconstruct_and_export(
     df.to_csv(csv_path, index=False)
     print(f"[{dataset_name}/{cis_gene}] backfilled {csv_path}")
 
-    save_dir = spec.save_for_plotting_dir_fn(cis_gene)
     print(f"[{dataset_name}/{cis_gene}] exporting for plotting -> {save_dir}")
     save_model_for_plotting(model, save_dir=save_dir)
+
+    del model, df
+    gc.collect()
 
     return save_dir
 

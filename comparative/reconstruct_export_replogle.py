@@ -29,6 +29,7 @@ Usage
     reconstruct_and_export_all(genes=['GFI1B'])   # just one
 """
 
+import gc
 import os
 import sys
 from typing import Dict, List, Optional
@@ -46,7 +47,7 @@ if REPO_ROOT not in sys.path:
 from save_for_plotting import save_model_for_plotting  # noqa: E402
 
 from .datasets import REPLOGLE, REPLOGLE_GENE_TO_ID  # noqa: E402
-from .hill_eval import add_log2fc_at_columns, HILL_LOG2FC_TARGETS  # noqa: E402
+from .hill_eval import add_log2fc_at_columns, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 
 # ── Paths / constants, from 10_bayesDREAM_fit_trans_MYB.ipynb (see the
 # module-level ASSUMPTION note above) ────────────────────────────────────────
@@ -175,12 +176,31 @@ def reconstruct_model(gene_symbol: str, *, device: Optional[str] = None):
 
 def reconstruct_and_export(
     gene_symbol: str, *, hill_log2fc_targets=HILL_LOG2FC_TARGETS, device: Optional[str] = None,
+    force: bool = False,
 ) -> str:
     """Full pipeline for one Replogle cis gene: reconstruct, backfill
     trans_feature_summary_gene.csv with hill_eval's y_at_x_log2fc{...}
     columns in place, and export for dose_response_panels.py via
     save_model_for_plotting(). Returns the export directory.
+
+    Checkpointed like comparative/reconstruct_export.py's version: if this
+    gene's summary CSV already has every requested column and its export
+    already exists, skips the reconstruction entirely (pass force=True to
+    redo it anyway). Also explicitly frees the model (del + gc.collect())
+    before returning -- see that module's docstring for why this matters at
+    Replogle's transcriptome-wide gene-panel scale.
     """
+    if gene_symbol not in REPLOGLE_GENE_TO_ID:
+        raise KeyError(f"{gene_symbol!r} not in REPLOGLE_GENE_TO_ID -- add its Ensembl ID to "
+                        "comparative/datasets.py first.")
+    label = f"papermill_{REPLOGLE_GENE_TO_ID[gene_symbol]}"
+    output_dir = os.path.join(OUTDIR, label)
+    save_dir = REPLOGLE.save_for_plotting_dir_fn(gene_symbol)
+
+    if not force and is_already_backfilled(output_dir, "gene", save_dir, hill_log2fc_targets):
+        print(f"[Replogle/{gene_symbol}] already backfilled + exported -- skipping (force=True to redo)")
+        return save_dir
+
     print(f"[Replogle/{gene_symbol}] reconstructing model...")
     model, label, output_dir = reconstruct_model(gene_symbol, device=device)
 
@@ -191,9 +211,11 @@ def reconstruct_and_export(
     df.to_csv(csv_path, index=False)
     print(f"[Replogle/{gene_symbol}] backfilled {csv_path}")
 
-    save_dir = REPLOGLE.save_for_plotting_dir_fn(gene_symbol)
     print(f"[Replogle/{gene_symbol}] exporting for plotting -> {save_dir}")
     save_model_for_plotting(model, save_dir=save_dir)
+
+    del model, df
+    gc.collect()
 
     return save_dir
 

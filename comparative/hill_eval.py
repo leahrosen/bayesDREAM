@@ -17,6 +17,7 @@ genome-wide comparisons (trans_param_compare.py) then just read the
 resulting y_at_..._median/lower/upper columns like any other parameter.
 """
 
+import os
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
@@ -26,6 +27,48 @@ import torch
 # Same default as the vignette -- x log2FC value(s) to evaluate the fitted
 # Hill curve at. -1.0 = the cis gene at 50% of its NTC expression.
 HILL_LOG2FC_TARGETS = (-1.0,)
+
+
+def tag_for_log2fc(x_log2fc: float) -> str:
+    """The column-name tag add_log2fc_at_columns() uses for a given
+    x_log2fc target, e.g. -1.0 -> 'x_log2fcm1'. Shared here (not just
+    inlined in add_log2fc_at_columns()) so callers checking whether a
+    summary CSV has already been backfilled -- see is_already_backfilled(),
+    used by comparative/reconstruct_export*.py for checkpointing -- use the
+    exact same naming and can't drift out of sync.
+    """
+    return f"x_log2fc{x_log2fc:+.0f}".replace("+", "p").replace("-", "m")
+
+
+def is_already_backfilled(output_dir: str, modality_name: str, save_dir: str,
+                           targets: Sequence[float] = HILL_LOG2FC_TARGETS) -> bool:
+    """True if this (dataset, cis_gene) doesn't need reconstruct_and_export()
+    run again: `output_dir`'s trans_feature_summary_{modality_name}.csv
+    already has every requested y_at_{tag}_median column from
+    add_log2fc_at_columns(), AND `save_dir` looks like a complete
+    save_model_for_plotting() export.
+
+    Only checks column presence (cheap: pandas' nrows=0 reads just the
+    header) and a couple of expected export filenames -- not that the
+    VALUES are correct. If a fit was re-run with different results, pass
+    force=True to comparative/reconstruct_export*.py's reconstruct_and_export()
+    rather than relying on this to detect that.
+    """
+    csv_path = os.path.join(output_dir, f'trans_feature_summary_{modality_name}.csv')
+    if not os.path.exists(csv_path):
+        return False
+    try:
+        cols = set(pd.read_csv(csv_path, nrows=0).columns)
+    except Exception:
+        return False
+    needed = {f'y_at_{tag_for_log2fc(t)}_median' for t in targets}
+    if not needed.issubset(cols):
+        return False
+
+    if not os.path.isdir(save_dir):
+        return False
+    required_files = ['meta_plot.csv', 'counts_plot.npz']
+    return all(os.path.exists(os.path.join(save_dir, f)) for f in required_files)
 
 
 def get_x_ntc(model) -> float:
@@ -152,7 +195,7 @@ def add_log2fc_at_columns(
     y_ntc = df["y_ntc"].values
 
     for x_log2fc in targets:
-        tag = f"x_log2fc{x_log2fc:+.0f}".replace("+", "p").replace("-", "m")
+        tag = tag_for_log2fc(x_log2fc)
 
         med, lo, hi, lfc_med, lfc_lo, lfc_hi = hill_value_at_log2fc(
             model, modality_name, x_log2fc, is_dep, y_ntc
