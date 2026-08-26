@@ -19,21 +19,29 @@ import numpy as np
 from scipy import sparse
 
 
-def save_model_for_plotting(model, verbose=True):
+def save_model_for_plotting(model, save_dir=None, verbose=True):
     """
-    Save everything compare_models.py needs to re-load this model.
+    Save everything compare_models.py / comparative/dose_response_panels.py
+    need to re-load this model.
 
-    Writes files to model.output_dir/model.label/ alongside the fitted
-    parameter files that save_ntc_fit/save_cis_fit/save_trans_fit produce.
+    Writes files to `save_dir` (default: model.output_dir/model.label,
+    alongside the fitted parameter files that save_ntc_fit/save_cis_fit/
+    save_trans_fit produce) -- pass an explicit save_dir to keep these
+    plotting-only exports out of a production run's own output directory
+    (e.g. into Comparative/input/<Dataset>_<gene>_GEX/, matching
+    comparative/datasets.py's save_for_plotting_dir_fn convention).
 
     Parameters
     ----------
     model : bayesDREAM
         A fitted model (fit_technical, fit_cis, and fit_trans all called).
+    save_dir : str, optional
+        Where to write the export. Defaults to model.output_dir/model.label.
     verbose : bool
         Print a summary of saved files.
     """
-    save_dir = os.path.join(model.output_dir, model.label)
+    if save_dir is None:
+        save_dir = os.path.join(model.output_dir, model.label)
     os.makedirs(save_dir, exist_ok=True)
 
     # ── 1. Cell metadata ────────────────────────────────────────────────────
@@ -121,10 +129,12 @@ def save_model_for_plotting(model, verbose=True):
             print(f"[SAVE] guide_assignment {model.guide_assignment.shape} → {ga_path}")
 
     # ── 5. Fitted parameters ─────────────────────────────────────────────────
-    # save_ntc_fit / save_cis_fit / save_trans_fit write to save_dir by default.
-    model.save_ntc_fit()
-    model.save_cis_fit()
-    model.save_trans_fit()
+    # Explicit output_dir=save_dir -- these default to model.output_dir/
+    # model.label, which is only the same as save_dir when save_dir was left
+    # at its own default above.
+    model.save_ntc_fit(output_dir=save_dir)
+    model.save_cis_fit(output_dir=save_dir)
+    model.save_trans_fit(output_dir=save_dir)
 
     if verbose:
         print(f"[SAVE] fitted params → {save_dir}/")
@@ -132,7 +142,12 @@ def save_model_for_plotting(model, verbose=True):
 
 
 # ── Call for each model ──────────────────────────────────────────────────────
-# Replace model_a / model_b with your actual variable names.
-
-save_model_for_plotting(model_a)
-save_model_for_plotting(model_b)
+# Paste this file's save_model_for_plotting() into your fitting session and
+# call it yourself for each fitted model, e.g.:
+#
+#   save_model_for_plotting(model_a)
+#   save_model_for_plotting(model_b, save_dir='/path/to/Comparative/input/Label_GEX')
+#
+# (Deliberately not called unconditionally at the bottom of this file -- that
+# would crash on `import save_for_plotting` with no model_a/model_b defined,
+# which comparative/reconstruct_export.py needs to do.)

@@ -21,4 +21,20 @@ Two independent workflows live here, matching two different scales of comparison
 
 ``datasets.py`` holds the shared configuration (paths, colors, palettes,
 which cis genes have completed fits) used by both.
+
+Two supporting modules feed both workflows:
+
+- ``hill_eval.py`` -- evaluates a fitted Hill curve at a given cis-gene
+  log2FC (e.g. -1.0 = 50% knockdown), with full posterior 95% CIs. Needs a
+  real model reload (posterior_samples_trans), so it's meant to be run once
+  per (dataset, cis_gene) and its result backfilled into that gene's
+  trans_feature_summary CSV -- not recomputed on every comparison. Column
+  naming matches ``examples/vignette_trans_fit_crispri.py`` exactly.
+
+- ``reconstruct_export.py`` -- automates save_model_for_plotting() +
+  hill_eval backfilling for Domingo and Morris, by replaying each cis
+  gene's real rendered ``<label>_trans.yaml`` config (the same recipe
+  ``publication_runs/common/backfill_trans_summary.py`` uses) rather than
+  re-deriving the sum-factor/data-loading logic by hand. Does not cover
+  Replogle (no rendered config there -- see its module docstring).
 """

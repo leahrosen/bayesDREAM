@@ -21,9 +21,13 @@ Or, for every cis gene shared between two datasets::
 
 Design notes
 ------------
-- The join key is always a gene *symbol* (``DatasetSpec.symbol_col`` tells
-  each dataset which raw column holds that), never the raw ``feature``
-  column -- Replogle's ``feature`` is an Ensembl gene ID.
+- The join key is the dataset's own unique identifier whenever both sides
+  have one -- 'gene_id' (Ensembl), preferred over 'gene_symbol' -- and
+  falls back to 'gene_symbol' only when at least one side lacks a 'gene_id'
+  (currently: any comparison involving Domingo, which carries no Ensembl
+  mapping at all -- see merge_pair()). Comparisons against Domingo will
+  therefore have noticeably fewer points than Morris-vs-Replogle, since
+  Domingo's own trans panel is only ~91 genes to begin with.
 - Parameter names differ slightly by function_type (additive_hill vs.
   single_hill) and across library versions (``_median`` vs ``_mean``
   suffixes). ``PARAM_ALIASES`` maps a stable "logical" parameter name to a
@@ -36,6 +40,8 @@ Design notes
 """
 
 import os
+import re
+from itertools import combinations
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -59,11 +65,20 @@ PARAM_ALIASES: Dict[str, List[str]] = {
     'Vmax_b':                  ['Vmax_b_median', 'Vmax_b_mean'],
     'inflection_a_log2fc':     ['inflection_a_log2fc_median'],
     'y_ntc':                   ['y_ntc'],
+    # From comparative/hill_eval.py's add_log2fc_at_columns() (x_log2fc=-1.0,
+    # i.e. the fitted curve's y-log2FC at 50% cis-gene knockdown) -- only
+    # present once comparative/reconstruct_export.py has backfilled a given
+    # dataset's trans_feature_summary CSV. Prefers the "_allgenes" variant
+    # (every gene, not NaN-masked by that dataset's OWN significance call)
+    # since datasets differ a lot in power -- use is_dependent/highlight_col
+    # to mark which points are independently significant instead of
+    # dropping the rest.
+    'y_log2fc_at_xm1':         ['y_at_x_log2fcm1_log2fc_median_allgenes', 'y_at_x_log2fcm1_log2fc_median'],
 }
 
 # Sensible default grid for "everything besides observed_log2fc" -- edit
 # freely per call via the `params=` argument.
-DEFAULT_GRID_PARAMS = ['full_log2fc', 'EC50_a_log2fc', 'n_a', 'Vmax_a']
+DEFAULT_GRID_PARAMS = ['full_log2fc', 'y_log2fc_at_xm1', 'EC50_a_log2fc', 'n_a', 'Vmax_a']
 
 
 def _standardize_params(df: pd.DataFrame, aliases: Dict[str, List[str]] = PARAM_ALIASES) -> pd.DataFrame:
@@ -86,7 +101,10 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
     for a given cis gene.
 
     Adds:
-      - 'gene_symbol': the cross-dataset join key (from spec.symbol_col)
+      - 'gene_symbol': a display/fallback join key (from spec.symbol_col)
+      - 'gene_id': a stable Ensembl-style identifier, when available (see
+        below) -- the PREFERRED cross-dataset join key (see merge_pair()),
+        since 'gene_symbol' can be many-to-one within a single dataset.
       - canonical PARAM_ALIASES columns (see module docstring)
     Drops the cis gene's own row if present (is_cis_gene == True) -- it's
     not a trans feature and would otherwise show up as a spurious point.
@@ -105,27 +123,51 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
         )
     df['gene_symbol'] = df[spec.symbol_col].astype(str)
 
+    # 'gene_id': a stable Ensembl-style id, if this dataset has one.
+    #   - Replogle: spec.symbol_col != 'feature' means 'feature' ITSELF is
+    #     that id (it's the Ensembl gene ID there, distinct from the symbol).
+    #   - Morris (and any dataset saved after comparative/reconstruct_export.py
+    #     backfills it): save_trans_summary() positionally attaches every
+    #     column from modality.feature_meta, so a 'gene_id' column shows up
+    #     for free whenever feature_meta carried one (Morris's does --
+    #     see CLAUDE.md's High-MOI section) -- just look for it directly,
+    #     no separate lookup file needed.
+    #   - Domingo: neither applies. No Ensembl mapping exists for this
+    #     dataset at all -- 'gene_id' stays null, and any merge involving
+    #     it falls back to 'gene_symbol' (see merge_pair()).
+    if spec.symbol_col != 'feature':
+        df['gene_id'] = df['feature'].astype(str)
+    elif 'gene_id' in df.columns:
+        df['gene_id'] = df['gene_id'].astype(str)
+    else:
+        df['gene_id'] = np.nan
+
     # 'feature' is guaranteed unique within a dataset (save_trans_summary()
     # enforces this at fit time -- see bayesDREAM/io/summary.py). 'gene_symbol'
     # is NOT, whenever it's derived rather than being 'feature' itself: e.g.
     # Replogle is indexed by Ensembl gene ID ('feature'), and a handful of
     # genes (TBCE, HSPA14, ...) are annotated as two separate Ensembl IDs
     # sharing one symbol -- a known segmental-duplication artifact, not a
-    # bug here. A symbol-only dataset (Domingo/Morris) has no Ensembl ID to
-    # disambiguate which locus it means, so there is no safe way to decide
-    # which of the ambiguous rows a cross-dataset match should use. Rather
-    # than silently pick one (wrong half the time) or let merge_pair's
-    # duplicate check crash the whole comparison, drop just the ambiguous
-    # symbols here -- using the dataset's OWN unique 'feature' id to detect
-    # them -- and keep everything else.
+    # bug here. This only matters for a SYMBOL-based merge (Domingo, which
+    # has no 'gene_id' to merge on instead) -- Morris/Replogle-vs-Replogle
+    # comparisons merge on 'gene_id' and are unaffected by this at all (see
+    # merge_pair()). Rather than silently pick one of the ambiguous rows
+    # (wrong half the time) or let merge_pair's duplicate check crash the
+    # whole comparison, drop just the ambiguous symbols here -- using the
+    # dataset's OWN unique 'feature' id to detect them -- and keep everything
+    # else.
     if spec.symbol_col != 'feature' and 'feature' in df.columns:
         dupe_symbols = df.loc[df['gene_symbol'].duplicated(keep=False), 'gene_symbol'].unique()
         if len(dupe_symbols):
-            n_before = len(df)
-            df = df[~df['gene_symbol'].isin(dupe_symbols)].copy()
-            print(f"[{spec.name}] dropped {len(dupe_symbols)} ambiguous gene_symbol value(s) that map "
-                  f"to >1 distinct 'feature' id in this dataset (e.g. {sorted(dupe_symbols)[:5]}) -- "
-                  f"{n_before - len(df)} row(s) excluded from cross-dataset comparison.")
+            n_ambig = df['gene_symbol'].isin(dupe_symbols).sum()
+            # Null out (not drop the row) -- gene_id-based merges still need
+            # these rows; only a symbol-based merge (merge_pair's fallback
+            # for datasets with no gene_id, e.g. Domingo) can't safely use them.
+            df.loc[df['gene_symbol'].isin(dupe_symbols), 'gene_symbol'] = np.nan
+            print(f"[{spec.name}] {len(dupe_symbols)} ambiguous gene_symbol value(s) map to >1 distinct "
+                  f"'feature' id in this dataset (e.g. {sorted(dupe_symbols)[:5]}) -- {n_ambig} row(s) "
+                  f"excluded from symbol-based cross-dataset comparison only (their gene_id, if any, "
+                  f"is unaffected).")
 
     if 'is_cis_gene' in df.columns:
         df = df.loc[~df['is_cis_gene'].fillna(False).astype(bool)].copy()
@@ -142,20 +184,55 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
 
 
 def merge_pair(df_a: pd.DataFrame, df_b: pd.DataFrame, name_a: str, name_b: str,
-                on: str = 'gene_symbol') -> pd.DataFrame:
-    """Inner-join two standardized trans summaries on gene symbol.
+                on: Optional[str] = None) -> pd.DataFrame:
+    """Inner-join two standardized trans summaries.
+
+    on : {'gene_id', 'gene_symbol'}, optional
+        Join key. If None (default), uses 'gene_id' (Ensembl) when BOTH
+        sides have at least one non-null value there, else falls back to
+        'gene_symbol'. 'gene_id' is preferred because 'gene_symbol' can be
+        many-to-one within a single dataset (see load_trans_summary());
+        'gene_id' avoids that entirely for any pair where both sides have
+        one (today: any pair not involving Domingo).
+
+    Rows with a null value in the chosen `on` column are excluded from
+    THIS merge only (e.g. Domingo's rows, when merging on 'gene_id'; or an
+    ambiguous-symbol row, when merging on 'gene_symbol' -- see
+    load_trans_summary()) -- not from the original DataFrames.
 
     Shared column names (parameters, 'is_dependent', etc.) get suffixed
-    ``_{name_a}`` / ``_{name_b}``; the join key itself is not suffixed.
+    ``_{name_a}`` / ``_{name_b}``; the join key itself is not suffixed. If
+    joined on 'gene_id', a single display 'gene_symbol' column is attached
+    afterward (preferring whichever side's symbol doesn't look
+    scanpy-deduplicated, e.g. 'TBCE-1' -- see bayesDREAM/modality.py).
     """
-    if df_a[on].duplicated().any():
-        dupes = df_a.loc[df_a[on].duplicated(), on].unique()[:5]
+    if on is None:
+        has_id_a = 'gene_id' in df_a.columns and df_a['gene_id'].notna().any()
+        has_id_b = 'gene_id' in df_b.columns and df_b['gene_id'].notna().any()
+        on = 'gene_id' if (has_id_a and has_id_b) else 'gene_symbol'
+
+    work_a = df_a.dropna(subset=[on])
+    work_b = df_b.dropna(subset=[on])
+
+    if work_a[on].duplicated().any():
+        dupes = work_a.loc[work_a[on].duplicated(), on].unique()[:5]
         raise ValueError(f"{name_a}: duplicated {on} values, e.g. {list(dupes)} -- cannot merge safely.")
-    if df_b[on].duplicated().any():
-        dupes = df_b.loc[df_b[on].duplicated(), on].unique()[:5]
+    if work_b[on].duplicated().any():
+        dupes = work_b.loc[work_b[on].duplicated(), on].unique()[:5]
         raise ValueError(f"{name_b}: duplicated {on} values, e.g. {list(dupes)} -- cannot merge safely.")
 
-    merged = df_a.merge(df_b, on=on, how='inner', suffixes=(f'_{name_a}', f'_{name_b}'))
+    merged = work_a.merge(work_b, on=on, how='inner', suffixes=(f'_{name_a}', f'_{name_b}'))
+
+    if on != 'gene_symbol':
+        sym_a, sym_b = f'gene_symbol_{name_a}', f'gene_symbol_{name_b}'
+        _clean = lambda s: not re.search(r'-\d+$', str(s))  # noqa: E731
+        if sym_a in merged.columns and sym_b in merged.columns:
+            merged['gene_symbol'] = [a if _clean(a) else b for a, b in zip(merged[sym_a], merged[sym_b])]
+        elif sym_a in merged.columns:
+            merged['gene_symbol'] = merged[sym_a]
+        elif sym_b in merged.columns:
+            merged['gene_symbol'] = merged[sym_b]
+
     return merged
 
 
@@ -210,7 +287,11 @@ def scatter_param(
             )
 
     keep_cols = [colA, colB]
-    if color_by and color_by in merged.columns:
+    # color_by can legitimately equal colA/colB (e.g. coloring the
+    # observed_log2fc panel itself by observed_log2fc) -- don't add it twice,
+    # or merged[keep_cols] silently returns a DataFrame instead of a Series
+    # for that column (duplicate column name), breaking everything downstream.
+    if color_by and color_by in merged.columns and color_by not in keep_cols:
         keep_cols.append(color_by)
     sub = merged[keep_cols].replace([np.inf, -np.inf], np.nan).dropna(subset=[colA, colB]).copy()
 
@@ -396,3 +477,92 @@ def compare_all_shared_cis_genes(
         except FileNotFoundError as e:
             print(f"[skip {g}] {e}")
     return results
+
+
+# ── N-way ("grid of pairwise comparisons") ───────────────────────────────────
+
+def load_all(specs: List[DatasetSpec], cis_gene: str) -> Dict[str, pd.DataFrame]:
+    """load_trans_summary() for every spec, keyed by dataset name. A missing
+    export for one dataset raises FileNotFoundError immediately (not
+    silently dropped) -- pass a smaller `specs` list if you expect that."""
+    return {s.name: load_trans_summary(s, cis_gene) for s in specs}
+
+
+def plot_pairwise_grid(
+    dfs: Dict[str, pd.DataFrame], param: str, cis_gene: str = '',
+    *, color_by_param: Optional[str] = 'observed_log2fc',
+    color_dataset: Optional[str] = None,
+    highlight_by: Optional[str] = 'is_dependent',
+    ncols: Optional[int] = None,
+    figsize_per: Tuple[float, float] = (3.8, 3.8),
+) -> plt.Figure:
+    """One scatter_param() subplot per unique pair of datasets in `dfs`
+    (e.g. 3 datasets -> 3 subplots: A-B, A-C, B-C), all for the same `param`.
+    Each pair's `on` key (gene_id vs gene_symbol) is chosen independently by
+    merge_pair() -- a pair not involving Domingo will merge on Ensembl ID,
+    so don't expect the same point count in every panel.
+
+    color_by_param/color_dataset/highlight_by are the same idea as
+    plot_param_grid(), applied per-pair -- `color_dataset` defaults to
+    whichever dataset in the pair comes first (alphabetically among the
+    pair, not globally), so it's always one of the two actually being
+    plotted in that panel.
+    """
+    names = sorted(dfs)
+    pairs = list(combinations(names, 2))
+    n = max(len(pairs), 1)
+    ncols = ncols or n
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows),
+                              constrained_layout=True, squeeze=False)
+    axes = axes.ravel()
+
+    for ax, (a, b) in zip(axes, pairs):
+        try:
+            merged = merge_pair(dfs[a], dfs[b], a, b)
+            cd = color_dataset or a
+            color_col = _col(color_by_param, cd) if color_by_param else None
+            if color_col and color_col not in merged.columns:
+                color_col = None
+            highlight_col = f'{highlight_by}_{a}' if highlight_by else None
+            if highlight_col and highlight_col not in merged.columns:
+                highlight_col = None
+            scatter_param(merged, param, a, b, ax=ax, color_by=color_col,
+                          highlight_col=highlight_col, title=f'{a} vs {b}')
+        except (KeyError, ValueError) as e:
+            ax.text(0.5, 0.5, str(e), ha='center', va='center', wrap=True, fontsize=7)
+            ax.axis('off')
+
+    for ax in axes[len(pairs):]:
+        ax.axis('off')
+
+    fig.suptitle(f'{cis_gene}: {param} (pairwise)'.strip(': '), fontsize=11)
+    return fig
+
+
+def compare_cis_gene_grid(
+    specs: List[DatasetSpec], cis_gene: str,
+    *, params: Optional[Iterable[str]] = None, out_dir: Optional[str] = None,
+    color_by_param: str = 'observed_log2fc', save: bool = True,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, plt.Figure]]:
+    """N-way version of compare_cis_gene(): load every spec's summary once,
+    then produce one pairwise-grid figure per parameter in `params`
+    (default: observed_log2fc + DEFAULT_GRID_PARAMS).
+
+    Returns (dfs_by_name, {param: figure}).
+    """
+    dfs = load_all(specs, cis_gene)
+    params = list(params) if params is not None else ['observed_log2fc'] + DEFAULT_GRID_PARAMS
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    figs = {}
+    for param in params:
+        fig = plot_pairwise_grid(dfs, param, cis_gene, color_by_param=color_by_param)
+        figs[param] = fig
+        if save and out_dir:
+            tag = '_'.join(sorted(dfs))
+            fig.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_{param}_pairwise_grid.png'),
+                        dpi=150, bbox_inches='tight')
+    return dfs, figs
