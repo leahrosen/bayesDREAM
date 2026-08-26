@@ -67,7 +67,22 @@ def is_already_backfilled(output_dir: str, modality_name: str, save_dir: str,
 
     if not os.path.isdir(save_dir):
         return False
-    required_files = ['meta_plot.csv', 'counts_plot.npz']
+    # meta_plot.csv/counts_plot.npz are written early in save_model_for_plotting()
+    # (before save_ntc_fit/save_cis_fit/save_trans_fit) -- checking only those
+    # would call an export "complete" even if it crashed partway through the
+    # actual fitted-parameter saves (confirmed: exactly this happened for
+    # Replogle/GFI1B, 2026-08-26 -- save_ntc_fit() raised after meta/counts
+    # were already on disk). Also require one file each save_ntc_fit/
+    # save_cis_fit/save_trans_fit actually writes (bayesDREAM/io/save.py) --
+    # this makes checkpointing correctly detect that partial run as
+    # incomplete, redoing it, rather than silently skipping it later with a
+    # broken export.
+    required_files = [
+        'meta_plot.csv', 'counts_plot.npz',
+        f'alpha_y_prefit_{modality_name}.pt',       # save_ntc_fit
+        'posterior_samples_cis.pt',                  # save_cis_fit
+        f'posterior_samples_trans_{modality_name}.pt',  # save_trans_fit
+    ]
     return all(os.path.exists(os.path.join(save_dir, f)) for f in required_files)
 
 
