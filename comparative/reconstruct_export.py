@@ -228,7 +228,24 @@ def reconstruct_and_export(
     # finds it on its primary (non-fallback) branch, same as Replogle. Passed
     # explicitly anyway for consistency/robustness rather than relying on
     # save_trans_summary()'s own internal auto-lookup to reach the same value.
-    df = model.save_trans_summary(output_dir=output_dir, modality_name=modality_name, x_ntc=get_x_ntc(model))
+    #
+    # compute_derivative_roots/compute_inflection/compute_lfc_ci=False: none of
+    # what this backfill actually needs -- add_log2fc_at_columns() only reads
+    # is_dependent/y_ntc off `df` and does its own Hill evaluation from
+    # posterior_samples_trans; observed_log2fc/EC50_a_log2fc/full_log2fc/n_a/
+    # Vmax_a (DEFAULT_GRID_PARAMS) are all gated by compute_log2fc_params alone,
+    # not these three. Confirmed 2026-08-27: for Domingo's 89-feature GFI1B
+    # panel, u_roots (compute_derivative_roots) was 68% of loop1's time and
+    # obs_lfc_ci+full_lfc_ci (compute_lfc_ci) another 30%, for columns nothing
+    # downstream reads -- for Morris/Replogle's ~11-20k-feature panels this is
+    # the difference between minutes and the better part of an hour. Losing
+    # compute_lfc_ci just means observed_log2fc_lower/upper fall back to the
+    # posterior mean instead of a real CI; trans_param_compare.py never reads
+    # those anyway (PARAM_ALIASES['observed_log2fc'] has no _lower/_upper).
+    df = model.save_trans_summary(
+        output_dir=output_dir, modality_name=modality_name, x_ntc=get_x_ntc(model),
+        compute_derivative_roots=False, compute_inflection=False, compute_lfc_ci=False,
+    )
     df = add_log2fc_at_columns(model, df, modality_name=modality_name, targets=hill_log2fc_targets)
     csv_path = os.path.join(output_dir, f'trans_feature_summary_{modality_name}.csv')
     df.to_csv(csv_path, index=False)

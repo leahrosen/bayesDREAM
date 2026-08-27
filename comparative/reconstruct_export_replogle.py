@@ -281,7 +281,16 @@ def reconstruct_and_export(
     # explicitly anyway for consistency with reconstruct_export.py (Domingo/
     # Morris, where it's NOT redundant -- see that module for why) and as a
     # defensive no-op if that auto-lookup ever fails for some other reason.
-    df = model.save_trans_summary(output_dir=save_dir, modality_name="gene", x_ntc=get_x_ntc(model))
+    #
+    # compute_derivative_roots/compute_inflection/compute_lfc_ci=False: see
+    # the matching comment in reconstruct_export.py -- none of what
+    # add_log2fc_at_columns()/DEFAULT_GRID_PARAMS need comes from these, and
+    # skipping them is the difference between minutes and the better part of
+    # an hour for a ~20k-gene panel.
+    df = model.save_trans_summary(
+        output_dir=save_dir, modality_name="gene", x_ntc=get_x_ntc(model),
+        compute_derivative_roots=False, compute_inflection=False, compute_lfc_ci=False,
+    )
     df = add_log2fc_at_columns(model, df, modality_name="gene", targets=hill_log2fc_targets)
     csv_path = os.path.join(save_dir, "trans_feature_summary_gene.csv")
     df.to_csv(csv_path, index=False)
