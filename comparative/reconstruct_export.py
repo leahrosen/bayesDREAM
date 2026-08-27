@@ -103,26 +103,63 @@ def reconstruct_model(dataset_name: str, cis_gene: str, spec: DatasetSpec, cfg: 
     config (see _load_trans_config()) -- backfill_trans_summary.py's exact
     recipe -- without re-fitting anything.
 
+    Builds DEFERRED (cis_gene omitted from the constructor, committed via
+    add_cis_gene() below) even though the real rendered trans.yaml sets
+    model.cis_gene eagerly. That's correct for the ORIGINAL fit -- fit_trans()
+    itself never needed add_cis_gene()'s NTC-posterior extraction -- but
+    replaying it here, on a model we're about to load_ntc_fit() onto, is
+    lossy. Eager construction carves the cis gene out of the primary modality
+    (and into the 'cis' modality) at __init__ time, BEFORE load_ntc_fit()
+    below reloads the shared/per-gene NTC posterior file -- which DOES
+    include the cis gene's row (it's the full untrimmed panel saved by the
+    deferred fit_ntc stage; see publication_runs/common/run_ntc.py). With no
+    'cis' feature slot to place that row into, feature-alignment-on-load
+    silently drops it, so the cis gene's mu_ntc/o_x/alpha_x never make it
+    into the reconstructed model even though they're sitting right there in
+    the file. Building deferred and calling add_cis_gene() AFTER
+    load_ntc_fit() -- the exact recipe publication_runs/common/
+    run_cis_deferred.py used for the real fit_cis stage -- extracts that row
+    into the 'cis' modality instead of discarding it.
+
+    Confirmed 2026-08-27 as the real root cause of hill_eval.get_x_ntc()'s
+    median-x_true fallback firing for every Domingo/Morris gene. It is NOT
+    "Domingo's fit_ntc is deferred, Morris's is eager": both datasets' own
+    fit_ntc/fit_cis stages already use deferred+add_cis_gene() (Morris's
+    primary genes just get their OWN per-gene ntc fit instead of one shared
+    across all genes -- see morris/generate_slurm.py's module docstring).
+    What was eager, for both, was this reconstruction script's replay of the
+    trans-stage config.
+
     Returns (model, output_dir, modality_name).
     """
     apply_device_override(cfg, device)
 
-    model = build_model_from_config(cfg)
+    cfg_for_build = dict(cfg)
+    model_cfg = dict(cfg.get('model') or {})
+    model_cfg.pop('cis_gene', None)
+    cfg_for_build['model'] = model_cfg
 
-    model_cfg = cfg.get('model') or {}
+    model = build_model_from_config(cfg_for_build)
+
     output_dir = os.path.join(model_cfg.get('output_dir', 'output'), model_cfg.get('label'))
     trans_cfg = cfg.get('trans') or {}
     ntc_cfg = cfg.get('ntc') or cfg.get('technical') or {}
-
-    if is_enabled(trans_cfg.get('load_ntc', trans_cfg.get('load_technical')), default=True):
-        model.load_ntc_fit(**normalize_stage_args(trans_cfg.get('load_ntc') or trans_cfg.get('load_technical')))
-    if is_enabled(trans_cfg.get('load_cis'), default=True):
-        model.load_cis_fit(**normalize_stage_args(trans_cfg.get('load_cis')))
 
     if 'technical_group_code' not in model.meta.columns:
         covariates = ntc_cfg.get('set_technical_groups')
         if covariates:
             model.set_technical_groups(covariates)
+
+    if is_enabled(trans_cfg.get('load_ntc', trans_cfg.get('load_technical')), default=True):
+        model.load_ntc_fit(**normalize_stage_args(trans_cfg.get('load_ntc') or trans_cfg.get('load_technical')))
+    # Commits to cis_gene now (not at construction) -- see the docstring above.
+    # Unconditional: even if load_ntc above was skipped/disabled, eager
+    # construction would still have set cis_gene unconditionally, so this
+    # must too (add_cis_gene() degrades gracefully to plain extraction with
+    # no NTC posteriors to draw from when fit_ntc wasn't loaded).
+    model.add_cis_gene(cis_gene)
+    if is_enabled(trans_cfg.get('load_cis'), default=True):
+        model.load_cis_fit(**normalize_stage_args(trans_cfg.get('load_cis')))
 
     apply_sum_factor_adjustments(model, cfg.get('sum_factor') or {})
 
@@ -185,16 +222,12 @@ def reconstruct_and_export(
     model, output_dir, modality_name = reconstruct_model(dataset_name, cis_gene, spec, cfg, device=device)
 
     print(f"[{dataset_name}/{cis_gene}] computing summary + y_at_x_log2fc{{...}} columns...")
-    # x_ntc=get_x_ntc(model): save_trans_summary()'s own auto-lookup only
-    # tries the cis modality's posterior_samples_ntc['mu_ntc'] -- populated by
-    # add_cis_gene()'s extraction step, which never runs here (cis_gene is set
-    # EAGERLY at construction via build_model_from_config(), not deferred).
-    # Confirmed 2026-08-26: without this, x_ntc silently stays None,
-    # compute_log2fc_params gets auto-disabled, and observed_log2fc (+ every
-    # other "vs NTC" column) never gets computed at all -- no error, just a
-    # missing column discovered later at merge time. get_x_ntc() has the
-    # right fallback (median fitted x_true among NTC cells) for exactly this
-    # eager-cis_gene case.
+    # x_ntc=get_x_ntc(model): now that reconstruct_model() builds deferred and
+    # calls add_cis_gene() (see its docstring), the cis modality's
+    # posterior_samples_ntc['mu_ntc'] is legitimately populated -- get_x_ntc()
+    # finds it on its primary (non-fallback) branch, same as Replogle. Passed
+    # explicitly anyway for consistency/robustness rather than relying on
+    # save_trans_summary()'s own internal auto-lookup to reach the same value.
     df = model.save_trans_summary(output_dir=output_dir, modality_name=modality_name, x_ntc=get_x_ntc(model))
     df = add_log2fc_at_columns(model, df, modality_name=modality_name, targets=hill_log2fc_targets)
     csv_path = os.path.join(output_dir, f'trans_feature_summary_{modality_name}.csv')
