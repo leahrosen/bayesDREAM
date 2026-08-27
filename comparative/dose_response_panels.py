@@ -84,11 +84,25 @@ def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[s
         guide_meta = None
         guide_target = None
 
+    # Translate symbol -> feature-index identifier where they differ (Replogle:
+    # Ensembl gene ID -- counts.index above comes straight from counts_plot.npz's
+    # feature_names, which for Replogle IS the Ensembl ID, not the symbol; see
+    # DatasetSpec.cis_gene_id_fn's docstring). None for Domingo/Morris, where
+    # the feature index already is the symbol.
+    feature_cis_gene = cis_gene
+    if spec.cis_gene_id_fn is not None:
+        feature_cis_gene = spec.cis_gene_id_fn(cis_gene)
+        if feature_cis_gene is None:
+            raise KeyError(
+                f"[{spec.name}] cis_gene_id_fn has no mapping for symbol {cis_gene!r} -- "
+                f"add one (e.g. to REPLOGLE_GENE_TO_ID in comparative/datasets.py)."
+            )
+
     model_kwargs = dict(
         meta=meta,
         counts=counts,
         feature_meta=gene_meta,
-        cis_gene=cis_gene,
+        cis_gene=feature_cis_gene,
         output_dir=spec.name,
         label=cis_gene,
         sum_factor_col=spec.init_sum_factor_col,

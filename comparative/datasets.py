@@ -90,6 +90,17 @@ class DatasetSpec:
         value after reload -- for CRISPRi-only datasets whose meta may be
         missing/inconsistent in that column (mirrors what the original
         GEX_comp_Doming_Morris.ipynb did for Morris).
+    cis_gene_id_fn : callable, optional
+        cis_gene (symbol) -> the identifier actually used in this dataset's
+        saved counts/feature index, ONLY where that differs from the symbol
+        (Replogle: Ensembl gene ID, via REPLOGLE_GENE_TO_ID.get -- see its
+        module comment). None (default) for datasets where the feature index
+        already IS the gene symbol (Domingo, Morris). dose_response_panels.py's
+        load_model_for_plotting() uses this to translate before constructing
+        bayesDREAM(cis_gene=...): counts_plot.npz's feature_names for Replogle
+        are Ensembl IDs, so passing the bare symbol straight through raises
+        "cis_gene 'GFI1B' not found in counts.index" against an
+        ENSG00000... index.
     """
     name: str
     color: str
@@ -99,6 +110,7 @@ class DatasetSpec:
     modality_name: str = 'gene'
     run_dir_fn: Optional[Callable[[str], str]] = None
     save_for_plotting_dir_fn: Optional[Callable[[str], str]] = None
+    cis_gene_id_fn: Optional[Callable[[str], Optional[str]]] = None
     init_sum_factor_col: str = 'sum_factor'
     plot_sum_factor_col: Optional[str] = None
     force_single_cell_line: Optional[str] = None
@@ -221,6 +233,7 @@ REPLOGLE = DatasetSpec(
     # a copy here).
     run_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Replogle_{g}_GEX'),
     save_for_plotting_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Replogle_{g}_GEX'),
+    cis_gene_id_fn=REPLOGLE_GENE_TO_ID.get,
     init_sum_factor_col='sum_factor',
     plot_sum_factor_col='sum_factor_adj',
     force_single_cell_line='CRISPRi',
