@@ -20,6 +20,7 @@ runs as of 2026-08-26:
 
 import os
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
@@ -40,23 +41,45 @@ DATASET_COLORS = {
     'Replogle': '#a6761d',   # ochre / brown
 }
 
-# Fixed color per unordered pair of dataset names, for trans_param_compare.py's
-# categorical 'dependency_category' coloring (the "dependent in both" value) --
-# keyed by pair_color_key() so lookup doesn't care which dataset is name_a vs
-# name_b. Remaining unused slots from the same colorblind-safe ColorBrewer
-# "Dark2" 8-class palette DATASET_COLORS draws from (#d95f02 orange, #e7298a
-# pink/magenta, #66a61e green, #e6ab02 yellow, #666666 gray -- last one
-# deliberately unused here, reserved to avoid clashing with 'neither's gray).
-DATASET_PAIR_COLORS = {
-    'Domingo+Morris':   '#d95f02',   # orange
-    'Domingo+Replogle': '#e7298a',   # pink / magenta
-    'Morris+Replogle':  '#66a61e',   # green
-}
+
+def _blend_hex(c1: str, c2: str) -> str:
+    """Midpoint RGB blend of two '#rrggbb' colors, so a 'both' color
+    visibly reads as a mix of its two parent dataset colors rather than an
+    arbitrary third hue.
+    """
+    def _rgb(h):
+        h = h.lstrip('#')
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    r1, g1, b1 = _rgb(c1)
+    r2, g2, b2 = _rgb(c2)
+    return '#{:02x}{:02x}{:02x}'.format(round((r1 + r2) / 2), round((g1 + g2) / 2), round((b1 + b2) / 2))
 
 
 def pair_color_key(name_a: str, name_b: str) -> str:
     """Order-independent lookup key into DATASET_PAIR_COLORS."""
     return '+'.join(sorted([name_a, name_b]))
+
+
+# Fixed color per unordered pair of dataset names, for trans_param_compare.py's
+# categorical 'dependency_category' coloring (the "dependent in both" value) --
+# keyed by pair_color_key() so lookup doesn't care which dataset is name_a vs
+# name_b. Blended (not a 3rd arbitrary hue) from DATASET_COLORS.
+#
+# IMPORTANT colorblind-safety caveat: DATASET_COLORS itself (ColorBrewer
+# "Dark2") is a vetted colorblind-safe qualitative set, but a blended color
+# is NOT automatically part of that vetted set, and checking by hand found
+# these three blends cluster within ~10 luminance units of each other and of
+# their own parent colors (127/118/122 for Domingo/Morris/Replogle vs
+# 123/124/120 for the three blends) -- i.e. hue is doing most of the
+# distinguishing work, which is exactly what red-green color-vision
+# deficiency degrades. Rather than trust a hand-derived approximation of how
+# these look under deuteranopia/protanopia, scatter_param() ALSO assigns a
+# distinct marker shape per category (redundant encoding) so the categories
+# stay distinguishable even if two colors read as near-identical.
+DATASET_PAIR_COLORS = {
+    pair_color_key(a, b): _blend_hex(ca, cb)
+    for (a, ca), (b, cb) in combinations(DATASET_COLORS.items(), 2)
+}
 
 
 @dataclass

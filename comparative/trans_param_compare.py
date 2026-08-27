@@ -476,14 +476,23 @@ def scatter_param(
             'both': DATASET_PAIR_COLORS.get(pair_key, '#55a868'),
             'neither': '#bbbbbb',
         }
+        # Marker shape is a SECOND, redundant encoding of category on top of
+        # color -- 'both' is a color blend of its two parents (see
+        # DATASET_PAIR_COLORS's docstring), which isn't guaranteed to stay
+        # distinguishable from them under red-green color-vision deficiency,
+        # so shape carries the distinction color alone can't be trusted with.
+        markers = {name_a: 'o', name_b: 's', 'both': '^', 'neither': 'x'}
         _extra_colors = plt.cm.tab10(np.linspace(0, 1, 10))
+        _extra_markers = ['D', 'P', 'v', '*']
         seen_order = list(dict.fromkeys(sub[color_by].dropna()))
         for cat in seen_order:
             if cat not in palette:
                 palette[cat] = _extra_colors[len(palette) % 10]
+            if cat not in markers:
+                markers[cat] = _extra_markers[len(markers) % len(_extra_markers)]
         for cat in seen_order:
             m = (sub[color_by] == cat).values
-            ax.scatter(sub.loc[m, colA], sub.loc[m, colB], color=palette[cat],
+            ax.scatter(sub.loc[m, colA], sub.loc[m, colB], color=palette[cat], marker=markers[cat],
                        s=s, alpha=alpha, edgecolor='none', label=f'{cat} (n={int(m.sum())})')
         ax.legend(fontsize=7, frameon=False, loc='lower right')
     elif color_by and color_by in sub.columns and sub[color_by].notna().any():
