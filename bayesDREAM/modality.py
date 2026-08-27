@@ -5,11 +5,14 @@ This module defines the Modality class for storing and validating
 different types of molecular measurements (genes, transcripts, splicing, etc.)
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 import torch
 from typing import Literal, Optional, Union, Dict, Any
 from scipy import sparse
+
+from .utils import make_names_unique, resolve_feature_names, is_lean_posterior
 
 
 class Modality:
@@ -117,6 +120,32 @@ class Modality:
             self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
 
+        # If no explicit feature_names and no DataFrame index/columns to derive
+        # from (raw ndarray/sparse counts, e.g. add_custom_modality), fall back
+        # to feature_meta — same priority order used everywhere else in the
+        # codebase, so downstream code can always rely on modality.feature_names
+        # instead of re-deriving its own guess from feature_meta.
+        if self.feature_names is None:
+            self.feature_names = resolve_feature_names(feature_meta, context=f"Modality '{name}'")
+
+        # Disambiguate duplicate feature names (e.g. Ensembl gene_name collisions
+        # from pseudogenes/readthrough transcripts, or a many-to-one fallback
+        # column like 'gene' repeating once per SJ belonging to that gene).
+        # Name-based lookups throughout the codebase (feature_names.index(),
+        # pd.Series indexed by feature_names, get_feature_subset(), plotting by
+        # gene name, etc.) all assume uniqueness.
+        if self.feature_names is not None:
+            deduped = make_names_unique(self.feature_names)
+            if deduped != self.feature_names:
+                n_dup = sum(1 for a, b in zip(deduped, self.feature_names) if a != b)
+                warnings.warn(
+                    f"Modality '{name}' had {n_dup} duplicate feature name(s); "
+                    "disambiguated by appending -1, -2, ... to repeats (scanpy-style). "
+                    "Original identifiers are still available in feature_meta.",
+                    UserWarning
+                )
+            self.feature_names = deduped
+
         self.feature_meta = feature_meta.copy()
 
         # For multinomial: ensure the implicit Kth residual slot (position K_max-1) is
@@ -188,7 +217,6 @@ class Modality:
 
                 n_dropped = int((~keep).sum())
                 if n_dropped > 0:
-                    import warnings
                     n_le1_cat = int((n_cats <= 1).sum())
                     n_zero_var = n_dropped - n_le1_cat
                     warnings.warn(
@@ -239,7 +267,7 @@ class Modality:
         # Distribution-specific alpha_y parameters (use these directly, not alpha_y_prefit)
         self.alpha_y_prefit_mult = None     # For negbinom: multiplicative correction [C, T]
         self.alpha_y_prefit_add = None      # For normal/studentt/binomial/multinomial: additive correction [C, T]
-        self.posterior_samples_technical = None  # Technical fit: full posterior samples
+        self.posterior_samples_ntc = None  # NTC fit: full posterior samples
         self.posterior_samples_trans = None      # Trans fit: full posterior samples
 
         # Sum factors DataFrame (negbinom modalities only).
@@ -422,6 +450,13 @@ class Modality:
                 raise ValueError("binomial distribution requires denominator")
             if self.denominator.shape != self.counts.shape:
                 raise ValueError(f"denominator shape {self.denominator.shape} must match counts shape {self.counts.shape}")
+            counts_dense = self.counts.toarray() if sparse.issparse(self.counts) else self.counts
+            denom_dense = self.denominator.toarray() if sparse.issparse(self.denominator) else self.denominator
+            if np.any(counts_dense > denom_dense):
+                raise ValueError(
+                    f"[Modality '{self.name}'] counts exceed denominator for binomial distribution "
+                    f"(found {int(np.sum(counts_dense > denom_dense))} violating entries)"
+                )
 
         # Validate exon skipping data if provided
         if self.inc1 is not None or self.inc2 is not None or self.skip is not None:
@@ -516,6 +551,7 @@ class Modality:
             denominator=new_denom,
             cells_axis=self.cells_axis,
             feature_names=new_feature_names,
+            cell_names=self.cell_names,
             min_count=self.min_count,
             inc1=new_inc1,
             inc2=new_inc2,
@@ -747,7 +783,17 @@ class Modality:
 
     def __repr__(self) -> str:
         exon_info = f", exon_agg='{self.exon_aggregate_method}'" if self.is_exon_skipping() else ""
-        return f"Modality(name='{self.name}', distribution='{self.distribution}', dims={self.dims}{exon_info})"
+        lean_info = ", ntc=LEAN" if self.is_ntc_lean else ""
+        return f"Modality(name='{self.name}', distribution='{self.distribution}', dims={self.dims}{exon_info}{lean_info})"
+
+    @property
+    def is_ntc_lean(self) -> bool:
+        """
+        True if posterior_samples_ntc was loaded with load_ntc_fit(lean=True) —
+        i.e. it holds point estimates (median + 95% CI) rather than full raw
+        posterior draws. See bayesDREAM.utils.is_lean_posterior.
+        """
+        return is_lean_posterior(self.posterior_samples_ntc)
 
     @property
     def alpha_y_prefit(self):

@@ -4,19 +4,16 @@ Basic plotting functions for x_true distributions.
 Provides scatter, violin, and density plots colored by guide.
 """
 
+import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 import pandas as pd
-from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior, _NTC_VARIANTS
+from .helpers import (to_np, resolve_guide_labels, _guide_ntc_mask,
+                       _xtrue_posterior_stats, _log2_safe, _NTC_VARIANTS)
 from .colors import ColorScheme
-
-
-def _log2_safe(x):
-    """log2 of x, returning NaN for non-positive values."""
-    with np.errstate(divide='ignore', invalid='ignore'):
-        return np.where(x > 0, np.log2(np.maximum(x, 1e-300)), np.nan)
+from ..utils import is_lean_posterior, require_full_posterior
 
 
 def _guide_sort_key(g):
@@ -78,13 +75,11 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
-    post = _xtrue_posterior(model)
-    if post is not None:
-        post = post[:, cell_mask]                          # [S, N_kept]
-        if log2:
-            post = np.where(post > 0, np.log2(np.maximum(post, 1e-300)), np.nan)
-        x_mean = np.nanmean(post, axis=0)                  # [N_kept]
-        x_std  = np.nanstd(post,  axis=0)                  # [N_kept]
+    x_mean, x_std, _, _ = _xtrue_posterior_stats(model, log2=log2)
+    _lean_x_true = getattr(model, 'is_cis_lean', False)
+    if x_mean is not None:
+        x_mean = x_mean[cell_mask]
+        x_std = x_std[cell_mask]
     else:
         x_vals = to_np(model.x_true)[cell_mask]
         if log2:
@@ -103,6 +98,8 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
         xlabel = f'mean x_true{" (log2)" if log2 else ""}'
 
     suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
+    if _lean_x_true:
+        suffix += ' [lean: mean→median, std≈CI/1.96]'
 
     def _draw(ax_, gl, xm, xs, title_):
         for guide in sorted(np.unique(gl), key=_guide_sort_key):
@@ -198,14 +195,16 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
-    post = _xtrue_posterior(model)
-    if post is not None:
-        post = post[:, cell_mask]                          # [S, N_kept]
-        if log2:
-            post = np.where(post > 0, np.log2(np.maximum(post, 1e-300)), np.nan)
-        x_mean = np.nanmean(post, axis=0)
-        q_lo   = np.nanpercentile(post, 2.5,  axis=0)
-        q_hi   = np.nanpercentile(post, 97.5, axis=0)
+    # Under lean loading, q_lo/q_hi come from the precomputed x_true_lower/upper
+    # sibling keys (exact — quantiles commute with the monotonic log2 transform);
+    # x_mean is the stored per-cell median rather than the true mean (see
+    # _xtrue_posterior_stats docstring). CI-width y-values are unaffected either way.
+    x_mean, _, q_lo, q_hi = _xtrue_posterior_stats(model, log2=log2)
+    _lean_x_true = getattr(model, 'is_cis_lean', False)
+    if x_mean is not None:
+        x_mean = x_mean[cell_mask]
+        q_lo = q_lo[cell_mask]
+        q_hi = q_hi[cell_mask]
     else:
         x_vals = to_np(model.x_true)[cell_mask]
         if log2:
@@ -225,6 +224,8 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
         xlabel = f'mean x_true{" (log2)" if log2 else ""}'
 
     suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
+    if _lean_x_true:
+        suffix += ' [lean: mean→median]'
     ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{" (log2)" if log2 else ""}'
 
     def _draw(ax_, gl, xm, yv, title_):
@@ -862,10 +863,21 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     -------------------
     n_a, n_b  : marginal over sigma_n ~ Exp(rate) of Normal(n_mu_raw, sigma_n),
                 then soft-clamped to [nmin, nmax]
-    Vmax_a/b  : LogNormal(Vmax_log_mu[gene], Vmax_log_sigma)
+    Vmax_a/b  : LogNormal(Vmax_log_mu[gene], Vmax_log_sigma) for negbinom/normal/studentt;
+                Beta(Vmax_beta_alpha[gene], Vmax_beta_beta[gene]) for binomial
+                (multinomial not yet supported — Vmax_mean is per-category [T, K])
     K_a/b     : LogNormal(K_log_mu, K_log_sigma)
-    A         : Exponential(rate=1/Amean[gene])
+    A (negbinom): 2^Normal(A_log2_mu[gene], A_log2_sigma[gene])
+                  lower anchor = log2(Amean/2), sigma = 1-4 octaves (NTC-anchored)
+    A (binomial): sigmoid(Normal(A_logit_mu[gene], A_logit_sigma[gene])) when y_ntc
+                  available (NTC-anchored, logit-space analogue of the negbinom case);
+                  falls back to Beta(1, A_beta_beta[gene]) without NTC data
+    A (normal/studentt): Normal(A_mean[gene], A_sigma[gene]) in natural (unbounded)
+                  value space — NTC-anchored when y_ntc is available, else a fixed
+                  shift from Amean scaled by the response amplitude
     alpha/beta: RelaxedBernoulli(logits=p_n_logits, temperature=1)
+    (multinomial 'A' has no analytic prior here yet — it's a per-category
+    LogisticNormal over the K-simplex; not currently reconstructed for plotting.)
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -886,11 +898,21 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     elif param in ('Vmax_a', 'Vmax_b'):
         Vmax_log_mu    = prior_params.get('Vmax_log_mu')
         Vmax_log_sigma = prior_params.get('Vmax_log_sigma')
-        if Vmax_log_mu is None or Vmax_log_sigma is None:
-            return None
-        mu = (float(Vmax_log_mu[gene_idx])
-              if hasattr(Vmax_log_mu, '__len__') else float(Vmax_log_mu))
-        return np.exp(rng.normal(mu, float(Vmax_log_sigma), n_samples))
+        if Vmax_log_mu is not None and Vmax_log_sigma is not None:
+            mu = (float(Vmax_log_mu[gene_idx])
+                  if hasattr(Vmax_log_mu, '__len__') else float(Vmax_log_mu))
+            return np.exp(rng.normal(mu, float(Vmax_log_sigma), n_samples))
+
+        Vmax_beta_alpha = prior_params.get('Vmax_beta_alpha')
+        Vmax_beta_beta  = prior_params.get('Vmax_beta_beta')
+        if Vmax_beta_alpha is not None and Vmax_beta_beta is not None:
+            a = (float(Vmax_beta_alpha[gene_idx])
+                 if hasattr(Vmax_beta_alpha, '__len__') else float(Vmax_beta_alpha))
+            b = (float(Vmax_beta_beta[gene_idx])
+                 if hasattr(Vmax_beta_beta, '__len__') else float(Vmax_beta_beta))
+            return rng.beta(a, b, n_samples)
+
+        return None
 
     elif param in ('K_a', 'K_b'):
         K_log_mu    = prior_params.get('K_log_mu')
@@ -902,12 +924,41 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
         return np.exp(rng.normal(mu, float(K_log_sigma), n_samples))
 
     elif param == 'A':
-        Amean = prior_params.get('Amean')
-        if Amean is None:
-            return None
-        amean_val = (float(Amean[gene_idx])
-                     if hasattr(Amean, '__len__') else float(Amean))
-        return rng.exponential(amean_val, n_samples)   # Exp(rate=1/amean)
+        A_log2_mu    = prior_params.get('A_log2_mu')
+        A_log2_sigma = prior_params.get('A_log2_sigma')
+        if A_log2_mu is not None and A_log2_sigma is not None:
+            mu    = (float(A_log2_mu[gene_idx])
+                     if hasattr(A_log2_mu, '__len__') else float(A_log2_mu))
+            sigma = (float(A_log2_sigma[gene_idx])
+                     if hasattr(A_log2_sigma, '__len__') else float(A_log2_sigma))
+            return np.power(2.0, rng.normal(mu, sigma, n_samples))
+
+        A_logit_mu    = prior_params.get('A_logit_mu')
+        A_logit_sigma = prior_params.get('A_logit_sigma')
+        if A_logit_mu is not None and A_logit_sigma is not None:
+            mu    = (float(A_logit_mu[gene_idx])
+                     if hasattr(A_logit_mu, '__len__') else float(A_logit_mu))
+            sigma = (float(A_logit_sigma[gene_idx])
+                     if hasattr(A_logit_sigma, '__len__') else float(A_logit_sigma))
+            logit_samps = rng.normal(mu, sigma, n_samples)
+            return 1.0 / (1.0 + np.exp(-logit_samps))
+
+        A_beta_beta = prior_params.get('A_beta_beta')
+        if A_beta_beta is not None:
+            beta = (float(A_beta_beta[gene_idx])
+                    if hasattr(A_beta_beta, '__len__') else float(A_beta_beta))
+            return rng.beta(1.0, beta, n_samples)
+
+        A_mean  = prior_params.get('A_mean')
+        A_sigma = prior_params.get('A_sigma')
+        if A_mean is not None and A_sigma is not None:
+            mu    = (float(A_mean[gene_idx])
+                     if hasattr(A_mean, '__len__') else float(A_mean))
+            sigma = (float(A_sigma[gene_idx])
+                     if hasattr(A_sigma, '__len__') else float(A_sigma))
+            return rng.normal(mu, sigma, n_samples)
+
+        return None
 
     elif param in ('alpha', 'beta'):
         logits = prior_params.get('p_n_logits', -13.8)
@@ -925,16 +976,17 @@ def _sample_prior_for_param(param, gene_idx, prior_params, n_samples=400, rng=No
     return None
 
 
-# Parameters that come from posterior_samples_technical rather than posterior_samples_trans.
+# Parameters that come from posterior_samples_ntc rather than posterior_samples_trans.
 # NOTE: o_y is sampled in BOTH technical and trans posteriors.
 #   'o_y'      → posterior_samples_trans  (trans fit overdispersion, the usual plotting target)
-#   'o_y_tech' → posterior_samples_technical  (NTC-only technical fit overdispersion)
+#   'o_y_tech' → posterior_samples_ntc  (NTC-only technical fit overdispersion)
 _TECHNICAL_PARAMS = frozenset({'alpha_y', 'alpha_y_mult', 'alpha_y_add', 'log2_alpha_y', 'mu_ntc', 'o_y_tech'})
 
 
-def _get_technical_param_samples(param, tech_posterior, technical_group):
+def _get_technical_param_samples(param, tech_posterior, technical_group, _suffix=''):
     """
-    Extract samples for a technical parameter from posterior_samples_technical.
+    Extract samples (or, with ``_suffix``, the lean CI bounds) for a technical
+    parameter from posterior_samples_ntc.
 
     Handles the C (technical group) dimension and log2 conversion for multiplicative params.
 
@@ -943,97 +995,128 @@ def _get_technical_param_samples(param, tech_posterior, technical_group):
     param : str
         Parameter name ('alpha_y', 'log2_alpha_y', 'alpha_y_mult', 'alpha_y_add', 'mu_ntc', 'o_y_tech')
     tech_posterior : dict
-        posterior_samples_technical dict
+        posterior_samples_ntc dict
     technical_group : int
         Which technical group index to display (1 = first non-reference group).
         Index 0 is always the reference group (alpha=1 for mult, 0 for add).
+    _suffix : str, default ''
+        Internal: '' fetches the raw/point-estimate key; '_lower'/'_upper' fetch
+        the lean-mode CI sibling key instead (see
+        bayesDREAM.io.load._reduce_posterior_samples), applying the exact same
+        group-selection and log2 transform as the point estimate — exact
+        because both are monotonic and quantiles commute with monotonic
+        transforms. Returns None if the requested (possibly suffixed) key is
+        absent (e.g. not lean-loaded, or the raw dict).
 
     Returns
     -------
-    np.ndarray of shape [S, T]
+    np.ndarray of shape [S, T] (or [1, T] / [T] under lean loading), or None
+    if _suffix is set and the sibling key doesn't exist.
     """
+    # Point estimates keep a leading sample axis ([S,C,T], or [1,C,T] under lean
+    # loading via keepdim=True), so "has a group axis" shows up as ndim==3.
+    # The lean CI siblings (_lower/_upper) DROP the sample axis entirely
+    # ([C,T]), so for those "has a group axis" shows up as ndim==2 instead —
+    # one dimension slimmer, but otherwise identically laid out (T last,
+    # C second-to-last). This is the only place that distinction matters.
+    _ndim_with_group = 2 if _suffix else 3
+
+    def _get(key):
+        full_key = key + _suffix
+        if full_key not in tech_posterior:
+            return None
+        return to_np(tech_posterior[full_key])
+
+    def _select_group(raw, group_idx, bounds_check_param=None):
+        if raw.ndim != _ndim_with_group:
+            return raw
+        if bounds_check_param is not None and not (0 <= group_idx < raw.shape[-2]):
+            if _suffix:
+                return None
+            raise ValueError(
+                f"technical_group={technical_group} out of range for {bounds_check_param} with "
+                f"{raw.shape[-2]} non-reference group(s). "
+                f"Use technical_group between 1 and {raw.shape[-2]}."
+            )
+        idx = [slice(None)] * raw.ndim
+        idx[-2] = group_idx
+        return raw[tuple(idx)]
+
     if param == 'alpha_y':
         # Try multiplicative first (negbinom), then additive
-        if 'alpha_y_mult' in tech_posterior:
-            raw = to_np(tech_posterior['alpha_y_mult'])
-            if raw.ndim == 3:
-                raw = raw[:, technical_group, :]
-            return np.log2(np.maximum(raw, 1e-10))
-        elif 'alpha_y_add' in tech_posterior:
-            raw = to_np(tech_posterior['alpha_y_add'])
-            if raw.ndim == 3:
-                raw = raw[:, technical_group, :]
-            return raw
-        elif 'alpha_y' in tech_posterior:
-            raw = to_np(tech_posterior['alpha_y'])
-            if raw.ndim == 3:
-                raw = raw[:, technical_group, :]
-            return raw
+        if (key := 'alpha_y_mult') + _suffix in tech_posterior:
+            pass
+        elif (key := 'alpha_y_add') + _suffix in tech_posterior:
+            pass
+        elif (key := 'alpha_y') + _suffix in tech_posterior:
+            pass
         else:
+            if _suffix:
+                return None
             raise KeyError(
-                f"'alpha_y' not found in posterior_samples_technical. "
+                f"'alpha_y' not found in posterior_samples_ntc. "
                 f"Available: {list(tech_posterior.keys())}"
             )
+        raw = _get(key)
+        if raw is None:
+            return None
+        raw = _select_group(raw, technical_group)
+        return np.log2(np.maximum(raw, 1e-10)) if key in ('alpha_y_mult', 'alpha_y') else raw
 
     elif param == 'alpha_y_mult':
-        raw = to_np(tech_posterior['alpha_y_mult'])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
+        raw = _get('alpha_y_mult')
+        if raw is None:
+            return None
+        raw = _select_group(raw, technical_group)
         return np.log2(np.maximum(raw, 1e-10))
 
     elif param == 'alpha_y_add':
-        raw = to_np(tech_posterior['alpha_y_add'])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
-        return raw
+        raw = _get('alpha_y_add')
+        if raw is None:
+            return None
+        return _select_group(raw, technical_group)
 
     elif param == 'log2_alpha_y':
         # Directly sampled in log2 space, shape [S, C-1, T] (no reference group)
-        raw = to_np(tech_posterior['log2_alpha_y'])
-        if raw.ndim == 3:
-            g_idx = technical_group - 1  # 1-based group → 0-based index into C-1 groups
-            if g_idx < 0 or g_idx >= raw.shape[1]:
-                raise ValueError(
-                    f"technical_group={technical_group} out of range for log2_alpha_y with "
-                    f"{raw.shape[1]} non-reference group(s). "
-                    f"Use technical_group between 1 and {raw.shape[1]}."
-                )
-            raw = raw[:, g_idx, :]
-        return raw
+        raw = _get('log2_alpha_y')
+        if raw is None:
+            return None
+        g_idx = technical_group - 1  # 1-based group → 0-based index into C-1 groups
+        return _select_group(raw, g_idx, bounds_check_param='log2_alpha_y')
 
     elif param == 'mu_ntc':
         # mu_ntc has no C dimension ([S, T]), but handle 3D defensively
-        raw = to_np(tech_posterior['mu_ntc'])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
-        return raw
+        raw = _get('mu_ntc')
+        if raw is None:
+            return None
+        return _select_group(raw, technical_group)
 
     elif param == 'o_y_tech':
         # o_y from the technical fit (NTC-only). Use 'o_y' for the trans fit version.
         # Shape [S, T] — not group-specific. If stored as [S, 1, T], use index 0.
-        raw = to_np(tech_posterior['o_y'])
-        if raw.ndim == 3:
-            raw = raw[:, 0, :]
-        return raw
+        raw = _get('o_y')
+        if raw is None:
+            return None
+        return _select_group(raw, 0)
 
     else:
         # Generic fallback for any other key in technical posterior
-        raw = to_np(tech_posterior[param])
-        if raw.ndim == 3:
-            raw = raw[:, technical_group, :]
-        return raw
+        raw = _get(param)
+        if raw is None:
+            return None
+        return _select_group(raw, technical_group)
 
 
 def plot_parameter_ci_panel(
     model,
     params: list,
     modality_name: str = None,
-    genes: list = None,
+    features: list = None,
     ci_level: float = 95.0,
     sort_by: str = 'none',
     filter_dependent: bool = False,
     dependency_params: list = None,
-    max_genes: int = 100,
+    max_features: int = 100,
     ymin: float = None,
     ymax: float = None,
     title: str = None,
@@ -1043,7 +1126,7 @@ def plot_parameter_ci_panel(
     marker_size: int = 18,
     capsize: int = 3,
     show_zero_line: bool = True,
-    show_gene_separators: bool = True,
+    show_feature_separators: bool = True,
     ax=None,
     show: bool = True,
     fdr_df=None,
@@ -1053,9 +1136,9 @@ def plot_parameter_ci_panel(
     technical_group: int = 1,
 ):
     """
-    Forest plot (dot + whisker CI) for posterior parameters across trans genes.
+    Forest plot (dot + whisker CI) for posterior parameters across trans features.
 
-    Creates a plot with genes on the x-axis and parameter values (median + CI) on
+    Creates a plot with features on the x-axis and parameter values (median + CI) on
     the y-axis. Multiple parameters are dodged side-by-side for comparison.
 
     Parameters
@@ -1067,27 +1150,27 @@ def plot_parameter_ci_panel(
         These must exist in posterior_samples_trans.
     modality_name : str, optional
         Modality name. If None, uses primary modality.
-    genes : list of str, optional
-        Specific genes to plot. If None, plots all genes (subject to max_genes).
-        Gene names must match feature names in the modality.
+    features : list of str, optional
+        Specific features to plot. If None, plots all features (subject to
+        max_features). Names must match feature names in the modality.
     ci_level : float
         Credible interval level (default: 95.0 for 95% CI)
     sort_by : str
-        How to sort genes on x-axis:
+        How to sort features on x-axis:
         - 'none': Keep original order
-        - 'alphabetical': Sort alphabetically by gene name
+        - 'alphabetical': Sort alphabetically by feature name
         - 'median': Sort by median of first parameter (ascending)
         - 'abs_median': Sort by absolute median of first parameter (descending)
         - 'effect': Sort by max absolute effect across all params (descending)
     filter_dependent : bool
-        If True, only show genes where CI excludes 0 for any param in
+        If True, only show features where CI excludes 0 for any param in
         dependency_params (default: False)
     dependency_params : list, optional
         Parameters to use for dependency filtering. If None, uses all params.
         Common: ['n_a', 'n_b'] for Hill coefficients.
-    max_genes : int
-        Maximum number of genes to plot (default: 100). If more genes would be
-        plotted, raises ValueError with suggestions. Set to None to disable limit.
+    max_features : int
+        Maximum number of features to plot (default: 100). If more features would
+        be plotted, raises ValueError with suggestions. Set to None to disable limit.
     ymin, ymax : float, optional
         Y-axis limits. If None, auto-scaled.
     title : str, optional
@@ -1095,7 +1178,7 @@ def plot_parameter_ci_panel(
     ylabel : str
         Y-axis label (default: 'value')
     figsize : tuple, optional
-        Figure size. If None, auto-scaled based on number of genes.
+        Figure size. If None, auto-scaled based on number of features.
     color_palette : dict, optional
         Custom colors for parameters. Keys are param names, values are colors.
         If None, uses seaborn color palette.
@@ -1105,9 +1188,9 @@ def plot_parameter_ci_panel(
         Size of error bar caps (default: 3)
     show_zero_line : bool
         Whether to draw horizontal line at y=0 (default: True)
-    show_gene_separators : bool
-        Whether to draw vertical lines between genes (default: True).
-        Helps visually distinguish which parameters belong to which gene.
+    show_feature_separators : bool
+        Whether to draw vertical lines between features (default: True).
+        Helps visually distinguish which parameters belong to which feature.
     ax : matplotlib axes, optional
         Axes to plot on. If None, creates new figure.
     show : bool
@@ -1148,10 +1231,10 @@ def plot_parameter_ci_panel(
 
     Examples
     --------
-    >>> # Plot n_a and n_b for all genes
+    >>> # Plot n_a and n_b for all features
     >>> fig, ax = model.plot_parameter_ci_panel(['n_a', 'n_b'])
 
-    >>> # Plot only dependent genes, sorted by effect size
+    >>> # Plot only dependent features, sorted by effect size
     >>> fig, ax = model.plot_parameter_ci_panel(
     ...     ['n_a', 'n_b'],
     ...     filter_dependent=True,
@@ -1207,11 +1290,11 @@ def plot_parameter_ci_panel(
     # Get technical posterior (required when technical params are requested)
     tech_posterior = None
     if tech_params:
-        tech_posterior = modality.posterior_samples_technical
+        tech_posterior = modality.posterior_samples_ntc
         if tech_posterior is None:
             raise ValueError(
-                f"Parameters {tech_params} require posterior_samples_technical. "
-                "Must run fit_technical() first."
+                f"Parameters {tech_params} require posterior_samples_ntc. "
+                "Must run fit_ntc() first."
             )
         # Validate that needed keys are present
         missing_tech = []
@@ -1226,24 +1309,19 @@ def plot_parameter_ci_panel(
                 missing_tech.append(p)
         if missing_tech:
             raise ValueError(
-                f"Technical parameters {missing_tech} not found in posterior_samples_technical. "
+                f"Technical parameters {missing_tech} not found in posterior_samples_ntc. "
                 f"Available: {list(tech_posterior.keys())}"
             )
 
-    # Get gene names from modality
-    gene_names = modality.feature_names
-    if gene_names is None:
-        # Fallback to feature_meta
-        for col in ['gene_name', 'gene', 'feature_id', 'feature']:
-            if col in modality.feature_meta.columns:
-                gene_names = modality.feature_meta[col].tolist()
-                break
-    if gene_names is None:
-        gene_names = [str(i) for i in range(modality.dims['n_features'])]
+    # Get feature names from modality — the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_names = modality.feature_names
+    if feature_names is None:
+        feature_names = [str(i) for i in range(modality.dims['n_features'])]
 
     # Extract samples for each parameter
     # Trans params: posterior[param] is typically (S, n_cis, T) where n_cis=1
-    # Technical params: posterior_samples_technical[param] may be (S, C, T) or (S, T)
+    # Technical params: posterior_samples_ntc[param] may be (S, C, T) or (S, T)
     samples_dict = {}
     for param in params:
         if param in _TECHNICAL_PARAMS:
@@ -1258,9 +1336,9 @@ def plot_parameter_ci_panel(
 
     T = samples_dict[params[0]].shape[1]
 
-    # Ensure gene_names matches T
-    if len(gene_names) != T:
-        gene_names = gene_names[:T]
+    # Ensure feature_names matches T
+    if len(feature_names) != T:
+        feature_names = feature_names[:T]
 
     # Build per-param FDR inactive masks from fdr_df (if provided)
     _PARAM_TO_FDR_COL = {
@@ -1269,119 +1347,139 @@ def plot_parameter_ci_panel(
     }
     inactive_masks = {}  # {param: bool array of length T}
     if fdr_df is not None:
-        _gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+        _feature_to_idx = {f: i for i, f in enumerate(feature_names)}
         _name_col = next((c for c in ['gene_name', 'gene', 'feature'] if c in fdr_df.columns), None)
         for param in params:
             fdr_col = _PARAM_TO_FDR_COL.get(param)
             if fdr_col and fdr_col in fdr_df.columns and _name_col:
                 mask = np.zeros(T, dtype=bool)
                 for _, row in fdr_df.iterrows():
-                    gname = row[_name_col]
-                    if gname in _gene_to_idx and np.isfinite(row[fdr_col]):
-                        mask[_gene_to_idx[gname]] = row[fdr_col] >= fdr_threshold
+                    fname = row[_name_col]
+                    if fname in _feature_to_idx and np.isfinite(row[fdr_col]):
+                        mask[_feature_to_idx[fname]] = row[fdr_col] >= fdr_threshold
                 inactive_masks[param] = mask
 
     # Compute CI bounds
     lo_q = (100 - ci_level) / 2.0
     hi_q = 100 - lo_q
 
+    # Technical params drawn from a lean-loaded posterior_samples_ntc only have
+    # a precomputed 95% CI (2.5%/97.5%) — no raw samples to recompute an
+    # arbitrary ci_level from. Use those exact bounds when ci_level matches;
+    # error clearly for any other level rather than silently falling back to
+    # a (wrong, zero-width) percentile of the singleton point estimate.
+    _tech_lean = bool(tech_params) and is_lean_posterior(tech_posterior)
+
     stats = {}  # {param: {'median': array, 'lo': array, 'hi': array}}
     for param, samps in samples_dict.items():
-        stats[param] = {
-            'median': np.nanmedian(samps, axis=0),
-            'lo': np.nanpercentile(samps, lo_q, axis=0),
-            'hi': np.nanpercentile(samps, hi_q, axis=0),
-        }
+        if param in _TECHNICAL_PARAMS and _tech_lean:
+            if ci_level != 95.0:
+                raise ValueError(
+                    f"plot_parameter_ci_panel: technical parameter '{param}' comes from a "
+                    f"lean-loaded posterior_samples_ntc, which only has a precomputed 95% CI "
+                    f"(2.5%/97.5%). ci_level={ci_level} cannot be computed from lean-loaded "
+                    f"data. Use ci_level=95.0, or reload with lean=False for other levels."
+                )
+            lo = _get_technical_param_samples(param, tech_posterior, technical_group, _suffix='_lower')
+            hi = _get_technical_param_samples(param, tech_posterior, technical_group, _suffix='_upper')
+            stats[param] = {
+                'median': np.nanmedian(samps, axis=0),  # exact: median of the [1,T] lean singleton
+                'lo': np.atleast_1d(lo),
+                'hi': np.atleast_1d(hi),
+            }
+        else:
+            stats[param] = {
+                'median': np.nanmedian(samps, axis=0),
+                'lo': np.nanpercentile(samps, lo_q, axis=0),
+                'hi': np.nanpercentile(samps, hi_q, axis=0),
+            }
 
-    # Filter to dependent genes if requested
-    gene_mask = np.ones(T, dtype=bool)
+    # Filter to dependent features if requested
+    feature_mask = np.ones(T, dtype=bool)
     if filter_dependent:
         dep_params = dependency_params if dependency_params else params
         # Start with all False, then OR with each param's dependency
-        gene_mask = np.zeros(T, dtype=bool)
+        feature_mask = np.zeros(T, dtype=bool)
         for param in dep_params:
-            if param in samples_dict:
-                samps = samples_dict[param]
-                lo = np.nanpercentile(samps, lo_q, axis=0)
-                hi = np.nanpercentile(samps, hi_q, axis=0)
-                param_dep = (lo > 0) | (hi < 0)
-                gene_mask = gene_mask | param_dep
+            if param in stats:
+                param_dep = (stats[param]['lo'] > 0) | (stats[param]['hi'] < 0)
+                feature_mask = feature_mask | param_dep
 
-        n_dep = gene_mask.sum()
-        print(f"[FILTER] {n_dep}/{T} genes pass dependency filter (CI excludes 0)")
+        n_dep = feature_mask.sum()
+        print(f"{n_dep}/{T} features pass dependency filter (CI excludes 0)")
 
-    # Get indices of genes to plot
-    gene_indices = np.where(gene_mask)[0]
+    # Get indices of features to plot
+    feature_indices = np.where(feature_mask)[0]
 
-    # Filter to user-specified genes if provided
-    if genes is not None:
-        # Map gene names to indices
-        name_to_idx = {name: i for i, name in enumerate(gene_names)}
+    # Filter to user-specified features if provided
+    if features is not None:
+        # Map feature names to indices
+        name_to_idx = {name: i for i, name in enumerate(feature_names)}
         user_indices = []
-        missing_genes = []
-        for g in genes:
-            if g in name_to_idx:
-                idx = name_to_idx[g]
-                if idx in gene_indices:  # Respect dependency filter
+        missing_features = []
+        for f in features:
+            if f in name_to_idx:
+                idx = name_to_idx[f]
+                if idx in feature_indices:  # Respect dependency filter
                     user_indices.append(idx)
             else:
-                missing_genes.append(g)
-        if missing_genes:
+                missing_features.append(f)
+        if missing_features:
             import warnings
-            warnings.warn(f"Genes not found in modality: {missing_genes[:5]}{'...' if len(missing_genes) > 5 else ''}")
-        gene_indices = np.array(user_indices)
+            warnings.warn(f"Features not found in modality: {missing_features[:5]}{'...' if len(missing_features) > 5 else ''}")
+        feature_indices = np.array(user_indices)
 
-    n_genes = len(gene_indices)
+    n_features = len(feature_indices)
 
-    if n_genes == 0:
-        print("No genes to plot after filtering.")
+    if n_features == 0:
+        print("No features to plot after filtering.")
         return None, None
 
-    # Check max_genes limit
-    if max_genes is not None and n_genes > max_genes:
+    # Check max_features limit
+    if max_features is not None and n_features > max_features:
         raise ValueError(
-            f"Too many genes to plot ({n_genes} > {max_genes}). Options:\n"
-            f"  1. Use filter_dependent=True to show only dependent genes\n"
-            f"  2. Use genes=['gene1', 'gene2', ...] to specify specific genes\n"
+            f"Too many features to plot ({n_features} > {max_features}). Options:\n"
+            f"  1. Use filter_dependent=True to show only dependent features\n"
+            f"  2. Use features=['feature1', 'feature2', ...] to specify specific features\n"
             f"  3. Use sort_by='effect' with filter_dependent=True for top effects\n"
-            f"  4. Set max_genes=None to disable this limit (not recommended)"
+            f"  4. Set max_features=None to disable this limit (not recommended)"
         )
-    elif n_genes > 100:
+    elif n_features > 100:
         import warnings
         warnings.warn(
-            f"Plotting {n_genes} genes. Consider using filter_dependent=True "
-            f"or genes=[...] to reduce the number of genes."
+            f"Plotting {n_features} features. Consider using filter_dependent=True "
+            f"or features=[...] to reduce the number of features."
         )
 
-    # Sort genes
+    # Sort features
     if sort_by == 'alphabetical':
-        # Get gene names for current indices, then sort alphabetically
-        names_for_sort = [gene_names[i] for i in gene_indices]
+        # Get feature names for current indices, then sort alphabetically
+        names_for_sort = [feature_names[i] for i in feature_indices]
         order = np.argsort(names_for_sort)
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
     elif sort_by == 'median':
-        sort_vals = stats[params[0]]['median'][gene_indices]
+        sort_vals = stats[params[0]]['median'][feature_indices]
         order = np.argsort(sort_vals)
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
     elif sort_by == 'abs_median':
-        sort_vals = np.abs(stats[params[0]]['median'][gene_indices])
+        sort_vals = np.abs(stats[params[0]]['median'][feature_indices])
         order = np.argsort(sort_vals)[::-1]  # Descending
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
     elif sort_by == 'effect':
         # Max absolute median across all params
-        max_effect = np.zeros(n_genes)
+        max_effect = np.zeros(n_features)
         for param in params:
-            max_effect = np.maximum(max_effect, np.abs(stats[param]['median'][gene_indices]))
+            max_effect = np.maximum(max_effect, np.abs(stats[param]['median'][feature_indices]))
         order = np.argsort(max_effect)[::-1]  # Descending
-        gene_indices = gene_indices[order]
+        feature_indices = feature_indices[order]
 
-    # Get sorted gene names
-    sorted_gene_names = [gene_names[i] for i in gene_indices]
+    # Get sorted feature names
+    sorted_feature_names = [feature_names[i] for i in feature_indices]
 
     # Create figure
     if ax is None:
         if figsize is None:
-            fig_w = min(max(0.5 * n_genes, 12), 28)
+            fig_w = min(max(0.5 * n_features, 12), 28)
             fig_h = 5.5
             figsize = (fig_w, fig_h)
         fig, ax = plt.subplots(figsize=figsize)
@@ -1394,10 +1492,10 @@ def plot_parameter_ci_panel(
         color_palette = dict(zip(params, colors))
 
     # Set up x positions with dodging
-    # Use smaller width to keep params for same gene close together
-    x_base = np.arange(n_genes)
+    # Use smaller width to keep params for same feature close together
+    x_base = np.arange(n_features)
     n_params = len(params)
-    width = 0.3  # Reduced from 0.7 to keep params closer within gene
+    width = 0.3  # Reduced from 0.7 to keep params closer within feature
     if n_params > 1:
         offsets = np.linspace(-width/2, width/2, n_params)
     else:
@@ -1423,9 +1521,9 @@ def plot_parameter_ci_panel(
             for j, param in enumerate(params):
                 violin_data = []
                 violin_positions = []
-                for k, gene_idx in enumerate(gene_indices):
+                for k, feature_idx in enumerate(feature_indices):
                     samps_prior = _sample_prior_for_param(
-                        param, int(gene_idx), prior_params, n_samples=400, rng=_rng)
+                        param, int(feature_idx), prior_params, n_samples=400, rng=_rng)
                     if samps_prior is not None and np.isfinite(samps_prior).any():
                         violin_data.append(samps_prior[np.isfinite(samps_prior)])
                         violin_positions.append(x_base[k] + offsets[j])
@@ -1449,19 +1547,19 @@ def plot_parameter_ci_panel(
 
     # Plot each parameter
     for j, param in enumerate(params):
-        medians = stats[param]['median'][gene_indices]
-        los = stats[param]['lo'][gene_indices]
-        his = stats[param]['hi'][gene_indices]
+        medians = stats[param]['median'][feature_indices]
+        los = stats[param]['lo'][feature_indices]
+        his = stats[param]['hi'][feature_indices]
 
         x = x_base + offsets[j]
         color = color_palette.get(param, 'blue')
 
         # Determine FDR inactive subset (greyed out)
         raw_inactive = inactive_masks.get(param)
-        inactive_plot = raw_inactive[gene_indices] if raw_inactive is not None else np.zeros(len(gene_indices), dtype=bool)
+        inactive_plot = raw_inactive[feature_indices] if raw_inactive is not None else np.zeros(len(feature_indices), dtype=bool)
         active_plot = ~inactive_plot
 
-        # Plot active genes with full color
+        # Plot active features with full color
         if active_plot.any():
             ax.scatter(x[active_plot], medians[active_plot], label=param,
                        s=marker_size, zorder=3, color=color)
@@ -1470,10 +1568,10 @@ def plot_parameter_ci_panel(
             ax.errorbar(x[active_plot], medians[active_plot], yerr=yerr_act,
                         fmt='none', elinewidth=1.5, capsize=capsize, color=color, zorder=2)
         else:
-            # No active genes — add phantom entry for legend
+            # No active features — add phantom entry for legend
             ax.scatter([], [], label=param, s=marker_size, color=color)
 
-        # Plot inactive genes: grey (default) or hidden (hide_inactive=True)
+        # Plot inactive features: grey (default) or hidden (hide_inactive=True)
         if inactive_plot.any() and not hide_inactive:
             ax.scatter(x[inactive_plot], medians[inactive_plot],
                        s=marker_size, zorder=3, color='lightgray', alpha=0.5)
@@ -1486,15 +1584,15 @@ def plot_parameter_ci_panel(
     # Styling
     if title is None:
         param_str = ', '.join(params)
-        title = f"{model.cis_gene} → trans genes: {param_str}"
+        title = f"{model.cis_gene} → trans features: {param_str}"
         if filter_dependent:
-            title += f" (n={n_genes} dependent)"
+            title += f" (n={n_features} dependent)"
 
     ax.set_title(title)
-    ax.set_xlabel("Trans gene")
+    ax.set_xlabel("Trans feature")
     ax.set_ylabel(ylabel)
     ax.set_xticks(x_base)
-    ax.set_xticklabels(sorted_gene_names, rotation=90, ha="center")
+    ax.set_xticklabels(sorted_feature_names, rotation=90, ha="center")
 
     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
     ax.xaxis.grid(False)
@@ -1502,13 +1600,13 @@ def plot_parameter_ci_panel(
     if show_zero_line:
         ax.axhline(0, color='black', linestyle=':', linewidth=1, alpha=0.7)
 
-    # Draw vertical separators between genes
-    if show_gene_separators and n_genes > 1:
-        for i in range(1, n_genes):
+    # Draw vertical separators between features
+    if show_feature_separators and n_features > 1:
+        for i in range(1, n_features):
             ax.axvline(i - 0.5, color='lightgray', linestyle='-', linewidth=0.5, alpha=0.7, zorder=1)
 
     # Tighten x-axis margins
-    ax.set_xlim(-0.5, n_genes - 0.5)
+    ax.set_xlim(-0.5, n_features - 0.5)
 
     if ymin is not None or ymax is not None:
         cur = ax.get_ylim()
@@ -1595,13 +1693,9 @@ def extract_posterior_dataframe(
             "Must run fit_trans() first."
         )
 
-    # Get gene names
+    # Get gene names — modality.feature_names is the single source of truth
+    # (resolved + deduped in Modality.__init__), no need to re-derive it here.
     gene_names = modality.feature_names
-    if gene_names is None:
-        for col in ['gene_name', 'gene', 'feature_id', 'feature']:
-            if col in modality.feature_meta.columns:
-                gene_names = modality.feature_meta[col].tolist()
-                break
     if gene_names is None:
         gene_names = [str(i) for i in range(modality.dims['n_features'])]
 
@@ -1609,7 +1703,7 @@ def extract_posterior_dataframe(
 
     for param in params:
         if param not in posterior:
-            print(f"[WARNING] Parameter '{param}' not found in posterior, skipping.")
+            warnings.warn(f"Parameter '{param}' not found in posterior_samples_trans, skipping.")
             continue
 
         samps = to_np(posterior[param])
@@ -2050,68 +2144,166 @@ def _pvalue_stars(p):
     return 'ns'
 
 
+def _apply_mht(raw_pvals, method):
+    """Apply MHT correction to a list of raw p-values.
+
+    None entries (untested groups) are passed through unchanged.
+    """
+    if method is None:
+        return list(raw_pvals)
+    from statsmodels.stats.multitest import multipletests
+    testable_idx = [i for i, p in enumerate(raw_pvals) if p is not None]
+    if not testable_idx:
+        return list(raw_pvals)
+    _, adj, _, _ = multipletests([raw_pvals[i] for i in testable_idx],
+                                  method=method)
+    result = list(raw_pvals)
+    for i, adj_p in zip(testable_idx, adj):
+        result[i] = float(adj_p)
+    return result
+
+
 def _draw_residual_panel(ax, groups, jitter, jitter_alpha, jitter_size, jitter_color,
-                          test, pvalue_fmt, zero_line=True):
+                          test, pvalue_fmt, zero_line=True, fill_palette=None, mht=None):
     """
     Draw a single residual violin panel onto *ax*.
 
     Parameters
     ----------
-    groups : list of (label, residuals_array, violin_color)
-    Returns the y-range used (for shared-axis decisions).
+    groups : list of (label, residuals_array, violin_color, fill_vals_or_None)
+        ``fill_vals_or_None`` is an array of per-cell category values.  When
+        *fill_palette* is provided each group is split into one sub-violin per
+        category, coloured accordingly.
+    fill_palette : dict {category_value -> colour}, optional
+        When set, one violin per (group × category) is drawn instead of one
+        plain violin per group.
+    mht : str or None
+        MHT correction method passed to ``_apply_mht``.
     """
     from scipy import stats as _stats
+
+    def _raw_pval(finite):
+        if test == 'wilcoxon':
+            _, p = _stats.wilcoxon(finite, alternative='two-sided')
+        elif test == 't':
+            _, p = _stats.ttest_1samp(finite, popmean=0)
+        else:
+            raise ValueError(f"test must be 'wilcoxon', 't', or None; got {test!r}")
+        return p
 
     if not groups:
         ax.set_visible(False)
         return
 
-    labels, data, colors = zip(*groups)
-    n = len(groups)
-    positions = np.arange(1, n + 1)
+    labels, data, colors, fill_vals_list = zip(*groups)
+    group_positions = np.arange(1, len(groups) + 1)
 
-    vp = ax.violinplot(list(data), positions=positions,
-                       showmeans=True, showextrema=True, widths=0.7)
-    for body, col in zip(vp['bodies'], colors):
-        body.set_facecolor(col)
-        body.set_edgecolor('black')
-        body.set_alpha(0.8)
-    for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
-        if key in vp:
-            vp[key].set_edgecolor('black')
-            vp[key].set_linewidth(1.1)
+    if fill_palette is None:
+        # ── Original path: one violin per group ──────────────────────────────
+        vp = ax.violinplot(list(data), positions=group_positions,
+                           showmeans=True, showextrema=True, widths=0.7)
+        for body, col in zip(vp['bodies'], colors):
+            body.set_facecolor(col)
+            body.set_edgecolor('black')
+            body.set_alpha(0.8)
+        for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+            if key in vp:
+                vp[key].set_edgecolor('black')
+                vp[key].set_linewidth(1.1)
 
-    if jitter:
-        rng = np.random.default_rng(0)
-        for pos, resids in zip(positions, data):
-            jx = pos + rng.uniform(-0.15, 0.15, size=len(resids))
-            ax.scatter(jx, resids, s=jitter_size, alpha=jitter_alpha,
-                       color=jitter_color, linewidths=0, zorder=3)
+        if jitter:
+            rng = np.random.default_rng(0)
+            for pos, resids in zip(group_positions, data):
+                jx = pos + rng.uniform(-0.15, 0.15, size=len(resids))
+                ax.scatter(jx, resids, s=jitter_size, alpha=jitter_alpha,
+                           color=jitter_color, linewidths=0, zorder=3)
 
-    if zero_line:
-        ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
-                   label='Zero (perfect additivity)')
+        if zero_line:
+            ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
+                       label='Zero (perfect additivity)')
 
-    # n= and optional test annotations
-    y_top = ax.get_ylim()[1]
-    for pos, resids in zip(positions, data):
-        finite = resids[np.isfinite(resids)]
-        n_cells = len(finite)
-        pval_str = ''
-        if test is not None and n_cells >= 10:
-            if test == 'wilcoxon':
-                _, pval = _stats.wilcoxon(finite, alternative='two-sided')
-            elif test == 't':
-                _, pval = _stats.ttest_1samp(finite, popmean=0)
-            else:
-                raise ValueError(f"test must be 'wilcoxon', 't', or None; got {test!r}")
-            pval_str = (f'\n{_pvalue_stars(pval)}' if pvalue_fmt == 'stars'
-                        else f'\np={pval:.2g}')
-        ax.text(pos, y_top, f'n={n_cells}{pval_str}',
-                ha='center', va='bottom', fontsize=7)
+        items = [(pos, resids[np.isfinite(resids)])
+                 for pos, resids in zip(group_positions, data)]
+        raw_pvals = [_raw_pval(f) if test is not None and len(f) >= 10 else None
+                     for _, f in items]
+        adj_pvals = _apply_mht(raw_pvals, mht)
 
-    ax.set_xticks(positions)
-    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        y_top = ax.get_ylim()[1]
+        for (pos, finite), adj_p in zip(items, adj_pvals):
+            pval_str = (f'\n{_pvalue_stars(adj_p)}' if pvalue_fmt == 'stars'
+                        else f'\np={adj_p:.2g}') if adj_p is not None else ''
+            ax.text(pos, y_top, f'n={len(finite)}{pval_str}',
+                    ha='center', va='bottom', fontsize=7)
+
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+    else:
+        # ── Split path: one violin per (group × experiment) ──────────────────
+        ordered_exps = list(fill_palette.keys())
+        E = len(ordered_exps)
+        gap = 0.06
+        sub_w = max((0.8 - gap * (E - 1)) / max(E, 1), 0.08)
+        half_span = (E - 1) * (sub_w + gap) / 2
+        offsets = (np.linspace(-half_span, half_span, E) if E > 1
+                   else np.array([0.0]))
+
+        sub_pos_list, sub_data_list, sub_col_list = [], [], []
+        for g_pos, (label, resids, _, fvals) in zip(group_positions, groups):
+            for e_idx, exp_val in enumerate(ordered_exps):
+                if fvals is None:
+                    continue
+                sub_resids = resids[fvals == exp_val]
+                if len(sub_resids) < 2:
+                    continue
+                sub_pos_list.append(float(g_pos) + offsets[e_idx])
+                sub_data_list.append(sub_resids)
+                sub_col_list.append(fill_palette[exp_val])
+
+        if not sub_pos_list:
+            ax.set_visible(False)
+            return
+
+        vp = ax.violinplot(sub_data_list, positions=sub_pos_list,
+                           showmeans=True, showextrema=True, widths=sub_w)
+        for body, col in zip(vp['bodies'], sub_col_list):
+            body.set_facecolor(col)
+            body.set_edgecolor('black')
+            body.set_alpha(0.85)
+        for key in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+            if key in vp:
+                vp[key].set_edgecolor('black')
+                vp[key].set_linewidth(1.1)
+
+        if jitter:
+            rng = np.random.default_rng(0)
+            half_w = sub_w * 0.4
+            for sub_pos, sub_resids in zip(sub_pos_list, sub_data_list):
+                jx = sub_pos + rng.uniform(-half_w, half_w, size=len(sub_resids))
+                ax.scatter(jx, sub_resids, s=jitter_size, alpha=jitter_alpha,
+                           color=jitter_color, linewidths=0, zorder=3)
+
+        if zero_line:
+            ax.axhline(0, color='crimson', linestyle='--', linewidth=1.5,
+                       label='Zero (perfect additivity)')
+
+        items = [(sp, sr[np.isfinite(sr)], sc)
+                 for sp, sr, sc in zip(sub_pos_list, sub_data_list, sub_col_list)]
+        raw_pvals = [_raw_pval(f) if test is not None and len(f) >= 10 else None
+                     for _, f, _ in items]
+        adj_pvals = _apply_mht(raw_pvals, mht)
+
+        y_top = ax.get_ylim()[1]
+        for (sub_pos, finite, sub_col), adj_p in zip(items, adj_pvals):
+            pval_str = (f'\n{_pvalue_stars(adj_p)}' if pvalue_fmt == 'stars'
+                        else f'\np={adj_p:.2g}') if adj_p is not None else ''
+            ax.text(sub_pos, y_top, f'n={len(finite)}{pval_str}',
+                    ha='center', va='bottom', fontsize=6,
+                    color=sub_col, fontweight='bold')
+
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
     ax.grid(axis='y', linewidth=0.5, alpha=0.3)
 
 
@@ -2121,6 +2313,8 @@ def plot_additivity_residuals(model, response='x_obs',
                                jitter=False, jitter_alpha=0.3, jitter_size=4,
                                jitter_color='black',
                                test=None, pvalue_fmt='stars',
+                               mht=None,
+                               fill_by=None, fill_palette=None,
                                axes=None, show=True):
     """
     Additivity residual violin plot for high-MOI models, split into three panels.
@@ -2159,12 +2353,24 @@ def plot_additivity_residuals(model, response='x_obs',
     jitter_alpha : float, default 0.3
     jitter_size : float, default 4
     jitter_color : str, default 'black'
-        Color for jittered points (applied to all panels).
+        Fallback color for jittered points when *fill_by* is not used.
     test : {None, 'wilcoxon', 't'}, default None
         One-sample test of H₀: residuals = 0.
         ``'wilcoxon'``: Wilcoxon signed-rank (tests median = 0, non-parametric).
         ``'t'``: one-sample t-test (tests mean = 0).
     pvalue_fmt : {'stars', 'numeric'}, default 'stars'
+    mht : str or None, default None
+        Multiple hypothesis testing correction applied within each panel
+        (across all violins in that panel).  Any method accepted by
+        ``statsmodels.stats.multitest.multipletests``, e.g. ``'fdr_bh'``,
+        ``'bonferroni'``, ``'holm'``.  ``None`` means no correction.
+    fill_by : str, optional
+        Column name in ``model.meta`` used to colour jitter points.  Each unique
+        value gets a distinct colour from *fill_palette* (or auto-generated from
+        ``tab10``).  When set, jitter is automatically enabled.
+    fill_palette : dict {value -> colour}, optional
+        Explicit colour mapping for *fill_by* values.  Any values absent from
+        the dict fall back to *jitter_color*.
     axes : list of 3 matplotlib Axes, optional
         Pre-created axes.  If None a new figure is created.
     show : bool, default True
@@ -2175,6 +2381,31 @@ def plot_additivity_residuals(model, response='x_obs',
         [ax_single, ax_ntc_target, ax_dual]
     """
     _require_high_moi(model, 'plot_additivity_residuals')
+
+    # ── fill_by setup ────────────────────────────────────────────────────────
+    cell_fill_vals = None
+    palette = None
+    if fill_by is not None:
+        if fill_by not in model.meta.columns:
+            raise ValueError(
+                f"fill_by={fill_by!r} not found in model.meta columns: "
+                f"{list(model.meta.columns)}"
+            )
+        cell_fill_vals = model.meta[fill_by].values
+        unique_vals = sorted(set(cell_fill_vals), key=str)
+        if fill_palette is not None:
+            palette = fill_palette
+        else:
+            import matplotlib.cm as _cm
+            cmap = _cm.get_cmap('tab10')
+            palette = {v: cmap(i % 10) for i, v in enumerate(unique_vals)}
+
+    def _fill(mask_or_idxs, is_idx=False):
+        if cell_fill_vals is None:
+            return None
+        if is_idx:
+            return cell_fill_vals[np.array(mask_or_idxs)]
+        return cell_fill_vals[mask_or_idxs]
 
     log2_vals = _cell_log2_response(model, response, sum_factor_col, epsilon)
     ntc_mean, guide_log2fc, single_mask, multi_mask, ntc_mask, is_ntc_guide = \
@@ -2193,7 +2424,7 @@ def plot_additivity_residuals(model, response='x_obs',
     panel1 = []
     ntc_resids = log2_vals[ntc_mask] - ntc_mean
     if len(ntc_resids) >= min_single_cells:
-        panel1.append(('NTC', ntc_resids, '#888888'))
+        panel1.append(('NTC', ntc_resids, '#888888', _fill(ntc_mask)))
 
     single_entries = []
     for j, gname in enumerate(guide_names):
@@ -2203,7 +2434,7 @@ def plot_additivity_residuals(model, response='x_obs',
         vals = log2_vals[cell_mask]
         if len(vals) >= min_single_cells:
             pred = ntc_mean + guide_log2fc[gname]
-            single_entries.append((gname, vals - pred, '#4C72B0'))
+            single_entries.append((gname, vals - pred, '#4C72B0', _fill(cell_mask)))
     single_entries.sort(key=lambda t: float(np.nanmean(t[1])))
     panel1.extend(single_entries)
 
@@ -2217,7 +2448,8 @@ def plot_additivity_residuals(model, response='x_obs',
         vals = log2_vals[cell_mask]
         if len(vals) >= min_single_cells:
             pred = ntc_mean + guide_log2fc[gname]
-            ntc_target_entries.append((f'NTC+{gname}', vals - pred, '#55A868'))
+            ntc_target_entries.append((f'NTC+{gname}', vals - pred, '#55A868',
+                                       _fill(cell_mask)))
     ntc_target_entries.sort(key=lambda t: float(np.nanmean(t[1])))
     panel2.extend(ntc_target_entries)
 
@@ -2240,7 +2472,7 @@ def plot_additivity_residuals(model, response='x_obs',
         label = '+'.join(combo)
         vals = log2_vals[np.array(idxs)]
         pred = ntc_mean + sum(guide_log2fc[g] for g in combo)
-        panel3.append((label, vals - pred, '#DD8452'))
+        panel3.append((label, vals - pred, '#DD8452', _fill(idxs, is_idx=True)))
 
     # ── Figure layout ────────────────────────────────────────────────────────
     n1 = max(len(panel1), 1)
@@ -2258,7 +2490,8 @@ def plot_additivity_residuals(model, response='x_obs',
 
     panel_kwargs = dict(jitter=jitter, jitter_alpha=jitter_alpha,
                         jitter_size=jitter_size, jitter_color=jitter_color,
-                        test=test, pvalue_fmt=pvalue_fmt)
+                        test=test, pvalue_fmt=pvalue_fmt, mht=mht,
+                        fill_palette=palette)
 
     row_labels = ['single guide', 'NTC + target (null)', '2× target']
     for ax_i, panel, row_label in zip(axes, [panel1, panel2, panel3], row_labels):
@@ -2273,8 +2506,109 @@ def plot_additivity_residuals(model, response='x_obs',
 
     cis_gene = getattr(model, 'cis_gene', 'cis')
     fig.suptitle(f'{cis_gene}: additivity residuals', fontsize=12, y=1.01)
+
+    if palette is not None:
+        from matplotlib.patches import Patch
+        legend_handles = [Patch(facecolor=col, label=str(val))
+                          for val, col in palette.items()]
+        fig.legend(handles=legend_handles, title=fill_by,
+                   loc='upper right', bbox_to_anchor=(1.12, 0.98),
+                   fontsize=8, title_fontsize=9, framealpha=0.9)
+
     plt.tight_layout()
 
     if show:
         plt.show()
     return axes
+
+
+def patch_A_prior(model, modality_name=None, beta_o_alpha=9.0, beta_o_beta=3.0):
+    """
+    Compute and store A_log2_mu / A_log2_sigma in trans_prior_params without re-running fit_trans.
+
+    Use this when debugging with a previously fitted model to get a correct prior violin
+    for the A parameter in plot_parameter_ci_panel(show_prior=True).
+
+    Parameters
+    ----------
+    model : bayesDREAM
+    modality_name : str, optional
+        Modality to patch. Defaults to model.primary_modality.
+    beta_o_alpha, beta_o_beta : float
+        Gamma prior hyperparameters for o_y used during fit_trans (defaults: 9, 3).
+        prior_mean_o_y = beta_o_beta / beta_o_alpha = 1/3.
+    """
+    if modality_name is None:
+        modality_name = model.primary_modality
+    modality = model.get_modality(modality_name)
+
+    pp = modality.trans_prior_params
+    if pp is None:
+        raise ValueError("trans_prior_params is None — run fit_trans first.")
+    if pp.get('distribution') != 'negbinom':
+        raise ValueError(f"A prior patch only applies to negbinom; got {pp.get('distribution')}.")
+
+    Amean_np = pp.get('Amean')
+    if Amean_np is None:
+        raise ValueError("trans_prior_params missing 'Amean'.")
+
+    # Extract y_ntc from NTC posterior (same reduction as fit_trans)
+    post_ntc = getattr(modality, 'posterior_samples_ntc', None)
+    y_ntc_np = None
+    if post_ntc is not None and 'mu_ntc' in post_ntc:
+        _mu = post_ntc['mu_ntc']
+        if hasattr(_mu, 'cpu'):
+            _mu = _mu.cpu().numpy()
+        else:
+            _mu = np.asarray(_mu)
+        while _mu.ndim > 1:
+            _mu = np.nanmedian(_mu, axis=0)
+        y_ntc_np = _mu.astype(float)
+
+    # Extract o_y_ntc from NTC posterior (same reduction as fit_trans)
+    o_y_ntc_np = None
+    if post_ntc is not None and 'o_y' in post_ntc:
+        _oy = post_ntc['o_y']
+        if hasattr(_oy, 'cpu'):
+            _oy = _oy.cpu().numpy()
+        else:
+            _oy = np.asarray(_oy)
+        T = len(Amean_np)
+        if _oy.ndim > 1 and _oy.shape[-1] == T:
+            while _oy.ndim > 1:
+                _oy = np.nanmedian(_oy, axis=0)
+            prior_mean_oy = beta_o_beta / beta_o_alpha
+            _oy = np.where(np.isnan(_oy) | (_oy <= 0), prior_mean_oy, _oy)
+            _oy = np.maximum(_oy, 1e-6)
+            o_y_ntc_np = _oy
+
+    if y_ntc_np is not None:
+        _log2_y_ntc = np.log2(np.maximum(y_ntc_np, 1e-12))
+        _log2_lower = np.maximum(
+            np.log2(np.maximum(Amean_np / 2.0, 1e-12)),
+            _log2_y_ntc - 4.0,
+        )
+        sigma_log2_A = np.clip(_log2_y_ntc - _log2_lower, 1.0, 4.0)
+        if o_y_ntc_np is not None:
+            prior_mean_oy = beta_o_beta / beta_o_alpha
+            w = o_y_ntc_np / (o_y_ntc_np + prior_mean_oy)
+        else:
+            w = np.zeros_like(Amean_np)
+        mu_log2_A = (1.0 - w) * _log2_lower + w * _log2_y_ntc
+    else:
+        mu_log2_A    = np.log2(np.maximum(Amean_np / 2.0, 1e-12))
+        sigma_log2_A = np.full_like(mu_log2_A, 4.0)
+
+    pp['A_log2_mu']    = mu_log2_A
+    pp['A_log2_sigma'] = sigma_log2_A
+
+    # Mirror to model-level trans_prior_params if this is the primary modality
+    if modality_name == model.primary_modality and hasattr(model, 'trans_prior_params') \
+            and model.trans_prior_params is not None:
+        model.trans_prior_params['A_log2_mu']    = mu_log2_A
+        model.trans_prior_params['A_log2_sigma'] = sigma_log2_A
+
+    print(f"[patch_A_prior] Patched '{modality_name}': "
+          f"sigma_log2_A range [{sigma_log2_A.min():.2f}, {sigma_log2_A.max():.2f}] octaves, "
+          f"weight range [{w.min():.2f}, {w.max():.2f}]" if y_ntc_np is not None
+          else f"[patch_A_prior] Patched '{modality_name}': no y_ntc, sigma=4 octaves flat.")

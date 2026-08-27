@@ -4,7 +4,7 @@ bayesDREAM: Bayesian Dosage Response Effects Across Modalities
 Core implementation for bayesDREAM - a three-step Bayesian framework for modeling
 perturbation effects across multiple molecular modalities:
 
-1. fit_technical() - Model technical variation in non-targeting controls
+1. fit_ntc() - Fit NTC cells to estimate gene-specific overdispersion and batch effects
 2. fit_cis() - Model direct effects on targeted genes
 3. fit_trans() - Model downstream effects as dose-response functions
 
@@ -13,10 +13,14 @@ The bayesDREAM class combines:
 - Modality mixins: Methods for adding different data types (transcripts, splicing, ATAC, custom)
 """
 
+import functools
 import warnings
 from typing import Dict, Optional
 import numpy as np
+from .plotting.model_plots import ModelPlottingMixin as _ModelPlottingMixin
+from .diagnostics import DiagnosticsMixin as _DiagnosticsMixin
 import pandas as pd
+import torch
 
 from .core import _BayesDREAMCore
 from .modality import Modality
@@ -67,7 +71,6 @@ class bayesDREAM(
         meta: pd.DataFrame,
         counts: pd.DataFrame = None,
         modality_name: str = 'gene',
-        primary_modality: str = None,
         feature_meta: pd.DataFrame = None,
         cis_gene: str = None,
         cis_feature: str = None,
@@ -83,9 +86,11 @@ class bayesDREAM(
         random_seed: int = 2402,
         cores: int = 1,
         exclude_targets: list = None,
+        exclude_guides: list = None,
         require_ntc: bool = True,
         min_count: int = 1,
         color_scheme: 'ColorScheme' = None,
+        cis_only: bool = False,
     ):
         """
         Initialize bayesDREAM.
@@ -93,7 +98,8 @@ class bayesDREAM(
         Parameters
         ----------
         meta : pd.DataFrame
-            Cell-level metadata with columns: cell, guide, target, sum_factor, etc.
+            Cell-level metadata with columns: cell, guide, sum_factor, etc. A 'target'
+            column is required unless guide_target is supplied instead (see below).
         counts : pd.DataFrame, np.ndarray, or scipy.sparse matrix, optional
             Count matrix for the primary modality (features × cells). This will be used
             for trans modeling and must represent negbinom count data.
@@ -138,6 +144,15 @@ class bayesDREAM(
             1. Extracted as a separate 'cis' modality (1 feature)
             2. Removed from the primary modality (which becomes trans-only)
             3. Used for cis effect modeling in fit_cis()
+
+            May be omitted — in single-guide mode, high-MOI mode, and single-guide
+            mode with a ``guide_target`` mapping alike — to defer commitment. When
+            omitted: no 'cis' modality is created, no cells are subset by target,
+            and ``label`` must be provided explicitly (it normally defaults to the
+            gene name). Call ``fit_ntc()`` (once, shared across candidate cis genes)
+            and then ``add_cis_gene(gene)`` later to commit to a specific gene,
+            extract its 'cis' modality, and subset to NTC + that gene's cells before
+            calling ``fit_cis()``. See ``add_cis_gene()`` for the full behavior.
         cis_feature : str, optional
             Alternative to cis_gene for non-gene modalities. Specifies which feature
             to extract as the 'cis' modality.
@@ -149,6 +164,19 @@ class bayesDREAM(
             Guide metadata for high MOI mode. Required columns: 'guide', 'target'.
             Must be provided together with guide_assignment. Index should match
             guide order in guide_assignment matrix.
+        guide_target : pd.DataFrame, optional
+            Many-to-many guide-target mapping: rows of {'guide', 'target'}, with
+            multiple rows allowed per guide (e.g. a guide with an ambiguous or
+            off-target effect on more than one gene).
+
+            High MOI mode: overrides guide_meta['target'] if both are given.
+
+            Single-guide mode: lets meta omit the 'target' column entirely — each
+            cell's target is looked up from its 'guide' column against this mapping,
+            resolving to cis_gene if cis_gene is among the guide's plausible targets,
+            else 'ntc' if any plausible target is an NTC variant, else 'other'
+            (dropped). Because resolution depends on cis_gene, the same guide_target
+            mapping can be reused across separate cis-gene fits without editing meta.
         guide_covariates : list, optional
             Covariates for guide grouping (e.g., ['cell_line', 'batch'])
         guide_covariates_ntc : list, optional
@@ -158,7 +186,9 @@ class bayesDREAM(
         output_dir : str, default="./model_out"
             Output directory for saving results
         label : str, optional
-            Run label for organizing outputs
+            Run label for organizing outputs. Defaults to the gene name when
+            cis_gene is given. Required (raises ValueError) when cis_gene is
+            omitted, since there is then no gene name to default to.
         device : str, optional
             'cpu' or 'cuda'. If None, auto-detects.
         random_seed : int, default=2402
@@ -169,6 +199,24 @@ class bayesDREAM(
             Color scheme for visualizations. If None, auto-built from model
             metadata via ``ColorScheme.from_model(self)`` after initialization.
             Can also be set later via ``set_color_scheme()``.
+        cis_only : bool, default=False
+            Allow the primary modality to end up with ZERO trans genes after
+            cis-gene extraction (e.g. counts pre-subsetted upstream to just the
+            one cis gene, for a cheap cis-only fit). Without this, providing
+            counts containing only the cis gene raises ``ValueError: No genes
+            left after filtering!`` — this flag opts in to that instead of
+            treating it as an error. Sets ``self.cis_only = True``, which
+            ``fit_ntc()`` checks to warn that fitting overdispersion fresh
+            from a single gene's NTC expression is very unstable; prefer
+            ``load_ntc_fit()`` from a fuller-panel run's saved output instead
+            (this still works normally — feature-alignment when loading
+            doesn't require the current and saved panels to match in size).
+            The deferred cis_gene workflow (``cis_gene=None`` at construction,
+            ``add_cis_gene()`` later) already tolerates this same "zero trans
+            genes left" outcome without needing this flag — it has no
+            equivalent raise — and ``add_cis_gene()`` sets ``self.cis_only``
+            automatically when it detects the same outcome, so the fit_ntc()
+            warning fires there too.
 
         Raises
         ------
@@ -213,19 +261,28 @@ class bayesDREAM(
         ...     cis_feature='feature_123'
         ... )
 
+        Deferred cis gene (fit_ntc() once, shared across candidate cis genes):
+        >>> model = bayesDREAM(
+        ...     meta=cell_metadata,
+        ...     counts=gene_counts,
+        ...     label='run1',  # required: no cis_gene to default to
+        ... )
+        >>> model.set_technical_groups(['cell_line'])
+        >>> model.fit_ntc(sum_factor_col='sum_factor')
+        >>> model.add_cis_gene('GFI1B')  # commits to a cis gene; subsets to NTC + GFI1B
+        >>> model.fit_cis(sum_factor_col='sum_factor')
+
         Notes
         -----
         - The 'cis' modality is ONLY extracted during initialization from the primary modality
         - When you call add_*_modality() methods later, NO cis extraction occurs
         - The primary modality MUST be negbinom (count data) for cis/trans modeling
         - Additional modalities (transcripts, splicing, etc.) are added via add_*_modality() methods
+        - cis_gene may be deferred (omitted here) in single-guide mode, high-MOI mode,
+          and single-guide mode with a guide_target mapping — see add_cis_gene()
         """
         # Initialize modalities dict (always start empty, build from counts)
         self.modalities = {}
-
-        # primary_modality is an alias for modality_name
-        if primary_modality is not None:
-            modality_name = primary_modality
 
         # Resolve cis_feature: cis_gene is an alias for cis_feature when modality_name='gene'
         if cis_gene is not None and cis_feature is not None:
@@ -241,6 +298,11 @@ class bayesDREAM(
 
         # Store min_count for use in modality creation
         self.min_count = min_count
+
+        # See __init__'s cis_only docstring entry. add_cis_gene() also sets
+        # this automatically when it independently arrives at the same
+        # zero-trans-genes outcome via the deferred workflow.
+        self.cis_only = cis_only
 
         # Store original counts for base class initialization
         counts_for_base = counts
@@ -264,7 +326,7 @@ class bayesDREAM(
             if modality_name == 'gene':
                 # Use gene-specific creation (with gene_meta handling)
                 # Pass both the name and numeric index for exclusion
-                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta, min_count=min_count)
+                self._create_gene_modality(counts, cis_feature, cis_numeric_idx, gene_meta=feature_meta, meta=meta, min_count=min_count, cis_only=cis_only)
             else:
                 # Generic negbinom modality creation
                 self._create_negbinom_modality(counts, modality_name, cis_feature, cis_numeric_idx, feature_meta, meta, min_count=min_count)
@@ -283,8 +345,6 @@ class bayesDREAM(
                     f"but bayesDREAM requires primary modality to be 'negbinom' for cis/trans modeling. "
                     f"The primary modality must represent count data that follows a negative binomial distribution."
                 )
-            if cis_feature is not None:
-                pass
         elif counts is None:
             # No counts provided - user will add modalities later
             warnings.warn(
@@ -332,6 +392,7 @@ class bayesDREAM(
             random_seed=random_seed,
             cores=cores,
             exclude_targets=exclude_targets,
+            exclude_guides=exclude_guides,
             require_ntc=require_ntc
         )
 
@@ -346,13 +407,13 @@ class bayesDREAM(
                               if c in valid_cells]
                 if len(cell_indices) < len(mod.cell_names):
                     self.modalities[mod_name] = mod.get_cell_subset(cell_indices)
-                else:
-                    # This shouldn't happen - means we have fewer cells in modality than in meta
-                    print(f"[WARNING] Modality '{mod_name}' has {len(mod.cell_names)} cells but filtered meta has {len(valid_cells)}")
 
         print(f"bayesDREAM: label={self.label}, device={self.device}, {len(self.modalities)} modalities")
         for name, mod in self.modalities.items():
             print(f"  - {name}: {mod}")
+
+        # Store sum_factor_col so add_cis_gene() can re-init sum_factors after cell subsetting.
+        self._sum_factor_col = sum_factor_col
 
         # Initialise sum_factors on all negbinom modalities from meta.
         # Must run AFTER super().__init__() and cell subsetting so self.meta is final.
@@ -375,6 +436,626 @@ class bayesDREAM(
             New color scheme to use for all visualizations.
         """
         self.color_scheme = color_scheme
+
+    # ------------------------------------------------------------------
+    # Deferred cis-gene specification
+    # ------------------------------------------------------------------
+
+    def add_cis_gene(self, cis_gene: str) -> None:
+        """
+        Specify the cis gene after initialization and prepare the model for cis/trans fitting.
+
+        Intended for workflows where fit_ntc() (and optionally adjust_ntc_sum_factor())
+        should be run once before the cis gene is committed, avoiding a separate technical-fit
+        run per gene.
+
+        The method:
+        1. Finds and extracts the cis gene from the primary modality, creating the 'cis' modality.
+        2. In high-MOI mode, or single-guide mode with a ``guide_target`` mapping supplied at
+           init: reclassifies any cell whose guide(s) target ``cis_gene`` from 'ntc'/'other' to
+           ``cis_gene`` (excluded cells are never reclassified). In high-MOI mode this also
+           prunes guide_assignment/guide_meta/guide_targets_dict down to NTC + cis-gene guides.
+        3. Subsets cells to NTC + cis-targeting cells only.
+        4. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
+           already been run, trims matching feature axes in the stored posteriors.
+        5. If fit_ntc() has already been run, extracts the cis gene's overdispersion parameters
+           from the primary modality posteriors into the 'cis' modality (equivalent to having
+           set cis_gene at init time).
+        6. Recomputes guide_code for compact indexing over the retained cells (single-guide mode
+           only — stays -1 in high-MOI mode, matching eager-init behavior).
+        7. Reinitialises sum_factors on the (now-final) cell set.
+
+        Supported in both single-guide and high-MOI mode. In high-MOI mode, ``fit_ntc()`` should
+        typically be run before this call (with cis_gene left unset, ``fit_ntc()`` defaults to
+        using all cells — see its ``use_all_cells`` parameter). Single-guide mode with a
+        ``guide_target`` mapping behaves the same way for deferred-cis-gene reclassification.
+
+        Parameters
+        ----------
+        cis_gene : str
+            Name of the cis gene (must exist in the primary modality's feature_meta). If the
+            model was built with guide_target (high-MOI, or single-guide with a guide_target
+            mapping), at least one guide must target it per guide_targets_dict.
+
+        Raises
+        ------
+        ValueError
+            If cis_gene is already set, if the gene is not found, if no guide targets it
+            (when a guide_target mapping is in use), or if the gene has zero counts across
+            NTC + cis cells.
+        """
+        if self.cis_gene is not None:
+            raise ValueError(
+                f"cis_gene is already set to '{self.cis_gene}'. Cannot call add_cis_gene() again."
+            )
+        if 'cis' in self.modalities:
+            raise ValueError("'cis' modality already exists.")
+
+        primary_mod = self.modalities[self.primary_modality]
+        n_total_features = primary_mod.dims['n_features']
+
+        # ----------------------------------------------------------------
+        # Step 1: locate the cis gene in the primary modality feature_meta
+        # ----------------------------------------------------------------
+        gene_col = None
+        for col in ['gene_name', 'gene', 'gene_id', 'feature_id']:
+            if col in primary_mod.feature_meta.columns and cis_gene in primary_mod.feature_meta[col].values:
+                gene_col = col
+                break
+
+        if gene_col is None:
+            raise ValueError(
+                f"cis_gene '{cis_gene}' not found in primary modality feature_meta. "
+                f"Tried columns: gene_name, gene, gene_id, feature_id. "
+                f"Available columns: {list(primary_mod.feature_meta.columns)}"
+            )
+
+        match_mask = primary_mod.feature_meta[gene_col] == cis_gene
+        cis_feat_iloc = int(np.where(match_mask.values)[0][0])
+
+        print(f"[INFO] add_cis_gene: found '{cis_gene}' at feature iloc {cis_feat_iloc} "
+              f"in primary modality (of {n_total_features} features)")
+
+        # ----------------------------------------------------------------
+        # Step 2: extract cis gene counts from primary modality
+        # ----------------------------------------------------------------
+        if primary_mod.cells_axis == 1:
+            cis_counts = primary_mod.counts[[cis_feat_iloc], :]
+        else:
+            cis_counts = primary_mod.counts[:, [cis_feat_iloc]]
+
+        cis_feature_meta = primary_mod.feature_meta.iloc[[cis_feat_iloc]].copy()
+        cis_feature_meta.index = [0]
+        if 'gene' not in cis_feature_meta.columns:
+            cis_feature_meta['gene'] = cis_gene
+        if 'gene_name' not in cis_feature_meta.columns:
+            cis_feature_meta['gene_name'] = cis_gene
+
+        self.modalities['cis'] = Modality(
+            name='cis',
+            counts=cis_counts,
+            feature_meta=cis_feature_meta,
+            cell_names=primary_mod.cell_names,
+            distribution='negbinom',
+            cells_axis=primary_mod.cells_axis,
+            min_count=self.min_count,
+        )
+
+        # ----------------------------------------------------------------
+        # Step 3: if fit_ntc already ran, extract cis posteriors from primary
+        #         BEFORE we remove the cis feature row (while indices still align)
+        # ----------------------------------------------------------------
+        ntc_ran = primary_mod.posterior_samples_ntc is not None
+
+        if ntc_ran:
+            self._extract_cis_alpha_from_ntc_posteriors(cis_gene, cis_feat_iloc, n_total_features)
+
+        # ----------------------------------------------------------------
+        # Step 4: remove cis gene from primary modality
+        # ----------------------------------------------------------------
+        trans_idx = list(range(cis_feat_iloc)) + list(range(cis_feat_iloc + 1, n_total_features))
+
+        if primary_mod.cells_axis == 1:
+            trans_counts = primary_mod.counts[trans_idx, :]
+        else:
+            trans_counts = primary_mod.counts[:, trans_idx]
+
+        trans_feature_meta = primary_mod.feature_meta.iloc[trans_idx].copy()
+        trans_feature_meta.index = range(len(trans_idx))
+
+        trans_feature_names = (
+            [primary_mod.feature_names[i] for i in trans_idx]
+            if primary_mod.feature_names is not None else None
+        )
+
+        new_primary_mod = Modality(
+            name=self.primary_modality,
+            counts=trans_counts,
+            feature_meta=trans_feature_meta,
+            distribution=primary_mod.distribution,
+            cells_axis=primary_mod.cells_axis,
+            feature_names=trans_feature_names,
+            cell_names=primary_mod.cell_names,
+            min_count=primary_mod.min_count,
+        )
+
+        # Transfer already-trimmed fitting results to the new primary modality object
+        if ntc_ran:
+            new_primary_mod.posterior_samples_ntc = primary_mod.posterior_samples_ntc
+            new_primary_mod.alpha_y_prefit_mult = primary_mod.alpha_y_prefit_mult
+            new_primary_mod.alpha_y_prefit_add = primary_mod.alpha_y_prefit_add
+            if hasattr(primary_mod, 'loss_ntc'):
+                new_primary_mod.loss_ntc = primary_mod.loss_ntc
+
+        self.modalities[self.primary_modality] = new_primary_mod
+        self.cis_gene = cis_gene
+
+        # See bayesDREAM.__init__'s cis_only docstring entry: the deferred
+        # workflow has no equivalent "no genes left" raise (a 1-gene starting
+        # panel is fine here), but should still be flagged the same way the
+        # eager cis_only=True path is, so fit_ntc()'s instability warning
+        # fires regardless of which path arrived at zero trans genes.
+        if new_primary_mod.dims['n_features'] == 0:
+            self.cis_only = True
+
+        # ----------------------------------------------------------------
+        # Step 5a (high-MOI only): reclassify cells carrying a cis_gene guide.
+        # At init (with cis_gene deferred), cells were classified only as
+        # 'excluded' / 'ntc' / 'other' (cis-target identity unknown). Now that
+        # cis_gene is known, promote any 'ntc'/'other' cell carrying a cis guide
+        # to target=cis_gene — mirroring the excluded > cis > ntc > other priority
+        # used at init. 'excluded' cells are never reclassified.
+        # ----------------------------------------------------------------
+        if self.is_high_moi:
+            cis_guide_indices = np.array([
+                pos_idx for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows())
+                if cis_gene in self.guide_targets_dict.get(guide_row['guide'], [])
+            ])
+            if len(cis_guide_indices) == 0:
+                raise ValueError(
+                    f"No guide in guide_targets_dict targets '{cis_gene}'. "
+                    f"Cannot commit to this cis gene in high-MOI mode."
+                )
+            has_cis_guide = self.guide_assignment[:, cis_guide_indices].sum(axis=1) > 0
+            new_targets = self.meta['target'].tolist()
+            for i, has_cis in enumerate(has_cis_guide):
+                if has_cis and new_targets[i] != 'excluded':
+                    new_targets[i] = cis_gene
+            self.meta['target'] = new_targets
+        elif self.guide_targets_dict is not None:
+            # Single-guide mode with a guide_target mapping: mirrors step 5a above.
+            # At init (with cis_gene deferred), each cell's guide could not resolve
+            # to cis_gene yet (unknown), so it landed in 'ntc'/'other'. Now that
+            # cis_gene is known, reclassify any cell whose guide's plausible targets
+            # include cis_gene.
+            if not any(cis_gene in targets for targets in self.guide_targets_dict.values()):
+                raise ValueError(
+                    f"No guide in guide_target maps to '{cis_gene}'. "
+                    f"Cannot commit to this cis gene."
+                )
+            has_cis_guide = self.meta['guide'].map(
+                lambda g: cis_gene in self.guide_targets_dict.get(g, [])
+            ).values
+            new_targets = self.meta['target'].tolist()
+            for i, has_cis in enumerate(has_cis_guide):
+                if has_cis:
+                    new_targets[i] = cis_gene
+            self.meta['target'] = new_targets
+
+        # ----------------------------------------------------------------
+        # Step 5b: subset cells to NTC + cis
+        # ----------------------------------------------------------------
+        valid_cells = set(self.meta[self.meta['target'].isin(['ntc', cis_gene])]['cell'].unique())
+        n_before = len(self.meta)
+        keep_mask = self.meta['cell'].isin(valid_cells).values
+        if self.is_high_moi:
+            # guide_assignment rows are aligned 1:1 with self.meta rows at this point
+            self.guide_assignment = self.guide_assignment[keep_mask, :]
+        self.meta = self.meta[keep_mask].copy()
+        n_after = len(self.meta)
+        if n_after < n_before:
+            print(f"[INFO] add_cis_gene: cells {n_before} → {n_after} (kept NTC + {cis_gene} only)")
+
+        for mod_name in list(self.modalities.keys()):
+            mod = self.modalities[mod_name]
+            if mod.cell_names is not None:
+                cell_idx = [i for i, c in enumerate(mod.cell_names) if c in valid_cells]
+                if len(cell_idx) < len(mod.cell_names):
+                    new_mod = mod.get_cell_subset(cell_idx)
+                    # Forward fitting results to cell-subsetted copy
+                    new_mod.posterior_samples_ntc = mod.posterior_samples_ntc
+                    new_mod.alpha_y_prefit_mult    = mod.alpha_y_prefit_mult
+                    new_mod.alpha_y_prefit_add     = mod.alpha_y_prefit_add
+                    if hasattr(mod, 'loss_ntc'):
+                        new_mod.loss_ntc = mod.loss_ntc
+                    self.modalities[mod_name] = new_mod
+
+        # ----------------------------------------------------------------
+        # Step 5c (high-MOI only): prune guide_assignment/guide_meta/guide_targets_dict
+        # down to NTC + cis-gene guides, and rebuild guide_assignment_tensor.
+        # Mirrors the guide-column pruning done at init when cis_gene is provided eagerly.
+        # ----------------------------------------------------------------
+        if self.is_high_moi:
+            def _is_ntc_target(target_name):
+                ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+                return target_name in ntc_variants
+
+            keep_guide_indices = np.array([
+                pos_idx for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows())
+                if any(_is_ntc_target(t) for t in self.guide_targets_dict.get(guide_row['guide'], []))
+                or cis_gene in self.guide_targets_dict.get(guide_row['guide'], [])
+            ])
+            n_guides_before = self.guide_assignment.shape[1]
+            self.guide_assignment = self.guide_assignment[:, keep_guide_indices]
+            self.guide_meta = self.guide_meta.iloc[keep_guide_indices].copy()
+            self.guide_meta['guide_code'] = range(len(self.guide_meta))
+            kept_guide_names = set(self.guide_meta['guide'].values)
+            self.guide_targets_dict = {
+                guide: targets
+                for guide, targets in self.guide_targets_dict.items()
+                if guide in kept_guide_names
+            }
+            print(f"[INFO] add_cis_gene: subsetted guides {n_guides_before} → {len(keep_guide_indices)} "
+                  f"(keeping NTC + {cis_gene} guides only)")
+
+            self.guide_assignment_tensor = torch.tensor(
+                self.guide_assignment, dtype=torch.float32, device=self.device
+            )
+
+        # ----------------------------------------------------------------
+        # Step 6: re-filter zero-count features after cell subsetting
+        # ----------------------------------------------------------------
+        self._refilter_zero_count_features(ntc_ran)
+
+        # ----------------------------------------------------------------
+        # Step 7: recompute guide_code for compact indices over retained cells
+        # (single-guide mode only; stays -1 in high-MOI mode, per init behavior)
+        # ----------------------------------------------------------------
+        if not self.is_high_moi:
+            self.meta['guide_code'] = pd.Categorical(self.meta['guide_used']).codes
+
+        # ----------------------------------------------------------------
+        # Step 8: reinitialise sum_factors on the final cell set
+        # ----------------------------------------------------------------
+        self._init_sum_factors(self._sum_factor_col)
+
+        # ----------------------------------------------------------------
+        # Step 9: rebuild color scheme
+        # ----------------------------------------------------------------
+        self.color_scheme = ColorScheme.from_model(self)
+
+        print(f"[INFO] add_cis_gene('{cis_gene}') complete: {n_after} cells, "
+              f"{self.modalities[self.primary_modality].dims['n_features']} trans features, "
+              f"{'NTC posteriors transferred' if ntc_ran else 'fit_ntc() not yet run'}.")
+
+    def _extract_cis_alpha_from_ntc_posteriors(
+        self, cis_gene: str, cis_feat_iloc: int, n_total_features: int
+    ) -> None:
+        """
+        Extract cis gene overdispersion from primary modality NTC posteriors,
+        populate the 'cis' modality's posterior_samples_ntc, and trim the cis
+        gene's entry from the primary modality posteriors in-place.
+
+        Called by add_cis_gene() when fit_ntc() has already been run.
+        """
+        primary_mod = self.modalities[self.primary_modality]
+        ps = primary_mod.posterior_samples_ntc  # mutated in-place
+
+        T = n_total_features
+        trans_idx = list(range(cis_feat_iloc)) + list(range(cis_feat_iloc + 1, T))
+
+        full_alpha_y_mult = ps.get('alpha_y_mult')
+        full_alpha_y_add  = ps.get('alpha_y_add')
+
+        # alpha_x_prefit: median of the cis gene's alpha_y_mult samples → [C]
+        if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
+            self.alpha_x_prefit = full_alpha_y_mult[..., cis_feat_iloc].median(dim=0).values
+
+        # alpha_y_prefit for primary modality (trans genes only)
+        if primary_mod.distribution == 'negbinom':
+            if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
+                primary_mod.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].median(dim=0).values
+        else:
+            if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
+                primary_mod.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
+
+        # Build cis modality's posterior_samples_ntc (matching what ntc.py produces)
+        cis_modality = self.modalities['cis']
+        cis_posterior = {}
+        for src_key, dst_key in [
+            ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
+            ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
+            ('mu_ntc',      'mu_ntc'),
+        ]:
+            if src_key in ps and isinstance(ps[src_key], torch.Tensor):
+                v = ps[src_key]
+                if v.shape[-1] == T:
+                    cis_posterior[dst_key] = v[..., cis_feat_iloc:cis_feat_iloc + 1]
+
+        if 'alpha_x_mul' in cis_posterior:
+            raw = cis_posterior['alpha_x_mul']
+            if raw.dim() == 3:
+                S, Cminus1, _ = raw.shape
+                cis_posterior['alpha_x_mult'] = torch.cat(
+                    [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
+                cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
+
+        if 'delta_x_add' in cis_posterior:
+            raw = cis_posterior['delta_x_add']
+            if raw.dim() == 3:
+                S, Cminus1, _ = raw.shape
+                cis_posterior['alpha_x_add'] = torch.cat(
+                    [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
+
+        cis_modality.posterior_samples_ntc = cis_posterior
+        print(f"[INFO] Extracted '{cis_gene}' posteriors from primary modality NTC fit")
+
+        # Trim cis gene row from primary modality posteriors in-place
+        if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
+            ps['alpha_y_mult'] = full_alpha_y_mult[..., trans_idx]
+            ps['alpha_y']      = ps['alpha_y_mult']
+        if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
+            ps['alpha_y_add'] = full_alpha_y_add[..., trans_idx]
+            if full_alpha_y_mult is None:
+                ps['alpha_y'] = ps['alpha_y_add']
+
+        for key in ['log2_alpha_y', 'alpha_y_mul', 'delta_y_add', 'o_y', 'mu_ntc']:
+            if key in ps and isinstance(ps[key], torch.Tensor):
+                v = ps[key]
+                if v.shape[-1] == T:
+                    ps[key] = v[..., trans_idx]
+
+        print(f"[INFO] Trimmed '{cis_gene}' from primary modality posteriors "
+              f"(T {T} → {len(trans_idx)})")
+
+    def _refilter_zero_count_features(self, ntc_ran: bool) -> None:
+        """
+        After cell subsetting in add_cis_gene(), drop features that have become
+        zero-count across the retained NTC + cis cells.  If fit_ntc() has already
+        been run, trim the corresponding axes in the stored NTC posteriors so they
+        stay aligned with the surviving feature set.
+
+        Operates on every modality except 'cis' (which is a single feature and
+        cannot usefully be dropped here).
+        """
+        for mod_name, mod in list(self.modalities.items()):
+            if mod_name == 'cis':
+                continue
+
+            n_features = mod.dims['n_features']
+
+            # Compute per-feature total counts (works for dense, sparse, multinomial)
+            if mod.distribution == 'multinomial':
+                raw = mod.counts  # [F, N, K]
+                feature_sums = np.array(raw.sum(axis=(1, 2))).flatten()
+            elif mod.cells_axis == 1:
+                feature_sums = np.array(mod.counts.sum(axis=1)).flatten()
+            else:
+                feature_sums = np.array(mod.counts.sum(axis=0)).flatten()
+
+            keep_idx = np.where(feature_sums > 0)[0]
+            n_dropped = n_features - len(keep_idx)
+
+            if n_dropped == 0:
+                continue
+
+            print(f"[INFO] add_cis_gene: dropping {n_dropped} zero-count features "
+                  f"from modality '{mod_name}' after cell subsetting")
+
+            # Trim posteriors on the existing modality object BEFORE creating subset
+            if mod.posterior_samples_ntc is not None:
+                self._trim_feature_axis_in_posteriors(mod, keep_idx, n_features)
+
+            # Create feature-subsetted copy and re-attach fitting results
+            new_mod = mod.get_feature_subset(keep_idx.tolist())
+            new_mod.posterior_samples_ntc = mod.posterior_samples_ntc  # already trimmed
+            new_mod.alpha_y_prefit_mult   = mod.alpha_y_prefit_mult
+            new_mod.alpha_y_prefit_add    = mod.alpha_y_prefit_add
+            if hasattr(mod, 'loss_ntc'):
+                new_mod.loss_ntc = mod.loss_ntc
+
+            self.modalities[mod_name] = new_mod
+
+    @staticmethod
+    def _trim_feature_axis_in_posteriors(
+        mod: 'Modality', keep_idx: np.ndarray, T: int
+    ) -> None:
+        """
+        Trim the feature (last) axis of every tensor in mod.posterior_samples_ntc
+        and the alpha_y_prefit arrays to the surviving feature indices.
+
+        Mutates mod in-place; called before get_feature_subset() so the counts
+        array still has T columns.
+        """
+        ps = mod.posterior_samples_ntc
+        if ps is None:
+            return
+
+        for key in list(ps.keys()):
+            v = ps[key]
+            if not isinstance(v, torch.Tensor):
+                continue
+            if v.shape[-1] == T:
+                ps[key] = v[..., keep_idx]
+
+        if mod.alpha_y_prefit_mult is not None and mod.alpha_y_prefit_mult.shape[-1] == T:
+            mod.alpha_y_prefit_mult = mod.alpha_y_prefit_mult[..., keep_idx]
+
+        if mod.alpha_y_prefit_add is not None and mod.alpha_y_prefit_add.shape[-1] == T:
+            mod.alpha_y_prefit_add = mod.alpha_y_prefit_add[..., keep_idx]
+
+    def exclude_trans_genes(
+        self,
+        genes: list = None,
+        feature_query: str = None,
+        min_log2_mu_ntc: float = None,
+        modality_name: str = None,
+    ) -> None:
+        """
+        Permanently drop features from a modality before fit_trans().
+
+        Three exclusion criteria can be given, alone or combined (a feature is
+        dropped if it matches ANY of them):
+
+        1. ``genes``: explicit feature name(s), matched against
+           ``modality.feature_names``.
+        2. ``feature_query``: a boolean expression evaluated against
+           ``modality.feature_meta`` (``DataFrame.eval()`` syntax); rows where
+           it evaluates ``True`` are dropped, e.g.
+           ``"protein_coding == False"`` or ``"chrom == 'chrY'"``.
+        3. ``min_log2_mu_ntc``: drop features whose log2 NTC mean expression
+           (the ``mu_ntc`` posterior from ``fit_ntc()``) is below this value,
+           e.g. ``min_log2_mu_ntc=-4`` drops genes with ``log2(mu_ntc) < -4``.
+           Requires ``fit_ntc()`` to already have been run on the modality;
+           if it hasn't, this criterion is skipped with a warning (so it can
+           still be combined with the other two before fit_ntc()).
+
+        Any per-feature results already stored on the modality
+        (``alpha_y_prefit_mult``/``add``, ``posterior_samples_ntc``) are
+        trimmed to match, so a subsequent ``fit_ntc()``/``fit_trans()`` call
+        sees a consistent, reduced feature set. Call this **before**
+        ``fit_trans()`` — if the modality already has
+        ``posterior_samples_trans`` from a previous fit, it is dropped (now
+        mismatched with the reduced feature set) with a warning.
+
+        Parameters
+        ----------
+        genes : str or list of str, optional
+            Feature name(s) to exclude outright.
+        feature_query : str, optional
+            Boolean expression over ``modality.feature_meta`` columns
+            (pandas ``DataFrame.eval()`` syntax). Matching rows are excluded.
+        min_log2_mu_ntc : float, optional
+            Lower bound on log2 NTC mean expression; features below it are
+            excluded.
+        modality_name : str, optional
+            Modality to filter. Defaults to the primary modality.
+
+        Examples
+        --------
+        >>> model.exclude_trans_genes(genes=['MALAT1', 'XIST'])
+        >>> model.exclude_trans_genes(feature_query='protein_coding == False')
+        >>> model.exclude_trans_genes(min_log2_mu_ntc=-4)  # requires fit_ntc() first
+        """
+        if genes is None and feature_query is None and min_log2_mu_ntc is None:
+            raise ValueError(
+                "Provide at least one of: genes, feature_query, min_log2_mu_ntc."
+            )
+        if isinstance(genes, str):
+            genes = [genes]
+
+        if modality_name is None:
+            modality_name = self.primary_modality
+        mod = self.get_modality(modality_name)
+
+        n_features = mod.dims['n_features']
+        exclude_mask = np.zeros(n_features, dtype=bool)
+
+        if genes is not None:
+            if mod.feature_names is None:
+                raise ValueError(
+                    f"Modality '{modality_name}' has no feature_names; cannot exclude by name."
+                )
+            name_to_idx = {}
+            for i, n in enumerate(mod.feature_names):
+                name_to_idx.setdefault(n, []).append(i)
+            not_found = []
+            for g in genes:
+                idxs = name_to_idx.get(g)
+                if idxs is None:
+                    not_found.append(g)
+                else:
+                    exclude_mask[idxs] = True
+            if not_found:
+                warnings.warn(
+                    f"exclude_trans_genes: {len(not_found)} gene(s) not found in "
+                    f"modality '{modality_name}' and were skipped: {not_found}",
+                    UserWarning,
+                )
+            print(f"[INFO] exclude_trans_genes: {int(exclude_mask.sum())} feature(s) "
+                  f"matched by name")
+
+        if feature_query is not None:
+            try:
+                query_mask = mod.feature_meta.eval(feature_query, engine='python').to_numpy(dtype=bool)
+            except Exception as e:
+                raise ValueError(
+                    f"exclude_trans_genes: failed to evaluate feature_query={feature_query!r} "
+                    f"against modality '{modality_name}' feature_meta "
+                    f"(columns: {list(mod.feature_meta.columns)}): {e}"
+                )
+            if query_mask.shape[0] != n_features:
+                raise ValueError(
+                    f"feature_query evaluated to {query_mask.shape[0]} values but modality "
+                    f"'{modality_name}' has {n_features} features."
+                )
+            print(f"[INFO] exclude_trans_genes: {int(query_mask.sum())} feature(s) "
+                  f"matched feature_query={feature_query!r}")
+            exclude_mask |= query_mask
+
+        if min_log2_mu_ntc is not None:
+            ps = mod.posterior_samples_ntc
+            if ps is None or 'mu_ntc' not in ps:
+                warnings.warn(
+                    f"exclude_trans_genes: min_log2_mu_ntc requires fit_ntc() to have been "
+                    f"run on modality '{modality_name}' first; this criterion was skipped.",
+                    UserWarning,
+                )
+            else:
+                mu_ntc = ps['mu_ntc']
+                mu_ntc_mean = mu_ntc.mean(dim=0) if mu_ntc.dim() > 1 else mu_ntc
+                mu_ntc_np = mu_ntc_mean.detach().cpu().numpy().flatten()
+                if mu_ntc_np.shape[0] != n_features:
+                    warnings.warn(
+                        f"exclude_trans_genes: mu_ntc has {mu_ntc_np.shape[0]} entries but "
+                        f"modality '{modality_name}' has {n_features} features; "
+                        f"min_log2_mu_ntc criterion was skipped.",
+                        UserWarning,
+                    )
+                else:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        log2_mu_ntc = np.log2(mu_ntc_np)
+                    low_expr_mask = log2_mu_ntc < min_log2_mu_ntc
+                    print(f"[INFO] exclude_trans_genes: {int(low_expr_mask.sum())} feature(s) "
+                          f"matched log2(mu_ntc) < {min_log2_mu_ntc}")
+                    exclude_mask |= low_expr_mask
+
+        n_excluded = int(exclude_mask.sum())
+        if n_excluded == 0:
+            print(f"[INFO] exclude_trans_genes: no features matched any exclusion criterion "
+                  f"for modality '{modality_name}'.")
+            return
+
+        keep_idx = np.where(~exclude_mask)[0]
+        if len(keep_idx) == 0:
+            raise ValueError(
+                f"exclude_trans_genes: all {n_features} features in modality "
+                f"'{modality_name}' were excluded. Loosen the exclusion criteria."
+            )
+
+        if mod.posterior_samples_trans is not None:
+            warnings.warn(
+                f"exclude_trans_genes: modality '{modality_name}' already has "
+                f"posterior_samples_trans from a previous fit_trans() call; discarding it "
+                f"since it no longer matches the reduced feature set. Re-run fit_trans().",
+                UserWarning,
+            )
+
+        # Trim stored NTC posteriors and alpha_y_prefit before creating the feature subset
+        self._trim_feature_axis_in_posteriors(mod, keep_idx, n_features)
+
+        new_mod = mod.get_feature_subset(keep_idx.tolist())
+        new_mod.posterior_samples_ntc = mod.posterior_samples_ntc  # already trimmed
+        new_mod.alpha_y_prefit_mult   = mod.alpha_y_prefit_mult
+        new_mod.alpha_y_prefit_add    = mod.alpha_y_prefit_add
+        new_mod.sum_factors           = mod.sum_factors
+        if hasattr(mod, 'loss_ntc'):
+            new_mod.loss_ntc = mod.loss_ntc
+
+        self.modalities[modality_name] = new_mod
+
+        print(f"[INFO] exclude_trans_genes: dropped {n_excluded}/{n_features} feature(s) "
+              f"from modality '{modality_name}' ({len(keep_idx)} remaining)")
 
     def _init_sum_factors(self, sum_factor_col: str = 'sum_factor'):
         """
@@ -413,6 +1094,248 @@ class bayesDREAM(
 
         print(f"[INIT] sum_factors initialised on '{self.primary_modality}' "
               f"with columns: {list(primary_mod.sum_factors.columns)}")
+
+    def _compute_ntc_log2_exprs_from_fit(self):
+        """
+        Per-gene log2 NTC expression using fit_ntc() posteriors.
+
+        fit_ntc() appends the cis gene as the last row of the counts matrix,
+        fits it together with all trans genes, and stores the result in
+        cis_modality.posterior_samples_ntc.  Both trans and cis mu_ntc
+        values are therefore available here — no raw-count computation needed.
+
+        Requires fit_ntc() to have been run (populates posterior_samples_ntc
+        on both the primary and cis modalities).
+
+        Returns
+        -------
+        dict with keys: all_log2_expr, cis_log2_expr, trans_log2_expr,
+        cis_ntc_counts (raw counts for plot annotation only), n_ntc_cells.
+        Or None on failure (warnings emitted).
+        """
+        import torch as _torch
+
+        primary_mod = self.modalities.get(self.primary_modality)
+        cis_mod     = self.modalities.get('cis')
+
+        if primary_mod is None:
+            warnings.warn(f"Primary modality '{self.primary_modality}' not found.", UserWarning)
+            return None
+
+        ps_primary = primary_mod.posterior_samples_ntc
+        if ps_primary is None or 'mu_ntc' not in ps_primary:
+            raise ValueError(
+                "fit_ntc() must be run before checking cis expression. "
+                "Call model.fit_ntc() first."
+            )
+
+        if cis_mod is None:
+            warnings.warn("No 'cis' modality found.", UserWarning)
+            return None
+
+        ps_cis = cis_mod.posterior_samples_ntc
+        if ps_cis is None or 'mu_ntc' not in ps_cis:
+            raise ValueError(
+                "fit_ntc() did not produce mu_ntc for the cis modality. "
+                "Ensure fit_ntc() completed successfully."
+            )
+
+        def _to_numpy(t):
+            if isinstance(t, _torch.Tensor):
+                return t.mean(dim=0).detach().cpu().numpy().flatten()
+            return np.asarray(t).mean(axis=0).flatten()
+
+        # Trans genes — NaN where features were excluded from fitting (zero NTC counts, etc.)
+        log2_trans = np.log2(_to_numpy(ps_primary['mu_ntc']))
+
+        # Cis gene (shape [S, 1] → scalar after mean+flatten)
+        cis_mu_ntc = float(_to_numpy(ps_cis['mu_ntc'])[0])
+        cis_log2_expr = float(np.log2(cis_mu_ntc))
+
+        if not np.isfinite(cis_log2_expr):
+            warnings.warn(
+                f"Cis gene '{self.cis_gene}' has non-finite log2 NTC expression "
+                f"(mu_ntc={cis_mu_ntc:.4g}). GMM check skipped.",
+                UserWarning,
+            )
+            return None
+
+        # Drop non-finite trans values (NaN-filled excluded features, any -inf from mu=0)
+        n_raw = len(log2_trans)
+        log2_trans = log2_trans[np.isfinite(log2_trans)]
+        n_dropped = n_raw - len(log2_trans)
+        if n_dropped > 0:
+            warnings.warn(
+                f"{n_dropped} trans gene(s) excluded from GMM (non-finite log2 NTC expression, "
+                f"likely zero-count features skipped during fit_ntc).",
+                UserWarning,
+            )
+
+        all_log2_expr = np.concatenate([log2_trans, [cis_log2_expr]])
+
+        # Raw NTC counts — used only for the plot title annotation, not for the GMM
+        ntc_meta  = self.meta[self.meta.get('target', pd.Series()).eq('ntc')] \
+                    if 'target' in self.meta.columns else self.meta.iloc[:0]
+        ntc_cells = ntc_meta['cell'].values
+        cell_to_col_cis = {c: i for i, c in enumerate(cis_mod.cell_names or [])}
+        ntc_idx_cis = np.array([cell_to_col_cis[c] for c in ntc_cells if c in cell_to_col_cis], dtype=int)
+        if len(ntc_idx_cis) > 0:
+            cis_raw = cis_mod.counts
+            if hasattr(cis_raw, 'toarray'):
+                cis_ntc = np.asarray(cis_raw[0, ntc_idx_cis].toarray()).flatten().astype(float)
+            elif isinstance(cis_raw, pd.DataFrame):
+                cis_ntc = cis_raw.iloc[0, ntc_idx_cis].values.astype(float)
+            else:
+                cis_ntc = np.asarray(cis_raw)[0, ntc_idx_cis].astype(float)
+        else:
+            cis_ntc = np.array([])
+
+        return {
+            'all_log2_expr':   all_log2_expr,
+            'cis_log2_expr':   cis_log2_expr,
+            'trans_log2_expr': log2_trans,
+            'cis_ntc_counts':  cis_ntc,
+            'n_ntc_cells':     len(ntc_idx_cis),
+        }
+
+    def plot_ntc_expression(
+        self,
+        figsize: tuple = (7, 4),
+        n_bins: int = 80,
+        threshold: float = -1.0,
+    ):
+        """
+        Histogram of per-gene log2 NTC expression with the cis gene marked.
+
+        Requires fit_ntc() to have been run first.  Useful for judging whether
+        the cis gene is sufficiently expressed in NTC cells before running
+        fit_cis().  fit_cis() raises a ValueError if the cis gene's log2 NTC
+        expression is below ``threshold`` (default -1); this plot shows exactly
+        where the gene falls relative to that cutoff.
+
+        Parameters
+        ----------
+        figsize : tuple, default (7, 4)
+        n_bins : int, default 80
+        threshold : float, default -1.0
+            The log2 expression cutoff used by fit_cis() to flag unexpressed
+            genes.  Drawn as a vertical dotted line for reference.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+        """
+        import matplotlib.pyplot as plt
+
+        data = self._compute_ntc_log2_exprs_from_fit()
+        if data is None:
+            raise ValueError("Ensure fit_ntc() has been run before plotting.")
+
+        all_expr  = data['all_log2_expr']
+        cis_val   = data['cis_log2_expr']
+        n_genes   = len(all_expr)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.hist(all_expr, bins=n_bins, color='steelblue', alpha=0.6, edgecolor='none')
+        ax.axvline(cis_val, color='red', lw=2, ls='--',
+                   label=f'{self.cis_gene}  (log$_2$ = {cis_val:.2f})')
+        ax.axvline(threshold, color='grey', lw=1.5, ls=':',
+                   label=f'fit_cis threshold ({threshold})')
+        ax.set_xlabel('log$_2$(NTC mean expression) from technical fit', fontsize=10)
+        ax.set_ylabel('Number of genes', fontsize=10)
+        ax.set_title(
+            f'NTC expression — {self.cis_gene}  '
+            f'({"BELOW" if cis_val < threshold else "above"} threshold)\n'
+            f'{n_genes} genes, {data["n_ntc_cells"]} NTC cells',
+            fontsize=9
+        )
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        return fig
+
+    def plot_ntc_overdispersion(
+        self,
+        modality_name: str = None,
+        ax=None,
+        figsize: tuple = (6, 5),
+    ):
+        """
+        Scatter plot of log2(mu_ntc) vs log2(o_y) from the technical fit.
+
+        Highlights the cis gene in red.  Useful for diagnosing whether the
+        cis gene falls in an unusual region of the mu_ntc–o_y relationship.
+
+        Requires fit_ntc() to have been run first.
+
+        Parameters
+        ----------
+        modality_name : str, optional
+            Modality to plot (default: primary modality).
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on.  Creates a new figure if None.
+        figsize : tuple, default=(6, 5)
+            Figure size (width, height) in inches.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+        """
+        import matplotlib.pyplot as plt
+
+        if modality_name is None:
+            modality_name = self.primary_modality
+
+        modality = self.get_modality(modality_name)
+        ps = modality.posterior_samples_ntc
+        if ps is None or 'mu_ntc' not in ps or 'o_y' not in ps:
+            raise ValueError(
+                f"No technical fit found for modality '{modality_name}'. "
+                "Run fit_ntc() first."
+            )
+
+        # Extract posterior means — tensors may be [S, T] or [S, C, T]
+        mu_ntc_raw = ps['mu_ntc'].mean(dim=0).detach().numpy()
+        o_y_raw    = ps['o_y'].mean(dim=0).detach().numpy()
+
+        # Flatten multi-group tensors to 1D (take first group = NTC reference)
+        mu_ntc = mu_ntc_raw.reshape(-1) if mu_ntc_raw.ndim == 1 else mu_ntc_raw[0]
+        o_y    = o_y_raw.reshape(-1)    if o_y_raw.ndim == 1    else o_y_raw[0]
+
+        log2_mu = np.log2(np.clip(mu_ntc, 1e-8, None))
+        log2_oy = np.log2(np.clip(o_y,    1e-8, None))
+
+        new_fig = ax is None
+        if new_fig:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.get_figure()
+
+        ax.scatter(log2_mu, log2_oy, alpha=0.25, s=4, c='steelblue', rasterized=True,
+                   label='trans genes')
+
+        # Highlight cis gene if available
+        if 'cis' in self.modalities:
+            cis_ps = self.modalities['cis'].posterior_samples_ntc
+            if cis_ps is not None and 'mu_ntc' in cis_ps and 'o_x' in cis_ps:
+                cis_mu = float(cis_ps['mu_ntc'].mean().item())
+                cis_ox = float(cis_ps['o_x'].mean().item())
+                ax.scatter(
+                    np.log2(max(cis_mu, 1e-8)),
+                    np.log2(max(cis_ox, 1e-8)),
+                    s=120, c='red', zorder=10, marker='*',
+                    label=f'{self.cis_gene}'
+                )
+
+        ax.set_xlabel('log$_2$(mu_ntc)', fontsize=11)
+        ax.set_ylabel('log$_2$(o_y)', fontsize=11)
+        ax.set_title('Technical fit: NTC mean expression vs overdispersion', fontsize=11)
+        ax.axhline(0, color='gray', lw=0.5, ls='--')
+        ax.legend(fontsize=9, markerscale=1.5)
+
+        if new_fig:
+            fig.tight_layout()
+
+        return fig
 
     def _filter_features(self, counts, feature_meta, features_to_keep):
         """
@@ -631,15 +1554,19 @@ class bayesDREAM(
 
         print(f"[INFO] Extracting 'cis' modality: {cis_gene}")
 
-        # Use numeric index and keep original gene name
-        cis_feature_meta = pd.DataFrame({
-            'gene': [cis_gene],
-            'gene_name': [cis_gene]  # Store original name
-        }, index=[numeric_idx])
-
-        # Add Ensembl ID if available in feature_meta
-        if feature_meta is not None and 'ens_id' in feature_meta.columns:
-            cis_feature_meta['ens_id'] = feature_meta.loc[numeric_idx, 'ens_id']
+        # Build cis_feature_meta: copy all columns from feature_meta row if available
+        if feature_meta is not None:
+            cis_feature_meta = feature_meta.iloc[[numeric_idx]].copy()
+            cis_feature_meta.index = [numeric_idx]
+            if 'gene' not in cis_feature_meta.columns:
+                cis_feature_meta['gene'] = cis_gene
+            if 'gene_name' not in cis_feature_meta.columns:
+                cis_feature_meta['gene_name'] = cis_gene
+        else:
+            cis_feature_meta = pd.DataFrame({
+                'gene': [cis_gene],
+                'gene_name': [cis_gene],
+            }, index=[numeric_idx])
 
         # Extract cell names from counts or meta
         if isinstance(counts, pd.DataFrame):
@@ -922,13 +1849,6 @@ class bayesDREAM(
         if len(features_to_keep) == 0:
             raise ValueError(f"No features left in '{modality_name}' after filtering!")
 
-        # Report what was filtered
-        n_total = len(feature_meta)
-        n_cis = 1 if cis_feature_idx is not None else 0
-        n_zero_std = n_total - len(features_to_keep) - n_cis
-
-        pass  # Modality.__init__ reports feature counts and filtering
-
         # Filter counts and metadata
         counts_trans, mod_feature_meta = self._filter_features(counts, feature_meta, features_to_keep)
 
@@ -974,6 +1894,7 @@ class bayesDREAM(
         gene_meta: Optional[pd.DataFrame] = None,
         meta: Optional[pd.DataFrame] = None,
         min_count: int = 1,
+        cis_only: bool = False,
     ):
         """
         Create 'gene' modality from gene counts (excluding cis gene if specified).
@@ -1089,15 +2010,12 @@ class bayesDREAM(
 
             features_to_keep.append(i)
 
-        if len(features_to_keep) == 0:
-            raise ValueError("No genes left after filtering!")
-
-        # Report what was filtered
-        n_total = len(gene_meta)
-        n_cis = 1 if cis_gene_idx is not None else 0
-        n_zero_std = n_total - len(features_to_keep) - n_cis
-
-        pass  # Modality.__init__ reports feature counts and filtering
+        if len(features_to_keep) == 0 and not cis_only:
+            raise ValueError(
+                "No genes left after filtering! (Pass cis_only=True to bayesDREAM's "
+                "constructor if this is intentional -- e.g. counts pre-subsetted "
+                "upstream to just the cis gene for a cheap cis-only fit.)"
+            )
 
         # Filter counts and metadata
         counts_trans, gene_feature_meta = self._filter_features(counts, gene_meta, features_to_keep)
@@ -1143,19 +2061,48 @@ class bayesDREAM(
         overwrite: bool = False
     ):
         """
-        Add a new modality.
+        Add a pre-constructed Modality object to the model.
 
         Parameters
         ----------
         name : str
-            Modality name
+            Modality name (e.g., ``'my_data'``). Must be unique unless
+            ``overwrite=True``.
         modality : Modality
-            Modality object
-        overwrite : bool
-            Whether to overwrite existing modality with same name
+            A fully constructed :class:`Modality` object.
+        overwrite : bool, default False
+            If True, replace an existing modality with the same name.
+
+        Warns
+        -----
+        UserWarning
+            If a ``negbinom`` modality is added without ``sum_factors`` set.
+            You must assign ``modality.sum_factors`` (a cell-indexed DataFrame)
+            before calling :meth:`fit_trans` on that modality.
+
+        Raises
+        ------
+        ValueError
+            If ``name`` already exists and ``overwrite=False``.
         """
         if name in self.modalities and not overwrite:
             raise ValueError(f"Modality '{name}' already exists. Use overwrite=True to replace it.")
+
+        # Negbinom modalities require their own sum_factors for normalisation.
+        # Primary and cis share the same DataFrame (handled by _init_sum_factors),
+        # but all other negbinom modalities must have sum_factors set explicitly
+        # by the caller before fit_trans() is called on them.
+        if (modality.distribution == 'negbinom'
+                and modality.sum_factors is None
+                and name not in (self.primary_modality, 'cis')):
+            import warnings
+            warnings.warn(
+                f"Negbinom modality '{name}' has no sum_factors set. "
+                f"You must assign modality.sum_factors (a cell-indexed DataFrame) "
+                f"before calling fit_trans() on this modality.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         self.modalities[name] = modality
         print(f"[INFO] Added modality '{name}': {modality}")
@@ -1178,20 +2125,20 @@ class bayesDREAM(
             - distribution: Distribution type
             - n_features: Number of features
             - n_cells: Number of cells
-            - fit_technical: ✓ if fitted, ✗ if not fitted, - if not configured
+            - fit_ntc: ✓ if fitted, ✗ if not fitted, - if not configured
             - fit_cis: ✓ if fitted, ✗ if not fitted, - if not applicable
             - fit_trans: ✓ if fitted, ✗ if not fitted
 
         Notes
         -----
-        fit_technical shows:
+        fit_ntc shows:
         - '-' if technical_group_code not set (no technical covariates configured)
-        - '✗' if technical_group_code set but fit_technical() not run
-        - '✓' if fit_technical() completed
+        - '✗' if technical_group_code set but fit_ntc() not run
+        - '✓' if fit_ntc() completed
         """
         if not self.modalities:
             return pd.DataFrame(columns=['name', 'distribution', 'n_features', 'n_cells',
-                                        'fit_technical', 'fit_cis', 'fit_trans'])
+                                        'fit_ntc', 'fit_cis', 'fit_trans'])
 
         # Check if technical groups are configured
         has_technical_groups = 'technical_group_code' in self.meta.columns
@@ -1229,17 +2176,143 @@ class bayesDREAM(
                 'distribution': mod.distribution,
                 'n_features': mod.dims['n_features'],
                 'n_cells': mod.dims['n_cells'],
-                'fit_technical': has_technical,
+                'fit_ntc': has_technical,
                 'fit_cis': has_cis,
                 'fit_trans': has_trans
             })
         return pd.DataFrame(rows)
+
+    # -----------------------------------------------------------------------
+    # Re-expose core methods at class level so pdoc renders them here.
+    # Docstrings flow from the implementation classes via functools.wraps in
+    # _BayesDREAMCore; no documentation lives in this block.
+    # -----------------------------------------------------------------------
+
+    @functools.wraps(_BayesDREAMCore.set_technical_groups)
+    def set_technical_groups(self, *args, **kwargs):
+        return super().set_technical_groups(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.fit_ntc)
+    def fit_ntc(self, *args, **kwargs):
+        return super().fit_ntc(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.fit_cis)
+    def fit_cis(self, *args, **kwargs):
+        return super().fit_cis(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.fit_trans)
+    def fit_trans(self, *args, **kwargs):
+        return super().fit_trans(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.set_alpha_x)
+    def set_alpha_x(self, *args, **kwargs):
+        return super().set_alpha_x(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.set_alpha_y)
+    def set_alpha_y(self, *args, **kwargs):
+        return super().set_alpha_y(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.set_x_true)
+    def set_x_true(self, *args, **kwargs):
+        return super().set_x_true(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.adjust_ntc_sum_factor)
+    def adjust_ntc_sum_factor(self, *args, **kwargs):
+        return super().adjust_ntc_sum_factor(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.refit_sumfactor)
+    def refit_sumfactor(self, *args, **kwargs):
+        return super().refit_sumfactor(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.subset_cells)
+    def subset_cells(self, *args, **kwargs):
+        return super().subset_cells(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.permute_x_true)
+    def permute_x_true(self, *args, **kwargs):
+        return super().permute_x_true(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_ntc_fit)
+    def save_ntc_fit(self, *args, **kwargs):
+        return super().save_ntc_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_cis_fit)
+    def save_cis_fit(self, *args, **kwargs):
+        return super().save_cis_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_trans_fit)
+    def save_trans_fit(self, *args, **kwargs):
+        return super().save_trans_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.load_ntc_fit)
+    def load_ntc_fit(self, *args, **kwargs):
+        return super().load_ntc_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.load_cis_fit)
+    def load_cis_fit(self, *args, **kwargs):
+        return super().load_cis_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.load_trans_fit)
+    def load_trans_fit(self, *args, **kwargs):
+        return super().load_trans_fit(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_ntc_summary)
+    def save_ntc_summary(self, *args, **kwargs):
+        return super().save_ntc_summary(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_cis_summary)
+    def save_cis_summary(self, *args, **kwargs):
+        return super().save_cis_summary(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.save_trans_summary)
+    def save_trans_summary(self, *args, **kwargs):
+        return super().save_trans_summary(*args, **kwargs)
+
+    @functools.wraps(_BayesDREAMCore.classify_second_deriv_roots)
+    def classify_second_deriv_roots(self, *args, **kwargs):
+        return super().classify_second_deriv_roots(*args, **kwargs)
+
+    def plot_technical_fit(self, *args, **kwargs):
+        return super().plot_technical_fit(*args, **kwargs)
+
+    def plot_cis_fit(self, *args, **kwargs):
+        return super().plot_cis_fit(*args, **kwargs)
+
+    def plot_trans_fit(self, *args, **kwargs):
+        return super().plot_trans_fit(*args, **kwargs)
+
+    def plot_xy_data(self, *args, **kwargs):
+        return super().plot_xy_data(*args, **kwargs)
+
+    def plot_trans_functions(self, *args, **kwargs):
+        return super().plot_trans_functions(*args, **kwargs)
+
+    def plot_parameter_ci_panel(self, *args, **kwargs):
+        return super().plot_parameter_ci_panel(*args, **kwargs)
+
+    def extract_posterior_dataframe(self, *args, **kwargs):
+        return super().extract_posterior_dataframe(*args, **kwargs)
+
+    def check_systematic_shift(self, *args, **kwargs):
+        return super().check_systematic_shift(*args, **kwargs)
+
+    def get_shift_window_cells(self, *args, **kwargs):
+        return super().get_shift_window_cells(*args, **kwargs)
 
     def __repr__(self) -> str:
         """String representation."""
         n_cells = len(self.meta)
         n_modalities = len(self.modalities)
         modality_names = ', '.join(self.modalities.keys())
+        lean_mods = [name for name, mod in self.modalities.items() if mod.is_ntc_lean]
+        lean_line = ""
+        if lean_mods or self.is_cis_lean:
+            parts = []
+            if lean_mods:
+                parts.append(f"ntc=[{', '.join(lean_mods)}]")
+            if self.is_cis_lean:
+                parts.append("cis=True")
+            lean_line = f"  LEAN-LOADED ({', '.join(parts)}) — point estimates only, see is_ntc_lean/is_cis_lean,\n"
 
         return (
             f"bayesDREAM(\n"
@@ -1249,5 +2322,25 @@ class bayesDREAM(
             f"  modalities=[{modality_names}],\n"
             f"  primary_modality='{self.primary_modality}',\n"
             f"  device={self.device}\n"
+            f"{lean_line}"
             f")"
         )
+
+
+# Copy docstrings from ModelPlottingMixin / DiagnosticsMixin to the forwarding
+# stubs above. We don't use functools.wraps because that copies __qualname__,
+# which would cause pdoc to attribute the methods to the mixin's own (hidden
+# via __pdoc__) page rather than showing them on bayesDREAM.
+for _plot_method in [
+    "plot_technical_fit", "plot_cis_fit", "plot_trans_fit",
+    "plot_xy_data", "plot_trans_functions",
+    "plot_parameter_ci_panel", "extract_posterior_dataframe",
+]:
+    _src = getattr(_ModelPlottingMixin, _plot_method, None)
+    if _src and _src.__doc__:
+        bayesDREAM.__dict__[_plot_method].__doc__ = _src.__doc__
+
+for _diag_method in ["check_systematic_shift", "get_shift_window_cells"]:
+    _src = getattr(_DiagnosticsMixin, _diag_method, None)
+    if _src and _src.__doc__:
+        bayesDREAM.__dict__[_diag_method].__doc__ = _src.__doc__

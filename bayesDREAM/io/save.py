@@ -5,6 +5,9 @@ Save methods for bayesDREAM fitted parameters.
 import os
 import torch
 
+from ..utils import is_lean_posterior
+from .load import _reduce_posterior_samples
+
 class ModelSaver:
     """Handles saving fitted parameters."""
 
@@ -23,10 +26,10 @@ class ModelSaver:
     # Save/Load fitted parameters
     ########################################################
 
-    def save_technical_fit(self, output_dir: str = None, modalities: list = None, verbose: bool = False,
+    def save_ntc_fit(self, output_dir: str = None, modalities: list = None, verbose: bool = False,
                           save_model_level: bool = None):
         """
-        Save fitted technical parameters from fit_technical().
+        Save fitted NTC parameters from fit_ntc().
 
         Parameters
         ----------
@@ -47,7 +50,7 @@ class ModelSaver:
         -----
         Saves per-modality:
         - alpha_y_prefit_{modality}.pt: Appropriate alpha_y for distribution (add or mult)
-        - posterior_samples_technical_{modality}.pt: Full posterior samples
+        - posterior_samples_ntc_{modality}.pt: Full posterior samples
 
         Saves model-level (automatically when primary modality is included):
         - alpha_x_prefit.pt: Cis gene overdispersion (if set)
@@ -71,6 +74,21 @@ class ModelSaver:
                 raise ValueError(f"Unknown modalities: {invalid}. Available: {list(self.model.modalities.keys())}")
             modalities_to_save = modalities
 
+        # Refuse to re-save lean-loaded posteriors as if they were a full fit:
+        # load_ntc_fit(lean=True) irreversibly collapses the per-draw samples
+        # to point estimates (see io.load._reduce_posterior_samples), so the
+        # resulting file would silently claim to be a full posterior archive
+        # while actually containing single-sample tensors.
+        for mod_name in modalities_to_save:
+            ps = getattr(self.model.modalities[mod_name], 'posterior_samples_ntc', None)
+            if is_lean_posterior(ps):
+                raise ValueError(
+                    f"Cannot save_ntc_fit(): modality '{mod_name}' was loaded with "
+                    f"load_ntc_fit(lean=True), so its posterior_samples_ntc only "
+                    f"contains collapsed point estimates, not the full posterior. "
+                    f"Reload with lean=False if you need to re-save a full fit."
+                )
+
         # Determine whether to save model-level parameters
         if save_model_level is None:
             should_save_model_level = self.model.primary_modality in modalities_to_save
@@ -87,17 +105,7 @@ class ModelSaver:
                 if verbose:
                     print(f"[SAVE] alpha_x_prefit → {path}")
 
-            # NOTE: model.alpha_y_prefit is deprecated - alpha_y_prefit is stored per-modality
-            # For backward compatibility, save primary modality's alpha_y_prefit as alpha_y_prefit.pt
-            primary_mod = self.model.get_modality(self.model.primary_modality)
-            if primary_mod.alpha_y_prefit is not None:
-                path = os.path.join(output_dir, 'alpha_y_prefit.pt')
-                torch.save(primary_mod.alpha_y_prefit, path)
-                saved_files['alpha_y_prefit'] = path
-                if verbose:
-                    print(f"[SAVE] alpha_y_prefit (from {self.model.primary_modality} modality) → {path}")
-
-        # Save per-modality alpha_y_prefit and posterior_samples_technical
+        # Save per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_save:
             mod = self.model.modalities[mod_name]
             mod_saved = []
@@ -129,11 +137,11 @@ class ModelSaver:
                 if verbose:
                     print(f"[SAVE] {mod_name}.alpha_y_prefit ({alpha_type}) → {path}")
 
-            # Save modality-specific posterior_samples_technical
-            if hasattr(mod, 'posterior_samples_technical') and mod.posterior_samples_technical is not None:
+            # Save modality-specific posterior_samples_ntc
+            if hasattr(mod, 'posterior_samples_ntc') and mod.posterior_samples_ntc is not None:
                 # Remove large observation arrays before saving
-                # Also ensure that alpha_y_add and alpha_y_mult are included for backward compatibility
-                posterior_clean = {k: v for k, v in mod.posterior_samples_technical.items()
+                # Ensure alpha_y_add and alpha_y_mult are present for downstream loading
+                posterior_clean = {k: v for k, v in mod.posterior_samples_ntc.items()
                                  if k not in ['y_obs_ntc', 'y_obs']}
 
                 # Verify critical keys are present for downstream loading
@@ -146,10 +154,12 @@ class ModelSaver:
                         posterior_clean['alpha_y_mult'] = mod.alpha_y_prefit_mult
 
                 # Add feature metadata (including full DataFrame for excluded features tracking)
-                # Use actual tensor shape (not modality dims which may differ after filtering)
-                _sample_tensor = next((v for v in posterior_clean.values()
-                                       if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
-                n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else mod.dims.get('n_features', None)
+                # Use the modality's authoritative feature count (same reason as trans save)
+                n_features = mod.dims.get('n_features', None)
+                if n_features is None:
+                    _sample_tensor = next((v for v in posterior_clean.values()
+                                           if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
+                    n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else None
                 posterior_with_meta = {
                     'posterior_samples': posterior_clean,
                     'modality_name': mod_name,
@@ -157,21 +167,34 @@ class ModelSaver:
                     'feature_names': mod.feature_names if hasattr(mod, 'feature_names') else None,
                     'n_features': n_features,
                     'feature_meta': mod.feature_meta.to_dict('records') if hasattr(mod, 'feature_meta') and mod.feature_meta is not None else None,
-                    'loss_technical': mod.loss_technical if hasattr(mod, 'loss_technical') else None
+                    'loss_ntc': mod.loss_ntc if hasattr(mod, 'loss_ntc') else None
                 }
 
-                path = os.path.join(output_dir, f'posterior_samples_technical_{mod_name}.pt')
+                path = os.path.join(output_dir, f'posterior_samples_ntc_{mod_name}.pt')
                 torch.save(posterior_with_meta, path)
-                saved_files[f'posterior_samples_technical_{mod_name}'] = path
+                saved_files[f'posterior_samples_ntc_{mod_name}'] = path
                 mod_saved.append(f'posterior({n_features} features)')
                 if verbose:
-                    print(f"[SAVE] {mod_name}.posterior_samples_technical ({n_features} features) → {path}")
+                    print(f"[SAVE] {mod_name}.posterior_samples_ntc ({n_features} features) → {path}")
+
+                # Also save a small lean companion file (point estimates + 95% CI
+                # only, see io.load._reduce_posterior_samples) so that
+                # load_ntc_fit(lean=True) can read this directly instead of the
+                # full multi-sample file above — cuts both disk I/O and peak
+                # memory during loading, not just the steady-state footprint.
+                lean_path = os.path.join(output_dir, f'posterior_samples_ntc_{mod_name}_lean.pt')
+                lean_posterior_with_meta = dict(posterior_with_meta)
+                lean_posterior_with_meta['posterior_samples'] = _reduce_posterior_samples(posterior_clean)
+                torch.save(lean_posterior_with_meta, lean_path)
+                saved_files[f'posterior_samples_ntc_{mod_name}_lean'] = lean_path
+                if verbose:
+                    print(f"[SAVE] {mod_name}.posterior_samples_ntc (lean) → {lean_path}")
 
             if mod_saved:
                 saved_summary.append(f"{mod_name}: {', '.join(mod_saved)}")
 
         # Print summary
-        print(f"[SAVE] Technical fit to {output_dir}")
+        print(f"[SAVE] NTC fit to {output_dir}")
         if saved_summary:
             print(f"[SAVE] Saved: {'; '.join(saved_summary)}")
 
@@ -203,6 +226,17 @@ class ModelSaver:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
 
         os.makedirs(output_dir, exist_ok=True)
+
+        # Refuse to re-save lean-loaded posteriors as if they were a full fit
+        # (see the matching guard in save_ntc_fit for why).
+        ps_cis = getattr(self.model, 'posterior_samples_cis', None)
+        if is_lean_posterior(ps_cis):
+            raise ValueError(
+                "Cannot save_cis_fit(): posterior_samples_cis was loaded with "
+                "load_cis_fit(lean=True), so it only contains collapsed point "
+                "estimates, not the full posterior. Reload with lean=False if "
+                "you need to re-save a full fit."
+            )
 
         saved_files = {}
         saved_summary = []
@@ -248,6 +282,19 @@ class ModelSaver:
             saved_summary.append(f'posterior_cis ({self.model.cis_gene})')
             if verbose:
                 print(f"[SAVE] posterior_samples_cis (cis_gene: {self.model.cis_gene}) → {path}")
+
+            # Also save a small lean companion file (point estimates + 95% CI
+            # only, see io.load._reduce_posterior_samples) so that
+            # load_cis_fit(lean=True) can read this directly instead of the
+            # full multi-sample file above — cuts both disk I/O and peak
+            # memory during loading, not just the steady-state footprint.
+            lean_path = os.path.join(output_dir, 'posterior_samples_cis_lean.pt')
+            lean_posterior_with_meta = dict(posterior_with_meta)
+            lean_posterior_with_meta['posterior_samples'] = _reduce_posterior_samples(posterior_clean)
+            torch.save(lean_posterior_with_meta, lean_path)
+            saved_files['posterior_samples_cis_lean'] = lean_path
+            if verbose:
+                print(f"[SAVE] posterior_samples_cis (lean) → {lean_path}")
 
         # Print summary
         print(f"[SAVE] Cis fit to {output_dir}")
@@ -316,11 +363,14 @@ class ModelSaver:
                 primary_mod = self.model.get_modality(self.model.primary_modality)
 
                 # Add modality and feature metadata (including full feature_meta DataFrame)
-                # Use actual tensor shape (not modality dims which may differ after filtering)
-                _sample_tensor = next((v for v in posterior_clean.values()
-                                       if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
-                n_features_primary = (_sample_tensor.shape[-1] if _sample_tensor is not None
-                                      else primary_mod.dims.get('n_features', None))
+                # Use the modality's authoritative feature count (not sample tensor shape[-1],
+                # which can pick a non-feature tensor such as alpha_y [S, C-1, T] whose
+                # last dim could coincidentally be 1 when C-1=1, saving wrong n_features).
+                n_features_primary = primary_mod.dims.get('n_features', None)
+                if n_features_primary is None:
+                    _sample_tensor = next((v for v in posterior_clean.values()
+                                           if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
+                    n_features_primary = _sample_tensor.shape[-1] if _sample_tensor is not None else None
                 posterior_with_meta = {
                     'posterior_samples': posterior_clean,
                     'modality_name': self.model.primary_modality,
@@ -347,10 +397,12 @@ class ModelSaver:
                 posterior_clean = {k: v for k, v in mod.posterior_samples_trans.items()
                                  if k not in ['y_obs', 'x_obs']}
 
-                # Use actual tensor shape (not modality dims which may differ after filtering)
-                _sample_tensor = next((v for v in posterior_clean.values()
-                                       if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
-                n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else mod.dims.get('n_features', None)
+                # Use the modality's authoritative feature count (same reason as primary modality)
+                n_features = mod.dims.get('n_features', None)
+                if n_features is None:
+                    _sample_tensor = next((v for v in posterior_clean.values()
+                                           if isinstance(v, torch.Tensor) and v.ndim >= 2), None)
+                    n_features = _sample_tensor.shape[-1] if _sample_tensor is not None else None
 
                 # Add modality and feature metadata (including full feature_meta DataFrame)
                 posterior_with_meta = {

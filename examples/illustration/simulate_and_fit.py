@@ -252,9 +252,9 @@ model = bayesDREAM(
 )
 
 # Step 1 — Technical fit (estimates alpha_y overdispersion for downstream use)
-print("\n=== Step 1: fit_technical ===")
+print("\n=== Step 1: fit_ntc ===")
 model.set_technical_groups(["cell_line"])
-model.fit_technical(
+model.fit_ntc(
     modality_name="gene",
     sum_factor_col="sum_factor",
     niters=3000,

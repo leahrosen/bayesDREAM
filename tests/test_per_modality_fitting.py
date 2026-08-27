@@ -1,6 +1,6 @@
 """Test per-modality fitting functionality.
 
-Verifies that fit_technical() and fit_trans() can fit different modalities
+Verifies that fit_ntc() and fit_trans() can fit different modalities
 and store results correctly per modality, without overwriting each other.
 """
 
@@ -30,7 +30,6 @@ def fitted_multimodal_model(shared_test_data):
         meta=meta,
         counts=gene_counts,
         cis_gene='GFI1B',
-        primary_modality='gene',
         output_dir='./test_output',
         label='per_modality_test',
         device='cpu',
@@ -52,9 +51,9 @@ def fitted_multimodal_model(shared_test_data):
 
     # Fit technical on both modalities
     model.set_technical_groups(['cell_line'])
-    model.fit_technical(sum_factor_col='sum_factor', modality_name='gene',
+    model.fit_ntc(sum_factor_col='sum_factor', modality_name='gene',
                         niters=NITERS, nsamples=NSAMPLES)
-    model.fit_technical(modality_name='splicing_test', niters=NITERS, nsamples=NSAMPLES)
+    model.fit_ntc(modality_name='splicing_test', niters=NITERS, nsamples=NSAMPLES)
 
     # Set dummy x_true for trans tests
     model.x_true = torch.ones(n_cells, dtype=torch.float32)
@@ -101,7 +100,7 @@ def test_gene_alpha_not_overwritten_by_splicing_fit(fitted_multimodal_model):
 
 def test_model_level_technical_stored(fitted_multimodal_model):
     gene_mod = fitted_multimodal_model.get_modality('gene')
-    assert gene_mod.posterior_samples_technical is not None
+    assert gene_mod.posterior_samples_ntc is not None
 
 
 # --- Trans fit checks ---
@@ -141,13 +140,13 @@ def test_trans_without_technical_fit_raises(fitted_multimodal_model):
 
 # --- Default behaviour ---
 
-def test_fit_technical_defaults_to_primary_modality(fitted_multimodal_model):
+def test_fit_ntc_defaults_to_primary_modality(fitted_multimodal_model):
     gene_mod = fitted_multimodal_model.get_modality('gene')
     # Reset the prefit for this test
     gene_mod.alpha_y_prefit = None
-    gene_mod.posterior_samples_technical = None
+    gene_mod.posterior_samples_ntc = None
     
     # Fit technical without specifying modality (should default to 'gene')
-    fitted_multimodal_model.fit_technical(sum_factor_col='sum_factor', niters=NITERS, nsamples=NSAMPLES)
+    fitted_multimodal_model.fit_ntc(sum_factor_col='sum_factor', niters=NITERS, nsamples=NSAMPLES)
     
     assert gene_mod.alpha_y_prefit is not None

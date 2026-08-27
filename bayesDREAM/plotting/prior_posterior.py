@@ -57,8 +57,8 @@ def plot_scalar_parameter(
     Examples
     --------
     >>> # Plot beta_o from technical fit
-    >>> beta_o_prior = model.posterior_samples_technical['beta_o']  # Prior samples
-    >>> beta_o_post = model.posterior_samples_technical['beta_o']   # Posterior samples
+    >>> beta_o_prior = model.posterior_samples_ntc['beta_o']  # Prior samples
+    >>> beta_o_post = model.posterior_samples_ntc['beta_o']   # Posterior samples
     >>> fig = plot_scalar_parameter(beta_o_prior, beta_o_post, 'beta_o')
     """
     if ax is None:
@@ -186,7 +186,7 @@ def plot_1d_parameter(
     Examples
     --------
     >>> # Plot alpha_y from technical fit
-    >>> alpha_y = model.posterior_samples_technical['alpha_y']  # shape: (samples, C, genes)
+    >>> alpha_y = model.posterior_samples_ntc['alpha_y']  # shape: (samples, C, genes)
     >>> # Extract for one cell line (e.g., first)
     >>> alpha_y_cl0 = alpha_y[:, 0, :]
     >>> prior_alpha_y = ...  # Prior samples
@@ -468,7 +468,7 @@ def plot_2d_parameter(
     Examples
     --------
     >>> # Plot alpha_y across multiple cell lines
-    >>> alpha_y = model.posterior_samples_technical['alpha_y']  # (samples, C, genes)
+    >>> alpha_y = model.posterior_samples_ntc['alpha_y']  # (samples, C, genes)
     >>> prior_alpha_y = ...  # Prior samples
     >>> gene_names = model.modalities['gene'].feature_meta['gene'].tolist()
     >>> cell_lines = ['K562', 'Jurkat', 'THP1']

@@ -13,6 +13,7 @@ from matplotlib.colors import Normalize, LinearSegmentedColormap
 from matplotlib.cm import ScalarMappable
 from matplotlib.collections import LineCollection
 from scipy.spatial import cKDTree
+import scipy.sparse as _sp
 from typing import Optional, Dict, List, Tuple, Union, Any
 import warnings
 import torch
@@ -93,8 +94,21 @@ def _align_cells_to_modality(
     modality_cell_to_idx = {cell: idx for idx, cell in enumerate(modality_cells)}
     y_indices = np.array([modality_cell_to_idx[cell] for cell in final_cells])
 
-    # Subset y_data using these indices
-    y_data_aligned = y_data[y_indices]
+    # Subset y_data using these indices.
+    # Scipy sparse matrix slices are always 2D, so indexing must match the cell axis:
+    #   - shape (1, n_cells): row slice from a features×cells matrix → select columns
+    #   - shape (n_cells, 1): col slice from a cells×features matrix → select rows, flatten
+    if _sp.issparse(y_data):
+        # np.asarray() on a sparse matrix gives a 0-d object array, not dense —
+        # must use .toarray() to get a proper 2D ndarray before flattening.
+        if y_data.ndim == 2 and y_data.shape[0] == 1:
+            # features×cells orientation: cells are along axis 1
+            y_data_aligned = y_data[:, y_indices].toarray().flatten()
+        else:
+            # cells×features orientation: cells are along axis 0
+            y_data_aligned = y_data[y_indices].toarray().flatten()
+    else:
+        y_data_aligned = y_data[y_indices]
 
     return x_true_aligned, y_data_aligned, meta_aligned
 
@@ -398,29 +412,13 @@ def _resolve_features(feature_or_gene: str, modality) -> Tuple[List[int], List[s
             # Found matches
             indices = mask.values.nonzero()[0].tolist()
 
-            # Get feature names for matched indices
-            if hasattr(modality, 'feature_names') and modality.feature_names is not None:
-                # Use explicit feature_names attribute if available
+            # Get feature names for matched indices.
+            # modality.feature_names is the single source of truth (resolved +
+            # deduped in Modality.__init__), no need to re-derive it here.
+            if modality.feature_names is not None:
                 names = [modality.feature_names[i] for i in indices]
             else:
-                # Extract from feature_meta columns
-                # Priority: feature_id > feature > gene_name > gene > junction coordinates > fallback to index
-                name_cols = ['feature_id', 'feature', 'gene_name', 'gene', 'coord.intron', 'junction_id']
-                name_col_found = None
-                for col in name_cols:
-                    if col in modality.feature_meta.columns:
-                        name_col_found = col
-                        break
-
-                if name_col_found:
-                    # Extract names from the identified column
-                    names = modality.feature_meta.iloc[indices][name_col_found].tolist()
-                elif modality.feature_meta.index.name:
-                    # Use index if it has a name
-                    names = modality.feature_meta.iloc[indices].index.tolist()
-                else:
-                    # Last resort: use str(index)
-                    names = [str(i) for i in indices]
+                names = [str(i) for i in indices]
 
             return indices, names, True
 
@@ -570,6 +568,34 @@ def _multinomial_correct_binned_probs(
 
 
 # ============================================================================
+# Posterior Extraction Utilities
+# ============================================================================
+
+def _extract_param_mean(param_samples, feature_idx: int):
+    """Extract the posterior-mean value for one feature from a parameter tensor."""
+    if hasattr(param_samples, 'mean'):
+        param_mean = param_samples.mean(dim=0)
+    else:
+        param_mean = param_samples.mean(axis=0)
+    if param_mean.ndim > 1:
+        param_mean = param_mean.squeeze(0)
+    val = param_mean[feature_idx]
+    return val.item() if hasattr(val, 'item') else val
+
+
+def _extract_param_samples(posterior, param_name: str, feature_idx: int) -> np.ndarray:
+    """Extract all posterior samples for one feature from a named parameter."""
+    samples = posterior[param_name]
+    if hasattr(samples, 'cpu'):
+        samples = samples.cpu().numpy()
+    else:
+        samples = np.array(samples)
+    if samples.ndim > 2:
+        samples = samples.squeeze(1)
+    return samples[:, feature_idx]
+
+
+# ============================================================================
 # Technical Group Utilities
 # ============================================================================
 
@@ -577,68 +603,35 @@ def get_technical_group_labels(model) -> List[str]:
     """
     Get informative labels for technical groups.
 
-    Returns human-readable labels like "K562", "TF1:lane1" instead of
-    generic "technical_group_0", "technical_group_1".
+    Returns human-readable labels like ``"K562"`` or ``"K562:lane1"`` built
+    from the covariates passed to ``set_technical_groups()``.
 
     Parameters
     ----------
     model : bayesDREAM
-        Fitted bayesDREAM model
+        Fitted bayesDREAM model.
 
     Returns
     -------
     List[str]
-        Informative labels for each technical group code
+        One label per unique ``technical_group_code`` value (sorted).
     """
     if 'technical_group_code' not in model.meta.columns:
-        return ['All']  # Single group when no technical groups
+        return ['All']
 
-    # Get unique technical groups
     group_codes = sorted(model.meta['technical_group_code'].unique())
 
-    # Determine which covariates were used
-    # We need to reverse engineer this from the grouping
-    # Try common covariate combinations
-    potential_covariates = ['cell_line', 'lane', 'batch', 'replicate']
-    available_covariates = [c for c in potential_covariates if c in model.meta.columns]
-
-    if not available_covariates:
-        # Fall back to generic labels
+    # Use stored covariates if available (set by set_technical_groups)
+    covariates = getattr(model, '_technical_group_covariates', None)
+    if not covariates:
         return [f'Group_{i}' for i in group_codes]
 
-    # Find which covariates were used by checking if they distinguish groups
-    used_covariates = []
-    for cov in available_covariates:
-        test_grouping = model.meta.groupby(used_covariates + [cov]).ngroup()
-        if test_grouping.nunique() == len(group_codes) and (test_grouping == model.meta['technical_group_code']).all():
-            # This covariate set matches
-            used_covariates.append(cov)
-            break
-        elif len(used_covariates) == 0:
-            # Try single covariate
-            test_grouping = model.meta.groupby([cov]).ngroup()
-            if test_grouping.nunique() == len(group_codes) and (test_grouping == model.meta['technical_group_code']).all():
-                used_covariates = [cov]
-                break
-
-    if not used_covariates:
-        # Couldn't determine covariates, use generic labels
-        return [f'Group_{i}' for i in group_codes]
-
-    # Create labels
     labels = []
     for code in group_codes:
         mask = model.meta['technical_group_code'] == code
-        group_data = model.meta.loc[mask, used_covariates].iloc[0]
-
-        if len(used_covariates) == 1:
-            # Single covariate: just use the value
-            labels.append(str(group_data[used_covariates[0]]))
-        else:
-            # Multiple covariates: join with ":"
-            parts = [str(group_data[cov]) for cov in used_covariates]
-            labels.append(':'.join(parts))
-
+        row = model.meta.loc[mask, covariates].iloc[0]
+        parts = [str(row[c]) for c in covariates]
+        labels.append(':'.join(parts))
     return labels
 
 
@@ -1012,7 +1005,9 @@ def predict_trans_derivatives(
     model,
     feature: str,
     x_range: np.ndarray,
-    modality_name: Optional[str] = None
+    modality_name: Optional[str] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute first, second, and third derivatives of trans effect function.
@@ -1029,6 +1024,12 @@ def predict_trans_derivatives(
         X values to compute derivatives at
     modality_name : str, optional
         Modality name (default: primary modality)
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero, matching predict_trans_function so the derivative is of the
+        *same* curve that gets plotted.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -1062,24 +1063,13 @@ def predict_trans_derivatives(
 
     A_samples = posterior['A']
 
-    # Get feature list
-    if modality_name == model.primary_modality:
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
-    else:
-        modality = model.get_modality(modality_name)
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            return None, None, None
+    # Get feature list — always from the modality, never from model.trans_genes.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
+    modality = model.get_modality(modality_name)
+    feature_list = modality.feature_names
+    if feature_list is None:
+        return None, None, None
 
     # Get dimensions
     if hasattr(A_samples, 'mean'):
@@ -1101,29 +1091,26 @@ def predict_trans_derivatives(
 
     feature_idx = feature_list.index(feature)
 
-    # Helper function to extract parameter value
-    def _extract_param(param_samples, feature_idx):
-        if hasattr(param_samples, 'mean'):
-            param_mean = param_samples.mean(dim=0)
-        else:
-            param_mean = param_samples.mean(axis=0)
-        if param_mean.ndim > 1:
-            param_mean = param_mean.squeeze(0)
-        val = param_mean[feature_idx]
-        return val.item() if hasattr(val, 'item') else val
-
     # Check function type and compute derivatives
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
 
             # First derivatives
             dHill_a = Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1148,14 +1135,22 @@ def predict_trans_derivatives(
     elif 'upper_limit' in posterior and 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL (binomial/multinomial) =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
 
             # First derivatives
             dHill_a = Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1180,10 +1175,10 @@ def predict_trans_derivatives(
     elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
 
             # First derivative
             first_deriv = alpha * Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1216,7 +1211,9 @@ def predict_trans_log2fc(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    return_derivatives: bool = True
+    return_derivatives: bool = True,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function and derivatives in log2FC space.
@@ -1235,7 +1232,7 @@ def predict_trans_log2fc(
     Parameters
     ----------
     model : bayesDREAM
-        Model with fit_trans() completed and posterior_samples_technical available
+        Model with fit_trans() completed and posterior_samples_ntc available
     feature : str
         Feature name (trans gene) to predict
     x_range : np.ndarray
@@ -1256,17 +1253,18 @@ def predict_trans_log2fc(
         All are None if computation fails
     """
     # Get S(x) - the function values
-    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name)
+    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name,
+                                     fdr_threshold=fdr_threshold, fdr_df=fdr_df)
     if y_pred is None:
         return None, None, None, None, None
 
     # Get NTC means
     # Cis NTC (for x-axis transformation)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1288,10 +1286,10 @@ def predict_trans_log2fc(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1301,23 +1299,11 @@ def predict_trans_log2fc(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            # Try other column names
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None, None, None, None
 
     feature_idx = feature_list.index(feature)
@@ -1332,7 +1318,10 @@ def predict_trans_log2fc(
         return y_log2fc, u_range, None, None, None
 
     # Get S'(x), S''(x), and S'''(x)
-    first_deriv, second_deriv, third_deriv = predict_trans_derivatives(model, feature, x_range, modality_name=modality_name)
+    first_deriv, second_deriv, third_deriv = predict_trans_derivatives(
+        model, feature, x_range, modality_name=modality_name,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
+    )
     if first_deriv is None:
         return y_log2fc, u_range, None, None, None
 
@@ -1349,7 +1338,9 @@ def predict_trans_log2fc_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function in log2FC space for all posterior samples.
@@ -1366,6 +1357,10 @@ def predict_trans_log2fc_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return
+    fdr_threshold : float, default 0.05
+        FDR-inactive components are gated to zero; see predict_trans_function.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -1376,17 +1371,18 @@ def predict_trans_log2fc_samples(
     """
     # Get all posterior samples for S(x)
     y_samples = predict_trans_function_samples(
-        model, feature, x_range, modality_name=modality_name, max_samples=max_samples
+        model, feature, x_range, modality_name=modality_name, max_samples=max_samples,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
     )
     if y_samples is None:
         return None, None
 
     # Get NTC means (same logic as predict_trans_log2fc)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None
 
@@ -1407,10 +1403,10 @@ def predict_trans_log2fc_samples(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None
 
@@ -1420,22 +1416,11 @@ def predict_trans_log2fc_samples(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None
 
     feature_idx = feature_list.index(feature)
@@ -1456,7 +1441,9 @@ def predict_trans_delta_p(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    return_derivatives: bool = True
+    return_derivatives: bool = True,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function in delta_p (probability difference) space for binomial modalities.
@@ -1470,7 +1457,7 @@ def predict_trans_delta_p(
     Parameters
     ----------
     model : bayesDREAM
-        Model with fit_trans() completed and posterior_samples_technical available
+        Model with fit_trans() completed and posterior_samples_ntc available
     feature : str
         Feature name (trans gene/SJ) to predict
     x_range : np.ndarray
@@ -1492,17 +1479,18 @@ def predict_trans_delta_p(
         All are None if computation fails
     """
     # Get p(x) - the probability values from fitted function
-    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name)
+    y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name,
+                                     fdr_threshold=fdr_threshold, fdr_df=fdr_df)
     if y_pred is None:
         return None, None, None, None, None
 
     # Get NTC means
     # Cis NTC (for x-axis transformation)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1524,10 +1512,10 @@ def predict_trans_delta_p(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None, None, None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None, None, None, None
 
@@ -1537,22 +1525,11 @@ def predict_trans_delta_p(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None, None, None, None
 
     feature_idx = feature_list.index(feature)
@@ -1568,7 +1545,8 @@ def predict_trans_delta_p(
 
     # Get dp/dx derivatives
     first_deriv_dx, second_deriv_dx, third_deriv_dx = predict_trans_derivatives(
-        model, feature, x_range, modality_name=modality_name
+        model, feature, x_range, modality_name=modality_name,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
     )
     if first_deriv_dx is None:
         return delta_p, u_range, None, None, None
@@ -1599,7 +1577,9 @@ def predict_trans_delta_p_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans effect function in delta_p space for all posterior samples.
@@ -1616,6 +1596,10 @@ def predict_trans_delta_p_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return
+    fdr_threshold : float, default 0.05
+        FDR-inactive components are gated to zero; see predict_trans_function.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -1626,17 +1610,18 @@ def predict_trans_delta_p_samples(
     """
     # Get all posterior samples for p(x)
     y_samples = predict_trans_function_samples(
-        model, feature, x_range, modality_name=modality_name, max_samples=max_samples
+        model, feature, x_range, modality_name=modality_name, max_samples=max_samples,
+        fdr_threshold=fdr_threshold, fdr_df=fdr_df
     )
     if y_samples is None:
         return None, None
 
     # Get NTC means (same logic as predict_trans_delta_p)
     cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_technical'):
+    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
         return None, None
 
-    cis_mu_ntc = cis_mod.posterior_samples_technical.get('mu_ntc', None)
+    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
     if cis_mu_ntc is None:
         return None, None
 
@@ -1657,10 +1642,10 @@ def predict_trans_delta_p_samples(
         modality_name = model.primary_modality
     trans_mod = model.get_modality(modality_name)
 
-    if not hasattr(trans_mod, 'posterior_samples_technical'):
+    if not hasattr(trans_mod, 'posterior_samples_ntc'):
         return None, None
 
-    trans_mu_ntc = trans_mod.posterior_samples_technical.get('mu_ntc', None)
+    trans_mu_ntc = trans_mod.posterior_samples_ntc.get('mu_ntc', None)
     if trans_mu_ntc is None:
         return None, None
 
@@ -1670,22 +1655,11 @@ def predict_trans_delta_p_samples(
         y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
-    # First priority: use modality.feature_names (this is what users see and should use)
-    feature_list = None
-    if trans_mod.feature_names is not None:
-        feature_list = trans_mod.feature_names
+    # trans_mod.feature_names is the single source of truth (resolved +
+    # deduped in Modality.__init__), no need to re-derive it here.
+    feature_list = trans_mod.feature_names
 
-    # Fallback: try feature_meta columns/index
     if feature_list is None or feature not in feature_list:
-        feature_list = trans_mod.feature_meta.index.tolist() if trans_mod.feature_meta is not None else []
-        if feature not in feature_list:
-            for col in ['feature_id', 'feature', 'gene_name', 'gene']:
-                if trans_mod.feature_meta is not None and col in trans_mod.feature_meta.columns:
-                    feature_list = trans_mod.feature_meta[col].tolist()
-                    if feature in feature_list:
-                        break
-
-    if feature not in feature_list:
         return None, None
 
     feature_idx = feature_list.index(feature)
@@ -1730,6 +1704,8 @@ def plot_trans_functions(
     overlay_roots_lw: float = 1.0,
     overlay_roots_alpha: float = 0.8,
     overlay_roots_also_on_function: bool = True,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> plt.Figure:
     """
     Plot fitted trans functions and/or their derivatives.
@@ -1766,7 +1742,7 @@ def plot_trans_functions(
         - x-axis: log2FC = log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
         - y-axis: log2FC = log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
         - Derivatives: dg/du and d²g/du² (chain rule transformed)
-        Requires posterior_samples_technical to be available for both cis and trans modalities.
+        Requires posterior_samples_ntc to be available for both cis and trans modalities.
         Not recommended for binomial modalities (use use_delta_p instead).
     use_delta_p : bool
         If True, plot in probability difference space relative to NTC (default: False).
@@ -1774,7 +1750,7 @@ def plot_trans_functions(
         - x-axis: log2FC = log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
         - y-axis: Δp = p - p_ntc where p is probability and p_ntc is NTC probability
         - Derivatives: dp/du and d²p/du² (chain rule transformed)
-        Requires posterior_samples_technical to be available for both cis and trans modalities.
+        Requires posterior_samples_ntc to be available for both cis and trans modalities.
         Mutually exclusive with use_log2fc.
     show_posterior_samples : bool
         If True, plot individual posterior fits behind the mean line (default: False).
@@ -1829,6 +1805,14 @@ def plot_trans_functions(
         Transparency for root vlines (default 0.8).
     overlay_roots_also_on_function : bool
         If True (default), draw all root sets also on the function subplot.
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero in the plotted curve/derivatives, consistent with
+        _compute_hill_markers, predict_hill_from_summary_row, and
+        save_trans_summary's point estimates.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from, instead
+        of recomputing Bayesian FDR live from the posterior for each feature.
 
     Returns
     -------
@@ -1865,7 +1849,8 @@ def plot_trans_functions(
     ...                            show_first_derivative=True)
 
     >>> # Plot all non-monotonic genes (genes where derivative changes sign)
-    >>> non_monotonic = [g for g in model.trans_genes if is_non_monotonic(model, g)]
+    >>> feature_names = model.get_modality(model.primary_modality).feature_names
+    >>> non_monotonic = [g for g in feature_names if is_non_monotonic(model, g)]
     >>> model.plot_trans_functions(non_monotonic, show_first_derivative=True)
     """
     import matplotlib.pyplot as plt
@@ -1908,15 +1893,15 @@ def plot_trans_functions(
         cis_mod = model.get_modality('cis')
         ntc_available = (
             cis_mod is not None
-            and hasattr(cis_mod, 'posterior_samples_technical')
-            and cis_mod.posterior_samples_technical is not None
-            and 'mu_ntc' in cis_mod.posterior_samples_technical
+            and hasattr(cis_mod, 'posterior_samples_ntc')
+            and cis_mod.posterior_samples_ntc is not None
+            and 'mu_ntc' in cis_mod.posterior_samples_ntc
         )
         if not ntc_available:
             import warnings
             flag = 'use_log2fc' if use_log2fc else 'use_delta_p'
             warnings.warn(
-                f"{flag}=True requested but NTC technical fit (posterior_samples_technical) "
+                f"{flag}=True requested but NTC technical fit (posterior_samples_ntc) "
                 f"is not available. Falling back to log2(x) x-axis.",
                 UserWarning
             )
@@ -1995,7 +1980,8 @@ def plot_trans_functions(
             if use_log2fc:
                 # Get log2FC transformed values
                 y_log2fc, u_range, first_deriv, second_deriv, third_deriv = predict_trans_log2fc(
-                    model, feature, x_range, modality_name=modality_name, return_derivatives=True
+                    model, feature, x_range, modality_name=modality_name, return_derivatives=True,
+                    fdr_threshold=fdr_threshold, fdr_df=fdr_df
                 )
                 if y_log2fc is None:
                     continue
@@ -2004,15 +1990,20 @@ def plot_trans_functions(
             elif use_delta_p:
                 # Get delta_p transformed values (probability difference from NTC)
                 delta_p, u_range, first_deriv, second_deriv, third_deriv = predict_trans_delta_p(
-                    model, feature, x_range, modality_name=modality_name, return_derivatives=True
+                    model, feature, x_range, modality_name=modality_name, return_derivatives=True,
+                    fdr_threshold=fdr_threshold, fdr_df=fdr_df
                 )
                 if delta_p is None:
                     continue
                 y_pred = delta_p
                 x_plot_feat = u_range  # Use u (log2FC of x) for this feature
             else:
-                y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name)
-                first_deriv, second_deriv, third_deriv = predict_trans_derivatives(model, feature, x_range, modality_name=modality_name)
+                y_pred = predict_trans_function(model, feature, x_range, modality_name=modality_name,
+                                                 fdr_threshold=fdr_threshold, fdr_df=fdr_df)
+                first_deriv, second_deriv, third_deriv = predict_trans_derivatives(
+                    model, feature, x_range, modality_name=modality_name,
+                    fdr_threshold=fdr_threshold, fdr_df=fdr_df
+                )
                 # X values for plotting (same for all features when not using log2fc/delta_p)
                 x_plot_feat = np.log2(x_range) if use_log2_x else x_range
         except ValueError as e:
@@ -2040,7 +2031,8 @@ def plot_trans_functions(
                     delta_p_samples, _ = predict_trans_delta_p_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     y_samples = delta_p_samples
 
@@ -2050,7 +2042,8 @@ def plot_trans_functions(
                     S_samples, dS_samples, d2S_samples, d3S_samples = predict_trans_derivatives_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     if S_samples is not None and dS_samples is not None:
                         # Transform derivatives to delta_p u-space using chain rule
@@ -2079,7 +2072,8 @@ def plot_trans_functions(
                     y_log2fc_samples, _ = predict_trans_log2fc_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     y_samples = y_log2fc_samples
 
@@ -2089,7 +2083,8 @@ def plot_trans_functions(
                     S_samples, dS_samples, d2S_samples, d3S_samples = predict_trans_derivatives_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
                     if S_samples is not None and dS_samples is not None:
                         # Transform derivatives to log2FC space using chain rule
@@ -2125,14 +2120,16 @@ def plot_trans_functions(
                     y_samples = predict_trans_function_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
 
                 if need_derivs:
                     _, first_deriv_samples, second_deriv_samples, third_deriv_samples = predict_trans_derivatives_samples(
                         model, feature, x_range,
                         modality_name=modality_name,
-                        max_samples=max_posterior_samples
+                        max_samples=max_posterior_samples,
+                        fdr_threshold=fdr_threshold, fdr_df=fdr_df
                     )
 
         # Plot each requested type
@@ -2224,19 +2221,19 @@ def plot_trans_functions(
                 _parse = _MS._parse_semicolon_roots
 
                 if use_log2fc:
-                    _r1 = _parse(_row.get('first_deriv_roots_log2fc_mean',  None))
-                    _r2 = _parse(_row.get('second_deriv_roots_log2fc_mean', None))
-                    _r3 = _parse(_row.get('third_deriv_roots_log2fc_mean',  None))
+                    _r1 = _parse(_row.get('first_deriv_roots_log2fc_median',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_log2fc_median', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_log2fc_median',  None))
                     _to_plot_x = lambda v: v  # already u-space
                 elif use_delta_p:
-                    _r1 = _parse(_row.get('first_deriv_roots_delta_p_mean',  None))
-                    _r2 = _parse(_row.get('second_deriv_roots_delta_p_mean', None))
-                    _r3 = _parse(_row.get('third_deriv_roots_delta_p_mean',  None))
+                    _r1 = _parse(_row.get('first_deriv_roots_delta_p_median',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_delta_p_median', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_delta_p_median',  None))
                     _to_plot_x = lambda v: v  # already u-space
                 else:
-                    _r1 = _parse(_row.get('first_deriv_roots_mean',  None))
-                    _r2 = _parse(_row.get('second_deriv_roots_mean', None))
-                    _r3 = _parse(_row.get('third_deriv_roots_mean',  None))
+                    _r1 = _parse(_row.get('first_deriv_roots_median',  None))
+                    _r2 = _parse(_row.get('second_deriv_roots_median', None))
+                    _r3 = _parse(_row.get('third_deriv_roots_median',  None))
                     _to_plot_x = (lambda v: np.log2(max(v, 1e-300))) if use_log2_x else (lambda v: v)
 
                 # Build a map: plot_type → (ax, roots, label)
@@ -2311,7 +2308,10 @@ def predict_trans_function(
     model,
     feature: str,
     x_range: np.ndarray,
-    modality_name: Optional[str] = None
+    modality_name: Optional[str] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
+    debug: bool = False
 ) -> Optional[np.ndarray]:
     """
     Predict trans effect function for a feature given x_true values.
@@ -2329,6 +2329,18 @@ def predict_trans_function(
         X values to predict at (cis expression levels)
     modality_name : str, optional
         Modality name (default: primary modality)
+    fdr_threshold : float, default 0.05
+        For additive_hill: components with Bayesian q-value >= fdr_threshold are
+        FDR-inactive and gated to zero, so the curve reflects only statistically
+        significant components — consistent with _compute_hill_markers,
+        predict_hill_from_summary_row, and save_trans_summary's
+        full_log2fc/observed_log2fc point estimates. Without gating, alpha/beta
+        for null components are ~0.4-0.5 (RelaxedBernoulli prior) rather than 0,
+        producing a spurious partial Hill contribution.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame (with fdr_alpha/fdr_beta columns) to
+        source activity calls from, instead of recomputing Bayesian FDR live from
+        the posterior on every call.
 
     Returns
     -------
@@ -2353,17 +2365,23 @@ def predict_trans_function(
     if modality_name == model.primary_modality:
         # Primary modality: check model-level posterior
         if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
+            if debug: print(f"[predict_trans_function] returning None: no posterior_samples_trans on model")
             return None
         posterior = model.posterior_samples_trans
     else:
         # Non-primary modality: check modality-level posterior
         modality = model.get_modality(modality_name)
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
+            if debug: print(f"[predict_trans_function] returning None: no posterior_samples_trans on modality '{modality_name}'")
             return None
         posterior = modality.posterior_samples_trans
 
+    if debug:
+        print(f"[predict_trans_function] posterior keys: {list(posterior.keys())}")
+
     # Get baseline A (present in all function types)
     if 'A' not in posterior:
+        if debug: print(f"[predict_trans_function] returning None: 'A' not in posterior keys {list(posterior.keys())}")
         return None
 
     A_samples = posterior['A']
@@ -2387,81 +2405,64 @@ def predict_trans_function(
             A_mean = A_mean.squeeze(0)
         n_genes_posterior = A_mean.shape[0]
 
-    # Get feature list from modality (NOT model.trans_genes!)
-    # model.trans_genes is only valid for primary modality
-    if modality_name == model.primary_modality:
-        # Primary modality: use model.trans_genes if available
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
-    else:
-        # Non-primary modality: get feature names from modality
-        modality = model.get_modality(modality_name)
-
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            # Fallback: Try common identifier columns in order of preference
-            # For splicing: prioritize coordinate-based identifiers (coord.intron, junction_id)
-            # For others: prioritize feature_id, feature, then fall back to gene names
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-
-            # If no column worked, try the index
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            # No feature metadata - try to use feature count from posterior
-            # Assume features are indexed 0, 1, 2, ... and cannot be matched by name
-            return None
+    # Get feature list from modality — always the ground truth.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
+    modality = model.get_modality(modality_name)
+    feature_list = modality.feature_names if modality.feature_names is not None else []
+    if not feature_list and modality_name != model.primary_modality:
+        if debug: print(f"[predict_trans_function] returning None: non-primary modality has no feature_names or feature_meta")
+        return None
 
     n_features_list = len(feature_list)
+
+    if debug:
+        print(f"[predict_trans_function] n_genes_posterior={n_genes_posterior}, n_features_list={n_features_list}")
+        print(f"[predict_trans_function] feature_list[:5]={feature_list[:5]}, ..., feature_list[-5:]={feature_list[-5:]}")
 
     # Check dimension consistency BEFORE using feature_list for indexing
     if n_genes_posterior != n_features_list:
         # Mismatch - cannot use feature_list for indexing
         # This happens when posterior was fitted on a subset of features
+        if debug: print(f"[predict_trans_function] returning None: dimension mismatch n_genes_posterior={n_genes_posterior} != n_features_list={n_features_list}")
         return None
 
     # Now safe to check if feature is in feature_list and get its index
     if feature not in feature_list:
+        if debug: print(f"[predict_trans_function] returning None: '{feature}' not in feature_list (len={n_features_list})")
         return None
 
     feature_idx = feature_list.index(feature)
     A = A_mean[feature_idx].item() if hasattr(A_mean, 'item') else A_mean[feature_idx]
 
-    # Helper function to extract parameter value for a specific feature
-    # Handles both primary modality (S, T) and non-primary modality (S, C, T) shapes
-    def _extract_param(param_samples, feature_idx):
-        """Extract mean parameter value for a specific feature, handling dimension squeezing."""
-        if hasattr(param_samples, 'mean'):
-            param_mean = param_samples.mean(dim=0)
-        else:
-            param_mean = param_samples.mean(axis=0)
-
-        # Squeeze out cis gene dimension if present
-        if param_mean.ndim > 1:
-            param_mean = param_mean.squeeze(0)
-
-        # Extract value for this feature
-        val = param_mean[feature_idx]
-        return val.item() if hasattr(val, 'item') else val
-
     # Determine function type from available parameters
+    if debug:
+        print(f"[predict_trans_function] A={A_mean[feature_idx]:.4g}, feature_idx={feature_idx}")
+        print(f"[predict_trans_function] branch check: Vmax_a={'Vmax_a' in posterior}, Vmax_b={'Vmax_b' in posterior}, upper_limit={'upper_limit' in posterior}, theta={'theta' in posterior}")
+
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL (negbinom/normal/studentt) =====
         try:
             # Extract parameters using helper function
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
+
+            if debug:
+                print(f"[predict_trans_function] additive_hill: A={A:.4g}, alpha={alpha:.4g}, beta={beta:.4g}, Vmax_a={Vmax_a:.4g}, Vmax_b={Vmax_b:.4g}, K_a={K_a:.4g}, K_b={K_b:.4g}, n_a={n_a:.4g}, n_b={n_b:.4g}")
 
             # Compute Hill functions
             Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
@@ -2469,23 +2470,34 @@ def predict_trans_function(
 
             # Combined prediction
             y_pred = A + alpha * Hill_a + beta * Hill_b
+            if debug:
+                print(f"[predict_trans_function] y_pred range: [{y_pred.min():.4g}, {y_pred.max():.4g}], any>0: {(y_pred > 0).any()}")
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: additive_hill extraction failed: {e}")
             return None
 
     elif 'upper_limit' in posterior and 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL (binomial/multinomial with upper_limit and Vmax_a/b) =====
         try:
             # Extract parameters using helper function
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            beta = _extract_param(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            K_b = _extract_param(posterior['K_b'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
-            n_b = _extract_param(posterior['n_b'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            beta = _extract_param_mean(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = 0.0
+            if b_null:
+                beta = 0.0
 
             # IMPORTANT: Match the actual model computation in fit_trans!
             # Model uses: y = A + (alpha * Hill_a(Vmax=Vmax_a)) + (beta * Hill_b(Vmax=Vmax_b))
@@ -2497,23 +2509,25 @@ def predict_trans_function(
             y_pred = A + alpha * Hill_a + beta * Hill_b
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: upper_limit additive_hill extraction failed: {e}")
             return None
 
     elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            alpha = _extract_param(posterior['alpha'], feature_idx)
-            Vmax_a = _extract_param(posterior['Vmax_a'], feature_idx)
-            K_a = _extract_param(posterior['K_a'], feature_idx)
-            n_a = _extract_param(posterior['n_a'], feature_idx)
+            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
+            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
 
             # Compute Hill function: y = A + alpha * Hill(x, Vmax=Vmax_a, K=K_a, n=n_a)
             Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
             y_pred = A + alpha * Hill_a
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: single_hill extraction failed: {e}")
             return None
 
     elif 'theta' in posterior:
@@ -2550,26 +2564,60 @@ def predict_trans_function(
 
             return y_pred
 
-        except (KeyError, IndexError, AttributeError):
+        except (KeyError, IndexError, AttributeError) as e:
+            if debug: print(f"[predict_trans_function] returning None: polynomial extraction failed: {e}")
             return None
 
     else:
         # Unknown function type
+        if debug: print(f"[predict_trans_function] returning None: unrecognized function type (posterior keys: {list(posterior.keys())})")
         return None
+
+
+def _row_component_active(row, fdr_col, n_lower_col, n_upper_col, fdr_threshold=0.05):
+    """
+    Whether a Hill component is active per a trans_summary row: Bayesian q-value
+    < fdr_threshold AND the Hill exponent's 95% CI excludes 0 (permissive True
+    fallback if the CI columns are missing/NaN). This is the row-based half of
+    the single active-component definition shared with io/summary.py's
+    active_a/active_b and xy_plots.py's _resolve_hill_null_flags — used by
+    predict_hill_from_summary_row and (via _resolve_hill_null_flags) by
+    _compute_hill_markers's fdr_df path.
+    """
+    fdr_val = row.get(fdr_col, 1.0)
+    try:
+        fdr_val = float(fdr_val)
+    except (TypeError, ValueError):
+        fdr_val = 1.0
+    if not np.isfinite(fdr_val):
+        fdr_val = 1.0
+
+    lo, hi = row.get(n_lower_col), row.get(n_upper_col)
+    if lo is None or hi is None or pd.isna(lo) or pd.isna(hi):
+        n_excludes_zero = True
+    else:
+        n_excludes_zero = not (float(lo) <= 0 <= float(hi))
+
+    return (fdr_val < fdr_threshold) and n_excludes_zero
 
 
 def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float = 0.05) -> Optional[np.ndarray]:
     """
     Compute a Hill curve from a trans_summary DataFrame row.
 
-    Supports both additive_hill (has Vmax_b_mean) and single_hill rows.
-    Parameters are read from columns named A_mean, alpha_mean, Vmax_a_mean,
-    K_a_mean, n_a_mean, beta_mean, Vmax_b_mean, K_b_mean, n_b_mean.
+    Supports both additive_hill (has Vmax_b_median) and single_hill rows.
+    Parameters are read from columns named A_median, alpha_median, Vmax_a_median,
+    K_a_median, n_a_median, beta_median, Vmax_b_median, K_b_median, n_b_median.
 
-    FDR gating: components with fdr_alpha > fdr_threshold (or fdr_beta) are zeroed
-    out so the curve reflects only statistically significant effects. Without gating,
-    alpha/beta for null components are ~0.4-0.5 (RelaxedBernoulli prior) rather than 0,
-    producing a spurious partial Hill contribution.
+    Gating: a component is zeroed out unless it's active — Bayesian q-value
+    (fdr_alpha/fdr_beta) < fdr_threshold AND its Hill exponent's 95% CI
+    (n_a_lower/n_a_upper, n_b_lower/n_b_upper) excludes 0 — so the curve reflects
+    only components with an identified, statistically significant dose-response.
+    Without gating, alpha/beta for null components are ~0.4-0.5 (RelaxedBernoulli
+    prior) rather than 0, producing a spurious partial Hill contribution; the q-value
+    alone would also let through alpha absorbing a constant offset while n ≈ 0
+    (flat Hill, unidentified K). Matches active_a/active_b in io/summary.py and
+    _resolve_hill_null_flags/_compute_hill_markers.
 
     Returns y values at x_range, or None if required columns are missing.
     """
@@ -2581,30 +2629,26 @@ def predict_hill_from_summary_row(row, x_range: np.ndarray, fdr_threshold: float
             return default
         return v if np.isfinite(v) else default
 
-    A       = _g('A_mean', 0.0)
-    alpha   = _g('alpha_mean', 1.0)
-    Vmax_a  = _g('Vmax_a_mean')
-    K_a     = _g('K_a_mean')
-    n_a     = _g('n_a_mean')
+    A       = _g('A_median', 0.0)
+    alpha   = _g('alpha_median', 1.0)
+    Vmax_a  = _g('Vmax_a_median')
+    K_a     = _g('K_a_median')
+    n_a     = _g('n_a_median')
     if Vmax_a is None or K_a is None or n_a is None:
         return None
 
-    # Apply FDR gating to alpha component
-    fdr_alpha = _g('fdr_alpha')
-    if fdr_alpha is not None and fdr_alpha > fdr_threshold:
+    if not _row_component_active(row, 'fdr_alpha', 'n_a_lower', 'n_a_upper', fdr_threshold):
         alpha = 0.0
 
     Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
     y_pred = A + alpha * Hill_a
 
-    beta   = _g('beta_mean', 0.0)
-    Vmax_b = _g('Vmax_b_mean')
-    K_b    = _g('K_b_mean')
-    n_b    = _g('n_b_mean')
+    beta   = _g('beta_median', 0.0)
+    Vmax_b = _g('Vmax_b_median')
+    K_b    = _g('K_b_median')
+    n_b    = _g('n_b_median')
 
-    # Apply FDR gating to beta component
-    fdr_beta = _g('fdr_beta')
-    if fdr_beta is not None and fdr_beta > fdr_threshold:
+    if not _row_component_active(row, 'fdr_beta', 'n_b_lower', 'n_b_upper', fdr_threshold):
         beta = 0.0
 
     if Vmax_b is not None and K_b is not None and n_b is not None and beta != 0.0:
@@ -2619,7 +2663,9 @@ def predict_trans_function_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Optional[np.ndarray]:
     """
     Predict trans effect function for all posterior samples.
@@ -2639,6 +2685,13 @@ def predict_trans_function_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return. If None, returns all samples.
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero for every sample, matching predict_trans_function so
+        posterior-sample overlays and CI bands reflect the same gated curve as
+        the mean line.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -2670,24 +2723,13 @@ def predict_trans_function_samples(
     else:
         A_samples = np.array(A_samples)
 
-    # Get feature list
-    if modality_name == model.primary_modality:
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
-    else:
-        modality = model.get_modality(modality_name)
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            return None
+    # Get feature list — always from the modality, never from model.trans_genes.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
+    modality = model.get_modality(modality_name)
+    feature_list = modality.feature_names
+    if feature_list is None:
+        return None
 
     # Handle dimension squeezing for non-primary modalities
     # A_samples shape: (S, T) for primary, (S, C, T) for non-primary
@@ -2717,32 +2759,27 @@ def predict_trans_function_samples(
             return None
         feature_idx = feature_list.index(feature)
 
-    # Helper to extract all samples for a parameter
-    def _extract_samples(param_name, feature_idx):
-        """Extract all posterior samples for a specific feature."""
-        samples = posterior[param_name]
-        if hasattr(samples, 'cpu'):
-            samples = samples.cpu().numpy()
-        else:
-            samples = np.array(samples)
-        # Squeeze cis gene dimension if present
-        if samples.ndim > 2:
-            samples = samples.squeeze(1)
-        return samples[:, feature_idx]  # [n_samples]
-
     # Determine function type and compute predictions
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
             A = A_samples[:, feature_idx]  # [n_samples]
-            alpha = _extract_samples('alpha', feature_idx)
-            beta = _extract_samples('beta', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            Vmax_b = _extract_samples('Vmax_b', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            K_b = _extract_samples('K_b', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
-            n_b = _extract_samples('n_b', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            beta = _extract_param_samples(posterior, 'beta', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            Vmax_b = _extract_param_samples(posterior, 'Vmax_b', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            K_b = _extract_param_samples(posterior, 'K_b', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
+            n_b = _extract_param_samples(posterior, 'n_b', feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = np.zeros_like(alpha)
+            if b_null:
+                beta = np.zeros_like(beta)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -2778,10 +2815,10 @@ def predict_trans_function_samples(
         # ===== SINGLE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            alpha = _extract_samples('alpha', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -2815,7 +2852,9 @@ def predict_trans_derivatives_samples(
     feature: str,
     x_range: np.ndarray,
     modality_name: Optional[str] = None,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    fdr_threshold: float = 0.05,
+    fdr_df: Optional["pd.DataFrame"] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute trans function and derivatives for all posterior samples.
@@ -2832,6 +2871,11 @@ def predict_trans_derivatives_samples(
         Modality name (default: primary modality)
     max_samples : int, optional
         Maximum number of samples to return
+    fdr_threshold : float, default 0.05
+        For additive_hill: FDR-inactive components (q-value >= fdr_threshold) are
+        gated to zero for every sample, matching predict_trans_derivatives.
+    fdr_df : pd.DataFrame, optional
+        Precomputed trans_summary DataFrame to source activity calls from.
 
     Returns
     -------
@@ -2863,24 +2907,13 @@ def predict_trans_derivatives_samples(
     else:
         A_samples = np.array(A_samples)
 
-    # Get feature list
-    if modality_name == model.primary_modality:
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
-    else:
-        modality = model.get_modality(modality_name)
-        # First priority: use modality.feature_names (this is what users see and should use)
-        if modality.feature_names is not None:
-            feature_list = modality.feature_names
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                feature_list = modality.feature_meta.index.tolist()
-        else:
-            return None, None, None, None
+    # Get feature list — always from the modality, never from model.trans_genes.
+    # modality.feature_names is the single source of truth (resolved + deduped
+    # in Modality.__init__), no need to re-derive it here.
+    modality = model.get_modality(modality_name)
+    feature_list = modality.feature_names
+    if feature_list is None:
+        return None, None, None, None
 
     # Handle dimension squeezing
     if A_samples.ndim > 2:
@@ -2906,29 +2939,27 @@ def predict_trans_derivatives_samples(
         feature_idx = feature_list.index(feature)
 
     # Helper to extract all samples for a parameter
-    def _extract_samples(param_name, feature_idx):
-        samples = posterior[param_name]
-        if hasattr(samples, 'cpu'):
-            samples = samples.cpu().numpy()
-        else:
-            samples = np.array(samples)
-        if samples.ndim > 2:
-            samples = samples.squeeze(1)
-        return samples[:, feature_idx]
-
     # Compute based on function type
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            alpha = _extract_samples('alpha', feature_idx)
-            beta = _extract_samples('beta', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            Vmax_b = _extract_samples('Vmax_b', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            K_b = _extract_samples('K_b', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
-            n_b = _extract_samples('n_b', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            beta = _extract_param_samples(posterior, 'beta', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            Vmax_b = _extract_param_samples(posterior, 'Vmax_b', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            K_b = _extract_param_samples(posterior, 'K_b', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
+            n_b = _extract_param_samples(posterior, 'n_b', feature_idx)
+
+            a_null, b_null = _resolve_hill_null_flags(
+                feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+            )
+            if a_null:
+                alpha = np.zeros_like(alpha)
+            if b_null:
+                beta = np.zeros_like(beta)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -2980,10 +3011,10 @@ def predict_trans_derivatives_samples(
         # ===== SINGLE HILL =====
         try:
             A = A_samples[:, feature_idx]
-            alpha = _extract_samples('alpha', feature_idx)
-            Vmax_a = _extract_samples('Vmax_a', feature_idx)
-            K_a = _extract_samples('K_a', feature_idx)
-            n_a = _extract_samples('n_a', feature_idx)
+            alpha = _extract_param_samples(posterior, 'alpha', feature_idx)
+            Vmax_a = _extract_param_samples(posterior, 'Vmax_a', feature_idx)
+            K_a = _extract_param_samples(posterior, 'K_a', feature_idx)
+            n_a = _extract_param_samples(posterior, 'n_a', feature_idx)
 
             n_samples = A.shape[0]
             if max_samples is not None and max_samples < n_samples:
@@ -3016,6 +3047,157 @@ def predict_trans_derivatives_samples(
     else:
         # Polynomial or unknown - not supported
         return None, None, None, None
+
+
+# ============================================================================
+# Bayesian FDR for plotting (mirrors ModelSaver._compute_bayesian_fdr)
+# ============================================================================
+
+def _compute_posterior_fdr(posterior, activity_epsilon: float = 0.01):
+    """
+    Compute per-component Bayesian q-values from posterior samples.
+
+    Mirrors ModelSaver._compute_bayesian_fdr in io/summary.py:
+      lfdr_i = 1 - P(alpha_i * Vmax_i / A_i > epsilon)
+      q-values = running-min of cumulative-mean(lfdr sorted ascending)
+    For additive_hill, alpha and beta form a single pooled family of 2T tests.
+
+    Returns (fdr_alpha, fdr_beta) each of shape (n_features,).
+    fdr_beta is all-NaN for single_hill / when Vmax_b is absent.
+    Returns (None, None) if the posterior lacks the required keys.
+    """
+    def _to_np(key):
+        if key not in posterior:
+            return None
+        v = posterior[key]
+        if hasattr(v, 'cpu'):
+            v = v.detach().cpu().numpy()
+        v = np.asarray(v, dtype=float)
+        if v.ndim >= 3 and v.shape[1] == 1:
+            v = v.squeeze(1)
+        return v
+
+    def _p_active(alpha_key, vmax_key):
+        alpha_s = _to_np(alpha_key)
+        vmax_s  = _to_np(vmax_key)
+        A_s     = _to_np('A')
+        if (alpha_s is not None and alpha_s.ndim >= 2
+                and vmax_s is not None and vmax_s.ndim >= 2
+                and A_s    is not None and A_s.ndim    >= 2):
+            ratio = alpha_s * vmax_s / np.maximum(A_s, 1e-12)
+            return (ratio > activity_epsilon).mean(axis=0)
+        if alpha_s is not None:
+            m = alpha_s.mean(axis=0) if alpha_s.ndim >= 2 else alpha_s
+            return np.clip(np.asarray(m, dtype=float), 0.0, 1.0)
+        return None
+
+    def _qvalues(lfdr):
+        n = len(lfdr)
+        if n == 0:
+            return np.array([], dtype=float)
+        order = np.argsort(lfdr)
+        cumfdr = np.cumsum(lfdr[order]) / (np.arange(n, dtype=float) + 1.0)
+        qvals_sorted = np.minimum.accumulate(cumfdr[::-1])[::-1]
+        qvals = np.empty(n, dtype=float)
+        qvals[order] = qvals_sorted
+        return qvals
+
+    p_a = _p_active('alpha', 'Vmax_a')
+    if p_a is None:
+        return None, None
+    p_a = np.asarray(p_a, dtype=float).ravel()
+    n = len(p_a)
+    nan_col = np.full(n, np.nan)
+
+    p_b = _p_active('beta', 'Vmax_b') if 'Vmax_b' in posterior else None
+
+    if p_b is not None:
+        p_b = np.asarray(p_b, dtype=float).ravel()
+        # Pool alpha and beta into a single family (matches summary.py)
+        lfdr_all = 1.0 - np.concatenate([p_a, p_b])
+        qvals_all = _qvalues(lfdr_all)
+        fdr_alpha = np.where(p_a < 1e-9, 1.0, qvals_all[:n])
+        fdr_beta  = np.where(p_b < 1e-9, 1.0, qvals_all[n:])
+    else:
+        lfdr_a = 1.0 - p_a
+        fdr_alpha = np.where(p_a < 1e-9, 1.0, _qvalues(lfdr_a))
+        fdr_beta  = nan_col
+
+    return fdr_alpha, fdr_beta
+
+
+def _posterior_n_excludes_zero(posterior, feature_idx):
+    """
+    Return (n_a_excludes_zero, n_b_excludes_zero): whether each Hill exponent's
+    95% posterior CI (2.5%/97.5% quantiles, matching io/summary.py's extract_param)
+    excludes 0 for this feature. True (excludes zero) is the permissive fallback
+    when there aren't enough samples to assess a CI, so a missing/degenerate
+    posterior doesn't spuriously gate a component off.
+    """
+    def _excludes_zero(key):
+        if key not in posterior:
+            return True
+        v = posterior[key]
+        if hasattr(v, 'cpu'):
+            v = v.detach().cpu().numpy()
+        v = np.asarray(v, dtype=float)
+        if v.ndim >= 3 and v.shape[1] == 1:
+            v = v.squeeze(1)
+        if v.ndim < 2 or feature_idx >= v.shape[1]:
+            return True
+        col = v[:, feature_idx]
+        lo = np.quantile(col, 0.025)
+        hi = np.quantile(col, 0.975)
+        return not (lo <= 0 <= hi)
+
+    return _excludes_zero('n_a'), _excludes_zero('n_b')
+
+
+def _resolve_hill_null_flags(feature, feature_idx, posterior, fdr_df=None, fdr_threshold=0.05):
+    """
+    Resolve (a_null, b_null): whether the additive-hill A/B components are
+    inactive for this feature, i.e. whether they should be gated to zero.
+
+    Single source of truth for component-activity gating shared by
+    predict_trans_function, predict_trans_derivatives, and _compute_hill_markers
+    (and their _samples variants), so the fitted curve, its derivatives, and its
+    markers always agree on which component(s) are "on". A component is active
+    iff BOTH: Bayesian q-value < fdr_threshold AND its Hill exponent's (n_a/n_b)
+    95% CI excludes 0 — this is exactly the active_a/active_b criterion in
+    io/summary.py (is_dependent/fit_type and the point-estimate/CI gating). The
+    q-value alone can't distinguish a real dose-response from alpha/beta
+    absorbing a constant offset while n ≈ 0 (flat Hill, unidentified K); the CI
+    check catches that degenerate case.
+
+    Prefers a precomputed fdr_df (e.g. a save_trans_summary row, which already
+    has fdr_alpha/fdr_beta/n_a_lower/n_a_upper/n_b_lower/n_b_upper columns) when
+    available — cheap and avoids recomputing q-values/quantiles on every call —
+    falling back to a live computation from the posterior otherwise.
+
+    Returns
+    -------
+    (a_null, b_null) : (bool, bool)
+    """
+    if fdr_df is not None:
+        _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
+        if _name_col:
+            _match = fdr_df[fdr_df[_name_col] == feature]
+            if not _match.empty:
+                row = _match.iloc[0]
+                a_null = not _row_component_active(row, 'fdr_alpha', 'n_a_lower', 'n_a_upper', fdr_threshold)
+                b_null = not _row_component_active(row, 'fdr_beta', 'n_b_lower', 'n_b_upper', fdr_threshold)
+                return a_null, b_null
+
+    fdr_a, fdr_b = _compute_posterior_fdr(posterior)
+    if fdr_a is not None and feature_idx < len(fdr_a):
+        n_a_excludes_zero, n_b_excludes_zero = _posterior_n_excludes_zero(posterior, feature_idx)
+        a_null = not (float(fdr_a[feature_idx]) < fdr_threshold and n_a_excludes_zero)
+        b_null = (not (float(fdr_b[feature_idx]) < fdr_threshold and n_b_excludes_zero)
+                  if fdr_b is not None and not np.isnan(fdr_b[feature_idx])
+                  else False)
+        return a_null, b_null
+
+    return False, False
 
 
 # ============================================================================
@@ -3200,7 +3382,7 @@ def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
     """
     Compute Hill parameter markers from a trans_summary DataFrame row.
 
-    Reads *_mean columns for parameter values and fdr_alpha / fdr_beta for
+    Reads *_median columns for parameter values and fdr_alpha / fdr_beta for
     activity classification.  Returns the same list-of-dicts format as
     _compute_hill_markers / _build_hill_markers_from_params.
     """
@@ -3212,13 +3394,13 @@ def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
             return default
         return v if np.isfinite(v) else default
 
-    A      = _g('A_mean', 0.0);  alpha = _g('alpha_mean', 1.0)
-    Vmax_a = _g('Vmax_a_mean');  K_a   = _g('K_a_mean');  n_a = _g('n_a_mean')
+    A      = _g('A_median', 0.0);  alpha = _g('alpha_median', 1.0)
+    Vmax_a = _g('Vmax_a_median');  K_a   = _g('K_a_median');  n_a = _g('n_a_median')
     if Vmax_a is None or K_a is None or n_a is None:
         return []
 
-    beta   = _g('beta_mean', 0.0)
-    Vmax_b = _g('Vmax_b_mean');  K_b   = _g('K_b_mean');  n_b = _g('n_b_mean')
+    beta   = _g('beta_median', 0.0)
+    Vmax_b = _g('Vmax_b_median');  K_b   = _g('K_b_median');  n_b = _g('n_b_median')
     is_additive = (Vmax_b is not None and K_b is not None and n_b is not None)
 
     fdr_alpha_val = _g('fdr_alpha', 1.0)
@@ -3235,7 +3417,7 @@ def _compute_hill_markers_from_summary_row(row, log2_space=True, y_scale=1.0,
     )
 
 
-def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=True, y_scale=1.0,
+def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0,
                           fdr_df=None, fdr_threshold=0.05):
     """
     Compute meaningful parameter markers for single_hill and additive_hill trans functions.
@@ -3249,31 +3431,27 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
         True for negbinom (y-axis is log2). False for binomial/normal (linear y-axis).
     y_scale : float
         Multiplicative scale applied to linear y-values before plotting (e.g. 100 for PSI%).
-    ci_level : float
-        Credible interval level used to classify additive_hill regime (default 95.0).
+    fdr_df : DataFrame, optional
+        FDR summary table. If provided, used to determine which Hill components are active.
+    fdr_threshold : float, default 0.05
+        FDR threshold for classifying components as active.
     """
     # ── Resolve posterior and feature list ─────────────────────────────────
     if modality.name == model.primary_modality:
         if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
             return []
         posterior = model.posterior_samples_trans
-        feature_list = model.trans_genes if hasattr(model, 'trans_genes') else []
+        # Use modality.feature_names — always matches the fitted posterior dimensions.
+        feature_list = list(modality.feature_names) if modality.feature_names is not None else []
     else:
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
             return []
         posterior = modality.posterior_samples_trans
-        if modality.feature_names is not None:
-            feature_list = list(modality.feature_names)
-        elif modality.feature_meta is not None:
-            feature_list = None
-            for col in ['feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene']:
-                if col in modality.feature_meta.columns:
-                    feature_list = modality.feature_meta[col].tolist()
-                    break
-            if feature_list is None:
-                return []
-        else:
+        # modality.feature_names is the single source of truth (resolved + deduped
+        # in Modality.__init__), no need to re-derive it here.
+        if modality.feature_names is None:
             return []
+        feature_list = list(modality.feature_names)
 
     if feature not in feature_list:
         return []
@@ -3290,13 +3468,6 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
     def pmean(key):
         return float(params[key].mean()) if key in params else None
 
-    def pci(key):
-        if key not in params:
-            return None, None
-        lo = float(np.percentile(params[key], (100 - ci_level) / 2))
-        hi = float(np.percentile(params[key], 100 - (100 - ci_level) / 2))
-        return lo, hi
-
     A      = pmean('A');     alpha = pmean('alpha');  Vmax_a = pmean('Vmax_a')
     K_a    = pmean('K_a');   n_a   = pmean('n_a')
 
@@ -3308,23 +3479,12 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
         beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
         K_b    = pmean('K_b');   n_b    = pmean('n_b')
 
-        n_a_lo, n_a_hi = pci('n_a')
-        n_b_lo, n_b_hi = pci('n_b')
-
-        # Prefer FDR-based null classification; fall back to CI criterion
-        _fdr_row = None
-        if fdr_df is not None:
-            _name_col = next((c for c in ['gene_name', 'gene'] if c in fdr_df.columns), None)
-            if _name_col:
-                _match = fdr_df[fdr_df[_name_col] == feature]
-                if not _match.empty:
-                    _fdr_row = _match.iloc[0]
-        if _fdr_row is not None:
-            a_null = float(_fdr_row.get('fdr_alpha', 1.0)) >= fdr_threshold
-            b_null = float(_fdr_row.get('fdr_beta',  1.0)) >= fdr_threshold
-        else:
-            a_null = (n_a_lo is not None) and (n_a_lo <= 0 <= n_a_hi)
-            b_null = (n_b_lo is not None) and (n_b_lo <= 0 <= n_b_hi)
+        # Null classification: same criterion used everywhere else (predict_trans_function,
+        # predict_trans_derivatives, save_trans_summary) so the curve, its derivatives,
+        # and these markers always agree on which component(s) are "on".
+        a_null, b_null = _resolve_hill_null_flags(
+            feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
+        )
     else:
         a_null = b_null = False
 
@@ -3337,15 +3497,28 @@ def _compute_hill_markers(model, feature, modality, ci_level=95.0, log2_space=Tr
     )
 
 
-def _draw_hill_markers(ax, markers):
-    """Draw Hill parameter marker lines (axhline / axvline) on ax."""
+def _draw_hill_markers(ax, markers, x_offset=0.0, y_offset=0.0):
+    """Draw Hill parameter marker lines (axhline / axvline) on ax.
+
+    Parameters
+    ----------
+    x_offset, y_offset : float
+        Subtract these from x/y marker values before drawing.  Pass the
+        log2FC offsets (log2(x_ntc), log2(y_ntc)) when the plot axes are in
+        log2FC space so that markers align with the shifted data.  Labels are
+        automatically updated to say ``log2FC(...)`` when offsets are non-zero.
+    """
+    in_log2fc = (x_offset != 0.0 or y_offset != 0.0)
     for m in markers:
+        label = m['label']
+        if in_log2fc:
+            label = label.replace('log2(', 'log2FC(')
         kw = dict(linestyle=m['linestyle'], color=m['color'],
-                  alpha=m['alpha'], linewidth=1, label=m['label'])
+                  alpha=m['alpha'], linewidth=1, label=label)
         if m['axis'] == 'h':
-            ax.axhline(m['value'], **kw)
+            ax.axhline(m['value'] - y_offset, **kw)
         elif m['axis'] == 'v':
-            ax.axvline(m['value'], **kw)
+            ax.axvline(m['value'] - x_offset, **kw)
 
 
 # ============================================================================
@@ -3366,6 +3539,101 @@ def _save_figure(fig, model, filename):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, bbox_inches='tight')
     print(f"[PLOT] Saved to {save_path}")
+
+
+def _compute_global_log2fc_offsets(
+    model, modality, feature_name: str, x_true: np.ndarray,
+    subset_mask: Optional[np.ndarray], sum_factor_col: str
+) -> Tuple[float, float]:
+    """
+    Compute the NTC log2 x_offset and y_offset from the GLOBAL (non-faceted) data.
+
+    This must be called with only the top-level ``subset_mask`` (no facet mask),
+    so that all panels for the same feature share an identical NTC reference —
+    even panels that contain no NTC cells (e.g. a "Targeting" facet column).
+
+    y_offset priority (consistent with ``save_trans_summary``):
+    1. ``mu_ntc`` from ``modality.posterior_samples_ntc`` (model-smoothed reference-
+       group NTC expression rate from ``fit_technical``).  Shape [n_samples, T]; we take
+       the posterior mean for the requested feature.
+    2. Fallback (``fit_technical`` not run): empirical mean of ``y_obs / sum_factor`` for
+       NTC reference-group cells (group_code == 0), or all NTC cells if no reference group
+       is tagged.
+
+    Returns
+    -------
+    (x_offset, y_offset) : (float, float)
+        Both in log2 space; 0.0 if no valid NTC cells found.
+    """
+    feature_idx = _get_feature_index(feature_name, modality)
+    if feature_idx is None:
+        return 0.0, 0.0
+
+    # Get counts for this feature
+    if modality.cells_axis == 1:
+        y_obs = modality.counts[feature_idx, :]
+    else:
+        y_obs = modality.counts[:, feature_idx]
+
+    # Align cells using the global subset_mask (no facet restriction)
+    x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(
+        model, modality, x_true, y_obs, subset_mask
+    )
+
+    is_ntc = (meta_aligned['target'].str.lower() == 'ntc').values
+
+    # x_offset: mean log2 NTC x_true (pooled, group-independent)
+    x_ntc = x_true_aligned[is_ntc & (x_true_aligned > 0)]
+    x_offset = np.log2(float(x_ntc.mean())) if len(x_ntc) > 0 else 0.0
+
+    # y_offset: use mu_ntc from technical fit when available (matches save_trans_summary).
+    # mu_ntc shape in posterior_samples_ntc: [n_samples, T].
+    # It represents the reference-group NTC expression rate — the same quantity that
+    # save_trans_summary uses as y_ntc for log2FC parameter computation.
+    y_offset = None
+    if (hasattr(modality, 'posterior_samples_ntc')
+            and modality.posterior_samples_ntc is not None
+            and 'mu_ntc' in modality.posterior_samples_ntc):
+        mu_ntc = modality.posterior_samples_ntc['mu_ntc']
+        if hasattr(mu_ntc, 'cpu'):          # torch.Tensor
+            mu_ntc = mu_ntc.cpu().numpy()
+        mu_ntc = np.asarray(mu_ntc, dtype=float)
+        # Collapse any unexpected leading dims beyond (samples, features)
+        while mu_ntc.ndim > 2:
+            mu_ntc = mu_ntc.mean(axis=0)
+        # Average over posterior samples → [T], then pick this feature
+        mu_ntc_mean = mu_ntc.mean(axis=0)   # [T]
+        if feature_idx < len(mu_ntc_mean):
+            y_ntc_val = float(mu_ntc_mean[feature_idx])
+            if np.isfinite(y_ntc_val) and y_ntc_val > 0:
+                y_offset = np.log2(y_ntc_val)
+
+    if y_offset is None:
+        # Fallback: empirical NTC reference-group mean (when fit_technical not run).
+        # Requires modality.sum_factors, which is only populated for modalities that
+        # went through sum-factor normalization (typically the primary 'gene'/'cis'
+        # modality) -- other modalities (e.g. splicing) may have sum_factors=None.
+        # This fallback -- and therefore y_offset -- is only meaningful for negbinom
+        # callers anyway (non-negbinom distributions discard y_offset), so silently
+        # fall back to 0.0 rather than raising when sum_factors is unavailable.
+        if getattr(modality, 'sum_factors', None) is not None:
+            sf_aligned = modality.sum_factors.loc[
+                meta_aligned['cell'].values, sum_factor_col
+            ].values
+            if 'technical_group_code' in meta_aligned.columns:
+                ntc_ref_mask = is_ntc & (meta_aligned['technical_group_code'].values == 0)
+            else:
+                ntc_ref_mask = is_ntc
+            y_ntc_expr = y_obs_aligned[ntc_ref_mask] / sf_aligned[ntc_ref_mask]
+            y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+            if len(y_ntc_valid) == 0:           # fallback: pooled NTC (all groups)
+                y_ntc_expr = y_obs_aligned[is_ntc] / sf_aligned[is_ntc]
+                y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+            y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
+        else:
+            y_offset = 0.0
+
+    return x_offset, y_offset
 
 
 def _collect_legend_handles(axes):
@@ -3394,7 +3662,7 @@ def plot_negbinom_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
-    mark_params: bool = False,
+    mark_params = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
@@ -3402,12 +3670,34 @@ def plot_negbinom_xy(
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
+    color_by: Optional[Union[str, List[str]]] = 'technical_group',
+    ntc_x_offset: Optional[float] = None,
+    ntc_y_offset: Optional[float] = None,
+    hill_color: str = 'black',
+    hill_label: str = 'Fitted Trans Function',
+    ref_color: str = 'red',
+    ref_label: str = 'Reference Function',
+    expand_x_to_params: bool = False,
+    expand_y_to_params: bool = False,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Axes:
     """
     Plot negbinom (gene counts) with optional Hill function overlay.
 
-    Y-axis: log2(expression) where expression = counts / (sum_factor * alpha_y)
+    Y-axis: log2(counts / sum_factor), optionally alpha_y-corrected.
+
+    Parameters (selected)
+    ---------------------
+    color_by : str, list of two str, or None
+        What to color smoothed lines by. Options:
+        - ``'technical_group'`` (default): one line per cell-line / technical group
+        - ``'targeting'``: two lines — NTC vs all targeting cells
+        - Any column name in ``model.meta``: one line per unique value
+        - A **list of two** values (e.g. ``['technical_group', 'targeting']``): cross-product
+          of two groupings. The first determines hue; the second determines shade — NTC gets
+          a lighter tint of the group colour, Targeting gets the full colour.
+        - ``None``: no grouping — a single ungrouped ``'All'`` line in one colour.
 
     Parameters
     ----------
@@ -3456,6 +3746,17 @@ def plot_negbinom_xy(
     if 'technical_group_code' in meta_aligned.columns:
         df_data['technical_group_code'] = meta_aligned['technical_group_code'].values
 
+    # Forward any extra meta columns referenced in color_by into df_data now,
+    # before the DataFrame is built, so that the min_counts filter applies to them too.
+    _cb_items = [] if color_by is None else ([color_by] if isinstance(color_by, str) else list(color_by))
+    _SPECIAL_CB = {'technical_group', 'targeting'}
+    for _cb in _cb_items:
+        if _cb in _SPECIAL_CB or _cb in df_data:
+            continue
+        if _cb in meta_aligned.columns:
+            df_data[_cb] = meta_aligned[_cb].values
+        # If not found anywhere, _resolve_grouping will warn later.
+
     df = pd.DataFrame(df_data)
 
     # Filter by min_counts (exclude cells with raw counts below threshold)
@@ -3495,64 +3796,210 @@ def plot_negbinom_xy(
     # Detect NTC cells for gradient coloring
     is_ntc = df['target'].str.lower() == 'ntc'
 
-    # Compute NTC reference values for log2FC mode
+    # Compute NTC reference offsets for log2FC mode.
+    # x_offset: pooled NTC x_true (x_true is group-independent).
+    # y_offset: reference group (group_code=0, alpha_y=1.0) NTC uncorrected expression.
+    #   Because alpha_y=1.0 for the reference group, its uncorrected NTC equals the corrected
+    #   NTC for any group — so this is the natural "true NTC" baseline.
+    #
+    # ntc_x_offset / ntc_y_offset: pre-computed overrides supplied by the caller
+    # (plot_xy_data passes these when faceting, so that panels without NTC cells —
+    # e.g. the "Targeting" facet — still use the correct global NTC baseline).
     if log2fc:
-        ntc_df = df[is_ntc]
-        x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
-        y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
-        y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
-        if len(x_ntc_valid) > 0 and len(y_ntc_valid) > 0:
-            x_offset = np.log2(float(x_ntc_valid.mean()))
-            y_offset = np.log2(float(y_ntc_valid.mean()))
+        if ntc_x_offset is not None and ntc_y_offset is not None:
+            # Use caller-supplied global offsets (correct even when df has no NTC cells)
+            x_offset = ntc_x_offset
+            y_offset = ntc_y_offset
         else:
-            import warnings
-            warnings.warn("log2fc=True: no valid NTC cells found; plotting raw log2 instead.")
-            x_offset = 0.0
-            y_offset = 0.0
+            ntc_df = df[is_ntc]
+            x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
+            if len(x_ntc_valid) > 0:
+                x_offset = np.log2(float(x_ntc_valid.mean()))
+            else:
+                warnings.warn("log2fc=True: no valid NTC cells found for x; plotting raw log2 instead.")
+                x_offset = 0.0
+            # y_offset: prefer mu_ntc from technical fit (same source as save_trans_summary).
+            # mu_ntc is the model-inferred reference-group NTC expression rate [n_samples, T].
+            # Fall back to empirical NTC reference-group mean when fit_technical not run.
+            _feature_idx = _get_feature_index(feature, modality)
+            _y_offset_from_technical = None
+            if (_feature_idx is not None
+                    and hasattr(modality, 'posterior_samples_ntc')
+                    and modality.posterior_samples_ntc is not None
+                    and 'mu_ntc' in modality.posterior_samples_ntc):
+                _mu_ntc = modality.posterior_samples_ntc['mu_ntc']
+                if hasattr(_mu_ntc, 'cpu'):
+                    _mu_ntc = _mu_ntc.cpu().numpy()
+                _mu_ntc = np.asarray(_mu_ntc, dtype=float)
+                while _mu_ntc.ndim > 2:
+                    _mu_ntc = _mu_ntc.mean(axis=0)
+                _mu_ntc_mean = _mu_ntc.mean(axis=0)   # [T]
+                if _feature_idx < len(_mu_ntc_mean):
+                    _val = float(_mu_ntc_mean[_feature_idx])
+                    if np.isfinite(_val) and _val > 0:
+                        _y_offset_from_technical = np.log2(_val)
+            if _y_offset_from_technical is not None:
+                y_offset = _y_offset_from_technical
+            else:
+                # Empirical fallback: reference-group NTC mean
+                if 'technical_group_code' in ntc_df.columns:
+                    ntc_ref_df = ntc_df[ntc_df['technical_group_code'] == 0]
+                else:
+                    ntc_ref_df = ntc_df
+                y_ntc_expr = ntc_ref_df['y_obs'] / ntc_ref_df['sum_factor']
+                y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+                if len(y_ntc_valid) == 0:  # fallback to pooled if reference group has no NTC
+                    y_ntc_expr = ntc_df['y_obs'] / ntc_df['sum_factor']
+                    y_ntc_valid = y_ntc_expr[(y_ntc_expr > 0) & np.isfinite(y_ntc_expr)]
+                y_offset = np.log2(float(y_ntc_valid.mean())) if len(y_ntc_valid) > 0 else 0.0
     else:
         x_offset = 0.0
         y_offset = 0.0
 
-    # Create colormaps for NTC gradient (per technical group)
-    # Each group gets white → group_color gradient
+    # Build color groups based on color_by.
+    # color_by can be a str (single grouping) or a list of two str (cross-product).
+    # Alpha_y correction is always per technical_group_code regardless of color_by.
+
+    def _resolve_grouping(cb):
+        """Return list of (label, boolean_mask) for one color_by value, or None if not found."""
+        if cb is None:
+            return [('All', pd.Series(True, index=df.index))]
+        if cb == 'technical_group':
+            if 'technical_group_code' in df.columns:
+                return [(code_to_label[int(gc)], df['technical_group_code'] == gc)
+                        for gc in group_codes]
+            return [('All', pd.Series(True, index=df.index))]
+        if cb == 'targeting':
+            ntc_m = df['target'].str.lower() == 'ntc'
+            return [('NTC', ntc_m), ('Targeting', ~ntc_m)]
+        if cb in df.columns:
+            n_unique = df[cb].nunique()
+            if n_unique == 0:
+                warnings.warn(f"color_by='{cb}': column has no values after filtering.")
+                return [('All', pd.Series(True, index=df.index))]
+            if pd.api.types.is_float_dtype(df[cb]) and n_unique > 10:
+                warnings.warn(
+                    f"color_by='{cb}' looks continuous (float dtype, {n_unique} unique values). "
+                    f"Coloring by a continuous column will produce many overlapping lines. "
+                    f"Consider binning or using a categorical column instead."
+                )
+            elif n_unique > 30:
+                warnings.warn(
+                    f"color_by='{cb}' has {n_unique} unique values — this will produce "
+                    f"{n_unique} smoothed lines and may be hard to read. "
+                    f"Consider a coarser grouping."
+                )
+            uvals = sorted(df[cb].dropna().unique(), key=str)
+            return [(str(v), df[cb] == v) for v in uvals]
+        return None  # not found
+
+    _cb_list = [color_by] if (color_by is None or isinstance(color_by, str)) else list(color_by)
+
+    if len(_cb_list) == 1:
+        # ── Single grouping ──────────────────────────────────────────────────
+        groups = _resolve_grouping(_cb_list[0])
+        if groups is None:
+            warnings.warn(f"color_by='{_cb_list[0]}' not found in data; "
+                          "falling back to 'technical_group'.")
+            groups = _resolve_grouping('technical_group')
+        color_groups_list = groups
+
+    else:
+        # ── Cross-product of two groupings, with auto shade variation ────────
+        # Primary grouping determines hue; secondary determines shade.
+        # For 'targeting' as secondary: NTC → light shade, Targeting → full color.
+        # For any other secondary: shades spread evenly from light to full.
+        primary_cb, secondary_cb = _cb_list[0], _cb_list[1]
+        primary_groups   = _resolve_grouping(primary_cb)   or _resolve_grouping('technical_group')
+        secondary_groups = _resolve_grouping(secondary_cb) or [('All', pd.Series(True, index=df.index))]
+
+        if secondary_cb == 'targeting':
+            _shade_for = {'NTC': 0.35, 'Targeting': 1.0}
+        else:
+            _n = len(secondary_groups)
+            _shade_for = {lbl: 0.3 + 0.7 * i / max(_n - 1, 1)
+                          for i, (lbl, _) in enumerate(secondary_groups)}
+
+        # Build cross-product; auto-populate color_palette with shade colours.
+        # shade=1.0 → full base colour; shade<1.0 → mixed with white (lighter).
+        from matplotlib.colors import to_rgb, to_hex
+        color_palette = dict(color_palette)  # local copy — do not mutate caller's dict
+        color_groups_list = []
+        for pidx, (plabel, pmask) in enumerate(primary_groups):
+            base_color = _color_for_label(plabel, fallback_idx=pidx, palette=color_palette)
+            try:
+                base_rgb = np.array(to_rgb(base_color))
+            except ValueError:
+                base_rgb = np.array([0.5, 0.5, 0.5])
+            for slabel, smask in secondary_groups:
+                combined_mask = pmask & smask
+                if not combined_mask.any():
+                    continue
+                combined_label = f"{plabel} / {slabel}"
+                if combined_label not in color_palette:
+                    shade = _shade_for.get(slabel, 1.0)
+                    shaded = np.clip(1 - shade * (1 - base_rgb), 0, 1)
+                    color_palette[combined_label] = to_hex(shaded)
+                color_groups_list.append((combined_label, combined_mask))
+
+    # Create colormaps for NTC gradient — one per color group (white → group color)
     group_cmaps = {}
     if show_ntc_gradient:
-        for idx, group_code in enumerate(group_codes):
-            group_code  = int(group_code)
-            group_label = code_to_label[group_code]
-            base_color  = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
+        for idx, (group_label, _) in enumerate(color_groups_list):
+            base_color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
             group_cmaps[group_label] = LinearSegmentedColormap.from_list(
-                f"white_{group_label}",
-                ["white", base_color]
+                f"white_{group_label}", ["white", base_color]
             )
 
     # Plot function
     def _plot_one(ax_plot, corrected):
-        colorbar_added = False  # Track if colorbar added
-
-        
-        for idx, group_code in enumerate(group_codes):
-            group_code = int(group_code)
-            group_label = code_to_label[group_code]
-
-            # Filter by technical group if column exists
+        # Compute per-cell y_expr with alpha_y correction applied per technical group.
+        # This is independent of color_by — correction always uses technical_group_code.
+        if corrected and has_technical_fit:
+            alpha_y_full = modality.alpha_y_prefit  # [C, T] or [S, C, T]
+            y_expr_vals = np.empty(len(df))
             if 'technical_group_code' in df.columns:
-                df_group = df[df['technical_group_code'] == group_code].copy()
+                for gc in df['technical_group_code'].unique():
+                    gc = int(gc)
+                    if alpha_y_full.ndim == 3:
+                        a = _to_scalar(alpha_y_full[:, gc, feature_idx].mean())
+                    else:
+                        a = _to_scalar(alpha_y_full[gc, feature_idx])
+                    mask = df['technical_group_code'].values == gc
+                    y_expr_vals[mask] = (df['y_obs'].values[mask] /
+                                         (df['sum_factor'].values[mask] * a))
             else:
-                df_group = df.copy()
+                y_expr_vals = (df['y_obs'] / df['sum_factor']).values
+        else:
+            y_expr_vals = (df['y_obs'] / df['sum_factor']).values
+        y_expr_all = pd.Series(y_expr_vals, index=df.index)
 
-            if corrected and has_technical_fit:
-                # Apply alpha_y correction
-                alpha_y_full = modality.alpha_y_prefit  # [S or 1, C, T]
-                if alpha_y_full.ndim == 3:
-                    alpha_y_val = _to_scalar(alpha_y_full[:, group_code, feature_idx].mean())
-                else:
-                    alpha_y_val = _to_scalar(alpha_y_full[group_code, feature_idx])
-                y_expr = df_group['y_obs'] / (df_group['sum_factor'] * alpha_y_val)
-            else:
-                y_expr = df_group['y_obs'] / df_group['sum_factor']
+        # Accumulate bounds from plotted data so we can set explicit axis limits.
+        # axhline / axvline are infinite lines that confuse matplotlib's auto-scaling;
+        # explicit set_xlim / set_ylim ensures the view is driven by the data.
+        _ax_x_segments = []   # (x_min, x_max) from each smooth curve
+        _ax_y_segments = []   # (y_min, y_max) from each smooth curve
+        _ax_y_hill = []       # y values from Hill curve (filtered to displayed x range)
+        _ax_h_markers = []    # y positions of horizontal parameter lines
+        _ax_v_markers = []    # x positions of vertical parameter lines (K / EC50)
 
-            # Filter valid
+        colorbar_added = False
+        for idx, (group_label, group_mask) in enumerate(color_groups_list):
+            df_group = df[group_mask].copy()
+            y_expr = y_expr_all[group_mask]
+
+            # Filter valid cells for kNN smoothing.
+            # Require positive x_true (log2 axis) and finite y_expr.
+            # Zero-count cells (y_expr=0) ARE included: isfinite(0) = True.
+            # The Hill function is the model's *unconditional* expected value
+            # E[y/SF] = A + α·Hill_a + β·Hill_b, which averages over all cells
+            # including zero-count ones.  The y_offset (from mu_ntc or empirical NTC
+            # mean) is also the unconditional reference.  Excluding zeros would raise
+            # the kNN smooth to the *conditional* mean E[y/SF | y>0] > E[y/SF],
+            # making it appear above the Hill curve.
+            # Windows where every cell in the kNN neighbourhood has zero counts
+            # are removed by the subsequent valid_smooth = y_smooth_linear > 0 filter,
+            # so no log2(0) is ever taken.
             valid = (df_group['x_true'] > 0) & np.isfinite(y_expr)
             df_group = df_group[valid].copy()
             y_expr = y_expr[valid]
@@ -3560,49 +4007,35 @@ def plot_negbinom_xy(
             if len(df_group) == 0:
                 continue
 
-            # Get is_ntc for this group
             is_ntc_group = is_ntc[df_group.index].values
-
-            # k-NN smoothing in LINEAR space first (matching old code behavior)
-            # Old code: smooth raw y, THEN take log2
-            # This matters because log2(mean(y)) >= mean(log2(y)) by Jensen's inequality
             k = _knn_k(len(df_group), window)
+
+            # k-NN smoothing in LINEAR space first (log2(mean(y)) ≥ mean(log2(y)))
             if show_ntc_gradient:
-                # Smoothing with NTC tracking in LINEAR space
                 x_smooth, y_smooth_linear, ntc_prop = _smooth_knn(
                     df_group['x_true'].values,
-                    y_expr.values if hasattr(y_expr, 'values') else y_expr,
-                    k,
-                    is_ntc=is_ntc_group
+                    y_expr.values if hasattr(y_expr, 'values') else np.asarray(y_expr),
+                    k, is_ntc=is_ntc_group
                 )
-
-                # Filter out zero/negative smoothed values before log transform
                 valid_smooth = y_smooth_linear > 0
                 if not valid_smooth.all():
                     x_smooth = x_smooth[valid_smooth]
                     y_smooth_linear = y_smooth_linear[valid_smooth]
                     ntc_prop = ntc_prop[valid_smooth]
-
-                # Now take log2 of smoothed values
                 y_smooth_log = np.log2(y_smooth_linear)
-
-                # Use per-group gradient coloring (white → group color)
-                # Color value = 1 - ntc_prop: high NTC → 0 → white, low NTC → 1 → group color
+                _xs = np.log2(x_smooth) - x_offset
+                _ys = y_smooth_log - y_offset
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
-                    x=np.log2(x_smooth) - x_offset,
-                    y=y_smooth_log - y_offset,
-                    color_values=1 - ntc_prop,  # Darker (group color) = fewer NTCs
-                    cmap=group_cmap,
-                    ax=ax_plot,
-                    linewidth=2
+                    x=_xs, y=_ys,
+                    color_values=1 - ntc_prop,
+                    cmap=group_cmap, ax=ax_plot, linewidth=2
                 )
-
-                # Add dummy invisible line for legend label (using base group color)
+                if len(_xs) > 0:
+                    _ax_x_segments.append((float(_xs.min()), float(_xs.max())))
+                    _ax_y_segments.append((float(_ys.min()), float(_ys.max())))
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
                 ax_plot.plot([], [], color=color, linewidth=2, label=group_label)
-
-                # Add colorbar (once per axis) - use grayscale to show NTC gradient
                 if not colorbar_added:
                     fig = ax_plot.get_figure()
                     cmap_gray = LinearSegmentedColormap.from_list("gray_gradient", ["white", "black"])
@@ -3612,26 +4045,23 @@ def plot_negbinom_xy(
                     cbar.set_label('1 - Proportion NTC (darker = fewer NTCs)')
                     colorbar_added = True
             else:
-                # Standard smoothing without NTC tracking in LINEAR space
                 x_smooth, y_smooth_linear = _smooth_knn(
                     df_group['x_true'].values,
-                    y_expr.values if hasattr(y_expr, 'values') else y_expr,
+                    y_expr.values if hasattr(y_expr, 'values') else np.asarray(y_expr),
                     k
                 )
-
-                # Filter out zero/negative smoothed values before log transform
                 valid_smooth = y_smooth_linear > 0
                 if not valid_smooth.all():
                     x_smooth = x_smooth[valid_smooth]
                     y_smooth_linear = y_smooth_linear[valid_smooth]
-
-                # Now take log2 of smoothed values
                 y_smooth_log = np.log2(y_smooth_linear)
-
-                # Use standard coloring
+                _xs = np.log2(x_smooth) - x_offset
+                _ys = y_smooth_log - y_offset
                 color = _color_for_label(group_label, fallback_idx=idx, palette=color_palette)
-                ax_plot.plot(np.log2(x_smooth) - x_offset, y_smooth_log - y_offset,
-                             color=color, linewidth=2, label=group_label)
+                ax_plot.plot(_xs, _ys, color=color, linewidth=2, label=group_label)
+                if len(_xs) > 0:
+                    _ax_x_segments.append((float(_xs.min()), float(_xs.max())))
+                    _ax_y_segments.append((float(_ys.min()), float(_ys.max())))
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -3639,30 +4069,113 @@ def plot_negbinom_xy(
             # Evenly spaced points in log2 space for smooth curve on log-log plot
             log2_min = np.log2(max(x_true.min(), 1e-6))
             log2_max = np.log2(x_true.max())
+            if expand_x_to_params and mark_params:
+                # Extend range to include K_a / K_b posterior means
+                _posterior_ep = (model.posterior_samples_trans
+                                 if modality.name == model.primary_modality
+                                 else getattr(modality, 'posterior_samples_trans', None))
+                if _posterior_ep is not None and 'K_a' in _posterior_ep:
+                    _fnames_ep = (list(modality.feature_names)
+                                  if modality.feature_names is not None else [])
+                    if feature in _fnames_ep:
+                        _fi_ep = _fnames_ep.index(feature)
+                        for _kname in ('K_a', 'K_b'):
+                            if _kname in _posterior_ep:
+                                _ks = _posterior_ep[_kname]
+                                _km = (_ks.mean(dim=0) if hasattr(_ks, 'mean')
+                                       else np.mean(_ks, axis=0))
+                                if hasattr(_km, 'detach'):
+                                    _km = _km.detach().cpu().numpy()
+                                _km = np.asarray(_km).ravel()
+                                if _fi_ep < len(_km):
+                                    _k_val = float(_km[_fi_ep])
+                                    if _k_val > 0:
+                                        log2_min = min(log2_min, np.log2(_k_val))
+                                        log2_max = max(log2_max, np.log2(_k_val))
             x_range = 2 ** np.linspace(log2_min, log2_max, 2000)
-            y_pred = predict_trans_function(model, feature, x_range, modality_name=None)
+            # Use reference_df as FDR source if no explicit fdr_df provided (also
+            # used below for markers, so components are gated consistently
+            # between the plotted curve and its parameter markers).
+            _effective_fdr_df = fdr_df if fdr_df is not None else reference_df
+            y_pred = predict_trans_function(model, feature, x_range, modality_name=None,
+                                             fdr_threshold=fdr_threshold, fdr_df=_effective_fdr_df)
 
             if y_pred is not None:
                 # Transform prediction to log2(y) space to match data
                 # Filter out zero/negative predictions
                 valid_pred = y_pred > 0
                 if valid_pred.any():
-                    ax_plot.plot(np.log2(x_range[valid_pred]) - x_offset,
-                                np.log2(y_pred[valid_pred]) - y_offset,
-                                color='black', linestyle='--', linewidth=2,
-                                label='Fitted Trans Function')
-
+                    _xh = np.log2(x_range[valid_pred]) - x_offset
+                    _yh = np.log2(y_pred[valid_pred]) - y_offset
+                    ax_plot.plot(_xh, _yh,
+                                color=hill_color, linestyle='--', linewidth=2,
+                                label=hill_label)
+                    # Collect Hill y values within the smooth x range (extended by
+                    # any V markers below) — done after markers are computed.
+                    # Store the full arrays for now; we trim after markers.
+                    _ax_y_hill_xh = _xh
+                    _ax_y_hill_yh = _yh
+                else:
+                    _ax_y_hill_xh = _ax_y_hill_yh = None
+            else:
+                _ax_y_hill_xh = _ax_y_hill_yh = None
 
             # Full parameter markers (replaces simple A baseline)
-            # Use reference_df as FDR source if no explicit fdr_df provided
-            _effective_fdr_df = fdr_df if fdr_df is not None else reference_df
-            if mark_params and (corrected or not has_technical_fit):
+            _show_fit_markers = mark_params in (True, 'both', 'fit')
+            _show_ref_markers = mark_params in (True, 'both', 'reference')
+            if _show_fit_markers and (corrected or not has_technical_fit):
                 _markers = _compute_hill_markers(
                     model, feature, modality,
-                    ci_level=ci_level, log2_space=True, y_scale=1.0,
+                    log2_space=True, y_scale=1.0,
                     fdr_df=_effective_fdr_df, fdr_threshold=fdr_threshold,
                 )
-                _draw_hill_markers(ax_plot, _markers)
+                # In log2FC mode the axes are shifted; pass the same offsets so
+                # that parameter lines (A, Vmax ceiling, EC50) land at the correct
+                # positions — consistent with A_log2fc / EC50_*_log2fc in
+                # save_trans_summary.
+                _moff_x = x_offset if log2fc else 0.0
+                _moff_y = y_offset if log2fc else 0.0
+                _draw_hill_markers(ax_plot, _markers,
+                                   x_offset=_moff_x,
+                                   y_offset=_moff_y)
+                # Collect marker positions for axis-limit computation
+                for _m in _markers:
+                    if _m['axis'] == 'h':
+                        _ax_h_markers.append(_m['value'] - _moff_y)
+                    elif _m['axis'] == 'v':
+                        _ax_v_markers.append(_m['value'] - _moff_x)
+
+            # Now that V markers are known, compute final displayed x range and
+            # trim Hill y to that range (so Hill y doesn't set limits for x values
+            # that aren't visible in the smooth).
+            if _ax_x_segments:
+                _x_lo = min(s[0] for s in _ax_x_segments)
+                _x_hi = max(s[1] for s in _ax_x_segments)
+                if _ax_v_markers:             # K markers extend x range
+                    _x_lo = min(_x_lo, min(_ax_v_markers))
+                    _x_hi = max(_x_hi, max(_ax_v_markers))
+                if _ax_y_hill_xh is not None and len(_ax_y_hill_xh) > 0:
+                    if expand_y_to_params:
+                        _ax_y_hill.extend(_ax_y_hill_yh.tolist())
+                    else:
+                        _in_xr = (_ax_y_hill_xh >= _x_lo) & (_ax_y_hill_xh <= _x_hi)
+                        if _in_xr.any():
+                            _ax_y_hill.extend(_ax_y_hill_yh[_in_xr].tolist())
+
+            # When expand_y_to_params, also sample Hill at x→0 and x→∞ to capture
+            # asymptotes (A floor and A+α·Vmax ceiling) even when they are outside
+            # the data x range or when both Hill components are classified as null
+            # (which suppresses the A+Vmax ceiling h_marker in mark_params mode).
+            if expand_y_to_params and y_pred is not None:
+                _x_asym = np.array([max(x_range[0] * 1e-6, 1e-30), x_range[-1] * 1e6])
+                _y_asym = predict_trans_function(model, feature, _x_asym, modality_name=None,
+                                                  fdr_threshold=fdr_threshold, fdr_df=_effective_fdr_df)
+                if _y_asym is not None:
+                    _valid_asym = _y_asym > 0
+                    if _valid_asym.any():
+                        _ax_y_hill.extend(
+                            (np.log2(_y_asym[_valid_asym]) - y_offset).tolist()
+                        )
 
             # Reference curve overlay (from trans_summary DataFrame)
             if reference_df is not None and (corrected or not has_technical_fit):
@@ -3674,38 +4187,82 @@ def plot_negbinom_xy(
                         _x_ref = x_range if 'x_range' in dir() else (
                             2 ** np.linspace(np.log2(max(x_true.min(), 1e-6)),
                                              np.log2(x_true.max()), 2000))
-                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref, fdr_threshold=fdr_threshold)
+                        # Resolve reference model's NTC baselines.
+                        _y_ntc_ref = float(_ref_row.get('y_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['y_ntc'])
+                        _x_ntc_ref = float(_ref_row.get('x_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['x_ntc'])
+                        _y_ref_offset = np.log2(_y_ntc_ref) if (log2fc and _y_ntc_ref > 0) else y_offset
+                        _x_ref_offset = np.log2(_x_ntc_ref) if (log2fc and _x_ntc_ref > 0) else x_offset
+                        # Build _x_ref so that after subtracting _x_ref_offset it spans
+                        # the same visible log2FC x range as the current plot.  If we used
+                        # x_range directly and the two models have different NTC levels, the
+                        # reference curve would be horizontally shifted off-screen.
+                        _log2fc_x_min = np.log2(max(x_true.min(), 1e-6)) - x_offset
+                        _log2fc_x_max = np.log2(x_true.max()) - x_offset
+                        _x_ref_abs = 2 ** (np.linspace(_log2fc_x_min, _log2fc_x_max, 2000)
+                                           + _x_ref_offset)
+                        _y_ref = predict_hill_from_summary_row(_ref_row, _x_ref_abs, fdr_threshold=fdr_threshold)
                         if _y_ref is not None:
                             _valid_ref = _y_ref > 0
                             if _valid_ref.any():
                                 ax_plot.plot(
-                                    np.log2(_x_ref[_valid_ref]) - x_offset,
-                                    np.log2(_y_ref[_valid_ref]) - y_offset,
-                                    color='red', linestyle='--', linewidth=2,
-                                    alpha=0.8, label='Reference Function')
+                                    np.log2(_x_ref_abs[_valid_ref]) - _x_ref_offset,
+                                    np.log2(_y_ref[_valid_ref]) - _y_ref_offset,
+                                    color=ref_color, linestyle='--', linewidth=2,
+                                    alpha=0.8, label=ref_label)
                         # Reference mark_params: full set of Hill markers (A, Vmax, K)
-                        if mark_params:
+                        if _show_ref_markers:
                             _ref_markers = _compute_hill_markers_from_summary_row(
                                 _ref_row, log2_space=True, y_scale=1.0,
                                 fdr_threshold=fdr_threshold,
                             )
-                            # Offset reference markers visually (thinner, semi-transparent)
+                            # Reference markers use x_ntc/y_ntc as baselines (same as curve).
+                            _y_ntc_ref_mk = float(_ref_row.get('y_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['y_ntc'])
+                            _x_ntc_ref_mk = float(_ref_row.get('x_ntc', 0.0)) if hasattr(_ref_row, 'get') else float(_ref_row['x_ntc'])
+                            _y_ref_mk_offset = np.log2(_y_ntc_ref_mk) if (log2fc and _y_ntc_ref_mk > 0) else y_offset
+                            _x_ref_mk_offset = np.log2(_x_ntc_ref_mk) if (log2fc and _x_ntc_ref_mk > 0) else x_offset
                             for _m in _ref_markers:
-                                _kw = dict(linestyle=_m['linestyle'], color='red',
+                                _kw = dict(linestyle=_m['linestyle'], color=ref_color,
                                            alpha=0.5, linewidth=1.2,
                                            label=f'Ref {_m["label"]}')
                                 if _m['axis'] == 'h':
-                                    ax_plot.axhline(_m['value'] - y_offset, **_kw)
+                                    ax_plot.axhline(_m['value'] - _y_ref_mk_offset, **_kw)
                                 elif _m['axis'] == 'v':
-                                    ax_plot.axvline(_m['value'] - x_offset, **_kw)
+                                    ax_plot.axvline(_m['value'] - _x_ref_mk_offset, **_kw)
 
         ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
-        ax_plot.set_ylabel("log2FC(Expression)" if log2fc else "log2(Expression)")
+        ax_plot.set_ylabel(ylabel if ylabel is not None else ("log2FC(counts)" if log2fc else "log2(counts)"))
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
         if log2fc:
             ax_plot.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
             ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
+
+        # ── Explicit axis limits ──────────────────────────────────────────────
+        # X: smooth data range, extended to include K/EC50 vertical markers.
+        # Y: smooth data range + Hill curve (within displayed x range) + h markers.
+        # axhline / axvline don't constrain auto-scaling reliably, so we set
+        # limits manually to keep the view focused on the actual content.
+        if _ax_x_segments:
+            _x_lo = min(s[0] for s in _ax_x_segments)
+            _x_hi = max(s[1] for s in _ax_x_segments)
+            if _ax_v_markers:
+                _x_lo = min(_x_lo, min(_ax_v_markers))
+                _x_hi = max(_x_hi, max(_ax_v_markers))
+
+            _y_lo = min(s[0] for s in _ax_y_segments)
+            _y_hi = max(s[1] for s in _ax_y_segments)
+            if _ax_y_hill:
+                _y_lo = min(_y_lo, min(_ax_y_hill))
+                _y_hi = max(_y_hi, max(_ax_y_hill))
+            if _ax_h_markers:
+                _y_lo = min(_y_lo, min(_ax_h_markers))
+                _y_hi = max(_y_hi, max(_ax_h_markers))
+
+            _x_pad = max(0.05 * (_x_hi - _x_lo), 0.1)
+            _y_pad = max(0.05 * (_y_hi - _y_lo), 0.1)
+            ax_plot.set_xlim(_x_lo - _x_pad, _x_hi + _x_pad)
+            ax_plot.set_ylim(_y_lo - _y_pad, _y_hi + _y_pad)
+
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
@@ -3739,16 +4296,24 @@ def plot_binomial_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
-    mark_params: bool = False,
+    mark_params = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
+    log2fc: bool = False,
+    ntc_x_offset: Optional[float] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Axes:
     """
-    Plot binomial (PSI - percent spliced in).
+    Plot binomial (a bounded count/denominator ratio, e.g. PSI or a
+    spliced/unspliced fraction).
 
-    Y-axis: PSI (%) = (counts / denominator) * 100  (percentage scale: 0-100)
+    Y-axis: 100 * counts / denominator (percentage scale: 0-100). Labeled
+    ``'Percentage (%)'`` by default since this distribution is used for any
+    bounded count/denominator ratio, not just splicing PSI (e.g. gene-level
+    spliced-vs-unspliced fractions for velocity) -- pass ``ylabel='PSI (%)'``
+    (or another description) to be more specific for a given modality.
     Filter: min_counts on denominator
 
     Parameters
@@ -3760,6 +4325,20 @@ def plot_binomial_xy(
         'uncorrected': no technical correction
         'corrected': apply alpha_y_add additive correction (PSI - alpha_y_add)
         'both': show both side-by-side
+    log2fc : bool
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true). The y-axis (PSI%) is left
+        as-is -- unlike negbinom, there is no natural log2FC transform for a
+        bounded proportion, so only the x-axis shifts. A grey dotted vertical
+        line is drawn at x=0 to mark the NTC reference.
+    ntc_x_offset : float, optional
+        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
+        and passes this automatically.
+    ylabel : str, optional
+        Override the y-axis label (default: ``'Percentage (%)'``). Pass
+        ``ylabel='PSI (%)'`` for splicing modalities, or e.g.
+        ``ylabel='Spliced (%)'`` for a gene velocity modality.
 
     Notes
     -----
@@ -3768,6 +4347,7 @@ def plot_binomial_xy(
     logit_corrected = logit(PSI) - alpha_y_add
     PSI_corrected = 1 / (1 + exp(-logit_corrected))
     """
+    _x_off = ntc_x_offset if (log2fc and ntc_x_offset is not None) else 0.0
     # Get data
     feature_idx = _get_feature_index(feature, modality)
     if feature_idx is None:
@@ -3816,16 +4396,16 @@ def plot_binomial_xy(
         raise ValueError(f"No data remaining after filtering (min_counts={min_counts})")
 
     # Check technical correction availability
-    # First check attribute, then fall back to posterior_samples_technical dict
+    # First check attribute, then fall back to posterior_samples_ntc dict
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
             # Set the attribute for future use
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
-            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_technical for modality '{modality.name}'")
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
+            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_ntc for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
         warnings.warn(f"Technical fit not available for modality '{modality.name}' - showing uncorrected only")
@@ -3931,7 +4511,7 @@ def plot_binomial_xy(
 
             # Plot (no additional smoothing needed - already binned)
             # Note: We don't currently support NTC gradient for binned data
-            ax_plot.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2, label=group_label)
+            ax_plot.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -3946,7 +4526,7 @@ def plot_binomial_xy(
                 # For binomial, PSI is in percentage scale [0, 100], so scale and clip predictions
                 y_pred_pct = y_pred * 100.0
                 y_pred_clipped = np.clip(y_pred_pct, 0, 100)
-                ax_plot.plot(np.log2(x_range), y_pred_clipped,
+                ax_plot.plot(np.log2(x_range) - _x_off, y_pred_clipped,
                            color='black', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
 
@@ -3954,14 +4534,16 @@ def plot_binomial_xy(
         if mark_params and (corrected or not has_technical_fit):
             _markers = _compute_hill_markers(
                 model, feature, modality,
-                ci_level=ci_level, log2_space=False, y_scale=100.0
+                log2_space=False, y_scale=100.0
             )
-            _draw_hill_markers(ax_plot, _markers)
+            _draw_hill_markers(ax_plot, _markers, x_offset=_x_off)
 
-        ax_plot.set_xlabel(xlabel)
-        ax_plot.set_ylabel('PSI (%)')
+        ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
+        ax_plot.set_ylabel(ylabel if ylabel is not None else 'Percentage (%)')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature} (min_counts={min_counts}{title_suffix})")
+        if log2fc:
+            ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
@@ -3997,6 +4579,9 @@ def plot_multinomial_xy(
     xlabel: str = "log2(x_true)",
     figsize: Optional[Tuple[int, int]] = None,
     subset_mask: Optional[np.ndarray] = None,
+    log2fc: bool = False,
+    ntc_x_offset: Optional[float] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> Union[plt.Figure, List[plt.Axes]]:
     """
@@ -4012,6 +4597,14 @@ def plot_multinomial_xy(
     show_ntc_gradient : bool
         If True, color lines by NTC proportion in k-NN window (default: False)
         **Note**: Not yet fully implemented for multinomial - will issue warning
+    log2fc : bool
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true). The y-axis (proportion) is
+        left as-is. A grey dotted vertical line is drawn at x=0 (NTC reference).
+    ntc_x_offset : float, optional
+        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
+        and passes this automatically.
 
     Notes
     -----
@@ -4019,6 +4612,7 @@ def plot_multinomial_xy(
     logits_corrected = logits - alpha_y_add
     proportions_corrected = softmax(logits_corrected)
     """
+    _x_off = ntc_x_offset if (log2fc and ntc_x_offset is not None) else 0.0
     if show_ntc_gradient:
         warnings.warn("NTC gradient coloring not yet implemented for multinomial distributions - using standard colors")
 
@@ -4116,12 +4710,12 @@ def plot_multinomial_xy(
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
             # Set the attribute for future use
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
-            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_technical for modality '{modality.name}'")
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
+            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_ntc for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
         warnings.warn(f"Technical fit not available for modality '{modality.name}' - showing uncorrected only")
@@ -4213,13 +4807,15 @@ def plot_multinomial_xy(
                         y_smooth = props_binned[:, k]
 
                     # Plot (no additional smoothing needed - already binned)
-                    ax.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2,
+                    ax.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2,
                            label=group_label if plot_idx == 0 else None)
 
-                ax.set_xlabel(xlabel)
-                ax.set_ylabel(f'Proportion')
+                ax.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
+                ax.set_ylabel(ylabel if ylabel is not None else 'Proportion')
                 title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                 ax.set_title(f"{cat_label}{title_suffix}")
+                if log2fc:
+                    ax.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
                 if plot_idx == 0:
                     ax.legend(frameon=False, loc='upper right')
         else:
@@ -4276,13 +4872,15 @@ def plot_multinomial_xy(
                     y_smooth = props_binned[:, k]
 
                 # Plot (no additional smoothing needed - already binned)
-                ax.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2,
+                ax.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2,
                        label=group_label if plot_idx == 0 else None)
 
-            ax.set_xlabel(xlabel)
+            ax.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
             ax.set_ylabel(f'Proportion')
             title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
             ax.set_title(f"{cat_label}{title_suffix}")
+            if log2fc:
+                ax.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
             if plot_idx == 0:
                 ax.legend(frameon=False, loc='upper right')
 
@@ -4303,10 +4901,13 @@ def plot_normal_xy(
     xlabel: str = "log2(x_true)",
     ax: Optional[plt.Axes] = None,
     subset_mask: Optional[np.ndarray] = None,
-    mark_params: bool = False,
+    mark_params = False,
     ci_level: float = 95.0,
     legend_outside: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
+    log2fc: bool = False,
+    ntc_x_offset: Optional[float] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Axes:
     """
@@ -4320,7 +4921,16 @@ def plot_normal_xy(
         If True, color lines by NTC proportion in k-NN window (default: False)
         Lighter colors = more NTC cells, Darker colors = fewer NTC cells
         Only applies to uncorrected plots
+    log2fc : bool
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true). The y-axis (raw value) is
+        left as-is. A grey dotted vertical line is drawn at x=0 (NTC reference).
+    ntc_x_offset : float, optional
+        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
+        and passes this automatically.
     """
+    _x_off = ntc_x_offset if (log2fc and ntc_x_offset is not None) else 0.0
     # Get data
     feature_idx = _get_feature_index(feature, modality)
     if feature_idx is None:
@@ -4359,11 +4969,11 @@ def plot_normal_xy(
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
             # Set the attribute for future use
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
             print(f"[INFO] Set alpha_y_prefit_add from poster ior_samples_technical for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
@@ -4450,7 +5060,7 @@ def plot_normal_xy(
                 # Color value = 1 - ntc_prop: high NTC → 0 → white, low NTC → 1 → group color
                 group_cmap = group_cmaps.get(group_label, plt.cm.gray)
                 plot_colored_line(
-                    x=np.log2(x_smooth),
+                    x=np.log2(x_smooth) - _x_off,
                     y=y_smooth,
                     color_values=1 - ntc_prop,  # Darker (group color) = fewer NTCs
                     cmap=group_cmap,
@@ -4475,7 +5085,7 @@ def plot_normal_xy(
                 x_smooth, y_smooth = _smooth_knn(df_group['x_true'].values, y_plot, k)
 
                 # Use standard coloring
-                ax_plot.plot(np.log2(x_smooth), y_smooth, color=color, linewidth=2, label=group_label)
+                ax_plot.plot(np.log2(x_smooth) - _x_off, y_smooth, color=color, linewidth=2, label=group_label)
 
         # Trans function overlay (if trans model fitted)
         # Show on corrected plot if available, otherwise show on uncorrected plot
@@ -4487,7 +5097,7 @@ def plot_normal_xy(
             y_pred = predict_trans_function(model, feature, x_range, modality_name=modality.name)
 
             if y_pred is not None:
-                ax_plot.plot(np.log2(x_range), y_pred,
+                ax_plot.plot(np.log2(x_range) - _x_off, y_pred,
                            color='black', linestyle='--', linewidth=2,
                            label='Fitted Trans Function')
 
@@ -4495,14 +5105,16 @@ def plot_normal_xy(
         if mark_params and (corrected or not has_technical_fit):
             _markers = _compute_hill_markers(
                 model, feature, modality,
-                ci_level=ci_level, log2_space=False, y_scale=1.0
+                log2_space=False, y_scale=1.0
             )
-            _draw_hill_markers(ax_plot, _markers)
+            _draw_hill_markers(ax_plot, _markers, x_offset=_x_off)
 
-        ax_plot.set_xlabel(xlabel)
-        ax_plot.set_ylabel('Value')
+        ax_plot.set_xlabel("log2FC(x_true)" if log2fc else xlabel)
+        ax_plot.set_ylabel(ylabel if ylabel is not None else 'Value')
         title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
         ax_plot.set_title(f"{model.cis_gene} → {feature}{title_suffix}")
+        if log2fc:
+            ax_plot.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.6)
         if not legend_outside:
             ax_plot.legend(frameon=False)
 
@@ -4540,6 +5152,7 @@ def _plot_multinomial_multifeature(
     xlabel: str,
     figsize: Optional[Tuple[int, int]] = None,
     subset_mask: Optional[np.ndarray] = None,
+    ylabel: Optional[str] = None,
     **kwargs
 ) -> plt.Figure:
     """
@@ -4637,11 +5250,11 @@ def _plot_multinomial_multifeature(
     has_technical_fit = False
     if hasattr(modality, 'alpha_y_prefit_add') and modality.alpha_y_prefit_add is not None:
         has_technical_fit = True
-    elif hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-        if 'alpha_y_add' in modality.posterior_samples_technical:
+    elif hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+        if 'alpha_y_add' in modality.posterior_samples_ntc:
             has_technical_fit = True
-            modality.alpha_y_prefit_add = modality.posterior_samples_technical['alpha_y_add']
-            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_technical for modality '{modality.name}'")
+            modality.alpha_y_prefit_add = modality.posterior_samples_ntc['alpha_y_add']
+            print(f"[INFO] Set alpha_y_prefit_add from posterior_samples_ntc for modality '{modality.name}'")
 
     if show_correction == 'corrected' and not has_technical_fit:
         warnings.warn(f"Technical fit not available for modality '{modality.name}' - showing uncorrected only")
@@ -4810,7 +5423,7 @@ def _plot_multinomial_multifeature(
                                label=group_label if cat_plot_idx == 0 and feat_i == 0 else None)
 
                     ax.set_xlabel(xlabel)
-                    ax.set_ylabel(f'Proportion')
+                    ax.set_ylabel(ylabel if ylabel is not None else 'Proportion')
                     title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                     ax.set_title(f"{feat_name[:20]}... {cat_label}{title_suffix}", fontsize=9)
                     if cat_plot_idx == 0 and feat_i == 0:
@@ -4873,7 +5486,7 @@ def _plot_multinomial_multifeature(
                            label=group_label if cat_plot_idx == 0 and feat_i == 0 else None)
 
                 ax.set_xlabel(xlabel)
-                ax.set_ylabel(f'Proportion')
+                ax.set_ylabel(ylabel if ylabel is not None else 'Proportion')
                 title_suffix = ' (corrected)' if corrected else ' (uncorrected)'
                 ax.set_title(f"{feat_name[:20]}... {cat_label}{title_suffix}", fontsize=9)
                 if cat_plot_idx == 0 and feat_i == 0:
@@ -4905,18 +5518,24 @@ def plot_xy_data(
     show_ntc_gradient: bool = False,
     sum_factor_col: str = 'sum_factor',
     xlabel: str = "log2(x_true)",
+    ylabel: Optional[str] = None,
     figsize: Optional[Tuple[int, int]] = None,
     src_barcodes: Optional[np.ndarray] = None,
     subset_meta: Optional[Dict[str, Any]] = None,
+    exclude_cells: Optional[List[str]] = None,
     only_dependent: bool = False,
     ci_level: float = 95.0,
-    mark_params: bool = False,
+    mark_params = False,
     legend_outside: bool = False,
     filename: Optional[str] = None,
     log2fc: bool = False,
     reference_df=None,
     fdr_df=None,
     fdr_threshold: float = 0.05,
+    color_by: Optional[Union[str, List[str]]] = 'technical_group',
+    facet_by: Optional[Union[str, List[str]]] = None,
+    expand_x_to_params: bool = False,
+    expand_y_to_params: bool = False,
     **kwargs
 ) -> Union[plt.Figure, plt.Axes]:
     """
@@ -4966,6 +5585,15 @@ def plot_xy_data(
         Only used for negbinom distribution (gene expression)
     xlabel : str
         X-axis label (default: "log2(x_true)")
+    ylabel : str, optional
+        Override the y-axis label (default: None, uses a distribution-specific
+        default -- ``"log2(counts)"`` for negbinom, ``"Percentage (%)"`` for
+        binomial (0-100 scale), ``"Proportion"`` for multinomial (0-1 scale),
+        ``"Value"`` for normal/studentt). The binomial default is deliberately
+        generic since that distribution covers any bounded count/denominator
+        ratio, not just splicing PSI -- pass e.g. ``ylabel='PSI (%)'`` for
+        splicing modalities or ``ylabel='Spliced (%)'`` for a gene velocity
+        modality.
     figsize : tuple, optional
         Figure size (auto-sized if None)
     src_barcodes : np.ndarray, optional
@@ -4976,19 +5604,32 @@ def plot_xy_data(
         Example: {'cell_line': 'K562'} - plot only K562 cells
         Example: {'lane': 'L1', 'cell_line': 'K562'} - plot L1 lane K562 cells
         Multiple conditions are combined with AND logic.
+    exclude_cells : list of str, optional
+        Cell names (matched against ``model.meta['cell']``) to drop before
+        plotting, e.g. cells identified by ``check_systematic_shift``'s
+        ``exclude_cells`` filtering logic. AND-combined with ``subset_meta``
+        when both are given, without needing to call ``model.subset_cells()``
+        first.
+        Example: ``exclude_cells=['cell_1', 'cell_2']``
     only_dependent : bool
         If True and plotting multiple features (gene name), filter to only "dependent" features
-        where the Hill coefficient (n_a or n_b) credible interval excludes 0 (default: False).
-        Requires fit_trans() to have been run with function_type='additive_hill'.
+        (default: False). When ``fdr_df`` is provided, uses its precomputed ``is_dependent``
+        column (FDR-significant AND the Hill coefficient's credible interval excludes 0).
+        Otherwise falls back to filtering on the n_a/n_b credible interval alone, which
+        requires fit_trans() to have been run with function_type='additive_hill'.
         Ignored for single-feature plots.
     ci_level : float
         Credible interval level for dependency filtering and parameter marker
         classification (default: 95.0).
         Used by only_dependent=True and mark_params=True.
-    mark_params : bool
+    mark_params : bool or str
         Overlay meaningful parameter markers on the Hill function (default: False).
         Requires show_hill_function=True and fit_trans() completed with
         function_type='single_hill' or 'additive_hill'.
+        - True or 'both': markers for both the fitted curve and the reference curve
+        - 'fit': markers for the fitted curve only
+        - 'reference': markers for the reference curve only (requires reference_df)
+        - False or None: no markers
         Markers drawn depend on the fitted regime:
         - **Single Hill / effectively single**: log2(A), log2(A+α·Vmax), log2(EC50)
         - **Same-sign additive** (both Hills in same direction):
@@ -4999,11 +5640,98 @@ def plot_xy_data(
         For non-negbinom distributions, all y-axis markers are in linear space.
         Note: asymptotes include the α/β weight factors (e.g. A+α·Vmax, not A+Vmax).
     log2fc : bool
-        If True, plot log2FC relative to NTC instead of raw log2 expression
-        (default: False). Only applies to negbinom modalities.
-        x-axis: log2(x_true) - log2(mean NTC x_true)
-        y-axis: log2(expression) - log2(mean NTC expression)
-        A grey dotted crosshair is drawn at (0, 0) to mark the NTC reference.
+        If True, x-axis becomes log2(x_true) - log2(mean NTC x_true) (log2FC
+        relative to NTC) instead of raw log2(x_true) (default: False).
+        For **negbinom**, the y-axis also becomes log2FC relative to NTC
+        (log2(counts) - log2(mean NTC counts, reference group)), and a grey
+        dotted crosshair is drawn at (0, 0).
+        For **binomial/normal/studentt/multinomial**, only the x-axis
+        transforms -- the y-axis is left in its natural scale (PSI%, raw
+        value, proportion), since there's no natural log2FC transform for a
+        bounded/non-count quantity. Only a vertical grey dotted line is drawn
+        at x=0 to mark the NTC reference.
+    color_by : str, list of two str, or None
+        What to color smoothed lines by (default: ``'technical_group'``).
+        - ``'technical_group'``: one line per cell-line / technical group (default)
+        - ``'targeting'``: two lines — ``NTC`` vs ``Targeting``
+        - **Any column name in ``model.meta``**: one line per unique value.
+          A warning is issued if the column looks continuous (float dtype with many
+          unique values) or has more than 30 unique values.
+        - **List of two** (e.g. ``['technical_group', 'targeting']``): cross-product of
+          two groupings — the first sets hue, the second sets shade. When the secondary
+          is ``'targeting'``, NTC lines are drawn as a light tint of the group colour
+          and targeting lines as the full colour (matching the classic "shades" style).
+          Override any auto-generated colour via ``color_palette`` using the combined
+          label ``"K562 / NTC"``, ``"K562 / Targeting"``, etc.
+        - ``None``: no grouping at all — every cell (NTC and targeting alike, all
+          technical groups pooled) is smoothed into a single ``'All'`` line in one
+          colour. Alpha-y correction is still applied per technical group under the
+          hood (that step is independent of ``color_by``); only the drawn line(s)
+          collapse to one.
+        Alpha-y technical correction is always applied per technical group regardless
+        of this setting.
+    facet_by : str or list of str, optional
+        Column name(s) to facet by (default: ``None``).  Accepts either a
+        single string or a list of **at most two** strings.  Each value may be
+        a real column name in ``model.meta`` **or** one of the same special
+        keywords supported by ``color_by``:
+
+        - ``'targeting'`` — two panels: ``NTC`` / ``Targeting``
+          (derived from ``model.meta['target']``)
+        - ``'technical_group'`` — one panel per technical group code
+
+        Analogous to ``facet_grid`` in ggplot2.
+
+        **1 column** (``facet_by='cell_line'``) — all unique values become
+        side-by-side column groups::
+
+            rows = n_features,  cols = n_facets × n_corrections
+
+        Example: 3 cell lines + ``show_correction='both'`` →  1 × 6 grid
+        ``[K562 uncorr | K562 corr | TF1 uncorr | TF1 corr | HL60 uncorr | HL60 corr]``
+
+        **2 columns** (``facet_by=['cell_line', 'perturbation']``) — first
+        column maps to grid *rows*, second column maps to grid *columns*::
+
+            rows = n_facet1_values × n_features
+            cols = n_facet2_values × n_corrections
+
+        Example: 3 cell lines × 2 perturbation types + ``show_correction='corrected'``
+        → 3 × 2 grid (cell lines as rows, perturbation types as columns).
+
+        **Combining with other parameters:**
+
+        - ``subset_meta`` / ``exclude_cells``: each facet mask is AND-combined
+          with the global ``subset_meta`` / ``exclude_cells`` filters, so you
+          can first narrow to CRISPRi cells (or drop specific cells) and then
+          facet by cell line within that subset.
+        - ``color_by``: works independently within each panel — e.g.
+          ``facet_by='cell_line'`` splits cell lines into columns while
+          ``color_by='targeting'`` still draws NTC / Targeting lines *inside*
+          each panel.
+        - ``legend_outside=True``: recommended when faceting produces many
+          panels, to keep the shared legend out of the plot area.
+
+        Facet labels appear as the first line of each panel title, e.g.
+        ``cell_line=K562`` or ``cell_line=K562  perturbation=CRISPRi``.
+        A warning is issued for columns with more than 20 unique values.
+        Not yet supported for ``multinomial`` distributions (ignored with a
+        warning in that case).
+    expand_x_to_params : bool
+        When True, extend the x-axis (and the Hill curve) beyond the data range
+        so that all K/EC50 parameters are visible on the plot (default: False).
+        Requires ``show_hill_function=True`` and a fitted trans model.
+        The x-axis minimum and maximum are widened to include the mean K_a and
+        K_b values from the posterior, so any EC50 that falls outside the data
+        range will still appear on the curve.  Ignored for polynomial function
+        types (which have no K parameters).
+    expand_y_to_params : bool
+        When True, extend the y-axis to show the full range of the fitted Hill
+        curve over the entire displayed x range, including any x values added by
+        ``expand_x_to_params`` (default: False).  Normally the Hill curve's y
+        values are only used for y-axis scaling within the data x range; this
+        flag removes that restriction so the y-axis accommodates the Hill
+        curve's y values at K/EC50 positions and at the asymptotes.
     legend_outside : bool
         Place the legend outside the panel to the right, shared across all panels
         (default: False). Useful when many lines clutter the plot area.
@@ -5017,15 +5745,18 @@ def plot_xy_data(
         for multi-panel plots, or (8, 5) / (14, 5) for single-panel plots.
     reference_df : pd.DataFrame, optional
         A ``trans_summary`` DataFrame whose rows contain fitted Hill parameters
-        (columns ending in ``_mean``, e.g. ``A_mean``, ``Vmax_a_mean``, etc.).
+        (columns ending in ``_median``, e.g. ``A_median``, ``Vmax_a_median``, etc.).
         When provided, a reference Hill curve is overlaid in red dashed on each
         negbinom panel.  The feature name is matched via a ``gene_name`` or
         ``gene`` column.  Only applied to negbinom modalities.
     fdr_df : pd.DataFrame, optional
-        A ``trans_summary`` DataFrame with ``fdr_alpha`` and ``fdr_beta`` columns
-        (e.g. the output of ``save_trans_summary``).  Used for two purposes:
-        (1) greying out FDR-inactive parameter markers in ``mark_params`` mode,
-        (2) classifying the Hill regime for ``_compute_hill_markers``.
+        A ``trans_summary`` DataFrame with ``fdr_alpha``, ``fdr_beta``, and
+        ``is_dependent`` columns (e.g. the output of ``save_trans_summary``).
+        Used for three purposes:
+        (1) filtering to dependent features via the ``is_dependent`` column when
+        ``only_dependent=True``,
+        (2) greying out FDR-inactive parameter markers in ``mark_params`` mode,
+        (3) classifying the Hill regime for ``_compute_hill_markers``.
         Feature names are matched via a ``gene_name`` or ``gene`` column.
     fdr_threshold : float
         FDR threshold for classifying components as active (default: 0.05).
@@ -5078,8 +5809,81 @@ def plot_xy_data(
     >>> # Plot only cells from one group
     >>> model.plot_xy_data('GFI1B', subset_meta={'cell_line': 'K562'})
     >>>
+    >>> # Drop a specific list of cells (e.g. flagged by check_systematic_shift)
+    >>> model.plot_xy_data('GFI1B', exclude_cells=exclude_cells)
+    >>>
     >>> # Plot all junctions for a gene, but only show dependent ones (n_a or n_b CI excludes 0)
     >>> model.plot_xy_data('HES4', modality_name='splicing_sj', only_dependent=True, ci_level=95.0)
+    >>>
+    >>> # ── color_by examples ─────────────────────────────────────────────────
+    >>> # No grouping at all — one line, one colour
+    >>> model.plot_xy_data('GFI1B', color_by=None)
+    >>>
+    >>> # Color by NTC vs targeting instead of technical group
+    >>> model.plot_xy_data('GFI1B', color_by='targeting')
+    >>>
+    >>> # Color by any column in model.meta (warns if continuous or >30 unique values)
+    >>> model.plot_xy_data('GFI1B', color_by='cell_line')
+    >>>
+    >>> # Cross-product: hue = technical group, shade = NTC vs targeting
+    >>> # NTC cells are drawn as a light tint of the group colour;
+    >>> # targeting cells as the full colour.
+    >>> model.plot_xy_data('GFI1B', color_by=['technical_group', 'targeting'])
+    >>>
+    >>> # Cross-product with a custom secondary grouping
+    >>> model.plot_xy_data('GFI1B', color_by=['cell_line', 'perturbation_type'])
+    >>>
+    >>> # ── facet_by: 1-column (values → columns) ────────────────────────────
+    >>> # One column-group of panels per cell line
+    >>> # Grid: 1 row × (n_cell_lines × 2) cols  (default show_correction='both')
+    >>> model.plot_xy_data('GFI1B', facet_by='cell_line')
+    >>>
+    >>> # Facet by cell line, show only corrected, log2FC mode
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by='cell_line',
+    ...     show_correction='corrected',
+    ...     log2fc=True)
+    >>>
+    >>> # Facet by cell line AND color by NTC vs targeting within each facet panel
+    >>> # Grid: 1 row × n_cell_lines cols; two lines per panel (NTC / Targeting)
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by='cell_line',
+    ...     color_by='targeting',
+    ...     show_correction='corrected',
+    ...     legend_outside=True)   # recommended when many panels
+    >>>
+    >>> # First restrict to CRISPRi guides, then facet by cell line within that subset
+    >>> model.plot_xy_data('GFI1B',
+    ...     subset_meta={'guide_type': 'CRISPRi'},
+    ...     facet_by='cell_line')
+    >>>
+    >>> # ── facet_by: 2-column (proper row × col grid) ────────────────────────
+    >>> # First column → row groups, second column → column groups
+    >>> # Grid: n_cell_lines rows × n_perturbation_types cols (each corrected only)
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by=['cell_line', 'perturbation_type'],
+    ...     show_correction='corrected')
+    >>>
+    >>> # 2-D facet with color_by and log2FC; legend outside the grid
+    >>> model.plot_xy_data('GFI1B',
+    ...     facet_by=['cell_line', 'perturbation_type'],
+    ...     color_by='targeting',
+    ...     show_correction='corrected',
+    ...     log2fc=True,
+    ...     legend_outside=True)
+    >>>
+    >>> # Multi-feature + 1-D facet: rows = features, cols = facets × corrections
+    >>> model.plot_xy_data('HES4', modality_name='splicing_sj',
+    ...     facet_by='cell_line',
+    ...     show_correction='corrected',
+    ...     only_dependent=True)
+    >>>
+    >>> # Multi-feature + 2-D facet:
+    >>> # rows = n_cell_lines × n_features,  cols = n_perturb_types × n_corrections
+    >>> model.plot_xy_data('HES4', modality_name='splicing_sj',
+    ...     facet_by=['cell_line', 'perturbation_type'],
+    ...     show_correction='corrected',
+    ...     only_dependent=True)
     """
     # Check x_true is set
     if not hasattr(model, 'x_true') or model.x_true is None:
@@ -5121,20 +5925,112 @@ def plot_xy_data(
                 raise ValueError(f"Column '{col}' not found in model.meta. Available columns: {list(model.meta.columns)}")
             subset_mask &= (model.meta[col] == value).values
 
+    if exclude_cells is not None:
+        if subset_mask is None:
+            subset_mask = np.ones(len(model.meta), dtype=bool)
+        cell_col = model.meta['cell'].values if 'cell' in model.meta.columns else model.meta.index.values
+        excl_mask = np.isin(cell_col, list(exclude_cells))
+        subset_mask &= ~excl_mask
+        print(f"[SUBSET] Excluding {excl_mask.sum()} cells via exclude_cells")
+
+    if subset_mask is not None:
         n_cells_before = len(model.meta)
         n_cells_after = subset_mask.sum()
         if n_cells_after == 0:
-            raise ValueError(f"No cells match subset_meta criteria: {subset_meta}")
+            raise ValueError(f"No cells remain after subset_meta={subset_meta} / exclude_cells filtering.")
 
-        print(f"[SUBSET] Filtering {n_cells_before} → {n_cells_after} cells based on {subset_meta}")
+        if subset_meta is not None:
+            print(f"[SUBSET] Filtering {n_cells_before} → {n_cells_after} cells based on {subset_meta}")
 
         # NOTE: Don't subset x_true here - let _align_cells_to_modality() handle it
         # (subsetting here causes IndexError when mask is applied again in alignment)
+
+    # Resolve facet groups (if facet_by is set).
+    # facet_by can be a single column name (str) or a list of 1-2 column names.
+    #   1 column  → all unique values become column groups (existing behaviour)
+    #   2 columns → first column → row groups, second column → column groups (2-D grid)
+    # Each group is a (label, boolean_mask on model.meta rows) pair.
+    facet_col_groups = None   # unique values of the *column* facet dimension
+    facet_row_groups = None   # unique values of the *row* facet dimension (2-column only)
+    _facet_by_list: List[str] = []  # normalised list, used for title-building later
+
+    if facet_by is not None:
+        _facet_by_list = [facet_by] if isinstance(facet_by, str) else list(facet_by)
+        if len(_facet_by_list) > 2:
+            raise ValueError(
+                f"facet_by supports at most 2 columns (got {len(_facet_by_list)}). "
+                f"Pass a string for a 1-D column facet, or a list of two strings for a "
+                f"2-D row × column facet grid."
+            )
+
+        def _resolve_facet_col(col: str, role: str):
+            """Return [(label, mask), ...] for one facet column; warn on edge cases.
+
+            Supports the same special keywords as color_by:
+              'targeting'       → two groups: NTC / Targeting
+              'technical_group' → one group per technical_group_code
+            Any other value is looked up as a column in model.meta.
+            """
+            # ── Special keyword: 'targeting' ──────────────────────────────────
+            if col == 'targeting':
+                if 'target' not in model.meta.columns:
+                    raise ValueError(
+                        "facet_by='targeting' requires a 'target' column in model.meta."
+                    )
+                ntc_mask = (model.meta['target'].str.lower() == 'ntc').values
+                return [('NTC', ntc_mask), ('Targeting', ~ntc_mask)]
+
+            # ── Special keyword: 'technical_group' ────────────────────────────
+            if col == 'technical_group':
+                if 'technical_group_code' not in model.meta.columns:
+                    warnings.warn(
+                        "facet_by='technical_group' requires technical_group_code in "
+                        "model.meta. Using a single 'All' group.",
+                        UserWarning
+                    )
+                    return [('All', np.ones(len(model.meta), dtype=bool))]
+                grp_labels = get_technical_group_labels(model)
+                codes = np.sort(model.meta['technical_group_code'].unique())
+                return [
+                    (grp_labels[int(c)] if int(c) < len(grp_labels) else str(int(c)),
+                     (model.meta['technical_group_code'] == c).values)
+                    for c in codes
+                ]
+
+            # ── Regular model.meta column ─────────────────────────────────────
+            if col not in model.meta.columns:
+                raise ValueError(
+                    f"facet_by column '{col}' not found in model.meta. "
+                    f"Available columns: {list(model.meta.columns)}\n"
+                    f"Special keywords also accepted: 'targeting', 'technical_group'."
+                )
+            fvals = sorted(model.meta[col].dropna().unique(), key=str)
+            n_uniq = len(fvals)
+            if n_uniq > 20:
+                warnings.warn(
+                    f"facet_by='{col}' ({role}) has {n_uniq} unique values — this will "
+                    f"create {n_uniq} panel {role}s. Consider a coarser grouping.",
+                    UserWarning
+                )
+            elif n_uniq <= 1:
+                warnings.warn(
+                    f"facet_by='{col}' has {n_uniq} unique value(s) — faceting has no effect.",
+                    UserWarning
+                )
+            return [(str(v), (model.meta[col] == v).values) for v in fvals]
+
+        if len(_facet_by_list) == 1:
+            facet_col_groups = _resolve_facet_col(_facet_by_list[0], 'column')
+        else:
+            # Two columns: first → row groups, second → column groups
+            facet_row_groups = _resolve_facet_col(_facet_by_list[0], 'row')
+            facet_col_groups = _resolve_facet_col(_facet_by_list[1], 'column')
 
     # Get modality
     if modality_name is None:
         modality_name = model.primary_modality
     modality = model.get_modality(modality_name)
+    distribution = modality.distribution
 
     # Set distribution-specific default for min_counts
     if min_counts is None:
@@ -5156,32 +6052,37 @@ def plot_xy_data(
         n_before = len(feature_indices)
 
         if fdr_df is not None:
-            # FDR-based filtering: use min(fdr_alpha, fdr_beta) per feature.
-            # fdr_beta is NaN for single_hill/polynomial — nanmin treats NaN as inf.
-            fdr_lookup = {}
-            if 'feature' not in fdr_df.columns:
+            # Use the precomputed is_dependent column (FDR-significant AND the
+            # corresponding Hill exponent's CI excludes 0) rather than recomputing
+            # a weaker FDR-only criterion here.
+            if 'feature' not in fdr_df.columns or 'is_dependent' not in fdr_df.columns:
                 warnings.warn(
-                    "fdr_df must have a 'feature' column matching modality feature names. "
-                    "Showing all features instead.",
+                    "fdr_df must have 'feature' and 'is_dependent' columns "
+                    "(as produced by save_trans_summary). Showing all features instead.",
                     UserWarning
                 )
+            elif not fdr_df['feature'].is_unique:
+                _dupes = fdr_df['feature'][fdr_df['feature'].duplicated()].unique().tolist()
+                raise ValueError(
+                    f"fdr_df['feature'] is not unique ({len(_dupes)} duplicated value(s), "
+                    f"e.g. {_dupes[:5]}) — a per-feature lookup would silently use only "
+                    "the last matching row. This likely means fdr_df was saved by an "
+                    "older/buggy version of save_trans_summary; regenerate it."
+                )
             else:
-                for _, row in fdr_df.iterrows():
-                    fa = row.get('fdr_alpha', np.nan)
-                    fb = row.get('fdr_beta', np.nan)
-                    fdr_lookup[row['feature']] = float(np.nanmin([fa, fb]))
+                dep_lookup = dict(zip(fdr_df['feature'], fdr_df['is_dependent']))
 
                 kept_indices = []
                 kept_names = []
                 for idx, name in zip(feature_indices, feature_names_resolved):
-                    fdr_val = fdr_lookup.get(name, np.nan)
-                    if np.isfinite(fdr_val) and fdr_val <= fdr_threshold:
+                    dep_val = dep_lookup.get(name, np.nan)
+                    if pd.notna(dep_val) and bool(dep_val):
                         kept_indices.append(idx)
                         kept_names.append(name)
 
                 if len(kept_indices) == 0:
                     warnings.warn(
-                        f"No features passed FDR <= {fdr_threshold} for '{feature}'. "
+                        f"No features have is_dependent=True for '{feature}'. "
                         f"Showing all {n_before} features instead.",
                         UserWarning
                     )
@@ -5189,7 +6090,7 @@ def plot_xy_data(
                     feature_indices = kept_indices
                     feature_names_resolved = kept_names
                     print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
-                          f"(FDR <= {fdr_threshold})")
+                          f"(is_dependent=True)")
 
         else:
             # Fallback: CI-based filtering on n_a / n_b from posterior samples.
@@ -5239,13 +6140,19 @@ def plot_xy_data(
                     print(f"[DEPENDENCY FILTER] {feature}: {n_before} → {len(feature_indices)} features "
                           f"(CI={ci_level}%, {dep_mask_a.sum()} positive, {dep_mask_b.sum()} negative)")
 
-    # If multiple features (gene input), create multi-panel figure
-    if is_gene and len(feature_indices) > 1:
-        n_features = len(feature_indices)
-        distribution = modality.distribution
+    # ── Grid path: multi-feature (gene input) OR single feature with facet_by ──
+    # Multinomial is handled separately (has its own K-category subplot layout).
+    use_grid = (is_gene and len(feature_indices) > 1) or (facet_by is not None)
 
+    if use_grid:
         # Special handling for multinomial - needs K subplots per feature
         if distribution == 'multinomial':
+            if facet_by is not None:
+                warnings.warn(
+                    "facet_by is not yet supported for multinomial distribution. "
+                    "Ignoring facet_by and plotting without faceting.",
+                    UserWarning
+                )
             return _plot_multinomial_multifeature(
                 model=model,
                 feature_indices=feature_indices,
@@ -5258,20 +6165,25 @@ def plot_xy_data(
                 show_correction=show_correction,
                 color_palette=color_palette,
                 xlabel=xlabel,
+                ylabel=ylabel,
                 figsize=figsize,
                 subset_mask=subset_mask,
                 **kwargs
             )
 
-        # Standard multi-feature plotting for 2D distributions
-        # Layout: features in rows; columns depend on show_correction
-        n_rows = n_features
-        if show_correction == 'both':
-            n_cols = 2
-            col_corrections = ['uncorrected', 'corrected']
-        else:
-            n_cols = 1
-            col_corrections = [show_correction]  # 'uncorrected' or 'corrected'
+        # Standard grid for 2D distributions.
+        # Layout:
+        #   rows = n_facet_rows × n_features   (facet-row groups nest features)
+        #   cols = n_facet_cols × n_corrections (facet-col groups nest correction mode)
+        # When facet_by is a single column, facet_row_groups is None (n_facet_rows=1),
+        # so the layout reduces to rows=features, cols=n_facets×n_corrections as before.
+        n_features = len(feature_indices)
+        corrections_list = ['uncorrected', 'corrected'] if show_correction == 'both' else [show_correction]
+        n_corrections = len(corrections_list)
+        n_facet_rows = len(facet_row_groups) if facet_row_groups else 1
+        n_facet_cols = len(facet_col_groups) if facet_col_groups else 1
+        n_rows = n_facet_rows * n_features
+        n_cols = n_facet_cols * n_corrections
 
         if figsize is None:
             figsize = (6 * n_cols, 3 * n_rows)
@@ -5279,7 +6191,9 @@ def plot_xy_data(
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False,
                                  constrained_layout=True)
 
-        def _plot_one_multifeature(feat_name, ax, correction):
+        def _plot_one_grid(feat_name, ax, correction, mask,
+                           ntc_x_offset=None, ntc_y_offset=None):
+            """Plot one panel: one feature × one correction × one (optional) facet."""
             if distribution == 'negbinom':
                 plot_negbinom_xy(
                     model=model, feature=feat_name, modality=modality,
@@ -5287,9 +6201,14 @@ def plot_xy_data(
                     color_palette=color_palette, show_hill_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, sum_factor_col=sum_factor_col,
                     min_counts=min_counts, xlabel=xlabel, ax=ax,
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
                     log2fc=log2fc, reference_df=reference_df,
                     fdr_df=fdr_df, fdr_threshold=fdr_threshold,
+                    color_by=color_by,
+                    ntc_x_offset=ntc_x_offset, ntc_y_offset=ntc_y_offset,
+                    expand_x_to_params=expand_x_to_params,
+                    expand_y_to_params=expand_y_to_params,
+                    ylabel=ylabel,
                     **kwargs
                 )
             elif distribution == 'binomial':
@@ -5299,7 +6218,9 @@ def plot_xy_data(
                     min_counts=min_counts, color_palette=color_palette,
                     show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
+                    log2fc=log2fc, ntc_x_offset=ntc_x_offset,
+                    ylabel=ylabel,
                     **kwargs
                 )
             elif distribution in ('normal', 'studentt'):
@@ -5308,32 +6229,132 @@ def plot_xy_data(
                     x_true=x_true, window=window, show_correction=correction,
                     color_palette=color_palette, show_trans_function=show_hill_function,
                     show_ntc_gradient=show_ntc_gradient, xlabel=xlabel, ax=ax,
-                    subset_mask=subset_mask, mark_params=mark_params, ci_level=ci_level,
+                    subset_mask=mask, mark_params=mark_params, ci_level=ci_level,
+                    log2fc=log2fc, ntc_x_offset=ntc_x_offset,
+                    ylabel=ylabel,
                     **kwargs
                 )
             else:
-                ax.text(0.5, 0.5, f"Multi-panel not supported for {distribution}",
+                ax.text(0.5, 0.5, f"Grid not supported for {distribution}",
                         ha='center', va='center', transform=ax.transAxes)
 
-        # Plot each feature (one row per feature)
-        for i, (feat_idx, feat_name) in enumerate(zip(feature_indices, feature_names_resolved)):
-            for j, correction in enumerate(col_corrections):
-                _plot_one_multifeature(feat_name, axes[i, j], correction)
+        # Iterate: features (outer) → row-facets → col-facets → corrections.
+        # Features are outer so we can compute the global NTC log2FC offsets once per
+        # feature (using the global subset_mask, not any facet mask) and reuse them
+        # across all facet panels — ensuring the NTC reference is consistent even when
+        # a facet panel contains no NTC cells (e.g. a "Targeting" column facet).
+        facet_col_iter = facet_col_groups if facet_col_groups else [(None, None)]
+        facet_row_iter = facet_row_groups if facet_row_groups else [(None, None)]
 
-        plt.suptitle(f"{model.cis_gene} → {feature} (gene, n={n_features} features)")
+        _axes_by_feat = {feat_i: [] for feat_i in range(n_features)}
 
-        if legend_outside:
-            handles, labels = _collect_legend_handles(axes.ravel())
-            axes[-1, -1].legend(handles, labels, bbox_to_anchor=(1.03, 0.5), loc='center left', frameon=False)
+        for feat_i, feat_name in enumerate(feature_names_resolved):
+            # Pre-compute global NTC log2FC offsets for this feature. x_offset is
+            # distribution-agnostic (log2 of mean NTC x_true); y_offset is only
+            # meaningful/used for negbinom (other distributions keep their y-axis
+            # as-is -- only the x-axis becomes log2FC when log2fc=True).
+            if log2fc:
+                _ntc_x_off, _ntc_y_off = _compute_global_log2fc_offsets(
+                    model, modality, feat_name, x_true, subset_mask, sum_factor_col
+                )
+            else:
+                _ntc_x_off = _ntc_y_off = None
+
+            for frow_i, (frow_label, frow_mask) in enumerate(facet_row_iter):
+                grid_row = frow_i * n_features + feat_i
+                for fcol_i, (fcol_label, fcol_mask) in enumerate(facet_col_iter):
+                    # Combine all masks (global subset_mask AND row-facet AND col-facet)
+                    combined_mask = subset_mask
+                    for m in [frow_mask, fcol_mask]:
+                        if m is not None:
+                            combined_mask = (combined_mask & m
+                                             if combined_mask is not None else m)
+
+                    for corr_i, correction in enumerate(corrections_list):
+                        grid_col = fcol_i * n_corrections + corr_i
+                        ax = axes[grid_row, grid_col]
+                        _plot_one_grid(feat_name, ax, correction, combined_mask,
+                                       ntc_x_offset=_ntc_x_off, ntc_y_offset=_ntc_y_off)
+                        _axes_by_feat[feat_i].append(ax)
+                        # Strip the per-panel legend — one shared legend is drawn below
+                        if ax.get_legend() is not None:
+                            ax.get_legend().remove()
+                        # Build title prefix from active facet labels
+                        title_parts = []
+                        if frow_label is not None:
+                            title_parts.append(f"{_facet_by_list[0]}={frow_label}")
+                        if fcol_label is not None:
+                            col_key = (_facet_by_list[1] if len(_facet_by_list) > 1
+                                       else _facet_by_list[0])
+                            title_parts.append(f"{col_key}={fcol_label}")
+                        if title_parts:
+                            current_title = ax.get_title()
+                            ax.set_title("  ".join(title_parts) + "\n" + current_title)
+
+        # ── Uniform axis limits across panels ────────────────────────────────
+        # Each panel has already set its own limits via set_xlim / set_ylim.
+        # The x-axis (cis gene expression) is shared across all panels so
+        # dose-response curves line up. The y-axis is only shared *within*
+        # a feature (across its facet-row/col/correction panels), not across
+        # different features — different features (e.g. different SJs) can
+        # have very different effect magnitudes, and forcing a common y-axis
+        # hides subtle effects in the smaller-magnitude ones.
+        _all_xlims = []
+        for _ax in axes.ravel():
+            # Skip axes that have no plotted lines (empty panels)
+            if not _ax.lines and not _ax.collections:
+                continue
+            _all_xlims.append(_ax.get_xlim())
+        if _all_xlims:
+            _shared_x = (min(lo for lo, hi in _all_xlims),
+                         max(hi for lo, hi in _all_xlims))
+            for _ax in axes.ravel():
+                _ax.set_xlim(_shared_x)
+
+        for _feat_axes in _axes_by_feat.values():
+            _feat_ylims = [_ax.get_ylim() for _ax in _feat_axes
+                           if _ax.lines or _ax.collections]
+            if not _feat_ylims:
+                continue
+            _feat_shared_y = (min(lo for lo, hi in _feat_ylims),
+                               max(hi for lo, hi in _feat_ylims))
+            for _ax in _feat_axes:
+                _ax.set_ylim(_feat_shared_y)
+
+        # Overall suptitle for multi-feature plots
+        if is_gene and len(feature_indices) > 1:
+            plt.suptitle(
+                f"{model.cis_gene} → {feature} (gene, n={len(feature_indices)} features)"
+            )
+
+        # One shared legend for the whole grid (no duplicates across panels).
+        handles, labels = _collect_legend_handles(axes.ravel())
+        if handles:
+            if legend_outside:
+                # Anchor to the right edge of the figure (transFigure coords)
+                fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5),
+                           loc='center left', frameon=False)
+            else:
+                axes[-1, -1].legend(handles, labels, frameon=False)
 
         _save_figure(fig, model, filename)
         return fig
 
-    # Single feature - use original code path
+    # ── Single-feature path (no faceting) ─────────────────────────────────────
     feature = feature_names_resolved[0]  # Use resolved feature name
 
-    # Route to distribution-specific plotting function
-    distribution = modality.distribution
+    # Pre-compute global NTC log2FC offsets (same approach as grid path). x_offset
+    # is distribution-agnostic (log2 of mean NTC x_true) and used by every
+    # distribution when log2fc=True; y_offset is only meaningful for negbinom
+    # (other distributions leave their y-axis as-is -- only x becomes log2FC).
+    # This ensures the NTC reference is computed from ALL NTC cells (ignoring
+    # min_counts and color_by grouping), making it independent of which colour
+    # or subset is shown.
+    _sf_ntc_x_off = _sf_ntc_y_off = None
+    if log2fc:
+        _sf_ntc_x_off, _sf_ntc_y_off = _compute_global_log2fc_offsets(
+            model, modality, feature, x_true, subset_mask, sum_factor_col
+        )
 
     if distribution == 'negbinom':
         result = plot_negbinom_xy(
@@ -5358,6 +6379,12 @@ def plot_xy_data(
             reference_df=reference_df,
             fdr_df=fdr_df,
             fdr_threshold=fdr_threshold,
+            color_by=color_by,
+            ntc_x_offset=_sf_ntc_x_off,
+            ntc_y_offset=_sf_ntc_y_off,
+            expand_x_to_params=expand_x_to_params,
+            expand_y_to_params=expand_y_to_params,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -5379,6 +6406,9 @@ def plot_xy_data(
             ci_level=ci_level,
             legend_outside=legend_outside,
             figsize=figsize,
+            log2fc=log2fc,
+            ntc_x_offset=_sf_ntc_x_off,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -5397,6 +6427,9 @@ def plot_xy_data(
             xlabel=xlabel,
             figsize=figsize,
             subset_mask=subset_mask,
+            log2fc=log2fc,
+            ntc_x_offset=_sf_ntc_x_off,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -5417,6 +6450,9 @@ def plot_xy_data(
             ci_level=ci_level,
             legend_outside=legend_outside,
             figsize=figsize,
+            log2fc=log2fc,
+            ntc_x_offset=_sf_ntc_x_off,
+            ylabel=ylabel,
             **kwargs
         )
 
@@ -5427,4 +6463,140 @@ def plot_xy_data(
     if filename is not None:
         ax_result = result if isinstance(result, plt.Axes) else result[0]
         _save_figure(ax_result.get_figure(), model, filename)
+    return result
+
+
+def restyle_targeting_lines(
+    result,
+    color_palette=None,
+    ntc_alpha=0.35,
+    ntc_linestyle="dashed",
+    targeting_alpha=1.0,
+    targeting_linestyle="solid",
+    ntc_label_fragment="NTC",
+    targeting_label_fragment="Targeting",
+    rebuild_legend=True,
+    legend_outside=False,
+    legend_kwargs=None,
+):
+    """
+    Restyle a ``plot_xy_data()`` result to use alpha + linestyle for NTC vs
+    targeting, ggplot ``scale_alpha_manual``/``scale_linetype_manual`` style,
+    instead of plot_xy_data's built-in color-tint shading.
+
+    Meant for plotting everything on one shared axes with a single flat hue
+    per primary group (e.g. cell_line) rather than faceting: call
+    ``plot_xy_data`` with ``facet_by=None`` and
+    ``color_by=['<primary>', 'targeting']`` (which labels lines
+    ``"<primary> / NTC"`` / ``"<primary> / Targeting"`` and tints NTC as a
+    lighter shade of the primary color), then pass the result here to flatten
+    each line back to its primary group's solid color and encode NTC vs
+    targeting as alpha/linestyle instead::
+
+        palette = {'CRISPRi': 'steelblue', 'CRISPRa': 'tomato'}
+        result = model.plot_xy_data(
+            'GFI1B',
+            facet_by=None,
+            color_by=['cell_line', 'targeting'],
+            color_palette=palette,
+            legend_outside=True,
+        )
+        restyle_targeting_lines(result, color_palette=palette, legend_outside=True)
+
+    Also works with plain ``color_by='targeting'`` (labels are bare
+    ``"NTC"``/``"Targeting"``, no primary-color reset needed --
+    ``color_palette=None`` in that case).
+
+    Parameters
+    ----------
+    result : matplotlib Figure, Axes, or array of Axes
+        Return value of ``model.plot_xy_data(...)``.
+    color_palette : dict, optional
+        ``{primary_label: color}`` -- the same dict passed to
+        ``plot_xy_data(color_palette=...)``. Used to reset each line to its
+        primary group's flat color, undoing plot_xy_data's NTC tint. If
+        None, colors are left as plot_xy_data drew them (tinted).
+    ntc_alpha, targeting_alpha : float
+        Alpha for lines whose label contains ``ntc_label_fragment`` /
+        ``targeting_label_fragment`` respectively.
+    ntc_linestyle, targeting_linestyle : str
+        Matplotlib linestyle for the same two groups (e.g. ``'dashed'``,
+        ``'solid'``).
+    ntc_label_fragment, targeting_label_fragment : str
+        Substrings identifying NTC vs targeting lines in their legend label.
+        Lines whose label matches neither are left untouched.
+    rebuild_legend : bool, default True
+        Regenerate each axes' legend from the restyled lines. Matplotlib
+        legends snapshot line style at creation time, so the original
+        legend won't reflect the restyle otherwise.
+    legend_outside : bool, default False
+        Match whatever you passed to ``plot_xy_data(legend_outside=...)``,
+        so the rebuilt legend is placed the same way.
+    legend_kwargs : dict, optional
+        Extra kwargs forwarded to the rebuilt ``legend()`` call, overriding
+        the defaults (``frameon=False``, plus ``bbox_to_anchor=(1.02, 0.5),
+        loc='center left'`` when ``legend_outside=True``).
+
+    Returns
+    -------
+    The same ``result`` object, restyled in place.
+
+    Notes
+    -----
+    Only ``Line2D`` artists (the smoothed trend lines) are restyled --
+    linestyle has no meaning for scatter points, and plot_xy_data's raw
+    per-cell scatter points are unlabeled and left untouched.
+
+    This function does not raise: if ``result`` isn't a ``plt.Axes``,
+    ``plt.Figure``, or an array/list containing ``plt.Axes`` instances, it
+    resolves to zero axes and silently does nothing. Likewise, any axes
+    found with no lines matching ``ntc_label_fragment``/
+    ``targeting_label_fragment`` are left untouched.
+    """
+    if isinstance(result, plt.Axes):
+        axes = [result]
+    elif isinstance(result, plt.Figure):
+        axes = result.axes
+    else:
+        axes = [a for a in np.ravel(result) if isinstance(a, plt.Axes)]
+
+    legend_kwargs = dict(legend_kwargs or {})
+
+    for ax in axes:
+        handles, labels = [], []
+        for line in ax.get_lines():
+            label = line.get_label()
+            if not label or label.startswith("_"):
+                continue
+
+            if ntc_label_fragment in label:
+                alpha, linestyle = ntc_alpha, ntc_linestyle
+            elif targeting_label_fragment in label:
+                alpha, linestyle = targeting_alpha, targeting_linestyle
+            else:
+                handles.append(line)
+                labels.append(label)
+                continue
+
+            if color_palette is not None:
+                primary = label.split(" / ")[0].strip()
+                if primary in color_palette:
+                    line.set_color(color_palette[primary])
+
+            line.set_alpha(alpha)
+            line.set_linestyle(linestyle)
+            handles.append(line)
+            labels.append(label)
+
+        if rebuild_legend and handles:
+            existing = ax.get_legend()
+            if existing is not None:
+                existing.remove()
+            if legend_outside:
+                kw = dict(bbox_to_anchor=(1.02, 0.5), loc="center left", frameon=False)
+            else:
+                kw = dict(frameon=False)
+            kw.update(legend_kwargs)
+            ax.legend(handles, labels, **kw)
+
     return result

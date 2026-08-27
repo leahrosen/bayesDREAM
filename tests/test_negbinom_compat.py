@@ -26,7 +26,7 @@ def negbinom_fitted_model(shared_test_data):
         label='negbinom_compat_test',
     )
     model.set_technical_groups(['cell_line'])
-    model.fit_technical(sum_factor_col='sum_factor', niters=NITERS, nsamples=NSAMPLES)
+    model.fit_ntc(sum_factor_col='sum_factor', niters=NITERS, nsamples=NSAMPLES)
 
     # Set dummy x_true for trans testing
     n_guides = len(model.meta)

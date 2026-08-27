@@ -1,4 +1,4 @@
-"""Test backward compatibility of fit_technical with negbinom distribution."""
+"""Test fit_ntc with negbinom distribution."""
 
 import numpy as np
 
@@ -25,7 +25,7 @@ def technical_compat_model(shared_test_data):
         label='technical_compat_test',
     )
     model.set_technical_groups(['cell_line'])
-    model.fit_technical(
+    model.fit_ntc(
         sum_factor_col='sum_factor',
         distribution='negbinom',
         niters=NITERS,
@@ -35,7 +35,7 @@ def technical_compat_model(shared_test_data):
     return model
 
 
-def test_fit_technical_negbinom_runs(technical_compat_model):
+def test_fit_ntc_negbinom_runs(technical_compat_model):
     gene_modality = technical_compat_model.get_modality('gene')
     assert gene_modality.alpha_y_prefit is not None
 
@@ -48,5 +48,5 @@ def test_alpha_y_prefit_set_in_modality(technical_compat_model):
 
 def test_alpha_y_prefit_correct_shape(technical_compat_model):
     gene_modality = technical_compat_model.get_modality('gene')
-    # Shape should be (n_samples, n_groups, n_genes)
-    assert len(gene_modality.alpha_y_prefit.shape) == 3
+    # Shape is (n_groups, n_genes) — point estimates, not posterior samples
+    assert len(gene_modality.alpha_y_prefit.shape) == 2

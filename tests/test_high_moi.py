@@ -213,3 +213,108 @@ def test_x_true_cell_count(high_moi_fitted_model):
 def test_x_eff_g_guide_count(high_moi_fitted_model):
     x_eff_g = high_moi_fitted_model.posterior_samples_cis['x_eff_g']
     assert x_eff_g.shape[1] == high_moi_fitted_model.guide_assignment.shape[1]
+
+
+# ----------------------------------------------------------------------
+# High MOI deferred cis_gene tests (cis_gene omitted at init, committed
+# later via add_cis_gene()). Stops short of fit_cis()/fit_trans(): those
+# hit a pre-existing dtype bug in fit_cis (guide_assignment_tensor vs.
+# log2_x_eff_g dtype mismatch) that reproduces identically in eager
+# high-MOI mode too, so it's out of scope here.
+# ----------------------------------------------------------------------
+@pytest.fixture(scope='module')
+def high_moi_deferred_model():
+    pytest.importorskip('torch')
+    pytest.importorskip('pyro')
+    from bayesDREAM import bayesDREAM
+
+    meta, counts, guide_assignment, guide_meta, n_guides = _make_high_moi_data()
+    model = bayesDREAM(
+        meta=meta,
+        counts=counts,
+        guide_assignment=guide_assignment,
+        guide_meta=guide_meta,
+        output_dir='./test_output',
+        label='test_high_moi_deferred',
+        device='cpu',
+    )
+    return {'model': model, 'n_guides': n_guides}
+
+
+def test_deferred_high_moi_mode_active(high_moi_deferred_model):
+    model = high_moi_deferred_model['model']
+    assert model.is_high_moi
+    assert model.cis_gene is None
+
+
+def test_deferred_high_moi_keeps_all_cells(high_moi_deferred_model):
+    model = high_moi_deferred_model['model']
+    assert len(model.meta) == 100
+
+
+def test_deferred_high_moi_keeps_all_guides(high_moi_deferred_model):
+    model = high_moi_deferred_model['model']
+    assert model.guide_assignment.shape[1] == high_moi_deferred_model['n_guides']
+    assert len(model.guide_meta) == high_moi_deferred_model['n_guides']
+
+
+def test_deferred_high_moi_target_has_no_gene_label(high_moi_deferred_model):
+    # cis_gene is unknown at this point, so target can only be 'ntc' or 'other'
+    model = high_moi_deferred_model['model']
+    assert set(model.meta['target'].unique()) <= {'ntc', 'other'}
+    assert (model.meta['target'] == 'ntc').sum() == 20
+
+
+def test_deferred_high_moi_fit_ntc_defaults_to_all_cells(high_moi_deferred_model):
+    import copy
+    model = copy.deepcopy(high_moi_deferred_model['model'])
+    model.set_technical_groups(['cell_line'])
+    with pytest.warns(UserWarning, match='use_all_cells=True'):
+        model.fit_ntc(sum_factor_col='sum_factor', niters=200, nsamples=50)
+    primary_mod = model.modalities[model.primary_modality]
+    assert primary_mod.posterior_samples_ntc is not None
+
+
+@pytest.fixture(scope='module')
+def high_moi_deferred_committed_model(high_moi_deferred_model):
+    import copy
+    model = copy.deepcopy(high_moi_deferred_model['model'])
+    model.set_technical_groups(['cell_line'])
+    model.fit_ntc(sum_factor_col='sum_factor', niters=200, nsamples=50)
+    model.add_cis_gene('GFI1B')
+    return model
+
+
+def test_add_cis_gene_sets_cis_gene(high_moi_deferred_committed_model):
+    assert high_moi_deferred_committed_model.cis_gene == 'GFI1B'
+    assert 'cis' in high_moi_deferred_committed_model.modalities
+
+
+def test_add_cis_gene_prunes_guides(high_moi_deferred_committed_model):
+    # Same expectation as the eager high_moi_model fixture: only NTC + GFI1B guides remain
+    assert len(high_moi_deferred_committed_model.guide_meta) == 3
+    assert high_moi_deferred_committed_model.guide_assignment.shape[1] == 3
+
+
+def test_add_cis_gene_subsets_cells(high_moi_deferred_committed_model):
+    assert set(high_moi_deferred_committed_model.meta['target'].unique()) == {'ntc', 'GFI1B'}
+    assert (high_moi_deferred_committed_model.meta['target'] == 'ntc').sum() == 20
+    assert (high_moi_deferred_committed_model.meta['target'] == 'GFI1B').sum() == 30
+
+
+def test_add_cis_gene_guide_code_stays_placeholder(high_moi_deferred_committed_model):
+    assert (high_moi_deferred_committed_model.meta['guide_code'] == -1).all()
+
+
+def test_add_cis_gene_already_set_raises(high_moi_deferred_committed_model):
+    with pytest.raises(ValueError, match='already set'):
+        high_moi_deferred_committed_model.add_cis_gene('GFI1B')
+
+
+def test_add_cis_gene_unknown_gene_raises(high_moi_deferred_model):
+    import copy
+    model = copy.deepcopy(high_moi_deferred_model['model'])
+    model.set_technical_groups(['cell_line'])
+    model.fit_ntc(sum_factor_col='sum_factor', niters=200, nsamples=50)
+    with pytest.raises(ValueError, match='not found'):
+        model.add_cis_gene('NOT_A_REAL_GENE')

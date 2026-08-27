@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 bayesDREAM is a Bayesian framework for modeling perturbation effects across multiple molecular modalities. The model consists of three sequential steps:
 
-1. **Technical fit** (`fit_technical`): Models technical variation in non-targeting controls (NTC) to estimate gene-specific overdispersion parameters (`alpha_y`)
+1. **Technical fit** (`fit_ntc`): Models technical variation in non-targeting controls (NTC) to estimate gene-specific overdispersion parameters (`alpha_y`)
 2. **Cis fit** (`fit_cis`): Models direct effects on the targeted gene expression (`model_x`)
 3. **Trans fit** (`fit_trans`): Models downstream effects on other genes as a function of the cis gene expression (`model_y`)
 
@@ -18,30 +18,54 @@ The codebase uses PyTorch and Pyro for probabilistic programming and variational
 bayesDREAM_forClaude/
 ├── bayesDREAM/
 │   ├── __init__.py          # Package exports
-│   ├── model.py             # Main bayesDREAM class (~311 lines)
-│   ├── core.py              # _BayesDREAMCore base class (~909 lines)
+│   ├── __main__.py          # CLI entry point
+│   ├── cli.py               # Command-line interface
+│   ├── model.py             # Main bayesDREAM class
+│   ├── core.py              # _BayesDREAMCore base class
 │   ├── modality.py          # Modality class for multi-modal data
-│   ├── distributions.py     # Distribution-specific observation samplers
-│   ├── splicing.py          # Splicing data processing (pure Python)
+│   ├── diagnostics.py       # Diagnostic utilities
+│   ├── slurm_jobgen.py      # SLURM job generation
+│   ├── utils.py             # Shared utility functions
 │   ├── fitting/             # Fitting methods (modular)
 │   │   ├── __init__.py
-│   │   ├── helpers.py       # Shared helper functions
-│   │   ├── technical.py     # TechnicalFitter class
+│   │   ├── ntc.py           # NTCFitter class (overdispersion estimation)
 │   │   ├── cis.py           # CisFitter class
-│   │   └── trans.py         # TransFitter class
-│   ├── io/                  # Save/load functionality
+│   │   ├── trans.py         # TransFitter class
+│   │   └── distributions.py # Distribution-specific observation samplers
+│   ├── io/                  # Save/load/summary functionality
 │   │   ├── __init__.py
 │   │   ├── save.py          # ModelSaver class
-│   │   └── load.py          # ModelLoader class
-│   └── modalities/          # Modality-specific methods
+│   │   ├── load.py          # ModelLoader class
+│   │   └── summary.py       # Summary export
+│   ├── modalities/          # Modality-specific methods
+│   │   ├── __init__.py
+│   │   ├── transcript.py    # TranscriptModalityMixin
+│   │   ├── splicing_modality.py  # SplicingModalityMixin
+│   │   ├── atac.py          # ATACModalityMixin
+│   │   ├── custom.py        # CustomModalityMixin
+│   │   └── plotting_mixin.py # PlottingMixin
+│   ├── plotting/            # Visualization subpackage
+│   │   ├── __init__.py
+│   │   ├── basic.py         # Basic plots
+│   │   ├── model_plots.py   # Model-specific plots
+│   │   ├── posterior.py     # Posterior visualization
+│   │   ├── prior_posterior.py
+│   │   ├── prior_sampling.py
+│   │   ├── xy_plots.py      # x/y dose-response plots
+│   │   ├── de_comparison.py # DE comparison plots
+│   │   ├── diagnostics.py   # Diagnostic plots
+│   │   ├── colors.py        # Color palettes
+│   │   ├── helpers.py       # Plotting helpers
+│   │   └── utils.py         # Plotting utilities
+│   └── simulation/          # Simulation and permutation
 │       ├── __init__.py
-│       ├── transcript.py    # TranscriptModalityMixin
-│       ├── splicing_modality.py  # SplicingModalityMixin
-│       ├── atac.py          # ATACModalityMixin
-│       └── custom.py        # CustomModalityMixin
-├── tests/                   # Test suite
+│       ├── simulation.py    # Data simulation
+│       └── permutation.py   # Permutation testing utilities
+├── tests/                   # Test suite (19 test files)
 ├── toydata/                 # Test datasets (genes, splicing, metadata)
-└── docs/                    # Documentation
+├── examples/                # Example scripts
+├── docs/                    # Documentation
+└── visualisation/           # Visualization scripts
 ```
 
 **Note**: The codebase was recently refactored from a single 4,537-line `model.py` file into a modular structure. This improves maintainability while preserving backward compatibility. See `docs/archive/planning/REFACTORING_SUMMARY.md` for details.
@@ -61,16 +85,18 @@ The main class in `bayesDREAM/model.py` implements multi-modal Bayesian modeling
   - Flexible identifier support: uses 'gene', 'gene_name', 'gene_id', or index
 - Creates guide-level metadata by grouping cells by guide and specified covariates
 - Supports both CPU and CUDA devices
+- `cis_gene` is **optional at init** (low-MOI only); omit it to run `fit_ntc()` once across all cis genes, then call `add_cis_gene()` before `fit_cis()`. When `cis_gene` is omitted, `label` must be provided explicitly (it normally defaults to the gene name).
 
 **Key Methods:**
 
-- `set_technical_groups(covariates)`: Sets technical_group_code based on covariates (must be called before fit_technical)
-- `fit_technical(sum_factor_col, modality_name, ...)`: Fits NTC-only model to estimate `alpha_y_prefit`
-- `set_alpha_x(alpha_x, is_posterior, covariates)`: Sets cis gene overdispersion parameters
-- `set_alpha_y(alpha_y, is_posterior, covariates)`: Sets trans gene overdispersion parameters
+- `set_technical_groups(covariates)`: Sets technical_group_code based on covariates (must be called before fit_ntc)
+- `fit_ntc(sum_factor_col, modality_name, ...)`: Fits NTC-only model to estimate `alpha_y_prefit`
+- `add_cis_gene(cis_gene)`: Specifies the cis gene after initialization (see **Deferred Cis-Gene Workflow** below). Can be called before or after `fit_ntc()`.
+- `set_alpha_x(alpha_x, covariates)`: Sets cis gene overdispersion parameters
+- `set_alpha_y(alpha_y, covariates)`: Sets trans gene overdispersion parameters
 - `adjust_ntc_sum_factor(covariates, ...)`: Adjusts NTC sum factors for covariates
 - `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`
-- `set_x_true(x_true, is_posterior)`: Sets true cis expression for trans modeling
+- `set_x_true(x_true)`: Sets true cis expression for trans modeling
 - `permute_genes(genes2permute, ...)`: Permutes guide-gene associations for null testing
 - `refit_sumfactor(covariates, ...)`: Re-estimates sum factors based on posterior cis expression
 - `fit_trans(sum_factor_col, function_type, modality_name, ...)`: Fits trans effects using `_model_y`
@@ -105,10 +131,12 @@ Three Pyro models implement the statistical framework:
 
 ### Testing
 
-Run infrastructure tests (requires pyroenv conda environment):
+Run infrastructure tests (requires `bayesdream` conda environment at `/Users/leahrosen/miniconda3/envs/bayesdream/`):
 
 ```bash
-/opt/anaconda3/envs/pyroenv/bin/python test_multimodal_fitting.py
+cd "/Users/leahrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/Code/bayesDREAM code/bayesDREAM_forClaude"
+export PYTHONPATH="."
+/Users/leahrosen/miniconda3/envs/bayesdream/bin/python -m pytest tests/ -v
 ```
 
 ### Modifying the Model
@@ -116,10 +144,10 @@ Run infrastructure tests (requires pyroenv conda environment):
 The codebase uses a modular structure with delegation:
 
 1. **Core fitting logic**: Pyro models and fitting methods are in `fitting/` directory
-   - `fitting/technical.py`: TechnicalFitter class with `_model_technical` and `fit_technical`
+   - `fitting/ntc.py`: NTCFitter class with `_model_ntc` and `fit_ntc`
    - `fitting/cis.py`: CisFitter class with `_model_x` and `fit_cis`
    - `fitting/trans.py`: TransFitter class with `_model_y` and `fit_trans`
-   - `fitting/helpers.py`: Shared helper functions (Hill functions, etc.)
+   - `fitting/distributions.py`: Distribution-specific observation samplers (shared across fitters)
 
 2. **Base class**: `core.py` contains `_BayesDREAMCore` which:
    - Initializes fitter objects (`_technical_fitter`, `_cis_fitter`, `_trans_fitter`)
@@ -137,12 +165,13 @@ The codebase uses a modular structure with delegation:
    - `atac.py`: `add_atac_modality`
    - `custom.py`: `add_custom_modality`
 
-5. **I/O operations**: `io/` directory contains save/load functionality
+5. **I/O operations**: `io/` directory contains save/load/summary functionality
    - `save.py`: ModelSaver class
    - `load.py`: ModelLoader class
+   - `summary.py`: Summary export for downstream analysis
 
 **When adding new functionality**:
-- Helper functions → `fitting/helpers.py`
+- Distribution sampling logic → `fitting/distributions.py`
 - New Pyro models → appropriate fitter in `fitting/` (follow `_model_<name>` convention)
 - Modality-specific code → appropriate mixin in `modalities/`
 - Save/load methods → `io/save.py` or `io/load.py`
@@ -155,6 +184,69 @@ To add a new dose-response function:
 1. Define the function in the helper section (e.g., `def my_function(x, params)`)
 2. Add a conditional branch in `_model_y` to handle the new function type
 3. Update `fit_trans` to set appropriate priors and optimization settings
+
+### Deferred Cis-Gene Workflow (`add_cis_gene`)
+
+In the standard pipeline, `cis_gene` is provided at initialization and the model is subset to NTC + that gene's cells immediately. This means `fit_ntc()` must be re-run separately per cis gene.
+
+**`add_cis_gene(cis_gene)`** allows a single `fit_ntc()` call to serve all cis genes:
+
+```python
+# One model, one fit_ntc call — shared across all cis genes
+model = bayesDREAM(meta=meta, counts=gene_counts, label='run1')
+model.set_technical_groups(['cell_line'])
+model.fit_ntc(sum_factor_col='sum_factor')
+model.adjust_ntc_sum_factor(covariates=['cell_line'])  # optional, also shareable
+
+# Then for each cis gene, fork from the fitted model:
+import copy
+for gene in ['GFI1B', 'MYB', 'TET2']:
+    m = copy.deepcopy(model)
+    m.add_cis_gene(gene)
+    m.fit_cis(sum_factor_col='sum_factor')
+    m.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
+```
+
+**What `add_cis_gene()` does internally (`model.py`):**
+
+1. Finds the cis gene by name in the primary modality's `feature_meta`
+2. Extracts its counts into a new `'cis'` modality
+3. If `fit_ntc()` has already run: calls `_extract_cis_alpha_from_ntc_posteriors()` — pulls the gene's alpha from the primary modality posteriors into the cis modality and trims it from the primary posteriors; sets `self.alpha_x_prefit`
+4. Removes the cis gene from the primary modality (counts + feature_meta, index reset)
+5. Subsets `self.meta` and all modalities to NTC + cis cells
+6. Calls `_refilter_zero_count_features()` — drops features that became zero-count after cell subsetting; trims matching axes in stored NTC posteriors via `_trim_feature_axis_in_posteriors()`
+7. Recomputes `guide_code` as compact integers over the retained cells
+8. Reinitialises `sum_factors` on the final cell set
+
+**Constraints:**
+- `label` must be provided explicitly when `cis_gene` is omitted at init
+- `fit_cis()` and `fit_trans()` require `add_cis_gene()` to have been called first
+- `adjust_ntc_sum_factor()` and `fit_ntc()` can safely be called before `add_cis_gene()`
+- `guide_code` is computed over all cells at init (harmless), then recomputed compactly inside `add_cis_gene()` (single-guide mode only — stays `-1` in high-MOI mode)
+
+**Supported in high-MOI mode too** (`guide_assignment`/`guide_meta` provided at init, `cis_gene` omitted):
+- At init: cells are classified as `'excluded'` / `'ntc'` / `'other'` (cis identity unknown yet); excluded cells are dropped immediately; the full guide panel is kept (no pruning) since which guides are "cis" isn't known until `add_cis_gene()`.
+- `fit_ntc(use_all_cells=...)` defaults to `True` when `cis_gene` is still unset in high-MOI mode (cell classification into NTC/cis/other isn't possible yet, so a per-gene NTC-only fit isn't well-defined). Pass `use_all_cells=False` explicitly to force NTC-only fitting instead (still correct, since 'ntc' cells are already properly classified at this point).
+- `add_cis_gene(gene)` additionally: reclassifies any cell carrying a guide targeting `gene` from `'ntc'`/`'other'` to `gene` (excluded cells are never reclassified — same `excluded > cis > ntc > other` priority used in eager high-MOI init), then prunes `guide_assignment`/`guide_meta`/`guide_targets_dict` down to NTC + cis-gene guides only and rebuilds `guide_assignment_tensor`.
+- Known pre-existing issue (not introduced by deferred-cis-gene support): `fit_cis()` in high-MOI mode currently raises `RuntimeError: expected scalar type Float but found Double` from a dtype mismatch between `guide_assignment_tensor` and `log2_x_eff_g` in `_model_x` — reproduces identically in eager high-MOI mode (`cis_gene` set at init), so it's an existing bug in `fitting/cis.py`, not specific to the deferred workflow.
+
+### Single-Guide Mode with `guide_target` (Ambiguous/Multi-Target Guides)
+
+Single-guide mode normally requires a `target` column in `meta`, pre-computed one-to-one per cell. When a guide's true target is ambiguous (e.g. predicted off-target effects on more than one gene), pass a `guide_target` DataFrame instead — same schema as the high-MOI many-to-many mapping (`{'guide', 'target'}` rows, multiple rows allowed per guide):
+
+```python
+guide_target = pd.DataFrame({
+    'guide':  ['guide_A', 'guide_C', 'guide_C', 'ntc_1'],
+    'target': ['GFI1B',   'GFI1B',   'MYB',     'ntc'],  # guide_C is ambiguous: GFI1B or MYB
+})
+model = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_target=guide_target)
+```
+
+- `meta` does NOT need a `'target'` column when `guide_target` is supplied — each cell's target is derived from its `'guide'` column: resolves to `cis_gene` if `cis_gene` is among the guide's plausible targets, else `'ntc'` if any plausible target is an NTC variant, else `'other'` (dropped).
+- Because resolution depends on `cis_gene`, the same ambiguous guide resolves differently across separate fits/models for different cis genes — no need to hand-edit `meta['target']` per gene.
+- Works with the deferred-cis-gene workflow too: omit `cis_gene` at init (all cells kept, target is `'ntc'`/`'other'` only), then `add_cis_gene(gene)` reclassifies any cell whose guide targets `gene` — mirroring the high-MOI `add_cis_gene()` reclassification step, but without the guide-panel pruning (there's no `guide_assignment` matrix to prune in single-guide mode).
+- `exclude_targets` also works in this mode (previously high-MOI only): a guide targeting any excluded gene drops all its cells, even if it also targets `cis_gene`.
+- Implementation: `core.py` builds `self.guide_targets_dict` from `guide_target` in the single-guide branch (mirrors the high-MOI dict, but is never `None`-checked the same way — high-MOI always populates it or raises, single-guide leaves it `None` when no `guide_target` is given); `add_cis_gene()` in `model.py` has an `elif self.guide_targets_dict is not None:` branch parallel to its `if self.is_high_moi:` branch for the reclassification step.
 
 ### Testing Changes
 
@@ -194,7 +286,7 @@ The `Modality` class (`bayesDREAM/modality.py`) provides a standardized containe
 
 The `bayesDREAM` class (`bayesDREAM/model.py`) provides full multi-modal support:
 
-**Initialization:**
+**Initialization (standard):**
 ```python
 from bayesDREAM import bayesDREAM
 
@@ -202,11 +294,25 @@ model = bayesDREAM(
     meta=cell_metadata,
     counts=gene_counts,              # Primary modality (genes)
     gene_meta=gene_metadata,         # Optional: gene annotations
-    cis_gene='GFI1B',
+    cis_gene='GFI1B',               # Optional — can be set later via add_cis_gene()
     primary_modality='gene',         # Which modality drives cis/trans effects
     output_dir='./output',
     label='multimodal_run'
 )
+```
+
+**Initialization (deferred cis gene — fit_ntc once for all genes):**
+```python
+model = bayesDREAM(
+    meta=cell_metadata,
+    counts=gene_counts,
+    label='run1',                   # Required when cis_gene is omitted
+)
+model.set_technical_groups(['cell_line'])
+model.fit_ntc(sum_factor_col='sum_factor')
+# model now has fit_ntc posteriors for ALL genes;
+# call add_cis_gene() to commit to one cis gene before fit_cis()
+model.add_cis_gene('GFI1B')
 ```
 
 **Adding Modalities:**
@@ -375,17 +481,38 @@ See `tests/` directory for complete examples including transcripts, custom modal
 
 ### Running Tests
 
-All tests are in the `tests/` directory. Run them with:
+All tests are in the `tests/` directory. The conda environment is `bayesdream` at `/Users/leahrosen/miniconda3/envs/bayesdream/bin/python`.
+
+Run the full suite with pytest:
 
 ```bash
-cd "/Users/lrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/bayesDREAM code/bayesDREAM_forClaude"
+cd "/Users/leahrosen/Library/Mobile Documents/com~apple~CloudDocs/Documents/Postdoc/Code/bayesDREAM code/bayesDREAM_forClaude"
 export PYTHONPATH="."
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_multimodal_fitting.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_negbinom_compat.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_technical_compat.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_per_modality_fitting.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_gene_meta.py
-/opt/anaconda3/envs/pyroenv/bin/python tests/test_modality_save_load.py
+/Users/leahrosen/miniconda3/envs/bayesdream/bin/python -m pytest tests/ -v
+```
+
+Or run individual test files:
+
+```bash
+PYTHON=/Users/leahrosen/miniconda3/envs/bayesdream/bin/python
+$PYTHON tests/test_multimodal_fitting.py       # Full pipeline (slow, requires toydata)
+$PYTHON tests/test_negbinom_compat.py          # Negbinom backward compat
+$PYTHON tests/test_technical_compat.py         # Technical fitting compat
+$PYTHON tests/test_per_modality_fitting.py     # Multi-modality fitting
+$PYTHON tests/test_gene_meta.py                # Gene metadata handling
+$PYTHON tests/test_modality_save_load.py       # Save/load
+$PYTHON tests/test_summary_export.py           # Summary export (slow)
+$PYTHON tests/test_summary_export_simple.py    # Summary export (mocked, faster)
+$PYTHON tests/test_system_quick_pipeline.py    # Quick end-to-end pipeline
+$PYTHON tests/test_trans_all_distributions.py  # Trans fitting all distributions
+$PYTHON tests/test_high_moi.py                 # High-MOI mode
+$PYTHON tests/test_cli_system.py               # CLI tests
+$PYTHON tests/test_imports.py                  # Import smoke tests
+$PYTHON tests/test_filtering_simple.py         # Feature filtering
+$PYTHON tests/test_matrix_types.py             # Sparse/dense matrix support
+$PYTHON tests/test_modality_atac.py            # ATAC modality
+$PYTHON tests/test_cell_names_numpy.py         # Cell name handling
+$PYTHON tests/test_exon_skip_aggregation.py    # Exon skipping aggregation
 ```
 
 ### Documentation
@@ -397,12 +524,21 @@ All documentation is in the `docs/` directory:
 - `INITIALIZATION.md`: Technical fitting initialization strategies (empirical Bayes for negbinom, binomial, multinomial)
 - `OUTSTANDING_TASKS.md`: **Current outstanding tasks and known issues**
 - `SAVE_LOAD_GUIDE.md`: Guide to save/load functionality
+- `SUMMARY_EXPORT_GUIDE.md`: Exporting results for R/plotting
 - `QUICKSTART_MULTIMODAL.md`: Quick start for multi-modal analysis
 - `SLURM_JOB_GENERATOR.md`: HPC job generation guide
 - `MEMORY_REQUIREMENTS.md`: Memory estimation guide
-- `PLOTTING_GUIDE.md`: Comprehensive visualization guide
-- `SUMMARY_EXPORT_GUIDE.md`: Exporting results for R/plotting
-- Various specialized guides (ATAC, splicing, high MOI, etc.)
+- `FIT_TRANS_GUIDE.md`: Trans fitting guide
+- `FIT_TRANS_DESIGN_DECISIONS.md`: Design decisions for trans fitting
+- `HIGH_MOI_GUIDE.md`: High-MOI mode guide
+- `SPLICING_LOADER_GUIDE.md`: Splicing data loading guide
+- `CIS_MODEL_PARAMETERS.md`: Cis model parameter documentation
+- `HILL_FUNCTION_PRIORS.md`: Hill function prior specification
+- `BAYESIAN_FDR.md`: Bayesian FDR approach
+- `CELL_NAMES_GUIDE.md`: Cell name handling
+- `DATA_ACCESS.md`: Data access patterns
+- `FALSE_POSITIVES_GFI1B_DIAGNOSIS.md`: False positive diagnosis for GFI1B run
+- `OX_PRIOR_DIAGNOSIS.md`: o_x prior diagnosis and fix
 - Historical planning documents available in `docs/archive/`
 
 **Important**: Check `docs/OUTSTANDING_TASKS.md` for current development priorities, including the guide-prior infrastructure that needs to be integrated into `fit_cis()`.

@@ -159,6 +159,53 @@ print(f"High MOI mode: {model.is_high_moi}")  # Should print True
 - Cell with NTC + MYB → classified as 'ntc', only NTC guide kept (MYB removed)
 - Cell with only MYB → excluded entirely
 
+### Deferred cis_gene (shared fit_ntc across multiple cis genes)
+
+`cis_gene` can be omitted at init in high-MOI mode too, mirroring the single-guide
+deferred workflow: run one `fit_ntc()` across the whole guide panel, then commit to
+each cis gene in turn via `add_cis_gene()`.
+
+```python
+model = bayesDREAM(
+    meta=meta,
+    counts=gene_counts,
+    guide_assignment=guide_assignment,
+    guide_meta=guide_meta,
+    label='high_moi_run',   # required when cis_gene is omitted
+)
+model.set_technical_groups(['cell_line'])
+model.fit_ntc(sum_factor_col='sum_factor')  # defaults to use_all_cells=True (see below)
+
+import copy
+for gene in ['GFI1B', 'MYB', 'TET2']:
+    m = copy.deepcopy(model)
+    m.add_cis_gene(gene)
+    m.fit_cis(sum_factor_col='sum_factor')
+    m.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
+```
+
+What's different from the eager (`cis_gene` provided at init) path:
+- At init, cells are classified only as `'excluded'` / `'ntc'` / `'other'` — cis identity
+  is unknown, so cells that will later turn out to be cis-targeting are lumped into
+  `'other'` for now. `'excluded'` cells (from `exclude_targets`/`exclude_guides`) are
+  still dropped immediately. The full guide panel is kept unpruned.
+- `fit_ntc()` defaults `use_all_cells=True` when `cis_gene` is still unset, since a
+  clean NTC-vs-perturbed split isn't available yet for genes other than the eventual
+  cis gene. Pass `use_all_cells=False` explicitly if you want NTC-only fitting instead
+  (still valid — `'ntc'`-classified cells are already correct at this point).
+- `add_cis_gene(gene)` reclassifies any cell carrying a guide targeting `gene` from
+  `'ntc'`/`'other'` up to `gene` (same `excluded > cis > ntc > other` priority as the
+  eager path), then prunes `guide_assignment`/`guide_meta`/`guide_targets_dict` down to
+  NTC + `gene` guides and subsets cells, matching what eager init would have produced
+  for that gene.
+
+**Known issue** (pre-existing, not specific to the deferred path): `fit_cis()` in
+high-MOI mode currently raises `RuntimeError: expected scalar type Float but found
+Double` due to a dtype mismatch in `_model_x` between `guide_assignment_tensor` and
+`log2_x_eff_g`. This reproduces identically whether `cis_gene` is set eagerly or via
+`add_cis_gene()` — it's a bug in `fitting/cis.py`, unrelated to init-time cis_gene
+handling.
+
 ### Step 3: Run Standard Pipeline
 
 The high MOI implementation works seamlessly with the standard three-step pipeline:
@@ -166,7 +213,7 @@ The high MOI implementation works seamlessly with the standard three-step pipeli
 ```python
 # Step 1: Technical fitting (NTC cells only)
 model.set_technical_groups(['cell_line'])
-model.fit_technical()
+model.fit_ntc()
 
 # Step 2: Adjust sum factors for guide effects
 model.adjust_ntc_sum_factor(

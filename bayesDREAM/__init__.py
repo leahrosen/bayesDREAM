@@ -22,7 +22,7 @@ from .plotting import (
     plot_1d_parameter,
     plot_2d_parameter
 )
-from .simulation import simulate_from_trans_summary
+from .simulation import simulate_from_trans_summary, permute_from_ntc
 from .diagnostics import DiagnosticsMixin
 
 __version__ = "1.0.0"
@@ -41,5 +41,6 @@ __all__ = [
     "plot_1d_parameter",
     "plot_2d_parameter",
     "simulate_from_trans_summary",
+    "permute_from_ntc",
     "DiagnosticsMixin",
 ]

@@ -9,7 +9,11 @@ This module contains helper functions used throughout the bayesDREAM package:
 """
 
 import os
+import warnings
+from typing import Optional
+
 import numpy as np
+import pandas as pd
 import torch
 from scipy.special import betainc
 from scipy.optimize import brentq
@@ -33,6 +37,119 @@ def set_max_threads(cores: int):
     os.environ["MKL_NUM_THREADS"] = str(cores)
     os.environ["VECLIB_MAXIMUM_THREADS"] = str(cores)
     os.environ["NUMEXPR_NUM_THREADS"] = str(cores)
+
+
+########################################
+# Name Handling
+########################################
+
+def make_names_unique(names, join: str = "-"):
+    """
+    Disambiguate duplicate names, AnnData/scanpy style.
+
+    The first occurrence of a name is kept unchanged; each subsequent
+    occurrence gets ``{join}{n}`` appended (n = 1, 2, ...). Used to make
+    modality ``feature_names`` safe for name-based lookup (e.g. gene
+    symbols that are not unique in Ensembl annotation, such as some
+    pseudogenes/readthrough transcripts).
+
+    Parameters
+    ----------
+    names : list of str
+    join : str, default="-"
+        Separator between the original name and the disambiguating suffix.
+
+    Returns
+    -------
+    list of str
+        Same length and order as `names`, with all entries unique.
+    """
+    names = [str(n) for n in names]
+    existing = set(names)
+    seen_counts = {}
+    out = []
+    for name in names:
+        if name not in seen_counts:
+            seen_counts[name] = 0
+            out.append(name)
+        else:
+            seen_counts[name] += 1
+            candidate = f"{name}{join}{seen_counts[name]}"
+            while candidate in existing:
+                seen_counts[name] += 1
+                candidate = f"{name}{join}{seen_counts[name]}"
+            existing.add(candidate)
+            out.append(candidate)
+    return out
+
+
+# Columns that are many-to-one (e.g. a gene name repeats once per SJ/transcript
+# belonging to that gene) rather than a genuine per-feature identifier. Falling
+# back this far is worth flagging louder than the earlier, safer columns.
+_MANY_TO_ONE_NAME_COLS = ('gene_name', 'gene')
+
+
+def resolve_feature_names(
+    feature_meta: Optional[pd.DataFrame],
+    context: Optional[str] = None,
+) -> Optional[list]:
+    """
+    Derive a per-feature identifier list from feature_meta when explicit
+    feature_names weren't provided (e.g. modality built from a raw ndarray).
+
+    Prefers a real per-feature identifier column over many-to-one parent
+    columns — e.g. 'gene'/'gene_name' repeat once per SJ belonging to that
+    gene, so picking those first would silently make feature_names non-unique.
+    Priority: 'feature_id' > 'feature' > 'coord.intron' > 'junction_id' >
+    'gene_name' > 'gene' > a named index > the (unnamed, integer) index as a
+    last resort.
+
+    This is the single source of truth for the fallback; callers should not
+    re-implement their own column-guessing here.
+
+    Parameters
+    ----------
+    feature_meta : pd.DataFrame or None
+    context : str, optional
+        Label (e.g. modality name) used in the warning message when this
+        function has to guess. If None, no warning is emitted (used for
+        purely internal/no-guessing recomputation).
+
+    Returns
+    -------
+    list or None
+        None if feature_meta is None/empty.
+    """
+    if feature_meta is None or len(feature_meta) == 0:
+        return None
+
+    index_is_integer = (
+        isinstance(feature_meta.index, pd.RangeIndex) or
+        feature_meta.index.dtype.kind in ('i', 'u')
+    )
+    if not index_is_integer:
+        return feature_meta.index.tolist()
+
+    for col in ('feature_id', 'feature', 'coord.intron', 'junction_id', 'gene_name', 'gene'):
+        if col in feature_meta.columns:
+            if context is not None:
+                if col in _MANY_TO_ONE_NAME_COLS:
+                    warnings.warn(
+                        f"{context}: no explicit feature_names given and feature_meta has no "
+                        f"per-feature identifier column (checked 'feature_id', 'feature', "
+                        f"'coord.intron', 'junction_id'); falling back to '{col}', which is "
+                        f"many-to-one for multi-feature genes (e.g. several SJs/transcripts "
+                        f"per gene). If features aren't actually 1:1 with '{col}', add a "
+                        f"unique 'feature_id' column to feature_meta or pass feature_names "
+                        f"explicitly.",
+                        UserWarning
+                    )
+                else:
+                    print(f"[INFO] {context}: no explicit feature_names given; "
+                          f"using feature_meta['{col}'] as the per-feature identifier.")
+            return feature_meta[col].tolist()
+
+    return feature_meta.index.tolist()
 
 
 ########################################
@@ -317,6 +434,61 @@ def sample_or_use_point(name, value, device):
         raise TypeError(f"Expected a tensor, float, or numpy array for {name}, but got {type(value)}.")
 
 
+class SplitNormal(torch.distributions.Distribution):
+    """
+    Asymmetric (two-piece) Normal distribution.
+
+    Mode at `loc`. Uses sigma_left for x < loc and sigma_right for x >= loc.
+    Integrates to 1 because each half of a Normal centred at loc integrates to 0.5.
+
+    Useful as a prior anchored at y_ntc with a longer left tail (down to Amean/2)
+    and a short right tail (A rarely exceeds NTC mean).
+
+    log_prob(x < loc)  = Normal(loc, sigma_left).log_prob(x)
+    log_prob(x >= loc) = Normal(loc, sigma_right).log_prob(x)
+    rsample: z ~ N(0,1), x = loc + (sigma_right if z>=0 else sigma_left) * z
+    """
+    arg_constraints = {
+        'loc': torch.distributions.constraints.real,
+        'sigma_left': torch.distributions.constraints.positive,
+        'sigma_right': torch.distributions.constraints.positive,
+    }
+    support = torch.distributions.constraints.real
+    has_rsample = True
+
+    def __init__(self, loc, sigma_left, sigma_right, validate_args=None):
+        self.loc = loc
+        self.sigma_left = sigma_left
+        self.sigma_right = sigma_right
+        def _shape(x):
+            return x.shape if isinstance(x, torch.Tensor) else torch.Size([])
+        batch_shape = torch.broadcast_shapes(_shape(loc), _shape(sigma_left), _shape(sigma_right))
+        super().__init__(batch_shape=batch_shape, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(SplitNormal, _instance)
+        batch_shape = torch.Size(batch_shape)
+        new.loc = self.loc.expand(batch_shape)
+        new.sigma_left = self.sigma_left.expand(batch_shape)
+        new.sigma_right = self.sigma_right.expand(batch_shape)
+        super(SplitNormal, new).__init__(batch_shape, validate_args=False)
+        return new
+
+    def log_prob(self, x):
+        lp_left = torch.distributions.Normal(self.loc, self.sigma_left).log_prob(x)
+        lp_right = torch.distributions.Normal(self.loc, self.sigma_right).log_prob(x)
+        return torch.where(x < self.loc, lp_left, lp_right)
+
+    def rsample(self, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        z = torch.randn(shape, dtype=self.loc.dtype, device=self.loc.device)
+        sigma = torch.where(z >= 0, self.sigma_right, self.sigma_left)
+        return self.loc + sigma * z
+
+    def __call__(self, sample_shape=torch.Size()):
+        return self.rsample(sample_shape)
+
+
 def check_tensor(name, tensor):
     """
     Debug utility to check tensor properties.
@@ -335,3 +507,71 @@ def check_tensor(name, tensor):
     print(f"  min: {tensor.min().item()}, max: {tensor.max().item()}")
     print(f"  has NaN: {torch.isnan(tensor).any().item()}")
     print(f"  has Inf: {torch.isinf(tensor).any().item()}")
+
+
+########################################
+# Lean-loaded posterior detection
+########################################
+
+LEAN_POSTERIOR_KEY = '__lean__'
+
+
+def is_lean_posterior(posterior) -> bool:
+    """
+    Check whether a posterior_samples dict is lean-loaded.
+
+    Lean loading (`load_ntc_fit(lean=True)` / `load_cis_fit(lean=True)`, see
+    `bayesDREAM.io.load._reduce_posterior_samples`) collapses every tensor's
+    sample axis to a point estimate (median, kept as a singleton leading dim)
+    plus `<key>_lower`/`<key>_upper` (2.5%/97.5%) sibling keys, and discards
+    the raw per-draw samples. Code that needs genuine multi-sample structure
+    (histograms, KDE, prior/posterior comparisons, joint per-draw correlation
+    across parameters) must check this first and refuse to run — see
+    `require_full_posterior`. Code that only needs a point estimate + CI band
+    can proceed either way.
+
+    Parameters
+    ----------
+    posterior : dict or None
+        A posterior_samples_ntc / posterior_samples_cis dict (or None).
+
+    Returns
+    -------
+    bool
+        True if lean-loaded, False for None, non-dict, or full posteriors.
+    """
+    return bool(isinstance(posterior, dict) and posterior.get(LEAN_POSTERIOR_KEY, False))
+
+
+def require_full_posterior(posterior, context: str) -> None:
+    """
+    Raise a clear error if `posterior` is lean-loaded.
+
+    Use this at the top of any plotting/analysis function that reads raw
+    per-draw posterior samples for something other than a point estimate +
+    95% CI band (e.g. histograms, KDE, prior/posterior overlays, joint
+    per-draw correlation across parameters) — those silently produce a
+    degenerate or misleading result on a lean-loaded posterior (only one
+    "sample" remains) instead of erroring, which is worse than failing loudly.
+
+    Parameters
+    ----------
+    posterior : dict or None
+        A posterior_samples_ntc / posterior_samples_cis dict (or None).
+    context : str
+        Short description of what's being plotted/computed, used in the
+        error message (e.g. "plot_prior_posterior_comparison").
+
+    Raises
+    ------
+    ValueError
+        If `posterior` is lean-loaded.
+    """
+    if is_lean_posterior(posterior):
+        raise ValueError(
+            f"{context} needs the full per-draw posterior samples, but this "
+            f"model was loaded with lean=True (load_ntc_fit/load_cis_fit), "
+            f"which collapses posterior_samples_ntc/posterior_samples_cis to "
+            f"point estimates (median + 95% CI only) and discards the raw "
+            f"draws. Reload with lean=False to use this plot."
+        )

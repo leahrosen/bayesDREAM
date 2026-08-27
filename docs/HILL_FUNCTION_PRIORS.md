@@ -97,9 +97,9 @@ K_std_prior = K_mean_prior * x_true_CV  # CV-based variance
 
 ### 1. **Negative Binomial** (Gene Expression Counts)
 
-| Parameter | Prior Distribution | Mean | Variance | Shape |
-|-----------|-------------------|------|----------|-------|
-| **A** | Exponential | `Amean_adjusted = (1-weight)*Amean + weight*Vmax_mean` | `1/Amean_adjusted` | `[T]` |
+| Parameter | Prior Distribution | Mean | Rate | Shape |
+|-----------|-------------------|------|------|-------|
+| **A** | Exponential | `mean_A = (1-w)*Q05/2 + w*y_ntc` (see below) | `1/mean_A` | `[T]` |
 | **Vmax_a** | Log-Normal | `Vmax_mean` | Raw variance (data-driven) | `[T]` |
 | **Vmax_b** | Log-Normal | `Vmax_mean` | Raw variance (data-driven) | `[T]` |
 | **K_a** | Log-Normal | `K_max / 2` | CV-based (data-driven) | `[T]` |
@@ -110,10 +110,45 @@ K_std_prior = K_mean_prior * x_true_CV  # CV-based variance
 | **beta** | RelaxedBernoulli | - | `temperature=1.0→0.1` | `[T]` |
 
 **Notes**:
-- `weight = o_y / (o_y + beta_o_beta/beta_o_alpha)` (adaptively blends min and max based on overdispersion)
+- `w = o_y / (o_y + prior_mean_o_y)` where `prior_mean_o_y = beta_o_beta / beta_o_alpha`; `w ∈ (0,1)`
 - `n_a = alpha * n_a_raw` (multiplied by sparsity parameter)
-- **NEW**: Vmax and K use Log-Normal (more stable than Gamma for AutoNormal Guide)
-- **NEW**: K variance is CV-based (works with or without guides)
+- Vmax and K use Log-Normal (more stable than Gamma for AutoNormal Guide)
+- K variance is CV-based (works with or without guides)
+
+**Negbinom A prior — NTC-anchored interpolation**:
+
+The A parameter is the global floor of the Hill function: A = y as x→0 for positive associations, y as x→∞ for negative, and below either endpoint for non-monotonic. Its prior must be small (mode=0) to allow the Hill curve to extend below the observable range, while being large enough that the variational guide does not initialize at log(A)≈−∞ (the "initialization trap").
+
+**Q05 floor**: Before computing `mean_A`, `Q05` (5th percentile of per-guide means) is floored at `q01(mu_ntc)`, the 1st percentile of the NTC posterior mean across MCMC samples. This prevents near-zero anchors for lowly-expressed genes.
+
+```python
+# Step 1: floor Q05 at q01 of NTC posterior
+q01_ntc = torch.quantile(mu_ntc, 0.01, dim=0)    # [T], from posterior_samples_ntc
+Amean_tensor = Amean_tensor.clamp_min(q01_ntc)    # Q05 ← max(Q05, q01_ntc)
+
+# Step 2: compute mean_A as weighted interpolation
+y_ntc_tensor = mu_ntc.mean(dim=0)                 # [T], posterior mean of NTC expression
+mean_A = (1.0 - w) * Amean_tensor / 2.0 + w * y_ntc_tensor
+
+# Step 3: Exponential prior
+rate_A = 1.0 / mean_A.clamp_min(epsilon)
+A ~ Exponential(rate_A)
+```
+
+**Interpretation of the weight interpolation**:
+
+| Regime | w | mean_A | Behavior |
+|--------|---|--------|----------|
+| Quiet gene (low o_y) | → 0 | → Q05 / 2 | Aggressive sparsity: A initialized near half the minimum observed guide mean |
+| Noisy gene (high o_y) | → 1 | → y_ntc | Conservative: A anchored near NTC level (avoids collapse for variable genes) |
+
+**Why Exponential?** The Exponential prior keeps mode=0, consistent with A being a minimum. In ADVI (AutoNormalMessenger), the variational guide parameterizes log(A) as Normal; its initial mean is near log(mean_A), not log(mode)=−∞. So changing mean_A directly controls the initialization point without changing the distributional form.
+
+**Fallback (no technical posterior available)**:
+```python
+# y_ntc_tensor is None → use original formula
+mean_A = Amean_tensor / (2.0 - w)
+```
 
 **Log-Normal parameterization for Vmax**:
 ```python
@@ -628,6 +663,21 @@ K_a = pyro.deterministic("K_a", torch.exp(log_K_a))
 ---
 
 ## Changelog
+
+### 2026-06: Negbinom A prior — NTC-anchored interpolation
+
+**Problem**: For lowly-expressed trans genes, Q05 of guide means ≈ 0. This caused ADVI to initialize log(A) near −∞, trapping A near 0. The Hill function then absorbed all NTC expression into Vmax with EC50 pushed below observable range — a spurious flat-Hill solution flagged as significant.
+
+**Changes to negbinom A prior**:
+1. `Amean_tensor.clamp_min(q01_ntc)` — floors Q05 at the 1st percentile of the NTC posterior mean, preventing near-zero anchors for lowly-expressed genes
+2. `mean_A = (1-w)*Q05/2 + w*y_ntc` — replaces old formula; noisy genes (w→1) anchor at NTC level rather than Q05≈0
+3. `y_ntc_tensor` is computed from `modality.posterior_samples_ntc['mu_ntc']` and passed through `fit_trans()` → `_model_y()`
+
+**Fallback**: when no technical posterior is available, reverts to `mean_A = Amean_tensor / (2 - w)`.
+
+See `docs/FALSE_POSITIVES_GFI1B_DIAGNOSIS.md` (Root Cause #4) for full diagnostic context.
+
+---
 
 ### 2025-01-26: Comprehensive Prior Refactoring
 

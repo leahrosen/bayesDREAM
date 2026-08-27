@@ -22,8 +22,7 @@ from .prior_posterior import (
 from .colors import ColorScheme, build_guide_colors, lighten, darken
 
 # Helper utilities
-from .helpers import (to_np, per_cell_mean_std, resolve_guide_labels,
-                       _guide_ntc_mask, _xtrue_posterior)
+from .helpers import (to_np, per_cell_mean_std, resolve_guide_labels)
 from .utils import (
     hill_xinf_samples,
     dependency_mask_from_n,
@@ -44,6 +43,7 @@ from .basic import (
     plot_additivity_scatter,
     plot_additivity_violin,
     plot_additivity_residuals,
+    patch_A_prior,
 )
 
 # Posterior density plots
@@ -61,14 +61,22 @@ from .de_comparison import (
     scatter_and_heatmap_edger_vs_bayes,
     plot_edger_vs_bayes_full_range,
     plot_edger_vs_bayes_observed_range,
-    dependency_mask_from_n
 )
+
+# X-Y plot post-processing
+from .xy_plots import restyle_targeting_lines
 
 # Diagnostic plots
 from .diagnostics import (
     scatter_with_smooth_by_group,
     plot_x_true_residuals_vs_sumfactor,
     plot_sum_factor_comparison,
+    plot_systematic_shift_volcano,
+    plot_shift_est_group_correlation,
+    plot_cross_dataset_correlation,
+    plot_systematic_shift_hits_xy,
+    plot_trans_hits_by_gene,
+    plot_trans_values_by_gene,
 )
 
 __all__ = [
@@ -100,6 +108,7 @@ __all__ = [
     'plot_additivity_scatter',
     'plot_additivity_violin',
     'plot_additivity_residuals',
+    'patch_A_prior',
     # Posterior plots
     'plot_posterior_density_lines',
     'plot_xtrue_density_by_guide',
@@ -116,4 +125,11 @@ __all__ = [
     'scatter_with_smooth_by_group',
     'plot_x_true_residuals_vs_sumfactor',
     'plot_sum_factor_comparison',
+    'plot_systematic_shift_volcano',
+    'plot_shift_est_group_correlation',
+    'plot_cross_dataset_correlation',
+    'plot_systematic_shift_hits_xy',
+    'plot_trans_hits_by_gene',
+    'plot_trans_values_by_gene',
+    'restyle_targeting_lines',
 ]

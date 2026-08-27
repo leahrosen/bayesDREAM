@@ -1,0 +1,152 @@
+# Domingo dataset -- orchestration config, consumed by generate_slurm.py.
+# NOT the bayesdream-CLI-schema config (see publication_runs/README.md);
+# generate_slurm.py renders that per gene/stage from this file.
+
+dataset: domingo
+label_prefix: domingo_20260806   # -> bayesdream label = <label_prefix>_<gene>
+
+paths:
+  repo_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/CRISPRmodelling/BayesianModelling/bayesDREAM_forClaude
+  python_env: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_cpu/bin/python
+  # GPU env, used ONLY for the two multinomial modalities (donor_choice/
+  # acceptor_choice) -- see modalities below. Everything else in Domingo
+  # runs on python_env (CPU).
+  python_env_gpu: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_rocm/bin/python
+
+  # raw_data_dir: has domingo_cellmeta.txt.gz + domingo_GEXcounts.csv, the
+  # raw exports preprocess.py reads (confirmed present/correctly-shaped on
+  # Dardel -- see domingo/README.md's "Preprocessing" section).
+  # data_dir: preprocess.py's OUTPUT (cell_meta.csv/gene_counts.csv/
+  # gene_meta.csv) -- kept in its own subdirectory rather than mixed in with
+  # the raw exports, mirroring morris/config.yaml's raw_data_dir/data_dir
+  # split. Run preprocess.py once before generate_slurm.py.
+  raw_data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah
+  data_dir: "{raw_data_dir}/preprocessed"
+  meta: "{data_dir}/cell_meta.csv"
+  counts: "{data_dir}/gene_counts.csv"
+  # gene_counts.csv is a plain CSV DataFrame (index_label="gene"), so most
+  # stages never need this explicitly -- ONLY counts_ntc below (sparse
+  # .npz, no row labels) requires it, same reason subset_data_block()
+  # passes feature_meta for every per-gene subset.
+  gene_meta: "{data_dir}/gene_meta.csv"
+  # NTC-only subset (also written by preprocess.py) -- used ONLY by
+  # ntc_shared, which never fits on non-NTC cells anyway (use_all_cells=False,
+  # the low-MOI default) but previously still had to load+classify the full
+  # 20001-cell dataset to get there.
+  meta_ntc: "{data_dir}/cell_meta_ntc.csv"
+  counts_ntc: "{data_dir}/gene_counts_ntc.npz"
+
+  output_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/BayesianModel_outs
+
+cluster:
+  account: naiss2025-5-479
+  # Domingo runs on CPU everywhere EXCEPT the two multinomial modalities
+  # (donor_choice/acceptor_choice -- fit_ntc's own niters default is 2x
+  # higher for multinomial than negbinom/binomial, and empirically these
+  # need GPU). partition_gpu/gpu_node_sbatch_lines: NOT confirmed against
+  # your account -- check `sinfo -p gpu -o "%P %G %c %N"` before submitting.
+  partition_cpu: shared
+  partition_gpu: gpu
+  # 4 cis_genes x 2 multinomial modalities = 8 tasks -- exactly one Dardel
+  # GPU node's worth (8 GPUs/node), packed via SbatchGpuNodeQueue (see
+  # generate_slurm.py's "GPU-packed multinomial modalities" section).
+  gpu_node_sbatch_lines: ["#SBATCH -N 1", "#SBATCH --gpus=8"]
+
+model_defaults:
+  modality_name: gene
+  guide_covariates: [cell_line]
+  guide_covariates_ntc: [cell_line]
+
+cis_genes: [GFI1B, MYB, NFE2, TET2]
+
+# fit_ntc is shared across all 4 cis genes (low-MOI deferred-cis-gene
+# workflow -- see CLAUDE.md "Deferred Cis-Gene Workflow"). One job, all
+# genes' fit_cis/compensation/trans depend on it.
+ntc_shared:
+  set_technical_groups: [cell_line]
+  resources: {cores: 1}   # from real profiling, 2026-08-11
+  fit: {tolerance: 0, niters: 50000}
+
+sum_factor:
+  # adjust_ntc_sum_factor/refit_sumfactor both use the library default
+  # sum_factor_col_old='sum_factor' (the R-preprocessed, already-scran-
+  # clustered column) -- NOT sum_factor_adj for refit; matches the reference
+  # GFI1B script exactly (model.refit_sumfactor(covariates=[...]) with no
+  # sum_factor_col_old override).
+  covariates: [lane, cell_line]
+
+# 01b_subset_<gene>.sh: pays bayesDREAM.__init__'s full-dataset-load +
+# subsetting cost ONCE per gene (see generate_slurm.py's "Per-gene data
+# subsetting" section) -- its own resources, decoupled from cis's.
+subset:
+  resources: {cores: 10}   # from real profiling, 2026-08-11
+
+cis:
+  resources: {cores: 2}   # from real profiling, 2026-08-11
+  fit: {tolerance: 0, niters: 100000}
+
+compensation:
+  resources: {cores: 2}   # matches trans (same 'full' data subset) -- see trans.resources below
+  # check_systematic_shift() always uses the raw 'sum_factor' column (no
+  # override) -- see run_compensation.py. Per-gene exclude_cells overrides,
+  # if any; leave empty for "exclude nothing" (matches the reference script,
+  # which calls check_systematic_shift() with no exclude_cells at all).
+  exclude_cells:
+    GFI1B: []
+    MYB: []
+    NFE2: []
+    TET2: []
+
+trans:
+  resources: {cores: 2}   # from real profiling, 2026-08-11
+  function_type: additive_hill
+  fit: {tolerance: 0}
+  # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
+  exclude_trans_genes: {min_log2_mu_ntc: -4.0}
+
+  # n_reps below are arbitrary placeholders (not derived from a power
+  # calculation or benchmark) -- set when scaffolding, never revisited.
+  # permutation/simulation no longer carry their own resources.cores --
+  # generate_slurm.py now reuses trans.resources.cores directly for both
+  # (same data/model shape as the real trans fit, just a different fit
+  # target -- no reason for them to diverge).
+  permutation:
+    n_reps: 5
+
+  simulation:
+    n_reps: 5
+
+# Further modalities (splicing/velocity/donor-acceptor choice), fit per
+# cis gene after that gene's own cis fit. See config_modalities.yaml.
+# data_dir is the shared loader_inputs/ directory (contains one subdirectory
+# per stype: sj/, exon_skip/, ..., donor_choice/) -- the SAME directory for
+# every gene, not a per-gene path; load_modalities.py aligns cells per gene
+# internally (see its module docstring).
+modalities:
+  config: config_modalities.yaml
+  data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Domingo2024/processed_Leah/20260328_splicing/loader_inputs
+  # Per-modality fit cores now live as `cores:` on each entry in
+  # config_modalities.yaml (from real profiling, 2026-08-11 -- sj/
+  # donor_efficiency/acceptor_efficiency: 4, exon_skip/intron_retention/mxe/
+  # gene_velocity: 2). `resources.cores` below is now ONLY a fallback for any
+  # modality entry that doesn't set its own `cores` -- currently just the two
+  # multinomial modalities (donor_choice/acceptor_choice), whose GPU-packed
+  # job uses this value for thread-pinning, not real per-task core
+  # allocation (see generate_slurm.py's "GPU-packed multinomial modalities").
+  resources: {cores: 8}
+  # 07a_modality_subset_<gene>_<mod>.sh: reads the shared raw splicing
+  # directory once per (gene, modality) -- same cost regardless of which
+  # modality, so one fixed value for all of them (2026-08-11), not split
+  # like the fit jobs above.
+  subset_resources: {cores: 25}   # bumped from real OOM evidence, 2026-08-12 -- 10 (8.7GB) was not enough for several (gene, modality) pairs
+  # Permutation + recapitulation reps for BINOMIAL modalities only (sj,
+  # exon_skip, intron_retention, mxe, gene_velocity, donor_efficiency,
+  # acceptor_efficiency) -- NOT multinomial (donor_choice/acceptor_choice),
+  # per instruction. n_reps are arbitrary placeholders (not derived from a
+  # power calculation or benchmark) -- set when scaffolding, never revisited.
+  # Their own resources.cores was removed -- generate_slurm.py now reuses
+  # each modality's own fit cores (spec['cores'] above) for its permutation/
+  # recapitulation jobs too, same rationale as trans.permutation/simulation.
+  trans:
+    permutation: {n_reps: 5}
+    simulation: {n_reps: 5}

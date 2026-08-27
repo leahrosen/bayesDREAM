@@ -2,7 +2,7 @@
 Summary export for bayesDREAM results.
 
 Exports model results as R-friendly CSV files with:
-- Mean and 95% credible intervals for all parameters
+- Median and 95% credible intervals for all parameters
 - Cell-wise and feature-wise summaries
 - Observed log2FC, predicted log2FC, inflection points for trans fits
 - Derivative roots and function classification
@@ -14,11 +14,15 @@ Supports three function types:
 """
 
 import os
+import time
 import numpy as np
 import pandas as pd
 import torch
 from typing import Optional, Dict, Any, Tuple, List
 from scipy.optimize import brentq
+from tqdm import tqdm
+
+from ..utils import is_lean_posterior
 
 
 class ModelSummarizer:
@@ -1003,21 +1007,21 @@ class ModelSummarizer:
     # Technical Fit Summary
     # ========================================================================
 
-    def save_technical_summary(
+    def save_ntc_summary(
         self,
         output_dir: Optional[str] = None,
         modality_name: Optional[str] = None
     ):
         """
-        Save technical fit parameters as feature-wise CSV.
+        Save NTC fit parameters as feature-wise CSV.
 
-        Creates: technical_feature_summary_{modality}.csv
+        Creates: ntc_feature_summary_{modality}.csv
 
         Columns:
         - feature: Feature name
         - modality: Modality name
         - distribution: Distribution type
-        - group_{i}_alpha_y_mean: Mean alpha_y for group i
+        - group_{i}_alpha_y_median: Median alpha_y for group i (point estimate from fit_ntc)
         - group_{i}_alpha_y_lower: 2.5% quantile for group i
         - group_{i}_alpha_y_upper: 97.5% quantile for group i
 
@@ -1039,7 +1043,7 @@ class ModelSummarizer:
 
         # Check if technical fit has been run for this modality
         if not hasattr(modality, 'alpha_y_prefit') or modality.alpha_y_prefit is None:
-            raise ValueError(f"Technical fit not found for modality '{modality_name}'. Run fit_technical() first.")
+            raise ValueError(f"NTC fit not found for modality '{modality_name}'. Run fit_ntc() first.")
 
         # Get alpha_y for this modality (prefer distribution-specific versions)
         if hasattr(modality, 'alpha_y_prefit_mult') and modality.alpha_y_prefit_mult is not None:
@@ -1053,45 +1057,122 @@ class ModelSummarizer:
         if isinstance(alpha_y, torch.Tensor):
             alpha_y = alpha_y.cpu().numpy()
 
-        # alpha_y is always 2D [C, T] — no samples dimension
-        if alpha_y.ndim == 3:
-            # Backward compat: collapse legacy 3D [S, C, T] to mean
-            alpha_y = alpha_y.mean(axis=0)
+        # For multinomial, alpha_y is [C, T, K]; for all others, [C, T].
+        # If an old-format tensor with a leading samples dim (S) was stored, collapse it.
+        if modality.distribution == 'multinomial':
+            if alpha_y.ndim == 4:  # [S, C, T, K] — collapse S
+                alpha_y = alpha_y.mean(axis=0)
+            # alpha_y is now [C, T, K]
+        else:
+            if alpha_y.ndim == 3:  # [S, C, T] — collapse S
+                alpha_y = alpha_y.mean(axis=0)
+            # alpha_y is now [C, T]
 
         # Get feature names - prefer modality.feature_names (what users see)
         if modality.feature_names is not None:
             feature_names = modality.feature_names
         else:
             feature_names = modality.feature_meta.index.tolist()
+
+        _fn_series = pd.Series(feature_names, dtype=str)
+        if not _fn_series.is_unique:
+            _dupes = _fn_series[_fn_series.duplicated()].unique().tolist()
+            raise ValueError(
+                f"Resolved feature names for modality '{modality_name}' are not unique "
+                f"({len(_dupes)} duplicated value(s), e.g. {_dupes[:5]}). "
+                "feature_meta.index must be unique per feature, or set "
+                "modality.feature_names explicitly."
+            )
+
         n_features = len(feature_names)
         n_groups = alpha_y.shape[0]  # [C, T] → C groups
 
-        alpha_mean = alpha_y  # [C, T]
+        alpha_median = alpha_y  # [C, T] — point estimate stored as median at fit time
         alpha_lower = alpha_y  # no uncertainty (point estimate)
         alpha_upper = alpha_y
 
-        # Build DataFrame
-        data = {
-            'feature': feature_names,
-            'modality': modality_name,
-            'distribution': modality.distribution
-        }
+        # Extract mu_ntc and o_y medians from posterior_samples_ntc ([S, T] → [T])
+        def _extract_scalar_posterior(ps, key):
+            v = ps.get(key)
+            if v is None:
+                return None
+            if isinstance(v, torch.Tensor):
+                v = v.cpu().numpy()
+            if v.ndim == 1:
+                return v
+            return np.median(v, axis=0).flatten()  # collapse samples + any extra dims → [T]
 
-        # Add columns for each group
-        for g in range(n_groups):
-            data[f'group_{g}_alpha_y_mean'] = alpha_mean[g, :]
-            data[f'group_{g}_alpha_y_lower'] = alpha_lower[g, :]
-            data[f'group_{g}_alpha_y_upper'] = alpha_upper[g, :]
+        ps = getattr(modality, 'posterior_samples_ntc', None) or {}
+        mu_ntc_vals = _extract_scalar_posterior(ps, 'mu_ntc')
+        o_y_vals    = _extract_scalar_posterior(ps, 'o_y')
+
+        # Build DataFrame
+        cis_gene = getattr(self.model, 'cis_gene', None)
+        is_primary = modality_name == self.model.primary_modality
+        data = {'feature': feature_names}
+        if is_primary and cis_gene is not None:
+            data['is_cis_gene'] = [f == cis_gene for f in feature_names]
+        data['modality'] = modality_name
+        data['distribution'] = modality.distribution
+
+        # Add columns for each group.
+        # For multinomial alpha_y is [C, T, K]: export one column per (group, category).
+        # For all others alpha_y is [C, T]: one column per group.
+        if modality.distribution == 'multinomial':
+            K_alpha = alpha_median.shape[2]
+            for g in range(n_groups):
+                for k in range(K_alpha):
+                    data[f'group_{g}_alpha_y_cat{k}_median'] = alpha_median[g, :, k]
+                    data[f'group_{g}_alpha_y_cat{k}_lower'] = alpha_lower[g, :, k]
+                    data[f'group_{g}_alpha_y_cat{k}_upper'] = alpha_upper[g, :, k]
+        else:
+            for g in range(n_groups):
+                data[f'group_{g}_alpha_y_median'] = alpha_median[g, :]
+                data[f'group_{g}_alpha_y_lower'] = alpha_lower[g, :]
+                data[f'group_{g}_alpha_y_upper'] = alpha_upper[g, :]
+
+        if mu_ntc_vals is not None:
+            data['mu_ntc'] = mu_ntc_vals
+        if o_y_vals is not None:
+            data['o_y'] = o_y_vals
 
         df = pd.DataFrame(data)
 
+        # Append cis gene row if this is the primary modality and alpha_x_prefit is available
+        alpha_x = getattr(self.model, 'alpha_x_prefit', None)
+        cis_appended = False
+        if is_primary and cis_gene is not None and alpha_x is not None:
+            alpha_x_np = alpha_x.cpu().numpy() if isinstance(alpha_x, torch.Tensor) else np.asarray(alpha_x)
+            cis_ps = getattr(self.model.get_modality('cis'), 'posterior_samples_ntc', None) or {}
+            cis_mu = _extract_scalar_posterior(cis_ps, 'mu_ntc')
+            cis_oy = _extract_scalar_posterior(cis_ps, 'o_x')  # stored as o_x in cis modality
+            cis_row = {
+                'feature': cis_gene,
+                'is_cis_gene': True,
+                'modality': modality_name,
+                'distribution': modality.distribution,
+            }
+            for g in range(n_groups):
+                val = float(alpha_x_np[g]) if g < len(alpha_x_np) else float('nan')
+                cis_row[f'group_{g}_alpha_y_median'] = val
+                cis_row[f'group_{g}_alpha_y_lower'] = val
+                cis_row[f'group_{g}_alpha_y_upper'] = val
+            if mu_ntc_vals is not None:
+                cis_row['mu_ntc'] = float(cis_mu[0]) if cis_mu is not None else float('nan')
+            if o_y_vals is not None:
+                cis_row['o_y'] = float(cis_oy[0]) if cis_oy is not None else float('nan')
+            df = pd.concat([df, pd.DataFrame([cis_row])], ignore_index=True)
+            cis_appended = True
+
         # Save
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f'technical_feature_summary_{modality_name}.csv')
+        output_file = os.path.join(output_dir, f'ntc_feature_summary_{modality_name}.csv')
         df.to_csv(output_file, index=False)
 
         print(f"[SAVE] Technical summary saved to {output_file}")
-        print(f"       {n_features} features × {n_groups} groups")
+        print(f"       {len(df)} features × {n_groups} groups ({n_features} trans + cis gene)"
+              if cis_appended
+              else f"       {n_features} features × {n_groups} groups")
 
         return df
 
@@ -1108,24 +1189,34 @@ class ModelSummarizer:
         Save cis fit parameters as guide-wise and cell-wise CSVs.
 
         Creates:
-        - cis_guide_summary.csv: Guide-level x_true with CI
+        - cis_guide_summary.csv: Guide-level summary
         - cis_cell_summary.csv: Cell-level data (if include_cell_level=True)
 
-        Guide-level columns:
+        Guide-level columns (single-guide mode):
         - guide: Guide name
         - target: Target gene
         - n_cells: Number of cells
-        - x_true_mean: Mean x_true
+        - x_true_mean: Mean x_true (averaged over cells in guide, then over posterior samples)
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts_mean: Average raw counts
 
+        Guide-level columns (high MOI mode):
+        - guide: Guide name
+        - targets: Comma-separated target gene(s)
+        - n_cells: Number of cells carrying this guide
+        - x_eff_g_mean: Mean per-guide effective expression
+        - x_eff_g_lower: 2.5% quantile
+        - x_eff_g_upper: 97.5% quantile
+        - sigma_eff_mean: Mean per-guide effect uncertainty
+        - raw_counts_mean: Average raw counts for cells carrying this guide
+
         Cell-level columns:
         - cell: Cell barcode
-        - guide: Guide name
-        - target: Target gene
-        - cell_line: Cell line (if available)
-        - x_true_mean: Mean x_true for this guide
+        - guide: Guide name (single-guide mode only)
+        - target: Target classification (cis gene or 'ntc')
+        - technical_group_code: Technical group (if available)
+        - x_true_mean: Mean cell-level x_true
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts: Raw counts for this cell
@@ -1144,7 +1235,27 @@ class ModelSummarizer:
         if not hasattr(self.model, 'x_true') or self.model.x_true is None:
             raise ValueError("Cis fit not found. Run fit_cis() first.")
 
-        # Get x_true samples — shape is [n_samples, n_cells] (cell-level)
+        is_high_moi = getattr(self.model, 'is_high_moi', False)
+
+        cis_ps_all = getattr(self.model, 'posterior_samples_cis', None) or {}
+        is_lean_cis = is_lean_posterior(cis_ps_all)
+
+        def _lean_ci(key):
+            """Fetch precomputed (lower, upper) sibling arrays for `key` when lean-loaded."""
+            lo = cis_ps_all.get(f'{key}_lower')
+            hi = cis_ps_all.get(f'{key}_upper')
+            if lo is None or hi is None:
+                return None
+            if isinstance(lo, torch.Tensor):
+                lo = lo.cpu().numpy()
+            if isinstance(hi, torch.Tensor):
+                hi = hi.cpu().numpy()
+            return lo, hi
+
+        # Get x_true samples — shape is [n_samples, n_cells] (cell-level).
+        # When lean-loaded, this is the [1, n_cells] median singleton (see
+        # bayesDREAM.io.load._reduce_posterior_samples) — real CI width comes
+        # from the 'x_true_lower'/'x_true_upper' sibling keys via _lean_ci().
         if hasattr(self.model, 'posterior_samples_cis') and 'x_true' in self.model.posterior_samples_cis:
             x_true_cell_samples = self.model.posterior_samples_cis['x_true']
             if isinstance(x_true_cell_samples, torch.Tensor):
@@ -1156,113 +1267,182 @@ class ModelSummarizer:
                 x_true_pt = x_true_pt.cpu().numpy()
             x_true_cell_samples = x_true_pt[np.newaxis, :]  # [1, n_cells]
 
-        # Get guide-level metadata
-        guide_meta = self.model.meta.groupby('guide').agg({
-            'target': 'first',
-            'cell': 'count'
-        }).rename(columns={'cell': 'n_cells'})
-
-        guides = guide_meta.index.tolist()
-
-        # Aggregate x_true from cell-level to guide-level (mean over cells per guide)
-        # Use positional indices (iloc) because meta.index may be cell-name strings
-        guide_to_cell_indices = {
-            g: np.where(self.model.meta['guide'].values == g)[0].tolist()
-            for g in guides
-        }
-
-        # Build [n_samples, n_guides] by averaging cells within each guide
-        n_samples = x_true_cell_samples.shape[0]
-        n_guides = len(guides)
-        x_true_guide_samples = np.zeros((n_samples, n_guides))
-        for gi, g in enumerate(guides):
-            cell_idx = guide_to_cell_indices[g]
-            x_true_guide_samples[:, gi] = x_true_cell_samples[:, cell_idx].mean(axis=1)
-
-        # Compute mean and CI per guide
-        x_true_mean = x_true_guide_samples.mean(axis=0)
-        x_true_lower = np.quantile(x_true_guide_samples, 0.025, axis=0)
-        x_true_upper = np.quantile(x_true_guide_samples, 0.975, axis=0)
-
         # Get raw counts from cis modality
         cis_mod = self.model.get_modality('cis')
         cis_counts = cis_mod.counts[0, :]  # [n_cells]
 
-        # Map cells to guides
-        cell_to_guide = dict(zip(self.model.meta['cell'], self.model.meta['guide']))
-        guide_to_cells = self.model.meta.groupby('guide')['cell'].apply(list).to_dict()
-
-        # Compute average raw counts per guide
-        raw_counts_mean = []
-        for guide in guides:
-            guide_cells = guide_to_cells.get(guide, [])
-            guide_cell_indices = [i for i, cell in enumerate(self.model.meta['cell']) if cell in guide_cells]
-            if len(guide_cell_indices) > 0:
-                raw_counts_mean.append(cis_counts[guide_cell_indices].mean())
-            else:
-                raw_counts_mean.append(np.nan)
-
-        # Build guide-level DataFrame
-        # 'target' column may be absent in high MOI mode when guide_targets_dict is used;
-        # fall back to deriving the primary target from guide_targets_dict.
-        if 'target' in guide_meta.columns:
-            guide_targets_col = guide_meta['target'].values
-        elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
-            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-            def _primary(g):
-                ts = self.model.guide_targets_dict.get(g, [])
-                if self.model.cis_gene and self.model.cis_gene in ts:
-                    return self.model.cis_gene
-                for t in ts:
-                    if t in _ntc_variants:
-                        return 'ntc'
-                return ts[0] if ts else 'unknown'
-            guide_targets_col = [_primary(g) for g in guides]
-        else:
-            guide_targets_col = ['unknown'] * len(guides)
-
-        guide_df = pd.DataFrame({
-            'guide': guides,
-            'target': guide_targets_col,
-            'n_cells': guide_meta['n_cells'].values,
-            'x_true_mean': x_true_mean,
-            'x_true_lower': x_true_lower,
-            'x_true_upper': x_true_upper,
-            'raw_counts_mean': raw_counts_mean
-        })
-
-        # Save guide-level
         os.makedirs(output_dir, exist_ok=True)
-        guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
-        guide_df.to_csv(guide_file, index=False)
 
-        print(f"[SAVE] Cis guide summary saved to {guide_file}")
-        print(f"       {len(guides)} guides")
+        # ── Guide-level summary ───────────────────────────────────────────────
+        if is_high_moi:
+            # In high MOI mode, guide-level parameters are x_eff_g and sigma_eff [G]
+            cis_ps = self.model.posterior_samples_cis
 
-        # Build cell-level DataFrame if requested
+            x_eff_g_samples = cis_ps['x_eff_g']  # [n_samples, G]
+            if isinstance(x_eff_g_samples, torch.Tensor):
+                x_eff_g_samples = x_eff_g_samples.cpu().numpy()
+
+            sigma_eff_samples = cis_ps['sigma_eff']  # [n_samples, G]
+            if isinstance(sigma_eff_samples, torch.Tensor):
+                sigma_eff_samples = sigma_eff_samples.cpu().numpy()
+
+            guides = self.model.guide_meta['guide'].tolist()
+            G = len(guides)
+
+            # Cells per guide from guide_assignment (N x G binary matrix)
+            guide_assignment = self.model.guide_assignment  # numpy [N, G]
+            n_cells_per_guide = guide_assignment.sum(axis=0).astype(int)  # [G]
+
+            # Average raw counts for cells carrying each guide
+            raw_counts_mean = []
+            for gi in range(G):
+                cell_mask = guide_assignment[:, gi].astype(bool)
+                if cell_mask.any():
+                    raw_counts_mean.append(float(cis_counts[cell_mask].mean()))
+                else:
+                    raw_counts_mean.append(float('nan'))
+
+            # Targets: comma-separated list from guide_targets_dict
+            gtd = getattr(self.model, 'guide_targets_dict', {})
+            targets_col = [
+                ','.join(gtd.get(g, ['unknown']))
+                for g in guides
+            ]
+
+            # x_eff_g/sigma_eff are already guide-level (no cross-cell aggregation
+            # needed), so in lean mode the precomputed sibling keys give an exact
+            # (not approximated) CI — unlike the single-guide x_true case below.
+            _x_eff_ci = _lean_ci('x_eff_g') if is_lean_cis else None
+            if _x_eff_ci is not None:
+                x_eff_g_lower, x_eff_g_upper = _x_eff_ci
+            else:
+                x_eff_g_lower = np.quantile(x_eff_g_samples, 0.025, axis=0)
+                x_eff_g_upper = np.quantile(x_eff_g_samples, 0.975, axis=0)
+
+            guide_df = pd.DataFrame({
+                'guide': guides,
+                'targets': targets_col,
+                'n_cells': n_cells_per_guide,
+                'x_eff_g_mean': x_eff_g_samples.mean(axis=0),
+                'x_eff_g_lower': x_eff_g_lower,
+                'x_eff_g_upper': x_eff_g_upper,
+                'sigma_eff_mean': sigma_eff_samples.mean(axis=0),
+                'raw_counts_mean': raw_counts_mean,
+            })
+
+            guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
+            guide_df.to_csv(guide_file, index=False)
+            print(f"[SAVE] Cis guide summary saved to {guide_file}")
+            print(f"       {G} guides (high MOI)")
+
+        else:
+            # Get guide-level metadata
+            guide_meta = self.model.meta.groupby('guide').agg({
+                'target': 'first',
+                'cell': 'count'
+            }).rename(columns={'cell': 'n_cells'})
+
+            guides = guide_meta.index.tolist()
+
+            # Aggregate x_true from cell-level to guide-level (mean over cells per guide)
+            # Use positional indices (iloc) because meta.index may be cell-name strings
+            guide_to_cell_indices = {
+                g: np.where(self.model.meta['guide'].values == g)[0].tolist()
+                for g in guides
+            }
+
+            # Build [n_samples, n_guides] by averaging cells within each guide
+            n_samples = x_true_cell_samples.shape[0]
+            n_guides = len(guides)
+            x_true_guide_samples = np.zeros((n_samples, n_guides))
+            for gi, g in enumerate(guides):
+                cell_idx = guide_to_cell_indices[g]
+                x_true_guide_samples[:, gi] = x_true_cell_samples[:, cell_idx].mean(axis=1)
+
+            # Compute mean and CI per guide. Under lean loading, x_true_cell_samples
+            # holds each cell's posterior MEDIAN (not mean) as a single "sample" (see
+            # bayesDREAM.io.load._reduce_posterior_samples), so this "mean" is really
+            # the mean of per-cell medians — a standard, reasonable point-estimate
+            # substitution (matches how alpha_x_prefit/alpha_y_prefit already use the
+            # median as their stored point estimate at fit time), but not identical
+            # to the true mean of per-cell posterior means.
+            x_true_mean = x_true_guide_samples.mean(axis=0)
+            _x_true_cell_ci = _lean_ci('x_true') if is_lean_cis else None
+            if _x_true_cell_ci is not None:
+                # Quantile does NOT commute with cell-averaging: the true
+                # guide-level CI needs the per-draw cross-cell average, which
+                # lean mode discarded. Approximate by averaging the per-cell
+                # lower/upper bounds within each guide instead. This is not
+                # exact (ignores cross-cell posterior correlation), but is a
+                # standard interval-averaging approximation.
+                cell_lower, cell_upper = _x_true_cell_ci
+                x_true_lower = np.array([cell_lower[guide_to_cell_indices[g]].mean() for g in guides])
+                x_true_upper = np.array([cell_upper[guide_to_cell_indices[g]].mean() for g in guides])
+                print("[SAVE] cis_guide_summary: x_true CI is lean-mode approximated "
+                      "(mean of per-cell 2.5%/97.5% bounds within each guide, not the "
+                      "true joint per-draw guide-level quantile). Reload with lean=False "
+                      "for an exact CI.")
+            else:
+                x_true_lower = np.quantile(x_true_guide_samples, 0.025, axis=0)
+                x_true_upper = np.quantile(x_true_guide_samples, 0.975, axis=0)
+
+            # Compute average raw counts per guide
+            guide_to_cells = self.model.meta.groupby('guide')['cell'].apply(list).to_dict()
+            raw_counts_mean = []
+            for guide in guides:
+                guide_cells = guide_to_cells.get(guide, [])
+                guide_cell_indices = [i for i, cell in enumerate(self.model.meta['cell']) if cell in guide_cells]
+                if len(guide_cell_indices) > 0:
+                    raw_counts_mean.append(cis_counts[guide_cell_indices].mean())
+                else:
+                    raw_counts_mean.append(np.nan)
+
+            guide_df = pd.DataFrame({
+                'guide': guides,
+                'target': guide_meta['target'].values,
+                'n_cells': guide_meta['n_cells'].values,
+                'x_true_mean': x_true_mean,
+                'x_true_lower': x_true_lower,
+                'x_true_upper': x_true_upper,
+                'raw_counts_mean': raw_counts_mean
+            })
+
+            guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
+            guide_df.to_csv(guide_file, index=False)
+            print(f"[SAVE] Cis guide summary saved to {guide_file}")
+            print(f"       {len(guides)} guides")
+
+        # ── Cell-level summary ────────────────────────────────────────────────
         if include_cell_level:
             cell_data = {
                 'cell': self.model.meta['cell'].values,
-                'guide': self.model.meta['guide'].values,
                 'target': self.model.meta['target'].values,
             }
 
-            # Add cell_line if available
-            if 'cell_line' in self.model.meta.columns:
-                cell_data['cell_line'] = self.model.meta['cell_line'].values
+            # In single-guide mode, include per-cell guide assignment
+            if not is_high_moi:
+                cell_data['guide'] = self.model.meta['guide'].values
 
-            # Use cell-level x_true directly from posterior samples
+            # Add technical_group_code if available
+            if 'technical_group_code' in self.model.meta.columns:
+                cell_data['technical_group_code'] = self.model.meta['technical_group_code'].values
+
+            # Use cell-level x_true directly from posterior samples. Cell-level
+            # CI is exact even under lean loading (no cross-cell aggregation
+            # involved), via the precomputed sibling keys.
             cell_data['x_true_mean'] = x_true_cell_samples.mean(axis=0)
-            cell_data['x_true_lower'] = np.quantile(x_true_cell_samples, 0.025, axis=0)
-            cell_data['x_true_upper'] = np.quantile(x_true_cell_samples, 0.975, axis=0)
+            _x_true_cell_ci2 = _lean_ci('x_true') if is_lean_cis else None
+            if _x_true_cell_ci2 is not None:
+                cell_data['x_true_lower'], cell_data['x_true_upper'] = _x_true_cell_ci2
+            else:
+                cell_data['x_true_lower'] = np.quantile(x_true_cell_samples, 0.025, axis=0)
+                cell_data['x_true_upper'] = np.quantile(x_true_cell_samples, 0.975, axis=0)
             cell_data['raw_counts'] = cis_counts
 
             cell_df = pd.DataFrame(cell_data)
 
-            # Save cell-level
             cell_file = os.path.join(output_dir, 'cis_cell_summary.csv')
             cell_df.to_csv(cell_file, index=False)
-
             print(f"[SAVE] Cis cell summary saved to {cell_file}")
             print(f"       {len(cell_df)} cells")
 
@@ -1274,16 +1454,45 @@ class ModelSummarizer:
     # Trans Fit Summary
     # ========================================================================
 
+    def _subset_posterior_features(self, posterior: dict, n: int, orig_n: int) -> dict:
+        """
+        Return a copy of posterior with each array sliced to the first n features.
+
+        Feature dimension is identified as any axis with size == orig_n.
+        Arrays with no feature dimension (e.g. scalar or sample-only) are kept as-is.
+        """
+        subset = {}
+        for k, v in posterior.items():
+            if isinstance(v, torch.Tensor):
+                v = v.cpu().numpy()
+            if not isinstance(v, np.ndarray):
+                subset[k] = v
+                continue
+            # Find axes whose size == orig_n (the feature dimension)
+            feat_axes = [ax for ax, sz in enumerate(v.shape) if sz == orig_n]
+            if not feat_axes:
+                subset[k] = v  # no feature dim — keep whole array (e.g. scalar params)
+            else:
+                # Slice the first matching axis
+                ax = feat_axes[0]
+                idx = [slice(None)] * v.ndim
+                idx[ax] = slice(None, n)
+                subset[k] = v[tuple(idx)]
+        return subset
+
     def save_trans_summary(
         self,
         output_dir: Optional[str] = None,
         modality_name: Optional[str] = None,
         compute_inflection: bool = True,
-        compute_full_log2fc: bool = True,
         compute_derivative_roots: bool = True,
         compute_log2fc_params: bool = True,
+        compute_lfc_ci: bool = True,
         x_ntc: Optional[float] = None,
         y_ntc=None,
+        verbose: bool = True,
+        max_features: Optional[int] = None,
+        fdr_threshold: float = 0.05,
     ):
         """
         Save trans fit parameters as feature-wise CSV.
@@ -1299,11 +1508,11 @@ class ModelSummarizer:
 
         For negbinom/normal/studentt distributions:
         - observed_log2fc: log2(y_max / y_min) over observed x range from fitted function
-        - full_log2fc_mean/lower/upper: log2(y_max / y_min) over theoretical x range (0 to ∞)
+        - full_log2fc_median/lower/upper: log2(y_max / y_min) over theoretical x range (0 to ∞)
 
         For binomial distributions (e.g., splicing_sj):
         - observed_delta_p: y_max - y_min over observed x range (probability difference)
-        - full_delta_p_mean/lower/upper: y_max - y_min over theoretical x range
+        - full_delta_p_median/lower/upper: y_max - y_min over theoretical x range
 
         FDR columns (all function types):
         - fdr_alpha: Bayesian q-value for component A (positive Hill, or the single Hill
@@ -1317,22 +1526,41 @@ class ModelSummarizer:
         - fdr_beta:  Bayesian q-value for component B (negative Hill).  NaN for
                      single_hill and polynomial.  Computed in the same pooled family as
                      fdr_alpha for additive_hill.
+        - is_dependent: True if the gene has a genuine (non-degenerate) dose-response:
+                     (fdr_alpha < fdr_threshold AND n_a's 95% CI excludes 0) OR
+                     (fdr_beta < fdr_threshold AND n_b's 95% CI excludes 0).
+                     Guards against the case where a component is FDR-significant purely
+                     because alpha/beta absorbed a constant offset while n_a/n_b ≈ 0
+                     (flat Hill, unidentified K) — see FIT_TRANS_DESIGN_DECISIONS.md §12.
+                     NaN for polynomial (no sparsity indicator to threshold).
+        - fit_type:  Per-feature functional form actually supported by the data, using
+                     the same per-component (fdr < fdr_threshold) AND (n's 95% CI
+                     excludes 0) criterion as is_dependent:
+                     - 'additive_hill': both component A and component B are active
+                     - 'single_hill':   exactly one of component A / component B is active
+                     - 'not_dependent': neither component is active
+                     NaN for polynomial (no Hill components to test).
+        - which_active: Which component(s) are active, using the same criterion as
+                     fit_type: 'a', 'b', 'both', or NaN if neither is active (or
+                     polynomial). Mainly informative when fit_type == 'single_hill',
+                     to distinguish which of the two Hill components (A vs B) is the
+                     one supported by the data.
 
         For additive_hill (all parameters needed to recreate: y = A + alpha*Vmax_a*Hill(x;K_a,n_a) + beta*Vmax_b*Hill(x;K_b,n_b)):
-        - A_mean, A_lower, A_upper: Baseline (intercept)
-        - Vmax_a_mean, Vmax_a_lower, Vmax_a_upper: Component A magnitude
-        - K_a_mean, K_a_lower, K_a_upper: Component A half-max (EC50)
-        - EC50_a_mean, EC50_a_lower, EC50_a_upper: Same as K_a (alias)
-        - n_a_mean, n_a_lower, n_a_upper: Component A Hill coefficient (cooperativity)
-        - alpha_mean, alpha_lower, alpha_upper: Component A weight
-        - Vmax_b_mean, Vmax_b_lower, Vmax_b_upper: Component B magnitude
-        - K_b_mean, K_b_lower, K_b_upper: Component B half-max (EC50)
-        - EC50_b_mean, EC50_b_lower, EC50_b_upper: Same as K_b (alias)
-        - n_b_mean, n_b_lower, n_b_upper: Component B Hill coefficient (cooperativity)
-        - beta_mean, beta_lower, beta_upper: Component B weight
-        - pi_y_mean, pi_y_lower, pi_y_upper: Sparsity weight (optional)
-        - inflection_a_mean, inflection_a_lower, inflection_a_upper: Component A inflection x
-        - inflection_b_mean, inflection_b_lower, inflection_b_upper: Component B inflection x
+        - A_median, A_lower, A_upper: Baseline (intercept)
+        - Vmax_a_median, Vmax_a_lower, Vmax_a_upper: Component A magnitude
+        - K_a_median, K_a_lower, K_a_upper: Component A half-max (EC50)
+        - EC50_a_median, EC50_a_lower, EC50_a_upper: Same as K_a (alias)
+        - n_a_median, n_a_lower, n_a_upper: Component A Hill coefficient (cooperativity)
+        - alpha_median, alpha_lower, alpha_upper: Component A weight
+        - Vmax_b_median, Vmax_b_lower, Vmax_b_upper: Component B magnitude
+        - K_b_median, K_b_lower, K_b_upper: Component B half-max (EC50)
+        - EC50_b_median, EC50_b_lower, EC50_b_upper: Same as K_b (alias)
+        - n_b_median, n_b_lower, n_b_upper: Component B Hill coefficient (cooperativity)
+        - beta_median, beta_lower, beta_upper: Component B weight
+        - pi_y_median, pi_y_lower, pi_y_upper: Sparsity weight (optional)
+        - inflection_a_median, inflection_a_lower, inflection_a_upper: Component A inflection x
+        - inflection_b_median, inflection_b_lower, inflection_b_upper: Component B inflection x
         - classification: Function shape classification based on dependency masks:
           - 'single_positive': Only one Hill component active, with positive n (increasing)
           - 'single_negative': Only one Hill component active, with negative n (decreasing)
@@ -1341,9 +1569,9 @@ class ModelSummarizer:
           - 'non_monotonic_min': Both active, opposite signs, concave up at x=x_ntc (local min)
           - 'non_monotonic_max': Both active, opposite signs, concave down at x=x_ntc (local max)
           - 'flat': No active components
-        - first_deriv_roots_mean: Roots of first derivative (x values where dy/dx=0)
-        - second_deriv_roots_mean: Roots of second derivative (x values where d²y/dx²=0, inflections)
-        - third_deriv_roots_mean: Roots of third derivative (x values where d³y/dx³=0)
+        - first_deriv_roots_median: Roots of first derivative (x values where dy/dx=0)
+        - second_deriv_roots_median: Roots of second derivative (x values where d²y/dx²=0, inflections)
+        - third_deriv_roots_median: Roots of third derivative (x values where d³y/dx³=0)
         - n_first_deriv_roots: Number of first derivative roots (0 for monotonic)
         - n_second_deriv_roots: Number of second derivative roots (inflection points)
         - n_third_deriv_roots: Number of third derivative roots
@@ -1353,15 +1581,15 @@ class ModelSummarizer:
         - y_ntc: NTC mean for each trans gene
         - log2fc_at_u0: log2FC value at u=0 (x = x_ntc), i.e., g(0) = log2(y(x_ntc)) - log2(y_ntc)
         - EC50_a_log2fc, EC50_b_log2fc: EC50 in log2FC x-space (log2(K) - log2(x_ntc))
-        - inflection_a_log2fc, inflection_b_log2fc: Inflection points in log2FC x-space
+        - inflection_a_log2fc_median, inflection_b_log2fc_median: Inflection points in log2FC x-space
 
         For negbinom/normal/studentt (log2FC y-space):
         - dg_du_at_u0, dg_du_at_u0_lower, dg_du_at_u0_upper: First derivative of log2FC at u=0 with 95% CI
         - d2g_du2_at_u0, d2g_du2_at_u0_lower, d2g_du2_at_u0_upper: Second derivative at u=0 with 95% CI
         - d3g_du3_at_u0, d3g_du3_at_u0_lower, d3g_du3_at_u0_upper: Third derivative at u=0 with 95% CI
-        - first_deriv_roots_log2fc_mean: Roots of dg/du=0 in u-space (g = log2(y) - log2(y_ntc))
-        - second_deriv_roots_log2fc_mean: Roots of d²g/du²=0
-        - third_deriv_roots_log2fc_mean: Roots of d³g/du³=0
+        - first_deriv_roots_log2fc_median: Roots of dg/du=0 in u-space (g = log2(y) - log2(y_ntc))
+        - second_deriv_roots_log2fc_median: Roots of d²g/du²=0
+        - third_deriv_roots_log2fc_median: Roots of d³g/du³=0
         - A_log2fc: Baseline in log2FC y-space (log2(A) - log2(y_ntc))
 
         For binomial distributions (delta_p y-space):
@@ -1369,25 +1597,27 @@ class ModelSummarizer:
         - dp_du_at_u0, dp_du_at_u0_lower, dp_du_at_u0_upper: First derivative of delta_p at u=0 with 95% CI
         - d2p_du2_at_u0, d2p_du2_at_u0_lower, d2p_du2_at_u0_upper: Second derivative at u=0 with 95% CI
         - d3p_du3_at_u0, d3p_du3_at_u0_lower, d3p_du3_at_u0_upper: Third derivative at u=0 with 95% CI
-        - first_deriv_roots_delta_p_mean: Roots of dp/du=0 in u-space
-        - second_deriv_roots_delta_p_mean: Roots of d²p/du²=0
-        - third_deriv_roots_delta_p_mean: Roots of d³p/du³=0
+        - first_deriv_roots_delta_p_median: Roots of dp/du=0 in u-space
+        - second_deriv_roots_delta_p_median: Roots of d²p/du²=0
+        - third_deriv_roots_delta_p_median: Roots of d³p/du³=0
         - A_delta_p: Baseline in delta_p space (A - y_ntc)
 
         For single_hill:
-        - B_mean, B_lower, B_upper: Hill magnitude
-        - K_mean, K_lower, K_upper: Hill coefficient
-        - xc_mean, xc_lower, xc_upper: Half-max point (EC50 or IC50)
-        - inflection_mean, inflection_lower, inflection_upper: Inflection x
-        - full_log2fc_mean, full_log2fc_lower, full_log2fc_upper: Full dynamic range
+        - B_median, B_lower, B_upper: Hill magnitude
+        - K_median, K_lower, K_upper: Hill coefficient
+        - xc_median, xc_lower, xc_upper: Half-max point (EC50 or IC50)
+        - inflection_median, inflection_lower, inflection_upper: Inflection x
+        - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
 
         For polynomial:
-        - coef_{i}_mean, coef_{i}_lower, coef_{i}_upper: Coefficient i
-        - full_log2fc_mean, full_log2fc_lower, full_log2fc_upper: Full dynamic range
+        - coef_{i}_median, coef_{i}_lower, coef_{i}_upper: Coefficient i
+        - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
 
         Overdispersion and technical group effects (for simulation):
-        - phi_y_mean, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2)
-        - group_{g}_alpha_y_mean: Technical group effect for group g (from fit_technical)
+        - phi_y_median, phi_y_lower, phi_y_upper: NB overdispersion (phi_y = 1/o_y^2) from fit_trans
+        - o_y_median, o_y_lower, o_y_upper: Posterior o_y (sqrt overdispersion) from fit_trans
+        - o_y_ntc_median: Median o_y from fit_ntc (posterior_samples_ntc)
+        - group_{g}_alpha_y_median: Technical group effect for group g (median, from fit_ntc)
 
         Parameters
         ----------
@@ -1397,8 +1627,6 @@ class ModelSummarizer:
             Modality to export (default: primary modality)
         compute_inflection : bool
             Whether to compute inflection points for Hill functions (default: True)
-        compute_full_log2fc : bool
-            Whether to compute full log2FC range (default: True)
         compute_derivative_roots : bool
             Whether to compute roots of first and second derivatives (default: True).
             Roots are found empirically over the observed x_range.
@@ -1406,16 +1634,27 @@ class ModelSummarizer:
             If True (default), compute parameters in log2FC space relative to NTC:
             - x-axis: log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
             - y-axis: log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
-            Requires posterior_samples_technical to be available, or x_ntc/y_ntc to be
+            Requires posterior_samples_ntc to be available, or x_ntc/y_ntc to be
             provided manually.
         x_ntc : float, optional
             Manually provided NTC mean for the cis gene (x-axis reference point).
-            If None (default), computed from posterior_samples_technical of the cis modality.
+            If None (default), computed from posterior_samples_ntc of the cis modality.
             Useful when fit_technical was not run (e.g., single-group subsets).
         y_ntc : array-like, optional
             Manually provided NTC means for each trans feature (y-axis reference points).
-            Shape: (n_features,). If None (default), computed from posterior_samples_technical
+            Shape: (n_features,). If None (default), computed from posterior_samples_ntc
             of the trans modality.
+        compute_lfc_ci : bool
+            If True (default), compute 95% credible intervals for observed_log2fc and
+            full_log2fc by iterating over all posterior samples. This is the main
+            bottleneck for large feature sets (~1.5h for 20k features × 1000 samples).
+            Set to False to skip the CI loops and use the posterior mean for lower/upper
+            bounds instead. EC50_log2fc, inflection_log2fc, and all parameter CIs are
+            unaffected — they remain fast vectorised computations.
+        fdr_threshold : float
+            Threshold on fdr_alpha/fdr_beta used to compute the `is_dependent` column
+            (default: 0.05). Does not affect the `classification` column, which uses
+            its own internal default independently.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -1427,8 +1666,8 @@ class ModelSummarizer:
         modality = self.model.get_modality(modality_name)
 
         # Check if trans fit has been run for this modality
-        # Primary modality: check model-level posterior (backward compatibility)
-        # Non-primary modality: check modality-level posterior
+        # Primary modality: use model-level posterior (model.posterior_samples_trans)
+        # Non-primary modality: use modality-level posterior
         if modality_name == self.model.primary_modality:
             if not hasattr(self.model, 'posterior_samples_trans') or self.model.posterior_samples_trans is None:
                 raise ValueError(f"Trans fit not found for primary modality '{modality_name}'. Run fit_trans() first.")
@@ -1448,36 +1687,46 @@ class ModelSummarizer:
         if modality.distribution == 'multinomial' and feature_meta is not None and len(feature_meta) > 0:
             if 'n_categories' in feature_meta.columns:
                 n_cats_per_feature = feature_meta['n_categories'].values.astype(int)
+        # modality.feature_names is populated by Modality.__init__ for every
+        # construction path (explicit, DataFrame index/columns, or resolved
+        # from feature_meta via resolve_feature_names()) and deduped there —
+        # this is the single source of truth, no need to re-derive it here.
         if modality.feature_names is not None:
-            # First priority: use modality.feature_names (this is what users see)
             feature_names = modality.feature_names
-        elif feature_meta is not None and len(feature_meta) > 0:
-            # Fallback: try feature_meta columns or index
-            # Check if index is integer-based (RangeIndex or integer dtype)
-            index_is_integer = (
-                isinstance(feature_meta.index, pd.RangeIndex) or
-                feature_meta.index.dtype in ['int64', 'int32', 'int']
-            )
-
-            if index_is_integer:
-                # Prefer named columns for feature identifiers
-                if 'gene' in feature_meta.columns:
-                    feature_names = feature_meta['gene'].tolist()
-                elif 'gene_name' in feature_meta.columns:
-                    feature_names = feature_meta['gene_name'].tolist()
-                elif 'feature' in feature_meta.columns:
-                    feature_names = feature_meta['feature'].tolist()
-                else:
-                    # Fall back to index
-                    feature_names = feature_meta.index.tolist()
-            else:
-                # Index is named, use it
-                feature_names = feature_meta.index.tolist()
         else:
-            # No feature_names or feature_meta, use range
+            # No feature_names or feature_meta at all
             feature_names = list(range(modality.counts.shape[0]))
 
+        # feature_names must be unique: it becomes the 'feature' column, which
+        # downstream code (plot_xy_data's dep_lookup/fdr_lookup, groupby, the
+        # feature_meta merge below, user analysis) treats as a per-row key.
+        # A silently non-unique key causes either lossy dict-based lookups or,
+        # worse, an unrestricted many-to-many merge that multiplies rows.
+        _fn_series = pd.Series(feature_names, dtype=str)
+        if not _fn_series.is_unique:
+            _dupes = _fn_series[_fn_series.duplicated()].unique().tolist()
+            raise ValueError(
+                f"Resolved feature names for modality '{modality_name}' are not unique "
+                f"({len(_dupes)} duplicated value(s), e.g. {_dupes[:5]}). "
+                "This usually means feature_meta lacks a proper per-feature identifier "
+                "column (e.g. 'feature_id') and fell back to a many-to-one column "
+                "like 'gene'. Set modality.feature_names explicitly or add a unique "
+                "'feature_id' column to feature_meta."
+            )
+
         n_features = len(feature_names)
+
+        # Optionally limit to first N features (useful for testing / debugging speed)
+        if max_features is not None and max_features < n_features:
+            _orig_n = n_features
+            feature_names = feature_names[:max_features]
+            n_features = max_features
+            if n_cats_per_feature is not None:
+                n_cats_per_feature = n_cats_per_feature[:max_features]
+            posterior = self._subset_posterior_features(posterior, max_features, _orig_n)
+            if verbose:
+                print(f"[save_trans_summary] max_features={max_features}: "
+                      f"using first {max_features} of {_orig_n} features")
 
         # Determine function type from posterior keys
         keys = set(posterior.keys())
@@ -1530,41 +1779,79 @@ class ModelSummarizer:
             data['x_obs_max'] = x_obs_max
 
 
-        # Get x_ntc and y_ntc for log2FC parameter computation
-        # Use manually provided values if given, otherwise try to compute from technical fit
+        # Get x_ntc and y_ntc for log2FC parameter computation.
+        # Always look these up and add to data if found — they are useful metadata
+        # regardless of whether compute_log2fc_params is True.
         _x_ntc = float(x_ntc) if x_ntc is not None else None
         _y_ntc = np.asarray(y_ntc) if y_ntc is not None else None
 
-        if compute_log2fc_params:
-            # Get x_ntc from cis modality's technical fit (if not manually provided)
-            if _x_ntc is None:
+        # x_ntc: from cis modality's technical fit (mu_ntc averaged over samples/groups)
+        if _x_ntc is None:
+            try:
                 cis_mod = self.model.get_modality('cis')
-                if hasattr(cis_mod, 'posterior_samples_technical') and cis_mod.posterior_samples_technical is not None:
-                    if 'mu_ntc' in cis_mod.posterior_samples_technical:
-                        mu_ntc_cis = cis_mod.posterior_samples_technical['mu_ntc']
+                if hasattr(cis_mod, 'posterior_samples_ntc') and cis_mod.posterior_samples_ntc is not None:
+                    if 'mu_ntc' in cis_mod.posterior_samples_ntc:
+                        mu_ntc_cis = cis_mod.posterior_samples_ntc['mu_ntc']
                         if isinstance(mu_ntc_cis, torch.Tensor):
                             mu_ntc_cis = mu_ntc_cis.cpu().numpy()
-                        # mu_ntc is [n_samples, n_groups, 1] for cis (single gene)
-                        # Average over samples and groups to get scalar x_ntc
                         _x_ntc = float(mu_ntc_cis.mean())
+            except Exception:
+                pass
 
-            if _x_ntc is not None:
-                data['x_ntc'] = _x_ntc
+        # y_ntc: from trans modality's technical fit (mu_ntc averaged over posterior samples → [T])
+        if _y_ntc is None:
+            if hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
+                if 'mu_ntc' in modality.posterior_samples_ntc:
+                    mu_ntc_trans = modality.posterior_samples_ntc['mu_ntc']
+                    if isinstance(mu_ntc_trans, torch.Tensor):
+                        mu_ntc_trans = mu_ntc_trans.cpu().numpy()
+                    while mu_ntc_trans.ndim > 2:
+                        mu_ntc_trans = mu_ntc_trans.mean(axis=0)
+                    _y_ntc = mu_ntc_trans.mean(axis=0)
 
-            # Get y_ntc from trans modality's technical fit (per-feature, if not manually provided)
-            if _y_ntc is None:
-                if hasattr(modality, 'posterior_samples_technical') and modality.posterior_samples_technical is not None:
-                    if 'mu_ntc' in modality.posterior_samples_technical:
-                        mu_ntc_trans = modality.posterior_samples_technical['mu_ntc']
-                        if isinstance(mu_ntc_trans, torch.Tensor):
-                            mu_ntc_trans = mu_ntc_trans.cpu().numpy()
-                        # mu_ntc is [n_samples, n_groups, n_features]
-                        # Average over samples and groups to get [n_features] y_ntc
-                        _y_ntc = mu_ntc_trans.mean(axis=(0, 1))
+        # Subset y_ntc to match max_features if applied
+        if max_features is not None and _y_ntc is not None:
+            _y_ntc_arr = np.asarray(_y_ntc)
+            if _y_ntc_arr.ndim >= 1 and _y_ntc_arr.shape[0] > max_features:
+                _y_ntc = _y_ntc_arr[:max_features]
 
-            if _y_ntc is not None:
-                data['y_ntc'] = _y_ntc
+        # Guard: y_ntc must match n_features.  A common cause of mismatch is that
+        # posterior_samples_ntc['mu_ntc'] was not subsetted when the modality was
+        # subsetted to fewer features (e.g. a random 100-gene subset).  When the
+        # modality has feature_names we try to align by name; otherwise we fall back
+        # to discarding y_ntc so the rest of the summary still completes.
+        if _y_ntc is not None and np.asarray(_y_ntc).shape[0] != n_features:
+            _y_ntc_arr = np.asarray(_y_ntc)
+            aligned = False
+            # Try name-based alignment
+            ntc_feat_names = None
+            if (hasattr(modality, 'posterior_samples_ntc')
+                    and isinstance(modality.posterior_samples_ntc, dict)):
+                ntc_feat_names = modality.posterior_samples_ntc.get('feature_names')
+            cur_feat_names = getattr(modality, 'feature_names', None)
+            if ntc_feat_names is not None and cur_feat_names is not None:
+                ntc_idx_map = {n: i for i, n in enumerate(ntc_feat_names)}
+                subset_idx = [ntc_idx_map.get(n, -1) for n in cur_feat_names]
+                if all(si >= 0 for si in subset_idx):
+                    _y_ntc = _y_ntc_arr[subset_idx]
+                    aligned = True
+            if not aligned:
+                print(
+                    f"[WARNING] y_ntc length ({_y_ntc_arr.shape[0]}) does not match "
+                    f"n_features ({n_features}) and cannot be aligned by feature name. "
+                    f"y_ntc will be ignored for log2FC computation. "
+                    f"To fix: subset posterior_samples_ntc['mu_ntc'] to match the current "
+                    f"modality features, or pass y_ntc manually to save_trans_summary()."
+                )
+                _y_ntc = None
 
+        # Always add x_ntc / y_ntc to data if available (useful metadata even without log2fc params)
+        if _x_ntc is not None:
+            data['x_ntc'] = _x_ntc
+        if _y_ntc is not None:
+            data['y_ntc'] = _y_ntc
+
+        if compute_log2fc_params:
             if _x_ntc is None:
                 print("[WARNING] Cannot compute log2FC params: x_ntc not available from cis modality. "
                       "Provide x_ntc manually to save_trans_summary().")
@@ -1575,44 +1862,122 @@ class ModelSummarizer:
                 compute_log2fc_params = False
 
         # Add function-specific parameters
+        _S = next((v.shape[0] for v in posterior.values()
+                   if isinstance(v, (np.ndarray, torch.Tensor)) and
+                   (v.numpy() if isinstance(v, torch.Tensor) else v).ndim >= 2), '?')
+        if verbose:
+            print(f"\n[save_trans_summary] function_type={function_type}  "
+                  f"n_features={n_features}  posterior_samples={_S}")
+            print(f"  compute_derivative_roots={compute_derivative_roots}  "
+                  f"compute_log2fc_params={compute_log2fc_params}  "
+                  f"compute_inflection={compute_inflection}")
+            print(f"  x_ntc={'set' if _x_ntc is not None else 'None'}  "
+                  f"y_ntc={'set' if _y_ntc is not None else 'None'}")
+        _t0 = time.time()
+
         if function_type == 'additive_hill':
             data = self._add_additive_hill_params(
                 data, posterior, n_features,
-                compute_inflection, compute_full_log2fc,
+                compute_inflection,
                 compute_derivative_roots, x_range,
                 compute_log2fc_params, _x_ntc, _y_ntc,
                 x_obs_min, x_obs_max,
-                n_cats_per_feature=n_cats_per_feature
+                n_cats_per_feature=n_cats_per_feature,
+                compute_lfc_ci=compute_lfc_ci,
+                verbose=verbose,
             )
         elif function_type == 'single_hill':
             data = self._add_single_hill_params(
                 data, posterior, n_features,
                 compute_inflection=compute_inflection,
-                compute_full_log2fc=compute_full_log2fc,
                 compute_derivative_roots=compute_derivative_roots,
                 x_range=x_range,
                 x_obs_min=x_obs_min,
                 x_obs_max=x_obs_max,
                 compute_log2fc_params=compute_log2fc_params,
+                compute_lfc_ci=compute_lfc_ci,
                 x_ntc=_x_ntc,
-                y_ntc=_y_ntc
+                y_ntc=_y_ntc,
+                verbose=verbose,
             )
         elif function_type == 'polynomial':
             data = self._add_polynomial_params(
                 data, posterior, n_features,
-                compute_full_log2fc=compute_full_log2fc,
                 compute_derivative_roots=compute_derivative_roots,
+                compute_log2fc_params=compute_log2fc_params,
                 x_range=x_range,
                 x_obs_min=x_obs_min,
-                x_obs_max=x_obs_max
+                x_obs_max=x_obs_max,
+                verbose=verbose,
             )
+        if verbose:
+            print(f"  _add_{function_type}_params: {time.time() - _t0:.1f}s")
 
         # Compute Bayesian q-values (FDR columns) for Hill components
+        _t0 = time.time()
         fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features,
                                               n_cats_per_feature=n_cats_per_feature)
         data.update(fdr_cols)
+        if verbose:
+            print(f"  _compute_bayesian_fdr:      {time.time() - _t0:.1f}s")
+
+        # is_dependent: FDR-significant AND the corresponding Hill exponent's CI
+        # excludes 0, guarding against alpha/beta being "significant" purely from a
+        # constant offset while n_a/n_b ≈ 0 (flat Hill, unidentified K).
+        if function_type == 'polynomial':
+            data['is_dependent'] = np.full(n_features, np.nan)
+        else:
+            fdr_alpha_arr = np.asarray(data['fdr_alpha'], dtype=float)
+            fdr_beta_arr = np.asarray(data['fdr_beta'], dtype=float)
+            n_a_lower_arr = np.asarray(data.get('n_a_lower', np.full(n_features, np.nan)), dtype=float)
+            n_a_upper_arr = np.asarray(data.get('n_a_upper', np.full(n_features, np.nan)), dtype=float)
+            n_b_lower_arr = np.asarray(data.get('n_b_lower', np.full(n_features, np.nan)), dtype=float)
+            n_b_upper_arr = np.asarray(data.get('n_b_upper', np.full(n_features, np.nan)), dtype=float)
+
+            n_a_excludes_zero = ~((n_a_lower_arr <= 0) & (0 <= n_a_upper_arr))
+            n_b_excludes_zero = ~((n_b_lower_arr <= 0) & (0 <= n_b_upper_arr))
+
+            active_a = (fdr_alpha_arr < fdr_threshold) & n_a_excludes_zero
+            active_b = (fdr_beta_arr < fdr_threshold) & n_b_excludes_zero
+            data['is_dependent'] = active_a | active_b
+
+        # fit_type: per-feature functional form actually supported by the data, based
+        # on the same (fdr < threshold) AND (n CI excludes 0) criterion used for
+        # is_dependent, applied per-component:
+        #   - 'additive_hill': both component A and component B are active
+        #   - 'single_hill':   exactly one of component A / component B is active
+        #   - 'not_dependent': neither component is active
+        # NaN for polynomial (no Hill components to test).
+        if function_type == 'polynomial':
+            data['fit_type'] = np.full(n_features, np.nan, dtype=object)
+            data['which_active'] = np.full(n_features, np.nan, dtype=object)
+        else:
+            fit_type = np.full(n_features, 'not_dependent', dtype=object)
+            fit_type[active_a & active_b] = 'additive_hill'
+            fit_type[active_a ^ active_b] = 'single_hill'
+            data['fit_type'] = fit_type
+
+            # which_active: which component(s) drove fit_type — 'a', 'b', 'both', or
+            # NaN when neither is active. Kept separate from fit_type so fit_type
+            # stays a plain equality-filterable field.
+            which_active = np.full(n_features, np.nan, dtype=object)
+            which_active[active_a & ~active_b] = 'a'
+            which_active[active_b & ~active_a] = 'b'
+            which_active[active_a & active_b] = 'both'
+            data['which_active'] = which_active
+
+            if verbose:
+                n_add = int(np.sum(fit_type == 'additive_hill'))
+                n_single = int(np.sum(fit_type == 'single_hill'))
+                n_flat = int(np.sum(fit_type == 'not_dependent'))
+                n_single_a = int(np.sum(which_active == 'a'))
+                n_single_b = int(np.sum(which_active == 'b'))
+                print(f"  fit_type: additive_hill={n_add}  single_hill={n_single}  "
+                      f"not_dependent={n_flat}  (fdr_threshold={fdr_threshold})")
+                print(f"  which_active (of single_hill): a={n_single_a}  b={n_single_b}")
 
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
+        # Also add o_y directly.
         if 'o_y' in posterior:
             o_y = posterior['o_y']
             if isinstance(o_y, torch.Tensor):
@@ -1622,13 +1987,32 @@ class ModelSummarizer:
                 o_y = o_y.squeeze(1)
             phi_y = 1.0 / (o_y ** 2)
             if phi_y.ndim >= 2:
-                data['phi_y_mean'] = phi_y.mean(axis=0)
+                data['phi_y_median'] = np.median(phi_y, axis=0)
                 data['phi_y_lower'] = np.quantile(phi_y, 0.025, axis=0)
                 data['phi_y_upper'] = np.quantile(phi_y, 0.975, axis=0)
+                data['o_y_median'] = np.median(o_y, axis=0)
+                data['o_y_lower'] = np.quantile(o_y, 0.025, axis=0)
+                data['o_y_upper'] = np.quantile(o_y, 0.975, axis=0)
             else:
-                data['phi_y_mean'] = phi_y
+                data['phi_y_median'] = phi_y
                 data['phi_y_lower'] = phi_y
                 data['phi_y_upper'] = phi_y
+                data['o_y_median'] = o_y
+                data['o_y_lower'] = o_y
+                data['o_y_upper'] = o_y
+
+        # Add fit_ntc o_y (median across posterior samples, per feature)
+        ps_ntc = getattr(modality, 'posterior_samples_ntc', None) or {}
+        ntc_oy = ps_ntc.get('o_y')
+        if ntc_oy is not None:
+            if isinstance(ntc_oy, torch.Tensor):
+                ntc_oy = ntc_oy.cpu().numpy()
+            if ntc_oy.ndim == 3 and ntc_oy.shape[1] == 1:
+                ntc_oy = ntc_oy.squeeze(1)
+            if ntc_oy.ndim >= 2:
+                data['o_y_ntc_median'] = np.median(ntc_oy, axis=0)[:n_features]
+            else:
+                data['o_y_ntc_median'] = ntc_oy[:n_features]
 
         # Add alpha_y (technical group effects) from modality.alpha_y_prefit
         if hasattr(modality, 'alpha_y_prefit') and modality.alpha_y_prefit is not None:
@@ -1641,47 +2025,48 @@ class ModelSummarizer:
                 alpha_y_tech = modality.alpha_y_prefit
             if isinstance(alpha_y_tech, torch.Tensor):
                 alpha_y_tech = alpha_y_tech.cpu().numpy()
-            # Shape: [n_samples, n_groups, n_features] (posterior) or [n_groups, n_features] (point)
+            # Shape: [n_samples, n_groups, n_features] (legacy posterior) or [n_groups, n_features] (point)
             if alpha_y_tech.ndim == 3:
-                alpha_y_mean = alpha_y_tech.mean(axis=0)  # [n_groups, n_features]
+                alpha_y_median = np.median(alpha_y_tech, axis=0)  # [n_groups, n_features]
             elif alpha_y_tech.ndim == 2:
-                alpha_y_mean = alpha_y_tech  # already [n_groups, n_features]
+                alpha_y_median = alpha_y_tech  # already [n_groups, n_features] point estimate
             else:
-                alpha_y_mean = None
-            if alpha_y_mean is not None and alpha_y_mean.ndim == 2:
-                n_groups = alpha_y_mean.shape[0]
+                alpha_y_median = None
+            if alpha_y_median is not None and alpha_y_median.ndim == 2:
+                n_groups = alpha_y_median.shape[0]
                 for g in range(n_groups):
-                    data[f'group_{g}_alpha_y_mean'] = alpha_y_mean[g, :]
+                    data[f'group_{g}_alpha_y_median'] = alpha_y_median[g, :n_features]
 
         df = pd.DataFrame(data)
+        df['feature'] = df['feature'].astype(str)
 
-        # Merge with feature_meta from modality
+        # Attach feature_meta columns from modality.
+        #
+        # This is a positional attach, not a key-based merge: feature_names (and
+        # therefore every row of `data`/`df`) was built directly from feature_meta's
+        # own rows/index above, in the same order, and optionally truncated to the
+        # first `max_features` rows. So feature_meta's rows are guaranteed row-aligned
+        # with df's rows by construction — merging on a guessed key column (e.g.
+        # 'gene') is both unnecessary and dangerous: 'gene' is many-to-one (many SJs
+        # share a gene), and merge(..., how='left') with no validate= silently turns
+        # that into an unrestricted many-to-many join, multiplying rows in the output.
         if modality.feature_meta is not None and len(modality.feature_meta) > 0:
-            # Reset index to get feature names as a column for merging
             feature_meta_df = modality.feature_meta.reset_index()
-            # Rename index column to avoid conflicts
             if 'index' in feature_meta_df.columns:
                 feature_meta_df = feature_meta_df.rename(columns={'index': 'feature_meta_idx'})
+            feature_meta_df = feature_meta_df.iloc[:n_features]
 
-            # Ensure feature column is string type for consistent merging
-            df['feature'] = df['feature'].astype(str)
+            if len(feature_meta_df) != len(df):
+                raise ValueError(
+                    f"feature_meta row count ({len(feature_meta_df)}) does not match "
+                    f"trans summary row count ({len(df)}) for modality '{modality_name}' "
+                    "after truncation — feature_meta is not row-aligned with the fitted "
+                    "features, so its columns cannot be safely attached."
+                )
 
-            # Merge on feature names - try to match by index or common columns
-            if 'feature' in feature_meta_df.columns:
-                feature_meta_df['feature'] = feature_meta_df['feature'].astype(str)
-                df = df.merge(feature_meta_df, on='feature', how='left')
-            elif 'gene' in feature_meta_df.columns:
-                feature_meta_df['gene'] = feature_meta_df['gene'].astype(str)
-                df = df.merge(feature_meta_df, left_on='feature', right_on='gene', how='left')
-            elif 'gene_name' in feature_meta_df.columns:
-                feature_meta_df['gene_name'] = feature_meta_df['gene_name'].astype(str)
-                df = df.merge(feature_meta_df, left_on='feature', right_on='gene_name', how='left')
-            else:
-                # Try direct concatenation if feature order matches
-                if len(feature_meta_df) == len(df):
-                    for col in feature_meta_df.columns:
-                        if col not in df.columns:
-                            df[col] = feature_meta_df[col].values
+            for col in feature_meta_df.columns:
+                if col not in df.columns:
+                    df[col] = feature_meta_df[col].values
 
         # Save
         os.makedirs(output_dir, exist_ok=True)
@@ -2006,11 +2391,11 @@ class ModelSummarizer:
         # Unknown function type — return NaN
         return {'fdr_alpha': nan_col.copy(), 'fdr_beta': nan_col.copy()}
 
-    def _add_additive_hill_params(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
+    def _add_additive_hill_params(self, data, posterior, n_features, compute_inflection,
                                     compute_derivative_roots=True, x_range=None,
                                     compute_log2fc_params=False, x_ntc=None, y_ntc=None,
                                     x_obs_min=None, x_obs_max=None, fdr_threshold=0.05,
-                                    n_cats_per_feature=None):
+                                    n_cats_per_feature=None, compute_lfc_ci=True, verbose=False):
         """
         Add additive Hill parameters to data dict.
 
@@ -2033,11 +2418,13 @@ class ModelSummarizer:
             )
 
         return self._add_additive_hill_params_individual(
-            data, posterior, n_features, compute_inflection, compute_full_log2fc,
+            data, posterior, n_features, compute_inflection,
             compute_derivative_roots, x_range,
             compute_log2fc_params, x_ntc, y_ntc, x_obs_min, x_obs_max,
             fdr_threshold=fdr_threshold,
-            n_cats_per_feature=n_cats_per_feature
+            n_cats_per_feature=n_cats_per_feature,
+            compute_lfc_ci=compute_lfc_ci,
+            verbose=verbose,
         )
 
     # Helper function to compute y(x) given parameters
@@ -2058,11 +2445,11 @@ class ModelSummarizer:
     
         return out if np.isfinite(out) else np.nan
 
-    def _add_additive_hill_params_individual(self, data, posterior, n_features, compute_inflection, compute_full_log2fc,
+    def _add_additive_hill_params_individual(self, data, posterior, n_features, compute_inflection,
                                               compute_derivative_roots=True, x_range=None,
                                               compute_log2fc_params=False, x_ntc=None, y_ntc=None,
                                               x_obs_min=None, x_obs_max=None, fdr_threshold=0.05,
-                                              n_cats_per_feature=None):
+                                              n_cats_per_feature=None, compute_lfc_ci=True, verbose=False):
         """
         Add additive Hill parameters from individual parameter architecture (Vmax_a, K_a, n_a, etc.).
 
@@ -2111,7 +2498,7 @@ class ModelSummarizer:
                     if param.ndim > 2:
                         param = param.mean(axis=tuple(range(2, param.ndim)))
 
-                mean_val = param.mean(axis=0)
+                mean_val = np.median(param, axis=0)
                 lower_val = np.quantile(param, 0.025, axis=0)
                 upper_val = np.quantile(param, 0.975, axis=0)
             else:
@@ -2157,55 +2544,56 @@ class ModelSummarizer:
                     param = param.mean(axis=tuple(range(2, param.ndim)))
         
             param_abs = np.abs(param)
-        
+
             if param_abs.ndim >= 2:
-                mean_val = param_abs.mean(axis=0)
+                mean_val = np.median(param_abs, axis=0)
                 lower_val = np.quantile(param_abs, 0.025, axis=0)
                 upper_val = np.quantile(param_abs, 0.975, axis=0)
             else:
                 mean_val = lower_val = upper_val = param_abs
-        
-            return mean_val, lower_val, upper_val
-        
-        # Component A (first Hill function)
-        Vmax_a_mean, Vmax_a_lower, Vmax_a_upper = extract_param('Vmax_a')
-        K_a_mean, K_a_lower, K_a_upper = extract_param('K_a')  # EC50
-        n_a_mean, n_a_lower, n_a_upper = extract_param('n_a')  # Hill coefficient
 
-        data['Vmax_a_mean'] = Vmax_a_mean
+            return mean_val, lower_val, upper_val
+
+        # Component A (first Hill function)
+        Vmax_a_median, Vmax_a_lower, Vmax_a_upper = extract_param('Vmax_a')
+        K_a_median, K_a_lower, K_a_upper = extract_param('K_a')  # EC50
+        n_a_median, n_a_lower, n_a_upper = extract_param('n_a')  # Hill coefficient
+
+        data['Vmax_a_median'] = Vmax_a_median
         data['Vmax_a_lower'] = Vmax_a_lower
         data['Vmax_a_upper'] = Vmax_a_upper
-        data['EC50_a_mean'] = K_a_mean
+        data['EC50_a_median'] = K_a_median
         data['EC50_a_lower'] = K_a_lower
         data['EC50_a_upper'] = K_a_upper
-        data['n_a_mean'] = n_a_mean
+        data['n_a_median'] = n_a_median
         data['n_a_lower'] = n_a_lower
         data['n_a_upper'] = n_a_upper
 
         # Component B (second Hill function)
-        Vmax_b_mean, Vmax_b_lower, Vmax_b_upper = extract_param('Vmax_b')
-        K_b_mean, K_b_lower, K_b_upper = extract_param('K_b')  # EC50
-        n_b_mean, n_b_lower, n_b_upper = extract_param('n_b')  # Hill coefficient
+        Vmax_b_median, Vmax_b_lower, Vmax_b_upper = extract_param('Vmax_b')
+        K_b_median, K_b_lower, K_b_upper = extract_param('K_b')  # EC50
+        n_b_median, n_b_lower, n_b_upper = extract_param('n_b')  # Hill coefficient
 
-        data['Vmax_b_mean'] = Vmax_b_mean
+        data['Vmax_b_median'] = Vmax_b_median
         data['Vmax_b_lower'] = Vmax_b_lower
         data['Vmax_b_upper'] = Vmax_b_upper
-        data['EC50_b_mean'] = K_b_mean
+        data['EC50_b_median'] = K_b_median
         data['EC50_b_lower'] = K_b_lower
         data['EC50_b_upper'] = K_b_upper
-        data['n_b_mean'] = n_b_mean
+        data['n_b_median'] = n_b_median
         data['n_b_lower'] = n_b_lower
         data['n_b_upper'] = n_b_upper
 
-        # Use raw posterior means for n; component activity is determined by FDR
-        # (q_active_a / q_active_b, computed below) rather than CI-based n-zeroing.
-        n_a_used = n_a_mean
-        n_b_used = n_b_mean
-        
+        # Use raw posterior medians for n; component activity is determined by
+        # active_a / active_b (q-value + n CI-exclusion, computed below), not by
+        # clamping n itself.
+        n_a_used = n_a_median
+        n_b_used = n_b_median
+
         # Pi_y (sparsity weight) - optional
         if 'pi_y' in posterior:
-            pi_y_mean, pi_y_lower, pi_y_upper = extract_param('pi_y')
-            data['pi_y_mean'] = pi_y_mean
+            pi_y_median, pi_y_lower, pi_y_upper = extract_param('pi_y')
+            data['pi_y_median'] = pi_y_median
             data['pi_y_lower'] = pi_y_lower
             data['pi_y_upper'] = pi_y_upper
 
@@ -2220,10 +2608,10 @@ class ModelSummarizer:
             return arr
 
         if 'alpha' in posterior:
-            alpha_mean, alpha_lower, alpha_upper = extract_param('alpha')
+            alpha_median, alpha_lower, alpha_upper = extract_param('alpha')
             alpha_full = extract_param_full('alpha')
             # Broadcast if scalar
-            alpha_mean = _broadcast_to_features(alpha_mean, n_features)
+            alpha_median = _broadcast_to_features(alpha_median, n_features)
             alpha_lower = _broadcast_to_features(alpha_lower, n_features)
             alpha_upper = _broadcast_to_features(alpha_upper, n_features)
             if alpha_full.ndim == 1:
@@ -2233,16 +2621,16 @@ class ModelSummarizer:
                 # (n_samples, 1) scalar → (n_samples, n_features)
                 alpha_full = np.broadcast_to(alpha_full, (alpha_full.shape[0], n_features)).copy()
         else:
-            alpha_mean = np.ones(n_features)
+            alpha_median = np.ones(n_features)
             alpha_lower = np.ones(n_features)
             alpha_upper = np.ones(n_features)
             alpha_full = np.ones((1, n_features))
 
         if 'beta' in posterior:
-            beta_mean, beta_lower, beta_upper = extract_param('beta')
+            beta_median, beta_lower, beta_upper = extract_param('beta')
             beta_full = extract_param_full('beta')
             # Broadcast if scalar
-            beta_mean = _broadcast_to_features(beta_mean, n_features)
+            beta_median = _broadcast_to_features(beta_median, n_features)
             beta_lower = _broadcast_to_features(beta_lower, n_features)
             beta_upper = _broadcast_to_features(beta_upper, n_features)
             if beta_full.ndim == 1:
@@ -2252,44 +2640,44 @@ class ModelSummarizer:
                 # (n_samples, 1) scalar → (n_samples, n_features)
                 beta_full = np.broadcast_to(beta_full, (beta_full.shape[0], n_features)).copy()
         else:
-            beta_mean = np.ones(n_features)
+            beta_median = np.ones(n_features)
             beta_lower = np.ones(n_features)
             beta_upper = np.ones(n_features)
             beta_full = np.ones((1, n_features))
 
-        data['alpha_mean'] = alpha_mean
+        data['alpha_median'] = alpha_median
         data['alpha_lower'] = alpha_lower
         data['alpha_upper'] = alpha_upper
-        data['beta_mean'] = beta_mean
+        data['beta_median'] = beta_median
         data['beta_lower'] = beta_lower
         data['beta_upper'] = beta_upper
 
         # Also save K_a and K_b explicitly (same as EC50 but clearer naming for function recreation)
-        data['K_a_mean'] = K_a_mean
+        data['K_a_median'] = K_a_median
         data['K_a_lower'] = K_a_lower
         data['K_a_upper'] = K_a_upper
-        data['K_b_mean'] = K_b_mean
+        data['K_b_median'] = K_b_median
         data['K_b_lower'] = K_b_lower
         data['K_b_upper'] = K_b_upper
 
         # Get A (baseline) - required to recreate the fitted function
         if 'A' in posterior:
-            A_mean, A_lower, A_upper = extract_param('A')
+            A_median, A_lower, A_upper = extract_param('A')
             A_full = extract_param_full('A')
             # Broadcast if scalar
-            A_mean = _broadcast_to_features(A_mean, n_features)
+            A_median = _broadcast_to_features(A_median, n_features)
             A_lower = _broadcast_to_features(A_lower, n_features)
             A_upper = _broadcast_to_features(A_upper, n_features)
             if A_full.ndim == 1 or A_full.shape[-1] == 1:
                 A_full = np.broadcast_to(A_full.reshape(-1, 1), (A_full.shape[0] if A_full.ndim > 1 else 1, n_features)).copy()
         else:
-            A_mean = np.zeros(n_features)
+            A_median = np.zeros(n_features)
             A_lower = np.zeros(n_features)
             A_upper = np.zeros(n_features)
             A_full = np.zeros((1, n_features))
 
         # Save A (baseline) to data dict
-        data['A_mean'] = A_mean
+        data['A_median'] = A_median
         data['A_lower'] = A_lower
         data['A_upper'] = A_upper
 
@@ -2319,7 +2707,7 @@ class ModelSummarizer:
                     n_cats = cat_arr.shape[2]
                     for k in range(n_cats):
                         ck = cat_arr[:, :, k]  # [S, T]
-                        data[f'{prefix}_cat{k}_mean'] = ck.mean(axis=0)
+                        data[f'{prefix}_cat{k}_median'] = np.median(ck, axis=0)
                         data[f'{prefix}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
                         data[f'{prefix}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
@@ -2327,6 +2715,8 @@ class ModelSummarizer:
             # Modality.__init__ ensures column K_max-1 is always a real category (by swapping
             # the last real category there for features with K_actual < K_max), so [:, :, -1]
             # is always the correct residual baseline.
+            # Also export all K per-category A values and per-category Hill params so that
+            # simulation can reconstruct the full per-category dose-response curves.
             if 'A' in posterior:
                 A_raw = posterior['A']
                 if isinstance(A_raw, torch.Tensor):
@@ -2335,9 +2725,27 @@ class ModelSummarizer:
                     A_raw = A_raw.squeeze(1)
                 if A_raw.ndim == 3 and A_raw.shape[1] == n_features:
                     AK = A_raw[:, :, -1]  # [S, T] — residual always at K_max-1
-                    data['A_K_mean'] = AK.mean(axis=0)
+                    data['A_K_median'] = np.median(AK, axis=0)
                     data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
                     data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)
+                    # Per-category A for k=0..K-2 (K-1 fitted, last is residual A_K above)
+                    K_dim = A_raw.shape[2]
+                    for k in range(K_dim - 1):
+                        ck = A_raw[:, :, k]  # [S, T]
+                        data[f'A_cat{k}_median'] = np.median(ck, axis=0)
+                        data[f'A_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'A_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
+
+            # Per-category Hill parameters for simulation (Vmax, K, n for a- and b-components)
+            for hill_param in ['Vmax_a', 'K_a', 'n_a', 'Vmax_b', 'K_b', 'n_b']:
+                cat_arr = _extract_cat_param(hill_param)
+                if cat_arr is not None:
+                    n_cats = cat_arr.shape[2]
+                    for k in range(n_cats):
+                        ck = cat_arr[:, :, k]  # [S, T]
+                        data[f'{hill_param}_cat{k}_median'] = np.median(ck, axis=0)
+                        data[f'{hill_param}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'{hill_param}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
         # Get full posterior samples (needed for FDR and per-sample CI computations)
         Vmax_a_full = extract_param_full('Vmax_a')
@@ -2354,12 +2762,12 @@ class ModelSummarizer:
             _ratio_a = alpha_full * Vmax_a_full / np.maximum(A_full, 1e-12)
             p_active_a = (_ratio_a > _ACTIVITY_EPSILON).mean(axis=0)
         else:
-            p_active_a = alpha_mean.copy()  # fallback to E[alpha]
+            p_active_a = alpha_median.copy()  # fallback to median[alpha]
         if (beta_full.ndim >= 2 and Vmax_b_full.ndim >= 2 and A_full.ndim >= 2):
             _ratio_b = beta_full * Vmax_b_full / np.maximum(A_full, 1e-12)
             p_active_b = (_ratio_b > _ACTIVITY_EPSILON).mean(axis=0)
         else:
-            p_active_b = beta_mean.copy()  # fallback to E[beta]
+            p_active_b = beta_median.copy()  # fallback to median[beta]
         p_active_a = np.asarray(p_active_a, dtype=float).ravel()
         p_active_b = np.asarray(p_active_b, dtype=float).ravel()
 
@@ -2377,9 +2785,23 @@ class ModelSummarizer:
         q_active_a = _qall[:n_features]
         q_active_b = _qall[n_features:]
 
+        # Single "active" definition used everywhere a component needs to be gated
+        # on/off (point estimates, CIs, plotted curves, markers): Bayesian q-value
+        # < fdr_threshold AND the Hill exponent's 95% CI excludes 0. The q-value
+        # alone can't tell a real dose-response apart from alpha/beta absorbing a
+        # constant offset while n ≈ 0 (flat Hill, unidentified K); the CI-exclusion
+        # guard catches that degenerate case. This matches is_dependent/fit_type
+        # below exactly, so every downstream consumer (summary columns, plotting,
+        # predict_trans_function, _compute_hill_markers) agrees on one criterion.
+        n_a_excludes_zero = ~((n_a_lower <= 0) & (0 <= n_a_upper))
+        n_b_excludes_zero = ~((n_b_lower <= 0) & (0 <= n_b_upper))
+        active_a = (q_active_a < fdr_threshold) & n_a_excludes_zero
+        active_b = (q_active_b < fdr_threshold) & n_b_excludes_zero
+
         # Compute inflection points for individual Hill components
         if compute_inflection:
-            # Use raw n means (FDR controls activity, not CI-based n-zeroing)
+            # Use raw n means (activity is controlled by active_a/active_b below,
+            # not by clamping n_a_used/n_b_used themselves)
             nA = np.asarray(n_a_used, dtype=float)
             nB = np.asarray(n_b_used, dtype=float)
 
@@ -2392,25 +2814,25 @@ class ModelSummarizer:
             nBabs_hi = np.maximum(np.abs(n_b_lower), np.abs(n_b_upper))
 
             # FDR-inactive components: zero inflection magnitude bounds
-            _fdr_inactive_a = q_active_a >= fdr_threshold
-            _fdr_inactive_b = q_active_b >= fdr_threshold
+            _fdr_inactive_a = ~active_a
+            _fdr_inactive_b = ~active_b
             nAabs_lo[_fdr_inactive_a] = 0.0
             nAabs_hi[_fdr_inactive_a] = 0.0
             nBabs_lo[_fdr_inactive_b] = 0.0
             nBabs_hi[_fdr_inactive_b] = 0.0
         
-            inflection_a_mean = self._compute_hill_inflection(nA,      K_a_mean)
+            inflection_a_mean = self._compute_hill_inflection(nA,      K_a_median)
             inflection_a_lower = self._compute_hill_inflection(nAabs_lo, K_a_lower)  # magnitude-lower
             inflection_a_upper = self._compute_hill_inflection(nAabs_hi, K_a_upper)  # magnitude-upper
-        
-            inflection_b_mean = self._compute_hill_inflection(nB,      K_b_mean)
+
+            inflection_b_mean = self._compute_hill_inflection(nB,      K_b_median)
             inflection_b_lower = self._compute_hill_inflection(nBabs_lo, K_b_lower)
             inflection_b_upper = self._compute_hill_inflection(nBabs_hi, K_b_upper)
         
-            data['inflection_a_mean'] = inflection_a_mean
+            data['inflection_a_median'] = inflection_a_mean
             data['inflection_a_lower'] = inflection_a_lower
             data['inflection_a_upper'] = inflection_a_upper
-            data['inflection_b_mean'] = inflection_b_mean
+            data['inflection_b_median'] = inflection_b_mean
             data['inflection_b_lower'] = inflection_b_lower
             data['inflection_b_upper'] = inflection_b_upper
 
@@ -2444,63 +2866,84 @@ class ModelSummarizer:
         if is_multinomial:
             return
 
+        # Timing accumulators for the per-feature loop
+        _n_sig = int(np.sum(active_a | active_b))
+        if verbose:
+            _S_val = Vmax_a_full.shape[0] if Vmax_a_full.ndim > 1 else 1
+            print(f"  [loop1] {n_features} features  "
+                  f"{_n_sig} active (q<{fdr_threshold} & n CI excludes 0)  "
+                  f"{_S_val} posterior samples")
+            _loop1_t = {'x_roots': 0.0, 'u_roots': 0.0, 'classify': 0.0,
+                        'full_lfc_mean': 0.0, 'full_lfc_ci': 0.0,
+                        'obs_lfc_mean': 0.0, 'obs_lfc_ci': 0.0}
+            _loop1_start = time.time()
+
         # Process each feature
-        for i in range(n_features):
-            # Get mean parameters for this feature
-            alpha_i = alpha_mean[i]
-            beta_i = beta_mean[i]
-            Vmax_a_i = Vmax_a_mean[i]
-            Vmax_b_i = Vmax_b_mean[i]
-            K_a_i = K_a_mean[i]
-            K_b_i = K_b_mean[i]
+        _iter = tqdm(range(n_features), desc="  [loop1]", disable=not verbose)
+        for i in _iter:
+            # Compute FDR activity flag once, used throughout this iteration
+            _is_flat_i = (not active_a[i]) and (not active_b[i])
+
+            # Get median parameters for this feature
+            alpha_i = alpha_median[i]
+            beta_i = beta_median[i]
+            Vmax_a_i = Vmax_a_median[i]
+            Vmax_b_i = Vmax_b_median[i]
+            K_a_i = K_a_median[i]
+            K_b_i = K_b_median[i]
             n_a_i = float(n_a_used[i])
             n_b_i = float(n_b_used[i])
-            A_i = A_mean[i]
+            A_i = A_median[i]
 
-            # Find derivative roots for mean parameters
+            # Observed-extrema arg-locations (used later for CI candidate points)
+            x_minloc = np.nan
+            x_maxloc = np.nan
+
+            if verbose: _ti = time.time()
+
+            # Find derivative roots for mean parameters (x-space)
             first_roots_mean = []
             second_roots_mean = []
             third_roots_mean = []
 
-            if compute_derivative_roots and x_range is not None:
-                # Skip root-finding for FDR-inactive features (both components flat)
-                _is_flat = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
-                if not _is_flat:
-                    # First derivative roots (where dy/dx = 0)
-                    def first_deriv_func(x):
-                        return self._additive_hill_first_derivative(
-                            x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                            beta_i, Vmax_b_i, K_b_i, n_b_i
-                        )
-                    first_roots_mean = self._find_roots_empirical_loose(first_deriv_func, x_range)
+            if compute_derivative_roots and x_range is not None and not _is_flat_i:
+                # First derivative roots (where dy/dx = 0)
+                def first_deriv_func(x):
+                    return self._additive_hill_first_derivative(
+                        x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
+                        beta_i, Vmax_b_i, K_b_i, n_b_i
+                    )
+                first_roots_mean = self._find_roots_empirical_loose(first_deriv_func, x_range)
 
-                    # Second derivative roots (inflection points of combined function)
-                    def second_deriv_func(x):
-                        return self._additive_hill_second_derivative(
-                            x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                            beta_i, Vmax_b_i, K_b_i, n_b_i
-                        )
-                    second_roots_mean = self._find_roots_empirical_loose(second_deriv_func, x_range)
+                # Second derivative roots (inflection points of combined function)
+                def second_deriv_func(x):
+                    return self._additive_hill_second_derivative(
+                        x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
+                        beta_i, Vmax_b_i, K_b_i, n_b_i
+                    )
+                second_roots_mean = self._find_roots_empirical_loose(second_deriv_func, x_range)
 
-                    # Third derivative roots (where d³y/dx³ = 0)
-                    def third_deriv_func(x):
-                        return self._additive_hill_third_derivative(
-                            x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                            beta_i, Vmax_b_i, K_b_i, n_b_i
-                        )
-                    third_roots_mean = self._find_roots_empirical_loose(third_deriv_func, x_range)
-                
+                # Third derivative roots (where d³y/dx³ = 0)
+                def third_deriv_func(x):
+                    return self._additive_hill_third_derivative(
+                        x, alpha_i, Vmax_a_i, K_a_i, n_a_i,
+                        beta_i, Vmax_b_i, K_b_i, n_b_i
+                    )
+                third_roots_mean = self._find_roots_empirical_loose(third_deriv_func, x_range)
+
+            if verbose: _loop1_t['x_roots'] += time.time() - _ti; _ti = time.time()
+
             # --- roots in log2FC x-space (u-space) ---
+            # Only computed when compute_log2fc_params AND compute_derivative_roots AND FDR-significant.
             # For negbinom: dg/du=0, d2g/du2=0, d3g/du3=0 where g = log2(y) - log2(y_ntc)
-            # For binomial: dp/du=0, etc. where delta_p = p - p_ntc
-            #   Since dp/du = dp/dx * x * ln(2), roots of dp/du=0 are same as dy/dx=0
-            #   So for binomial, just convert x-space roots to u-space
+            # For binomial: dp/du=0, etc.
             u_roots_g1 = []
             u_roots_g2 = []
             u_roots_g3 = []
 
-            if compute_log2fc_params and (x_ntc is not None) and np.isfinite(x_ntc) and (x_ntc > 0) \
-               and (x_obs_min is not None) and (x_obs_max is not None):
+            if (compute_log2fc_params and compute_derivative_roots and not _is_flat_i
+                    and (x_ntc is not None) and np.isfinite(x_ntc) and (x_ntc > 0)
+                    and (x_obs_min is not None) and (x_obs_max is not None)):
 
                 eps = 1e-10
                 log2_xntc = np.log2(max(float(x_ntc), eps))
@@ -2634,6 +3077,8 @@ class ModelSummarizer:
             n_second_deriv_roots.append(len(second_roots_mean))
             n_third_deriv_roots.append(len(third_roots_mean))
 
+            if verbose: _loop1_t['u_roots'] += time.time() - _ti; _ti = time.time()
+
             # Classify function
             classification = self._classify_additive_hill(
                 alpha_i, alpha_lower[i], alpha_upper[i],
@@ -2648,189 +3093,188 @@ class ModelSummarizer:
                 p_active_b=float(q_active_b[i]),
                 fdr_threshold=fdr_threshold
             )
+
             classifications.append(classification)
 
-            # Compute full dynamic range
-            # For negbinom: full_log2fc = log2(y_max / y_min)
-            # For binomial: full_delta_p = y_max - y_min
-            is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
-            if is_flat_i:
-                full_log2fc_i = 0.0
-            elif is_binomial:
-                # For binomial: compute y_max - y_min
-                full_log2fc_i = self._full_delta_p_from_extrema_and_boundaries(
-                    A_i, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                    beta_i, Vmax_b_i, K_b_i, n_b_i,
-                    x_range if x_range is not None else np.linspace(1e-3, 1e3, 6000)
-                )
-            else:
-                # For negbinom: compute log2(y_max / y_min)
-                full_log2fc_i = self._full_log2fc_from_extrema_and_boundaries(
-                    A_i, alpha_i, Vmax_a_i, K_a_i, n_a_i,
-                    beta_i, Vmax_b_i, K_b_i, n_b_i,
-                    x_range if x_range is not None else np.linspace(1e-3, 1e3, 6000)
-                )
+            if verbose: _loop1_t['classify'] += time.time() - _ti; _ti = time.time()
 
-            full_log2fc_mean_list.append(full_log2fc_i)
-
-            # Compute observed dynamic range over observed x range (min to max x_eff_g)
-            # For negbinom: observed_log2fc = log2(y_max / y_min)
-            # For binomial: observed_delta_p = y_max - y_min
-            if x_obs_min is not None and x_obs_max is not None:
-                if is_binomial:
-                    obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_delta_p_fitted(
-                        A_i, alpha_i, Vmax_a_i, beta_i, Vmax_b_i,
-                        K_a_i, n_a_i, K_b_i, n_b_i,
-                        x_obs_min, x_obs_max,
-                        return_argextrema=True
+            # Compute full and observed dynamic ranges — only when compute_log2fc_params=True.
+            # For negbinom: log2(y_max / y_min); for binomial: y_max - y_min (delta_p).
+            # Inactive components (active_a/active_b False — q >= fdr_threshold OR n's CI
+            # includes 0) are gated to zero here (same criterion used below for the
+            # per-sample CI), so a point estimate never includes a "phantom" contribution
+            # from a component that's individually insignificant or unidentified —
+            # consistent with predict_trans_function, _compute_hill_markers, and
+            # predict_hill_from_summary_row.
+            if compute_log2fc_params:
+                _alpha_range_i = 0.0 if not active_a[i] else alpha_i
+                _beta_range_i  = 0.0 if not active_b[i] else beta_i
+                if _is_flat_i:
+                    full_log2fc_i = 0.0
+                elif is_binomial:
+                    full_log2fc_i = self._full_delta_p_from_extrema_and_boundaries(
+                        A_i, _alpha_range_i, Vmax_a_i, K_a_i, n_a_i,
+                        _beta_range_i, Vmax_b_i, K_b_i, n_b_i,
+                        x_range if x_range is not None else np.linspace(1e-3, 1e3, 6000)
                     )
                 else:
-                    obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_log2fc_fitted(
-                        A_i, alpha_i, Vmax_a_i, beta_i, Vmax_b_i,
-                        K_a_i, n_a_i, K_b_i, n_b_i,
-                        x_obs_min, x_obs_max,
-                        return_argextrema=True
+                    full_log2fc_i = self._full_log2fc_from_extrema_and_boundaries(
+                        A_i, _alpha_range_i, Vmax_a_i, K_a_i, n_a_i,
+                        _beta_range_i, Vmax_b_i, K_b_i, n_b_i,
+                        x_range if x_range is not None else np.linspace(1e-3, 1e3, 6000)
                     )
-                observed_log2fc_list.append(obs_log2fc_i)
-            else:
-                observed_log2fc_list.append(np.nan)
-            
-            # Compute CI for observed dynamic range from posterior samples (FAST: no per-sample root finding)
-            if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_a_full.ndim > 1):
-                S = Vmax_a_full.shape[0]
-                n_samples = min(S, 500)
+                full_log2fc_mean_list.append(full_log2fc_i)
 
-                # candidates = mean first-derivative roots inside observed range
-                x0 = float(max(x_obs_min, 1e-10))
-                x1 = float(max(x_obs_max, 1e-10))
-                x_candidates_obs = [r for r in first_roots_mean if (x0 <= r <= x1)]
-                # add grid extrema locations as candidates (if finite and inside window)
-                for xx in (x_minloc, x_maxloc):
-                    if np.isfinite(xx) and (x0 <= xx <= x1):
-                        x_candidates_obs.append(float(xx))
+                if verbose: _loop1_t['full_lfc_mean'] += time.time() - _ti; _ti = time.time()
 
-                # optional: dedup candidates in log2 space
-                x_candidates_obs = self._dedup_roots_log2(x_candidates_obs, tol_log2=1e-3)
-
-                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
-                if is_flat_i:
-                    observed_log2fc_lower_list.append(0.0)
-                    observed_log2fc_upper_list.append(0.0)
-                else:
-                    vals = []
-                    for s in range(n_samples):
-                        sa = s % alpha_full.shape[0] if alpha_full.ndim > 1 else None
-                        sb = s % beta_full.shape[0]  if beta_full.ndim > 1 else None
-                        sA = s % A_full.shape[0]     if A_full.ndim > 1 else None
-                        alpha_s = float(alpha_full[sa, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
-                        beta_s  = float(beta_full[sb, i])  if beta_full.ndim > 1 else float(beta_full[i])
-                        A_s     = float(A_full[sA, i])     if A_full.ndim > 1 else float(A_full[i])
-
-                        Vmax_a_s = float(Vmax_a_full[s, i])
-                        Vmax_b_s = float(Vmax_b_full[s, i])
-                        K_a_s    = float(K_a_full[s, i])
-                        K_b_s    = float(K_b_full[s, i])
-
-                        n_a_s = float(n_a_full[s, i])
-                        n_b_s = float(n_b_full[s, i])
-                        # Gate inactive components via FDR (zero alpha/beta, not n)
-                        if q_active_a[i] >= fdr_threshold:
-                            alpha_s = 0.0
-                        if q_active_b[i] >= fdr_threshold:
-                            beta_s = 0.0
-
-                        if is_binomial:
-                            v = self._observed_delta_p_candidates_no_roots(
-                                A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
-                                beta_s, Vmax_b_s, K_b_s, n_b_s,
-                                x_obs_min=x0, x_obs_max=x1,
-                                x_candidates=x_candidates_obs
-                            )
-                        else:
-                            v = self._observed_log2fc_candidates_no_roots(
-                                A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
-                                beta_s, Vmax_b_s, K_b_s, n_b_s,
-                                x_obs_min=x0, x_obs_max=x1,
-                                x_candidates=x_candidates_obs
-                            )
-                        if np.isfinite(v):
-                            vals.append(v)
-
-                    if vals:
-                        observed_log2fc_lower_list.append(np.quantile(vals, 0.025))
-                        observed_log2fc_upper_list.append(np.quantile(vals, 0.975))
+                # Observed dynamic range over observed x range
+                if x_obs_min is not None and x_obs_max is not None:
+                    if is_binomial:
+                        obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_delta_p_fitted(
+                            A_i, _alpha_range_i, Vmax_a_i, _beta_range_i, Vmax_b_i,
+                            K_a_i, n_a_i, K_b_i, n_b_i,
+                            x_obs_min, x_obs_max,
+                            return_argextrema=True
+                        )
                     else:
-                        observed_log2fc_lower_list.append(np.nan)
-                        observed_log2fc_upper_list.append(np.nan)
-
-            else:
-                # no posterior samples or no x-range -> fall back to mean
-                observed_log2fc_lower_list.append(obs_log2fc_i)
-                observed_log2fc_upper_list.append(obs_log2fc_i)
-
-            # Compute CI for full dynamic range from posterior samples (FAST: no per-sample root finding)
-            if Vmax_a_full.ndim > 1:
-                S = Vmax_a_full.shape[0]
-                n_samples = min(S, 500)  # tune as you like
-
-                # reuse mean-root locations as interior candidates for ALL samples
-                # (this is the key speedup)
-                x_candidates = first_roots_mean  # already computed above per feature
-
-                sample_log2fcs = []
-
-                # Short-circuit genes where both components are FDR-inactive
-                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
-                if is_flat_i:
-                    full_log2fc_lower_list.append(0.0)
-                    full_log2fc_upper_list.append(0.0)
+                        obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_log2fc_fitted(
+                            A_i, _alpha_range_i, Vmax_a_i, _beta_range_i, Vmax_b_i,
+                            K_a_i, n_a_i, K_b_i, n_b_i,
+                            x_obs_min, x_obs_max,
+                            return_argextrema=True
+                        )
+                    observed_log2fc_list.append(obs_log2fc_i)
                 else:
-                    for s in range(n_samples):
-                        sa = s % alpha_full.shape[0] if alpha_full.ndim > 1 else None
-                        sb = s % beta_full.shape[0]  if beta_full.ndim > 1 else None
-                        sA = s % A_full.shape[0]     if A_full.ndim > 1 else None
-                        alpha_s = float(alpha_full[sa, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
-                        beta_s  = float(beta_full[sb, i])  if beta_full.ndim > 1 else float(beta_full[i])
-                        A_s     = float(A_full[sA, i])     if A_full.ndim > 1 else float(A_full[i])
+                    observed_log2fc_list.append(np.nan)
 
-                        Vmax_a_s = float(Vmax_a_full[s, i])
-                        Vmax_b_s = float(Vmax_b_full[s, i])
-                        K_a_s    = float(K_a_full[s, i])
-                        K_b_s    = float(K_b_full[s, i])
+                if verbose: _loop1_t['obs_lfc_mean'] += time.time() - _ti; _ti = time.time()
 
-                        n_a_s = float(n_a_full[s, i])
-                        n_b_s = float(n_b_full[s, i])
-                        # Gate inactive components via FDR (zero alpha/beta, not n)
-                        if q_active_a[i] >= fdr_threshold:
-                            alpha_s = 0.0
-                        if q_active_b[i] >= fdr_threshold:
-                            beta_s = 0.0
+                # CI for observed dynamic range from all posterior samples
+                if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_a_full.ndim > 1) and compute_lfc_ci:
+                    S = Vmax_a_full.shape[0]
 
-                        if is_binomial:
-                            val = self._full_delta_p_candidates_no_roots(
-                                A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
-                                beta_s, Vmax_b_s, K_b_s, n_b_s,
-                                x_candidates=x_candidates
-                            )
-                        else:
-                            val = self._full_log2fc_candidates_no_roots(
-                                A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
-                                beta_s, Vmax_b_s, K_b_s, n_b_s,
-                                x_candidates=x_candidates
-                            )
-                        if np.isfinite(val):
-                            sample_log2fcs.append(val)
+                    x0 = float(max(x_obs_min, 1e-10))
+                    x1 = float(max(x_obs_max, 1e-10))
+                    x_candidates_obs = [r for r in first_roots_mean if (x0 <= r <= x1)]
+                    for xx in (x_minloc, x_maxloc):
+                        if np.isfinite(xx) and (x0 <= xx <= x1):
+                            x_candidates_obs.append(float(xx))
+                    x_candidates_obs = self._dedup_roots_log2(x_candidates_obs, tol_log2=1e-3)
 
-                    if sample_log2fcs:
-                        full_log2fc_lower_list.append(np.quantile(sample_log2fcs, 0.025))
-                        full_log2fc_upper_list.append(np.quantile(sample_log2fcs, 0.975))
+                    if _is_flat_i:
+                        observed_log2fc_lower_list.append(0.0)
+                        observed_log2fc_upper_list.append(0.0)
                     else:
-                        full_log2fc_lower_list.append(np.nan)
-                        full_log2fc_upper_list.append(np.nan)
-            else:
-                full_log2fc_lower_list.append(full_log2fc_i)
-                full_log2fc_upper_list.append(full_log2fc_i)
+                        vals = []
+                        for s in range(S):
+                            sa = s % alpha_full.shape[0] if alpha_full.ndim > 1 else None
+                            sb = s % beta_full.shape[0]  if beta_full.ndim > 1 else None
+                            sA = s % A_full.shape[0]     if A_full.ndim > 1 else None
+                            alpha_s = float(alpha_full[sa, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
+                            beta_s  = float(beta_full[sb, i])  if beta_full.ndim > 1 else float(beta_full[i])
+                            A_s     = float(A_full[sA, i])     if A_full.ndim > 1 else float(A_full[i])
+                            Vmax_a_s = float(Vmax_a_full[s, i])
+                            Vmax_b_s = float(Vmax_b_full[s, i])
+                            K_a_s    = float(K_a_full[s, i])
+                            K_b_s    = float(K_b_full[s, i])
+                            n_a_s = float(n_a_full[s, i])
+                            n_b_s = float(n_b_full[s, i])
+                            if not active_a[i]:
+                                alpha_s = 0.0
+                            if not active_b[i]:
+                                beta_s = 0.0
 
+                            if is_binomial:
+                                v = self._observed_delta_p_candidates_no_roots(
+                                    A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
+                                    beta_s, Vmax_b_s, K_b_s, n_b_s,
+                                    x_obs_min=x0, x_obs_max=x1,
+                                    x_candidates=x_candidates_obs
+                                )
+                            else:
+                                v = self._observed_log2fc_candidates_no_roots(
+                                    A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
+                                    beta_s, Vmax_b_s, K_b_s, n_b_s,
+                                    x_obs_min=x0, x_obs_max=x1,
+                                    x_candidates=x_candidates_obs
+                                )
+                            if np.isfinite(v):
+                                vals.append(v)
+
+                        if vals:
+                            observed_log2fc_lower_list.append(np.quantile(vals, 0.025))
+                            observed_log2fc_upper_list.append(np.quantile(vals, 0.975))
+                        else:
+                            observed_log2fc_lower_list.append(np.nan)
+                            observed_log2fc_upper_list.append(np.nan)
+                else:
+                    # no posterior samples or no x-range -> fall back to mean
+                    observed_log2fc_lower_list.append(obs_log2fc_i if 'obs_log2fc_i' in dir() else np.nan)
+                    observed_log2fc_upper_list.append(obs_log2fc_i if 'obs_log2fc_i' in dir() else np.nan)
+
+                if verbose: _loop1_t['obs_lfc_ci'] += time.time() - _ti; _ti = time.time()
+
+                # CI for full dynamic range from all posterior samples
+                if Vmax_a_full.ndim > 1 and compute_lfc_ci:
+                    S = Vmax_a_full.shape[0]
+                    x_candidates = first_roots_mean
+
+                    if _is_flat_i:
+                        full_log2fc_lower_list.append(0.0)
+                        full_log2fc_upper_list.append(0.0)
+                    else:
+                        sample_log2fcs = []
+                        for s in range(S):
+                            sa = s % alpha_full.shape[0] if alpha_full.ndim > 1 else None
+                            sb = s % beta_full.shape[0]  if beta_full.ndim > 1 else None
+                            sA = s % A_full.shape[0]     if A_full.ndim > 1 else None
+                            alpha_s = float(alpha_full[sa, i]) if alpha_full.ndim > 1 else float(alpha_full[i])
+                            beta_s  = float(beta_full[sb, i])  if beta_full.ndim > 1 else float(beta_full[i])
+                            A_s     = float(A_full[sA, i])     if A_full.ndim > 1 else float(A_full[i])
+                            Vmax_a_s = float(Vmax_a_full[s, i])
+                            Vmax_b_s = float(Vmax_b_full[s, i])
+                            K_a_s    = float(K_a_full[s, i])
+                            K_b_s    = float(K_b_full[s, i])
+                            n_a_s = float(n_a_full[s, i])
+                            n_b_s = float(n_b_full[s, i])
+                            if not active_a[i]:
+                                alpha_s = 0.0
+                            if not active_b[i]:
+                                beta_s = 0.0
+
+                            if is_binomial:
+                                val = self._full_delta_p_candidates_no_roots(
+                                    A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
+                                    beta_s, Vmax_b_s, K_b_s, n_b_s,
+                                    x_candidates=x_candidates
+                                )
+                            else:
+                                val = self._full_log2fc_candidates_no_roots(
+                                    A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
+                                    beta_s, Vmax_b_s, K_b_s, n_b_s,
+                                    x_candidates=x_candidates
+                                )
+                            if np.isfinite(val):
+                                sample_log2fcs.append(val)
+
+                        if sample_log2fcs:
+                            full_log2fc_lower_list.append(np.quantile(sample_log2fcs, 0.025))
+                            full_log2fc_upper_list.append(np.quantile(sample_log2fcs, 0.975))
+                        else:
+                            full_log2fc_lower_list.append(np.nan)
+                            full_log2fc_upper_list.append(np.nan)
+                else:
+                    full_log2fc_lower_list.append(full_log2fc_i)
+                    full_log2fc_upper_list.append(full_log2fc_i)
+
+                if verbose: _loop1_t['full_lfc_ci'] += time.time() - _ti
+
+        if verbose:
+            _loop1_total = time.time() - _loop1_start
+            print(f"  [loop1] total: {_loop1_total:.1f}s")
+            for _k, _v in _loop1_t.items():
+                if _v > 0.05 or _k in ('obs_lfc_ci', 'full_lfc_ci'):
+                    print(f"    {_k:20s}: {_v:.1f}s  ({100*_v/_loop1_total:.0f}%)")
 
         # Add computed values to data dict
         data['classification'] = classifications
@@ -2839,59 +3283,56 @@ class ModelSummarizer:
         data['n_third_deriv_roots'] = n_third_deriv_roots
 
         # Store derivative roots as strings (list of x values)
-        # For mean parameters
-        data['first_deriv_roots_mean'] = [
+        # Computed at posterior median parameters
+        data['first_deriv_roots_median'] = [
             ';'.join(f'{r:.4f}' for r in roots) if roots else np.nan
             for roots in first_deriv_roots_mean_list
         ]
-        
-        data['second_deriv_roots_mean'] = [
+
+        data['second_deriv_roots_median'] = [
             ';'.join(f'{r:.4f}' for r in roots) if roots else np.nan
             for roots in second_deriv_roots_mean_list
         ]
-        
-        data['third_deriv_roots_mean'] = [
+
+        data['third_deriv_roots_median'] = [
             ';'.join(f'{r:.4f}' for r in roots) if roots else np.nan
             for roots in third_deriv_roots_mean_list
         ]
 
-        # Derivative roots in u-space (log2FC x-space)
-        # For negbinom: roots of dg/du = 0 where g = log2(y) - log2(y_ntc)
-        # For binomial: roots of dp/du = 0 where delta_p = p - p_ntc (same as dy/dx = 0 roots in u-space)
-        if is_binomial:
-            data['first_deriv_roots_delta_p_mean']  = first_deriv_roots_log2fc_mean_list
-            data['second_deriv_roots_delta_p_mean'] = second_deriv_roots_log2fc_mean_list
-            data['third_deriv_roots_delta_p_mean']  = third_deriv_roots_log2fc_mean_list
-        else:
-            data['first_deriv_roots_log2fc_mean']  = first_deriv_roots_log2fc_mean_list
-            data['second_deriv_roots_log2fc_mean'] = second_deriv_roots_log2fc_mean_list
-            data['third_deriv_roots_log2fc_mean']  = third_deriv_roots_log2fc_mean_list
-
-        # Full dynamic range (theoretical range) and observed dynamic range (observed x range)
-        # For negbinom: log2(y_max / y_min)
-        # For binomial: y_max - y_min (delta_p)
-        if compute_full_log2fc:
+        # Derivative roots in u-space: only add when both flags were True
+        if compute_log2fc_params and compute_derivative_roots:
             if is_binomial:
-                data['full_delta_p_mean'] = full_log2fc_mean_list
+                data['first_deriv_roots_delta_p_median']  = first_deriv_roots_log2fc_mean_list
+                data['second_deriv_roots_delta_p_median'] = second_deriv_roots_log2fc_mean_list
+                data['third_deriv_roots_delta_p_median']  = third_deriv_roots_log2fc_mean_list
+            else:
+                data['first_deriv_roots_log2fc_median']  = first_deriv_roots_log2fc_mean_list
+                data['second_deriv_roots_log2fc_median'] = second_deriv_roots_log2fc_mean_list
+                data['third_deriv_roots_log2fc_median']  = third_deriv_roots_log2fc_mean_list
+
+        # Full and observed dynamic ranges: only add when compute_log2fc_params=True
+        if compute_log2fc_params:
+            if is_binomial:
+                data['full_delta_p_median'] = full_log2fc_mean_list
                 data['full_delta_p_lower'] = full_log2fc_lower_list
                 data['full_delta_p_upper'] = full_log2fc_upper_list
+                data['observed_delta_p'] = observed_log2fc_list
+                data['observed_delta_p_lower'] = observed_log2fc_lower_list
+                data['observed_delta_p_upper'] = observed_log2fc_upper_list
             else:
-                data['full_log2fc_mean'] = full_log2fc_mean_list
+                data['full_log2fc_median'] = full_log2fc_mean_list
                 data['full_log2fc_lower'] = full_log2fc_lower_list
                 data['full_log2fc_upper'] = full_log2fc_upper_list
-
-        # Observed dynamic range over the observed x range (min to max x_eff_g)
-        if is_binomial:
-            data['observed_delta_p'] = observed_log2fc_list
-            data['observed_delta_p_lower'] = observed_log2fc_lower_list
-            data['observed_delta_p_upper'] = observed_log2fc_upper_list
-        else:
-            data['observed_log2fc'] = observed_log2fc_list
-            data['observed_log2fc_lower'] = observed_log2fc_lower_list
-            data['observed_log2fc_upper'] = observed_log2fc_upper_list
+                data['observed_log2fc'] = observed_log2fc_list
+                data['observed_log2fc_lower'] = observed_log2fc_lower_list
+                data['observed_log2fc_upper'] = observed_log2fc_upper_list
 
         # Compute log2FC versions of parameters relative to NTC
         if compute_log2fc_params and x_ntc is not None and y_ntc is not None:
+            if verbose:
+                _t_loop2_start = time.time()
+                print(f"  [loop2] log2fc_at_u0 + derivatives  "
+                      f"compute_derivative_roots={compute_derivative_roots}")
             epsilon = 1e-12  # Avoid log(0)
             ln2 = np.log(2)
 
@@ -2931,10 +3372,6 @@ class ModelSummarizer:
             d2g_du2_at_0_upper = np.full(n_features, np.nan)
             d3g_du3_at_0_lower = np.full(n_features, np.nan)
             d3g_du3_at_0_upper = np.full(n_features, np.nan)
-
-            # Check if this is a binomial distribution (for delta_p computation)
-            distribution = data.get('distribution', 'negbinom')
-            is_binomial = (distribution == 'binomial')
 
             # Helper to compute all three derivatives at u=0 for given parameters
             # For negbinom: compute dg/du (log2FC derivatives)
@@ -3009,14 +3446,14 @@ class ModelSummarizer:
                     return dg_du, d2g_du2, d3g_du3
 
             for i in range(n_features):
-                is_flat_i = (q_active_a[i] >= fdr_threshold) and (q_active_b[i] >= fdr_threshold)
+                is_flat_i = (not active_a[i]) and (not active_b[i])
                 
                 if is_flat_i:
                     y_ntc_i = y_ntc[i] if y_ntc is not None else np.nan
                     # if n==0 for both, Hill(x_ntc)=0.5*Vmax
-                    H_a = 0.5 * Vmax_a_mean[i]
-                    H_b = 0.5 * Vmax_b_mean[i]
-                    y_at_ntc = A_mean[i] + alpha_mean[i] * H_a + beta_mean[i] * H_b
+                    H_a = 0.5 * Vmax_a_median[i]
+                    H_b = 0.5 * Vmax_b_median[i]
+                    y_at_ntc = A_median[i] + alpha_median[i] * H_a + beta_median[i] * H_b
                     if (y_at_ntc > epsilon) and (y_ntc_i > epsilon):
                         log2fc_at_0[i] = np.log2(y_at_ntc) - np.log2(y_ntc_i)
                     else:
@@ -3024,182 +3461,168 @@ class ModelSummarizer:
                     # For binomial: compute delta_p = p(x_ntc) - p_ntc
                     if is_binomial and np.isfinite(y_ntc_i):
                         delta_p_at_0[i] = y_at_ntc - y_ntc_i
-                    dg_du_at_0[i] = 0.0
-                    d2g_du2_at_0[i] = 0.0
-                    d3g_du3_at_0[i] = 0.0
-                    dg_du_at_0_lower[i] = 0.0
-                    dg_du_at_0_upper[i] = 0.0
-                    d2g_du2_at_0_lower[i] = 0.0
-                    d2g_du2_at_0_upper[i] = 0.0
-                    d3g_du3_at_0_lower[i] = 0.0
-                    d3g_du3_at_0_upper[i] = 0.0
+                    # Derivatives at u0 are zero for flat genes (only stored if compute_derivative_roots)
+                    if compute_derivative_roots:
+                        dg_du_at_0[i] = 0.0
+                        d2g_du2_at_0[i] = 0.0
+                        d3g_du3_at_0[i] = 0.0
+                        dg_du_at_0_lower[i] = 0.0
+                        dg_du_at_0_upper[i] = 0.0
+                        d2g_du2_at_0_lower[i] = 0.0
+                        d2g_du2_at_0_upper[i] = 0.0
+                        d3g_du3_at_0_lower[i] = 0.0
+                        d3g_du3_at_0_upper[i] = 0.0
                     continue
 
-                # Get mean parameters for this feature
-                alpha_i = alpha_mean[i]
-                beta_i = beta_mean[i]
-                Vmax_a_i = Vmax_a_mean[i]
-                Vmax_b_i = Vmax_b_mean[i]
-                K_a_i = K_a_mean[i]
-                K_b_i = K_b_mean[i]
+                # Get median parameters for this feature.
+                # Inactive components (active_a/active_b False) are gated to zero (same
+                # criterion as the per-sample CI loop below), so y_at_ntc/log2fc_at_0/
+                # delta_p_at_0 never include a phantom contribution from an individually
+                # inactive component — consistent with the full/observed range point
+                # estimates above.
+                alpha_i = 0.0 if not active_a[i] else alpha_median[i]
+                beta_i = 0.0 if not active_b[i] else beta_median[i]
+                Vmax_a_i = Vmax_a_median[i]
+                Vmax_b_i = Vmax_b_median[i]
+                K_a_i = K_a_median[i]
+                K_b_i = K_b_median[i]
                 n_a_i = float(n_a_used[i])
                 n_b_i = float(n_b_used[i])
-                A_i = A_mean[i]
+                A_i = A_median[i]
                 y_ntc_i = y_ntc[i] if y_ntc is not None else 1.0
 
-                # Compute y(x_ntc) using Hill function
+                # Compute y(x_ntc) and log2fc_at_u0 for all significant genes (cheap)
                 H_a_at_ntc = self._hill_value(x_ntc, Vmax_a_i, K_a_i, n_a_i)
                 H_b_at_ntc = self._hill_value(x_ntc, Vmax_b_i, K_b_i, n_b_i)
                 y_at_ntc = A_i + alpha_i * H_a_at_ntc + beta_i * H_b_at_ntc
 
-                # log2FC at u=0: g(0) = log2(y(x_ntc)) - log2(y_ntc)
-                # For binomial: also compute delta_p = p(x_ntc) - p_ntc
                 if is_binomial and np.isfinite(y_ntc_i):
                     delta_p_at_0[i] = y_at_ntc - y_ntc_i
 
                 if y_at_ntc > epsilon and y_ntc_i > epsilon:
                     log2fc_at_0[i] = np.log2(y_at_ntc) - np.log2(y_ntc_i)
 
-                    # Compute mean derivatives
-                    dg_du, d2g_du2, d3g_du3 = _compute_derivs_at_u0(
-                        alpha_i, beta_i, Vmax_a_i, Vmax_b_i, K_a_i, K_b_i, n_a_i, n_b_i, A_i, y_ntc_i
-                    )
-                    dg_du_at_0[i] = dg_du
-                    d2g_du2_at_0[i] = d2g_du2
-                    d3g_du3_at_0[i] = d3g_du3
+                    # Derivatives at u0: only computed when compute_derivative_roots=True
+                    if compute_derivative_roots:
+                        dg_du, d2g_du2, d3g_du3 = _compute_derivs_at_u0(
+                            alpha_i, beta_i, Vmax_a_i, Vmax_b_i, K_a_i, K_b_i, n_a_i, n_b_i, A_i, y_ntc_i
+                        )
+                        dg_du_at_0[i] = dg_du
+                        d2g_du2_at_0[i] = d2g_du2
+                        d3g_du3_at_0[i] = d3g_du3
 
-                    # Compute CI from posterior samples
-                    if Vmax_a_full.ndim > 1:
-                        n_samples = min(Vmax_a_full.shape[0], 1000)
-                        sample_dg_du = []
-                        sample_d2g_du2 = []
-                        sample_d3g_du3 = []
+                        # CI from all posterior samples (no cap)
+                        if Vmax_a_full.ndim > 1:
+                            S = Vmax_a_full.shape[0]
+                            sample_dg_du = []
+                            sample_d2g_du2 = []
+                            sample_d3g_du3 = []
 
-                        for s in range(n_samples):
-                            alpha_s = float(alpha_full[s, i] if alpha_full.ndim > 1 else alpha_full[i])
-                            beta_s  = float(beta_full[s, i]  if beta_full.ndim > 1 else beta_full[i])
-                            Vmax_a_s = Vmax_a_full[s, i]
-                            Vmax_b_s = Vmax_b_full[s, i]
-                            K_a_s = K_a_full[s, i]
-                            K_b_s = K_b_full[s, i]
-                            n_a_s = float(n_a_full[s, i])
-                            n_b_s = float(n_b_full[s, i])
-                            # Gate inactive components via FDR (zero alpha/beta, not n)
-                            if q_active_a[i] >= fdr_threshold:
-                                alpha_s = 0.0
-                            if q_active_b[i] >= fdr_threshold:
-                                beta_s = 0.0
-                            A_s = A_full[s, i] if A_full.ndim > 1 else A_full[i]
+                            for s in range(S):
+                                alpha_s = float(alpha_full[s, i] if alpha_full.ndim > 1 else alpha_full[i])
+                                beta_s  = float(beta_full[s, i]  if beta_full.ndim > 1 else beta_full[i])
+                                Vmax_a_s = Vmax_a_full[s, i]
+                                Vmax_b_s = Vmax_b_full[s, i]
+                                K_a_s = K_a_full[s, i]
+                                K_b_s = K_b_full[s, i]
+                                n_a_s = float(n_a_full[s, i])
+                                n_b_s = float(n_b_full[s, i])
+                                if not active_a[i]:
+                                    alpha_s = 0.0
+                                if not active_b[i]:
+                                    beta_s = 0.0
+                                A_s = A_full[s, i] if A_full.ndim > 1 else A_full[i]
 
-                            dg, d2g, d3g = _compute_derivs_at_u0(
-                                alpha_s, beta_s, Vmax_a_s, Vmax_b_s, K_a_s, K_b_s, n_a_s, n_b_s, A_s, y_ntc_i
-                            )
-                            if not np.isnan(dg):
-                                sample_dg_du.append(dg)
-                            if not np.isnan(d2g):
-                                sample_d2g_du2.append(d2g)
-                            if not np.isnan(d3g):
-                                sample_d3g_du3.append(d3g)
+                                dg, d2g, d3g = _compute_derivs_at_u0(
+                                    alpha_s, beta_s, Vmax_a_s, Vmax_b_s, K_a_s, K_b_s, n_a_s, n_b_s, A_s, y_ntc_i
+                                )
+                                if not np.isnan(dg):
+                                    sample_dg_du.append(dg)
+                                if not np.isnan(d2g):
+                                    sample_d2g_du2.append(d2g)
+                                if not np.isnan(d3g):
+                                    sample_d3g_du3.append(d3g)
 
-                        if sample_dg_du:
-                            dg_du_at_0_lower[i] = np.quantile(sample_dg_du, 0.025)
-                            dg_du_at_0_upper[i] = np.quantile(sample_dg_du, 0.975)
-                        if sample_d2g_du2:
-                            d2g_du2_at_0_lower[i] = np.quantile(sample_d2g_du2, 0.025)
-                            d2g_du2_at_0_upper[i] = np.quantile(sample_d2g_du2, 0.975)
-                        if sample_d3g_du3:
-                            d3g_du3_at_0_lower[i] = np.quantile(sample_d3g_du3, 0.025)
-                            d3g_du3_at_0_upper[i] = np.quantile(sample_d3g_du3, 0.975)
-                    else:
-                        # No posterior samples, use mean as lower/upper
-                        dg_du_at_0_lower[i] = dg_du
-                        dg_du_at_0_upper[i] = dg_du
-                        d2g_du2_at_0_lower[i] = d2g_du2
-                        d2g_du2_at_0_upper[i] = d2g_du2
-                        d3g_du3_at_0_lower[i] = d3g_du3
-                        d3g_du3_at_0_upper[i] = d3g_du3
+                            if sample_dg_du:
+                                dg_du_at_0_lower[i] = np.quantile(sample_dg_du, 0.025)
+                                dg_du_at_0_upper[i] = np.quantile(sample_dg_du, 0.975)
+                            if sample_d2g_du2:
+                                d2g_du2_at_0_lower[i] = np.quantile(sample_d2g_du2, 0.025)
+                                d2g_du2_at_0_upper[i] = np.quantile(sample_d2g_du2, 0.975)
+                            if sample_d3g_du3:
+                                d3g_du3_at_0_lower[i] = np.quantile(sample_d3g_du3, 0.025)
+                                d3g_du3_at_0_upper[i] = np.quantile(sample_d3g_du3, 0.975)
+                        else:
+                            # No posterior samples, use mean as lower/upper
+                            dg_du_at_0_lower[i] = dg_du
+                            dg_du_at_0_upper[i] = dg_du
+                            d2g_du2_at_0_lower[i] = d2g_du2
+                            d2g_du2_at_0_upper[i] = d2g_du2
+                            d3g_du3_at_0_lower[i] = d3g_du3
+                            d3g_du3_at_0_upper[i] = d3g_du3
 
+            if verbose:
+                print(f"  [loop2] total: {time.time() - _t_loop2_start:.1f}s")
+
+            # log2fc_at_u0 is always added (cheap, per-gene scalar) when compute_log2fc_params=True
             data['log2fc_at_u0'] = log2fc_at_0
-            # For binomial distributions: add delta_p_at_u0 and use dp_du column names
-            # For negbinom: use dg_du column names (log2FC derivatives)
             if is_binomial:
                 data['delta_p_at_u0'] = delta_p_at_0
-                # dp/du derivatives (delta_p space)
-                data['dp_du_at_u0'] = dg_du_at_0
-                data['dp_du_at_u0_lower'] = dg_du_at_0_lower
-                data['dp_du_at_u0_upper'] = dg_du_at_0_upper
-                data['d2p_du2_at_u0'] = d2g_du2_at_0
-                data['d2p_du2_at_u0_lower'] = d2g_du2_at_0_lower
-                data['d2p_du2_at_u0_upper'] = d2g_du2_at_0_upper
-                data['d3p_du3_at_u0'] = d3g_du3_at_0
-                data['d3p_du3_at_u0_lower'] = d3g_du3_at_0_lower
-                data['d3p_du3_at_u0_upper'] = d3g_du3_at_0_upper
-            else:
-                # dg/du derivatives (log2FC space)
-                data['dg_du_at_u0'] = dg_du_at_0
-                data['dg_du_at_u0_lower'] = dg_du_at_0_lower
-                data['dg_du_at_u0_upper'] = dg_du_at_0_upper
-                data['d2g_du2_at_u0'] = d2g_du2_at_0
-                data['d2g_du2_at_u0_lower'] = d2g_du2_at_0_lower
-                data['d2g_du2_at_u0_upper'] = d2g_du2_at_0_upper
-                data['d3g_du3_at_u0'] = d3g_du3_at_0
-                data['d3g_du3_at_u0_lower'] = d3g_du3_at_0_lower
-                data['d3g_du3_at_u0_upper'] = d3g_du3_at_0_upper
+
+            # Derivative columns only added when compute_derivative_roots=True
+            if compute_derivative_roots:
+                if is_binomial:
+                    data['dp_du_at_u0'] = dg_du_at_0
+                    data['dp_du_at_u0_lower'] = dg_du_at_0_lower
+                    data['dp_du_at_u0_upper'] = dg_du_at_0_upper
+                    data['d2p_du2_at_u0'] = d2g_du2_at_0
+                    data['d2p_du2_at_u0_lower'] = d2g_du2_at_0_lower
+                    data['d2p_du2_at_u0_upper'] = d2g_du2_at_0_upper
+                    data['d3p_du3_at_u0'] = d3g_du3_at_0
+                    data['d3p_du3_at_u0_lower'] = d3g_du3_at_0_lower
+                    data['d3p_du3_at_u0_upper'] = d3g_du3_at_0_upper
+                else:
+                    data['dg_du_at_u0'] = dg_du_at_0
+                    data['dg_du_at_u0_lower'] = dg_du_at_0_lower
+                    data['dg_du_at_u0_upper'] = dg_du_at_0_upper
+                    data['d2g_du2_at_u0'] = d2g_du2_at_0
+                    data['d2g_du2_at_u0_lower'] = d2g_du2_at_0_lower
+                    data['d2g_du2_at_u0_upper'] = d2g_du2_at_0_upper
+                    data['d3g_du3_at_u0'] = d3g_du3_at_0
+                    data['d3g_du3_at_u0_lower'] = d3g_du3_at_0_lower
+                    data['d3g_du3_at_u0_upper'] = d3g_du3_at_0_upper
 
             # EC50 in log2FC space: log2(K) - log2(x_ntc)
-            data['EC50_a_log2fc'] = np.log2(np.maximum(K_a_mean, epsilon)) - log2_x_ntc
-            data['EC50_b_log2fc'] = np.log2(np.maximum(K_b_mean, epsilon)) - log2_x_ntc
+            data['EC50_a_log2fc'] = np.log2(np.maximum(K_a_median, epsilon)) - log2_x_ntc
+            data['EC50_b_log2fc'] = np.log2(np.maximum(K_b_median, epsilon)) - log2_x_ntc
 
             # Inflection points in log2FC space
             if compute_inflection:
-                inflection_a_mean = data.get('inflection_a_mean', np.full(n_features, np.nan))
-                inflection_b_mean = data.get('inflection_b_mean', np.full(n_features, np.nan))
-
-                # Handle NaN values properly for log transformation
-                inflection_a_log2fc = np.full(n_features, np.nan)
-                inflection_b_log2fc = np.full(n_features, np.nan)
-                valid_a = ~np.isnan(inflection_a_mean) & (inflection_a_mean > epsilon)
-                valid_b = ~np.isnan(inflection_b_mean) & (inflection_b_mean > epsilon)
-
-                if np.any(valid_a):
-                    inflection_a_log2fc[valid_a] = np.log2(inflection_a_mean[valid_a]) - log2_x_ntc
-                if np.any(valid_b):
-                    inflection_b_log2fc[valid_b] = np.log2(inflection_b_mean[valid_b]) - log2_x_ntc
-
-                # Inflection points in log2FC space: log2(inflection) - log2(x_ntc)
                 def _log2fc_transform(arr):
                     out = np.full(n_features, np.nan)
                     ok = np.isfinite(arr) & (arr > epsilon)
                     out[ok] = np.log2(arr[ok]) - log2_x_ntc
                     return out
-                
-                inf_a_mean = data.get('inflection_a_mean', np.full(n_features, np.nan))
-                inf_a_lo   = data.get('inflection_a_lower', np.full(n_features, np.nan))
-                inf_a_hi   = data.get('inflection_a_upper', np.full(n_features, np.nan))
-                
-                inf_b_mean = data.get('inflection_b_mean', np.full(n_features, np.nan))
-                inf_b_lo   = data.get('inflection_b_lower', np.full(n_features, np.nan))
-                inf_b_hi   = data.get('inflection_b_upper', np.full(n_features, np.nan))
-                
-                data['inflection_a_log2fc_mean']  = _log2fc_transform(inf_a_mean)
-                data['inflection_a_log2fc_lower'] = _log2fc_transform(inf_a_lo)
-                data['inflection_a_log2fc_upper'] = _log2fc_transform(inf_a_hi)
-                
-                data['inflection_b_log2fc_mean']  = _log2fc_transform(inf_b_mean)
-                data['inflection_b_log2fc_lower'] = _log2fc_transform(inf_b_lo)
-                data['inflection_b_log2fc_upper'] = _log2fc_transform(inf_b_hi)
+
+                data['inflection_a_log2fc_median'] = _log2fc_transform(data.get('inflection_a_median', np.full(n_features, np.nan)))
+                data['inflection_a_log2fc_lower']  = _log2fc_transform(data.get('inflection_a_lower', np.full(n_features, np.nan)))
+                data['inflection_a_log2fc_upper']  = _log2fc_transform(data.get('inflection_a_upper', np.full(n_features, np.nan)))
+
+                data['inflection_b_log2fc_median'] = _log2fc_transform(data.get('inflection_b_median', np.full(n_features, np.nan)))
+                data['inflection_b_log2fc_lower']  = _log2fc_transform(data.get('inflection_b_lower', np.full(n_features, np.nan)))
+                data['inflection_b_log2fc_upper']  = _log2fc_transform(data.get('inflection_b_upper', np.full(n_features, np.nan)))
                             
             # A (baseline) in transformed y-space
             # For negbinom: A_log2fc = log2(A) - log2(y_ntc)
             # For binomial: A_delta_p = A - y_ntc
             if is_binomial:
-                A_delta_p = A_mean - y_ntc
+                A_delta_p = A_median - y_ntc
                 data['A_delta_p'] = A_delta_p
             else:
                 A_log2fc = np.full(n_features, np.nan)
-                valid_A = (A_mean > epsilon) & (y_ntc > epsilon)
+                valid_A = (A_median > epsilon) & (y_ntc > epsilon)
                 if np.any(valid_A):
-                    A_log2fc[valid_A] = np.log2(A_mean[valid_A]) - np.log2(y_ntc[valid_A])
+                    A_log2fc[valid_A] = np.log2(A_median[valid_A]) - np.log2(y_ntc[valid_A])
                 data['A_log2fc'] = A_log2fc
 
         return data
@@ -3207,15 +3630,16 @@ class ModelSummarizer:
     def _add_single_hill_params(
         self, data, posterior, n_features,
         compute_inflection: bool = True,
-        compute_full_log2fc: bool = True,
         compute_derivative_roots: bool = True,
         x_range: Optional[np.ndarray] = None,
         x_obs_min: Optional[float] = None,
         x_obs_max: Optional[float] = None,
         compute_log2fc_params: bool = False,
+        compute_lfc_ci: bool = True,
         x_ntc=None,
         y_ntc=None,
         fdr_threshold: float = 0.05,
+        verbose: bool = False,
     ):
         """
         Add single Hill parameters to data dict.
@@ -3247,15 +3671,15 @@ class ModelSummarizer:
             # average over extra dims if needed (e.g. multinomial categories)
             if param.ndim > 2:
                 param = param.mean(axis=tuple(range(2, param.ndim)))
-    
+
             if param.ndim == 2:  # [S, T]
-                mean = param.mean(axis=0)
+                mean = np.median(param, axis=0)
                 lo = np.quantile(param, 0.025, axis=0)
                 hi = np.quantile(param, 0.975, axis=0)
             else:                # [T] point
                 mean = lo = hi = param
             return mean, lo, hi
-    
+
         def extract_param_full(name):
             param = posterior[name]
             if isinstance(param, torch.Tensor):
@@ -3274,16 +3698,16 @@ class ModelSummarizer:
                 param = param.squeeze(1)
             if param.ndim > 2:
                 param = param.mean(axis=tuple(range(2, param.ndim)))
-        
+
             param_abs = np.abs(param)
             if param_abs.ndim == 2:
-                mean = param_abs.mean(axis=0)
+                mean = np.median(param_abs, axis=0)
                 lo = np.quantile(param_abs, 0.025, axis=0)
                 hi = np.quantile(param_abs, 0.975, axis=0)
             else:
                 mean = lo = hi = param_abs
             return mean, lo, hi
-    
+
         def _broadcast(arr):
             arr = np.atleast_1d(arr)
             if arr.size == 1:
@@ -3327,21 +3751,63 @@ class ModelSummarizer:
             A_full = np.zeros((1, n_features))
 
         
-        data['Vmax_a_mean'] = Vmax_mean
+        data['Vmax_a_median'] = Vmax_mean
         data['Vmax_a_lower'] = Vmax_lo
         data['Vmax_a_upper'] = Vmax_hi
-        data['K_a_mean'] = K_mean
+        data['K_a_median'] = K_mean
         data['K_a_lower'] = K_lo
         data['K_a_upper'] = K_hi
-        data['n_a_mean'] = n_mean
+        data['n_a_median'] = n_mean
         data['n_a_lower'] = n_lo
         data['n_a_upper'] = n_hi
-        data['alpha_mean'] = alpha_mean
+        data['alpha_median'] = alpha_mean
         data['alpha_lower'] = alpha_lo
         data['alpha_upper'] = alpha_hi
-        data['A_mean'] = A_mean
+        data['A_median'] = A_mean
         data['A_lower'] = A_lo
         data['A_upper'] = A_hi
+
+        # Multinomial: export per-category A, Vmax_a, K_a, n_a, alpha for simulation.
+        # These parallel the per-category alpha/beta columns already in _add_additive_hill_params.
+        distribution = data.get('distribution', 'negbinom')
+        if distribution == 'multinomial':
+            def _extract_single_cat_param(name):
+                """Return raw numpy [S, T, K-1] (or [S, T, K] for A) for a per-category parameter."""
+                if name not in posterior:
+                    return None
+                p = posterior[name]
+                if isinstance(p, torch.Tensor):
+                    p = p.cpu().numpy()
+                if p.ndim == 4 and p.shape[1] == 1:
+                    p = p.squeeze(1)
+                if p.ndim == 3 and p.shape[1] == n_features:
+                    return p
+                return None
+
+            # A: shape [S, T, K] — export K-1 fitted categories and residual
+            A_raw_sh = _extract_single_cat_param('A')
+            if A_raw_sh is not None:
+                K_dim = A_raw_sh.shape[2]
+                AK = A_raw_sh[:, :, -1]
+                data['A_K_median'] = np.median(AK, axis=0)
+                data['A_K_lower'] = np.quantile(AK, 0.025, axis=0)
+                data['A_K_upper'] = np.quantile(AK, 0.975, axis=0)
+                for k in range(K_dim - 1):
+                    ck = A_raw_sh[:, :, k]
+                    data[f'A_cat{k}_median'] = np.median(ck, axis=0)
+                    data[f'A_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                    data[f'A_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
+
+            # Vmax_a, K_a, n_a, alpha: shape [S, T, K-1]
+            for hill_param in ['Vmax_a', 'K_a', 'n_a', 'alpha']:
+                cat_arr = _extract_single_cat_param(hill_param)
+                if cat_arr is not None:
+                    n_cats = cat_arr.shape[2]
+                    for k in range(n_cats):
+                        ck = cat_arr[:, :, k]
+                        data[f'{hill_param}_cat{k}_median'] = np.median(ck, axis=0)
+                        data[f'{hill_param}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
+                        data[f'{hill_param}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
         # Compute product-based FDR for single_hill: P(alpha * Vmax / A > epsilon)
         _ACTIVITY_EPSILON = 0.01
@@ -3367,17 +3833,22 @@ class ModelSummarizer:
             infl_hi   = self._compute_hill_inflection(n_abs_hi,   K_hi)
             
             # (optional) store |n| summaries too
-            data['n_a_abs_mean'] = n_abs_mean
+            data['n_a_abs_median'] = n_abs_mean
             data['n_a_abs_lower'] = n_abs_lo
             data['n_a_abs_upper'] = n_abs_hi
-            data['inflection_a_mean'] = infl_mean
+            data['inflection_a_median'] = infl_mean
             data['inflection_a_lower'] = infl_lo
             data['inflection_a_upper'] = infl_hi
     
         # --- full log2FC range for y = A + alpha*Hill ---
-        if compute_full_log2fc:
+        if compute_log2fc_params:
+            _S_val = Vmax_full.shape[0] if Vmax_full.ndim == 2 else 1
+            if verbose:
+                _n_sig = int(np.sum(q_active < fdr_threshold))
+                print(f"  [single_hill] {n_features} features  {_n_sig} FDR-sig  {_S_val} samples")
+            _t_sh = time.time()
             eps = 1e-10
-        
+
             # mean version using n_used, with correct n==0 limits (Hill == 0.5*V everywhere)
             n_u = np.asarray(n_used, dtype=float)
 
@@ -3395,18 +3866,19 @@ class ModelSummarizer:
             y0 = np.maximum(A_mean + alpha_mean * hill0, eps)
             yinf = np.maximum(A_mean + alpha_mean * hillinf, eps)
 
-            data['full_log2fc_mean'] = np.log2(np.maximum(y0, yinf) / np.minimum(y0, yinf))
-        
-            # CI from posterior samples (coherent)
-            if Vmax_full.ndim == 2:
+            fdr_inactive = q_active >= fdr_threshold
+            log2fc_vals = np.log2(np.maximum(y0, yinf) / np.minimum(y0, yinf))
+            data['full_log2fc_median'] = np.where(fdr_inactive, 0.0, log2fc_vals)
+
+            # CI from posterior samples (coherent; use all available samples)
+            if Vmax_full.ndim == 2 and compute_lfc_ci:
                 S = Vmax_full.shape[0]
-                nS = min(S, 500)
                 lo = np.full(n_features, np.nan)
                 hi = np.full(n_features, np.nan)
-        
+
                 for i in range(n_features):
                     vals = []
-                    for s in range(nS):
+                    for s in range(S):
                         V_s = float(Vmax_full[s, i])
                         K_s = float(K_full[s, i])
                         a_s = float(alpha_full[s, i]) if alpha_full.ndim == 2 else float(alpha_full[i])
@@ -3436,65 +3908,71 @@ class ModelSummarizer:
                 data['full_log2fc_lower'] = lo
                 data['full_log2fc_upper'] = hi
             else:
-                data['full_log2fc_lower'] = data['full_log2fc_mean']
-                data['full_log2fc_upper'] = data['full_log2fc_mean']
+                data['full_log2fc_lower'] = data['full_log2fc_median']
+                data['full_log2fc_upper'] = data['full_log2fc_median']
 
-    
-        # --- observed log2FC over observed x-range (optional; uses fitted function) ---
-        if (x_obs_min is not None) and (x_obs_max is not None) and np.isfinite(x_obs_min) and np.isfinite(x_obs_max):
-            obs = []
-            for i in range(n_features):
-                obs.append(
-                    self._compute_observed_log2fc_fitted(
-                        A_mean[i], alpha_mean[i], Vmax_mean[i], 0.0, 0.0,
-                        K_mean[i], n_used[i], 1.0, 1.0,
-                        float(x_obs_min), float(x_obs_max)
+            if verbose:
+                print(f"    full_log2fc (median + CI):  {time.time() - _t_sh:.1f}s")
+                _t_sh = time.time()
+
+        # --- observed log2FC over observed x-range (gated by compute_log2fc_params) ---
+        if compute_log2fc_params:
+            if (x_obs_min is not None) and (x_obs_max is not None) and np.isfinite(x_obs_min) and np.isfinite(x_obs_max):
+                obs = []
+                for i in range(n_features):
+                    obs.append(
+                        self._compute_observed_log2fc_fitted(
+                            A_mean[i], alpha_mean[i], Vmax_mean[i], 0.0, 0.0,
+                            K_mean[i], n_used[i], 1.0, 1.0,
+                            float(x_obs_min), float(x_obs_max)
+                        )
                     )
-                )
-            data['observed_log2fc'] = obs
+                data['observed_log2fc'] = obs
 
-        if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_full.ndim == 2):
-            eps = 1e-10
-            x0 = float(max(x_obs_min, eps))
-            x1 = float(max(x_obs_max, eps))
-        
-            lo = np.full(n_features, np.nan)
-            hi = np.full(n_features, np.nan)
-        
-            S = Vmax_full.shape[0]
-            nS = min(S, 500)
-        
-            for i in range(n_features):
-                if q_active[i] >= fdr_threshold:
-                    lo[i] = 0.0
-                    hi[i] = 0.0
-                    continue
+            if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_full.ndim == 2) and compute_lfc_ci:
+                eps = 1e-10
+                x0 = float(max(x_obs_min, eps))
+                x1 = float(max(x_obs_max, eps))
 
-                vals = []
-                for s in range(nS):
-                    V_s = float(Vmax_full[s, i])
-                    K_s = float(K_full[s, i])
-                    a_s = float(alpha_full[s, i])
-                    A_s = float(A_full[s, i])
-                    n_s = float(n_full[s, i])
-        
-                    def y_at(x):
-                        H = self._hill_value(x, V_s, K_s, n_s)
-                        return A_s + a_s * H
-        
-                    y0 = max(y_at(x0), eps)
-                    y1 = max(y_at(x1), eps)
-                    vals.append(np.log2(max(y0, y1) / min(y0, y1)))
-        
-                lo[i] = np.quantile(vals, 0.025)
-                hi[i] = np.quantile(vals, 0.975)
-        
-            data['observed_log2fc_lower'] = lo
-            data['observed_log2fc_upper'] = hi
-        else:
-            data['observed_log2fc_lower'] = data.get('observed_log2fc', np.full(n_features, np.nan))
-            data['observed_log2fc_upper'] = data.get('observed_log2fc', np.full(n_features, np.nan))
-    
+                lo = np.full(n_features, np.nan)
+                hi = np.full(n_features, np.nan)
+
+                S = Vmax_full.shape[0]
+
+                for i in range(n_features):
+                    if q_active[i] >= fdr_threshold:
+                        lo[i] = 0.0
+                        hi[i] = 0.0
+                        continue
+
+                    vals = []
+                    for s in range(S):
+                        V_s = float(Vmax_full[s, i])
+                        K_s = float(K_full[s, i])
+                        a_s = float(alpha_full[s, i])
+                        A_s = float(A_full[s, i])
+                        n_s = float(n_full[s, i])
+
+                        def y_at(x):
+                            H = self._hill_value(x, V_s, K_s, n_s)
+                            return A_s + a_s * H
+
+                        y0 = max(y_at(x0), eps)
+                        y1 = max(y_at(x1), eps)
+                        vals.append(np.log2(max(y0, y1) / min(y0, y1)))
+
+                    lo[i] = np.quantile(vals, 0.025)
+                    hi[i] = np.quantile(vals, 0.975)
+
+                data['observed_log2fc_lower'] = lo
+                data['observed_log2fc_upper'] = hi
+            else:
+                data['observed_log2fc_lower'] = data.get('observed_log2fc', np.full(n_features, np.nan))
+                data['observed_log2fc_upper'] = data.get('observed_log2fc', np.full(n_features, np.nan))
+
+            if verbose:
+                print(f"    observed_log2fc (mean + CI): {time.time() - _t_sh:.1f}s")
+
         # --- derivative roots over x_range ---
         if compute_derivative_roots and (x_range is not None):
             first_roots = []
@@ -3524,11 +4002,11 @@ class ModelSummarizer:
             data['n_first_deriv_roots'] = n_first
             data['n_second_deriv_roots'] = n_second
             data['n_third_deriv_roots'] = n_third
-            data['first_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
-            data['second_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
-            data['third_deriv_roots_mean']  = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
-    
-        # --- log2FC transforms (unchanged from your version) ---
+            data['first_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
+            data['second_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
+            data['third_deriv_roots_median']  = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
+
+        # --- log2FC transforms ---
         if compute_log2fc_params and (x_ntc is not None) and (y_ntc is not None):
             eps = 1e-10
             log2_x_ntc = np.log2(max(float(x_ntc), eps))
@@ -3536,31 +4014,30 @@ class ModelSummarizer:
     
             if compute_inflection:
                 eps = 1e-10
-                infl_mean = data.get('inflection_a_mean', np.full(n_features, np.nan))
+                infl_mean = data.get('inflection_a_median', np.full(n_features, np.nan))
                 infl_lo   = data.get('inflection_a_lower', np.full(n_features, np.nan))
                 infl_hi   = data.get('inflection_a_upper', np.full(n_features, np.nan))
-            
+
                 def _log2fc(arr):
                     out = np.full(n_features, np.nan)
                     ok = np.isfinite(arr) & (arr > eps)
                     out[ok] = np.log2(arr[ok]) - log2_x_ntc
                     return out
-            
-                data['inflection_a_log2fc_mean']  = _log2fc(infl_mean)
-                data['inflection_a_log2fc_lower'] = _log2fc(infl_lo)
-                data['inflection_a_log2fc_upper'] = _log2fc(infl_hi)
-            
-                # Backwards compat
-                data['inflection_a_log2fc'] = data['inflection_a_log2fc_mean']
+
+                data['inflection_a_log2fc_median'] = _log2fc(infl_mean)
+                data['inflection_a_log2fc_lower']  = _log2fc(infl_lo)
+                data['inflection_a_log2fc_upper']  = _log2fc(infl_hi)
+
     
             y_ntc_arr = np.asarray(y_ntc, dtype=float)
             outA = np.full(n_features, np.nan)
             okA = (A_mean > eps) & (y_ntc_arr > eps)
             outA[okA] = np.log2(A_mean[okA]) - np.log2(y_ntc_arr[okA])
             data['A_log2fc'] = outA
+
     
             # Also roots in log2FC x-space, if present:
-            if compute_derivative_roots and (x_range is not None) and ('first_deriv_roots_mean' in data):
+            if compute_derivative_roots and (x_range is not None) and ('first_deriv_roots_median' in data):
                 first_log = []
                 second_log = []
                 third_log = []
@@ -3574,17 +4051,17 @@ class ModelSummarizer:
                             return []
                         return [float(x) for x in str(s).split(';') if x != '']
 
-                    r1 = _parse(data['first_deriv_roots_mean'][i])
-                    r2 = _parse(data['second_deriv_roots_mean'][i])
-                    r3 = _parse(data['third_deriv_roots_mean'][i])
+                    r1 = _parse(data['first_deriv_roots_median'][i])
+                    r2 = _parse(data['second_deriv_roots_median'][i])
+                    r3 = _parse(data['third_deriv_roots_median'][i])
 
                     # Use np.nan for empty roots (consistent with additive_hill)
                     first_log.append(';'.join([f'{(np.log2(max(r, eps)) - log2_x_ntc):.4f}' for r in r1]) if r1 else np.nan)
                     second_log.append(';'.join([f'{(np.log2(max(r, eps)) - log2_x_ntc):.4f}' for r in r2]) if r2 else np.nan)
                     third_log.append(';'.join([f'{(np.log2(max(r, eps)) - log2_x_ntc):.4f}' for r in r3]) if r3 else np.nan)
-                data['first_deriv_roots_log2fc_mean'] = first_log
-                data['second_deriv_roots_log2fc_mean'] = second_log
-                data['third_deriv_roots_log2fc_mean'] = third_log
+                data['first_deriv_roots_log2fc_median'] = first_log
+                data['second_deriv_roots_log2fc_median'] = second_log
+                data['third_deriv_roots_log2fc_median'] = third_log
     
         return data
 
@@ -3593,11 +4070,12 @@ class ModelSummarizer:
         data,
         posterior,
         n_features,
-        compute_full_log2fc: bool = True,
         compute_derivative_roots: bool = True,
+        compute_log2fc_params: bool = False,
         x_range: Optional[np.ndarray] = None,
         x_obs_min: Optional[float] = None,
-        x_obs_max: Optional[float] = None
+        x_obs_max: Optional[float] = None,
+        verbose: bool = False,
     ):
         """
         Add polynomial parameters to data dict.
@@ -3634,15 +4112,15 @@ class ModelSummarizer:
         if coefs.ndim == 3:
             # summary per coefficient
             for i in range(degree + 1):
-                data[f'coef_{i}_mean']  = coefs[:, :, i].mean(axis=0)
-                data[f'coef_{i}_lower'] = np.quantile(coefs[:, :, i], 0.025, axis=0)
-                data[f'coef_{i}_upper'] = np.quantile(coefs[:, :, i], 0.975, axis=0)
-            coefs_mean = coefs.mean(axis=0)  # [T, d+1]
+                data[f'coef_{i}_median'] = np.median(coefs[:, :, i], axis=0)
+                data[f'coef_{i}_lower']  = np.quantile(coefs[:, :, i], 0.025, axis=0)
+                data[f'coef_{i}_upper']  = np.quantile(coefs[:, :, i], 0.975, axis=0)
+            coefs_mean = np.median(coefs, axis=0)  # [T, d+1] — used for function evaluation
         else:
             for i in range(degree + 1):
-                data[f'coef_{i}_mean']  = coefs[:, i]
-                data[f'coef_{i}_lower'] = coefs[:, i]
-                data[f'coef_{i}_upper'] = coefs[:, i]
+                data[f'coef_{i}_median'] = coefs[:, i]
+                data[f'coef_{i}_lower']  = coefs[:, i]
+                data[f'coef_{i}_upper']  = coefs[:, i]
             coefs_mean = coefs  # [T, d+1]
     
         # Determine if polynomial is in log2 space (negbinom) or linear space (others)
@@ -3652,7 +4130,12 @@ class ModelSummarizer:
         # full_log2fc and observed_log2fc: evaluate over observed x-range
         # For negbinom: poly(log2(x)), evaluate on log2 grid
         # For others: poly(x), evaluate on linear grid
-        if compute_full_log2fc:
+        if verbose:
+            print(f"  [polynomial] {n_features} features  "
+                  f"compute_derivative_roots={compute_derivative_roots}  "
+                  f"compute_log2fc_params={compute_log2fc_params}")
+        _t_poly = time.time()
+        if compute_log2fc_params:
             if (x_obs_min is not None) and (x_obs_max is not None) and np.isfinite(x_obs_min) and np.isfinite(x_obs_max):
                 x_min = float(x_obs_min)
                 x_max = float(x_obs_max)
@@ -3699,7 +4182,7 @@ class ModelSummarizer:
                         full_mean.append(np.nan)
                         observed_log2fc.append(np.nan)
 
-            data['full_log2fc_mean'] = full_mean
+            data['full_log2fc_median'] = full_mean
             data['full_log2fc_lower'] = full_mean
             data['full_log2fc_upper'] = full_mean
             data['observed_log2fc'] = observed_log2fc
@@ -3750,11 +4233,12 @@ class ModelSummarizer:
             data['n_second_deriv_roots'] = n_second
             data['n_third_deriv_roots'] = n_third
             # Roots are now in linear x space for all distributions
-            data['first_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
-            data['second_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
-            data['third_deriv_roots_mean'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
+            data['first_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
+            data['second_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
+            data['third_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
 
-            if 'x_ntc' in data and data['x_ntc'] is not None and np.isfinite(data['x_ntc']):
+            # u-space root conversion: only when compute_log2fc_params is also True
+            if compute_log2fc_params and 'x_ntc' in data and data['x_ntc'] is not None and np.isfinite(data['x_ntc']):
                 log2_x_ntc = np.log2(max(float(data['x_ntc']), eps))
 
                 def _to_log2fc_str(root_str):
@@ -3767,11 +4251,13 @@ class ModelSummarizer:
                     u = [np.log2(max(r, eps)) - log2_x_ntc for r in roots]
                     return ';'.join([f'{val:.4f}' for val in u]) if u else np.nan
 
-                data['first_deriv_roots_log2fc_mean'] = [_to_log2fc_str(s) for s in data['first_deriv_roots_mean']]
-                data['second_deriv_roots_log2fc_mean'] = [_to_log2fc_str(s) for s in data['second_deriv_roots_mean']]
-                data['third_deriv_roots_log2fc_mean'] = [_to_log2fc_str(s) for s in data['third_deriv_roots_mean']]
+                data['first_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['first_deriv_roots_median']]
+                data['second_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['second_deriv_roots_median']]
+                data['third_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['third_deriv_roots_median']]
 
-    
+        if verbose:
+            print(f"  [polynomial] total: {time.time() - _t_poly:.1f}s")
+
         return data
 
 
@@ -4164,10 +4650,16 @@ class ModelSummarizer:
 
         Classification Logic:
         - dep_mask_a: Component A is active — Bayesian q-value < fdr_threshold (default 0.05)
-          where q-value is derived from P(alpha*Vmax_a/A > epsilon) pooled over both components.
+          AND n_a's 95% CI excludes 0, where q-value is derived from
+          P(alpha*Vmax_a/A > epsilon) pooled over both components.
           Note: p_active_a is actually the q-value passed from _add_additive_hill_params_individual.
-        - dep_mask_b: Component B is active — q-value < fdr_threshold
-          Falls back to CI-based check if p_active_a/p_active_b not provided.
+          The n_a CI-exclusion guard matches the criterion used for `is_dependent`/`fit_type`
+          (see the `active_a`/`active_b` computation above): without it, a component can be
+          "significant" purely because alpha/beta absorbed a constant offset while n_a/n_b ≈ 0
+          (flat Hill, unidentified K) -- the same degenerate case is_dependent guards against.
+          Falls back to CI-based check on alpha/beta (instead of the q-value) if
+          p_active_a/p_active_b not provided.
+        - dep_mask_b: Component B is active — same as dep_mask_a for n_b/beta.
         - dep_mask: Either component is active
 
         Categories:
@@ -4184,21 +4676,27 @@ class ModelSummarizer:
         - 'non_monotonic_max': Both active, opposite signs, local maximum at nearest extremum to x_ntc
             (where S'=0, checked via S'' < 0 at that point)
         """
-        # Define dependency masks using Bayesian q-value < fdr_threshold when available
-        # (p_active_a/b are actually q-values passed from _add_additive_hill_params_individual),
-        # falling back to CI-based check otherwise.
+        # Define dependency masks using Bayesian q-value < fdr_threshold AND n's CI
+        # excluding 0 when q-values are available (p_active_a/b are actually q-values
+        # passed from _add_additive_hill_params_individual), falling back to a pure
+        # CI-based check on alpha/beta otherwise. This mirrors exactly the
+        # active_a/active_b criterion used for is_dependent/fit_type above, so
+        # dep_mask (and therefore whether classification == 'flat') is consistent
+        # with is_dependent: a component can no longer be classified as active from
+        # q-value alone while its Hill exponent is unidentified (CI includes 0).
+        n_a_active = not (n_a_lower <= 0 <= n_a_upper)
+        n_b_active = not (n_b_lower <= 0 <= n_b_upper)
+
         if p_active_a is not None:
-            dep_mask_a = p_active_a < fdr_threshold
+            dep_mask_a = (p_active_a < fdr_threshold) and n_a_active
         else:
             alpha_active = not (alpha_lower <= 0 <= alpha_upper)
-            n_a_active   = not (n_a_lower   <= 0 <= n_a_upper)
             dep_mask_a   = alpha_active and n_a_active
 
         if p_active_b is not None:
-            dep_mask_b = p_active_b < fdr_threshold
+            dep_mask_b = (p_active_b < fdr_threshold) and n_b_active
         else:
             beta_active = not (beta_lower <= 0 <= beta_upper)
-            n_b_active  = not (n_b_lower  <= 0 <= n_b_upper)
             dep_mask_b  = beta_active and n_b_active
         dep_mask = dep_mask_a or dep_mask_b  # At least one component active
 
@@ -4485,7 +4983,7 @@ class ModelSummarizer:
     def classify_second_deriv_roots(
         self,
         df: "pd.DataFrame",
-        root_col: str = "second_deriv_roots_log2fc_mean",
+        root_col: str = "second_deriv_roots_log2fc_median",
         tol_f: float = 1e-10,
         tol_f3: float = 1e-12,
     ) -> "pd.DataFrame":
@@ -4506,13 +5004,13 @@ class ModelSummarizer:
         df : pd.DataFrame
             Summary DataFrame returned by ``save_trans_summary`` (with
             ``compute_derivative_roots=True``).  Required columns:
-            ``feature``, ``x_ntc``, ``A_mean``, ``alpha_mean``, ``beta_mean``,
-            ``Vmax_a_mean``, ``K_a_mean``, ``n_a_mean``, ``Vmax_b_mean``,
-            ``K_b_mean``, ``n_b_mean``, and the root column specified by
+            ``feature``, ``x_ntc``, ``A_median``, ``alpha_median``, ``beta_median``,
+            ``Vmax_a_median``, ``K_a_median``, ``n_a_median``, ``Vmax_b_median``,
+            ``K_b_median``, ``n_b_median``, and the root column specified by
             ``root_col``.
         root_col : str
             Column in *df* containing the semicolon-separated root strings to
-            evaluate (default: ``"second_deriv_roots_log2fc_mean"``).
+            evaluate (default: ``"second_deriv_roots_log2fc_median"``).
         tol_f : float
             Absolute tolerance below which g'(u) is treated as zero (default 1e-10).
         tol_f3 : float
@@ -4539,9 +5037,9 @@ class ModelSummarizer:
         >>> # Keep only clear local maxima of rate of change
         >>> peaks = df_roots[df_roots["extremum_type_abs"] == "local_max_abs"]
         """
-        required_params = ["x_ntc", "A_mean", "alpha_mean", "beta_mean",
-                           "Vmax_a_mean", "K_a_mean", "n_a_mean",
-                           "Vmax_b_mean", "K_b_mean", "n_b_mean"]
+        required_params = ["x_ntc", "A_median", "alpha_median", "beta_median",
+                           "Vmax_a_median", "K_a_median", "n_a_median",
+                           "Vmax_b_median", "K_b_median", "n_b_median"]
         missing = [c for c in ["feature", root_col] + required_params if c not in df.columns]
         if missing:
             raise ValueError(
@@ -4558,15 +5056,15 @@ class ModelSummarizer:
 
             try:
                 x_ntc  = float(r["x_ntc"])
-                A      = float(r["A_mean"])
-                alpha  = float(r["alpha_mean"])
-                beta   = float(r["beta_mean"])
-                Vmax_a = float(r["Vmax_a_mean"])
-                K_a    = float(r["K_a_mean"])
-                n_a    = float(r["n_a_mean"])
-                Vmax_b = float(r["Vmax_b_mean"])
-                K_b    = float(r["K_b_mean"])
-                n_b    = float(r["n_b_mean"])
+                A      = float(r["A_median"])
+                alpha  = float(r["alpha_median"])
+                beta   = float(r["beta_median"])
+                Vmax_a = float(r["Vmax_a_median"])
+                K_a    = float(r["K_a_median"])
+                n_a    = float(r["n_a_median"])
+                Vmax_b = float(r["Vmax_b_median"])
+                K_b    = float(r["K_b_median"])
+                n_b    = float(r["n_b_median"])
             except (KeyError, TypeError, ValueError):
                 continue
 

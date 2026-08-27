@@ -4,7 +4,7 @@ Example: Run technical fit and save results.
 This script demonstrates how to:
 1. Load data
 2. Initialize bayesDREAM with multi-modal support
-3. Run fit_technical() on the primary modality
+3. Run fit_ntc() on the primary modality
 4. Save fitted parameters for later use
 
 Usage:
@@ -77,8 +77,8 @@ if __name__ == "__main__":
     model.set_technical_groups(args.covariates)
 
     # Fit technical
-    print(f"\nRunning fit_technical...")
-    model.fit_technical(
+    print(f"\nRunning fit_ntc...")
+    model.fit_ntc(
         modality_name='gene',
         sum_factor_col='sum_factor',
         tolerance=0
@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
     # Save results
     print(f"\nSaving technical fit...")
-    saved_files = model.save_technical_fit()
+    saved_files = model.save_ntc_fit()
 
     print(f"\n✓ Technical fit complete!")
     print(f"\nSaved files:")

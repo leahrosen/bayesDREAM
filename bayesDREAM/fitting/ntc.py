@@ -1,7 +1,7 @@
 """
-Technical variation fitting for bayesDREAM.
+NTC fitting for bayesDREAM.
 
-This module contains the technical model and fitting logic.
+This module contains the NTC model and fitting logic (overdispersion estimation and batch effect correction).
 """
 
 import os
@@ -26,12 +26,12 @@ except ImportError:
 
 
 
-class TechnicalFitter:
-    """Handles technical variation fitting on NTC cells."""
+class NTCFitter:
+    """Handles NTC fitting: estimates gene-specific overdispersion and batch effects."""
 
     def __init__(self, model):
         """
-        Initialize technical fitter.
+        Initialize NTC fitter.
 
         Parameters
         ----------
@@ -172,7 +172,7 @@ class TechnicalFitter:
             print(f"[INFO] Minibatching: {recommended_batch} samples/batch × {n_batches} batches (parallel=False)")
             return recommended_batch, use_parallel
 
-    def _model_technical(
+    def _model_ntc(
         self,
         N,
         T,
@@ -188,9 +188,14 @@ class TechnicalFitter:
         distribution='negbinom',
         denominator_ntc_tensor=None,
         K=None,
-        D=None,
         sigma_hat_tensor=None,
         skip_obs_sampling=False,
+        log_mu_ntc=None,
+        log_sigma_ntc=None,
+        zero_cat_mask_precomp=None,
+        ref_counts_precomp=None,
+        beta_a_precomp=None,
+        beta_b_precomp=None,
     ):
         """
         Technical model used for NTC-only prefit of cell-line effects.
@@ -202,7 +207,6 @@ class TechnicalFitter:
         # ----------------------------
         # PLATES for groups and feats
         # ----------------------------
-        c_plate  = pyro.plate("c_plate", C - 1, dim=-2)      # groups except baseline
         f_plate  = pyro.plate("feature_plate_technical", T, dim=-1)
     
         # ----------------------------
@@ -215,33 +219,28 @@ class TechnicalFitter:
         if distribution == 'multinomial':
             assert K is not None, "multinomial requires K"
 
-            # ---- zero-probability category mask per (T,K) from ALL NTC counts ----
-            # (We need ALL NTC data to identify structurally absent categories)
-            total_counts_per_feature = y_obs_ntc_tensor.sum(dim=0)  # [T, K]
-            zero_cat_mask = (total_counts_per_feature == 0)         # [T, K] bool
-
-            # ---- Per-group zero-count masking ----
-            # Mask categories that are 0 in ANY technical group
-            # This prevents fitting corrections for categories with no data in some groups
-            any_group_zero_mask = torch.zeros_like(zero_cat_mask, dtype=torch.bool)
-            for g in range(C):
-                group_mask = (groups_ntc_tensor == g)
-                if group_mask.sum() > 0:
-                    group_counts = y_obs_ntc_tensor[group_mask, :, :].sum(dim=0)  # [T, K]
-                    any_group_zero_mask = any_group_zero_mask | (group_counts == 0)
-
-            # Combine: mask if zero across all data OR zero in any group
-            zero_cat_mask = zero_cat_mask | any_group_zero_mask
-            pyro.deterministic("zero_cat_mask", zero_cat_mask)
-
-            # ---- Compute counts from reference group (group 0) for Dirichlet prior ----
-            ref_mask = (groups_ntc_tensor == 0)
-            if ref_mask.sum() > 0:
-                # Use reference group only for more accurate baseline
-                total_counts_ref = y_obs_ntc_tensor[ref_mask, :, :].sum(dim=0)  # [T, K]
+            if zero_cat_mask_precomp is not None:
+                zero_cat_mask = zero_cat_mask_precomp
+                total_counts_ref = ref_counts_precomp
             else:
-                # Fallback to all data if no reference group
-                total_counts_ref = total_counts_per_feature  # [T, K]
+                # ---- zero-probability category mask per (T,K) from ALL NTC counts ----
+                total_counts_per_feature = y_obs_ntc_tensor.sum(dim=0)  # [T, K]
+                zero_cat_mask = (total_counts_per_feature == 0)         # [T, K] bool
+
+                # ---- Per-group zero-count masking ----
+                any_group_zero_mask = torch.zeros_like(zero_cat_mask, dtype=torch.bool)
+                for g in range(C):
+                    group_mask = (groups_ntc_tensor == g)
+                    if group_mask.sum() > 0:
+                        group_counts = y_obs_ntc_tensor[group_mask, :, :].sum(dim=0)  # [T, K]
+                        any_group_zero_mask = any_group_zero_mask | (group_counts == 0)
+
+                zero_cat_mask = zero_cat_mask | any_group_zero_mask
+
+                ref_mask = (groups_ntc_tensor == 0)
+                total_counts_ref = (y_obs_ntc_tensor[ref_mask, :, :].sum(dim=0)
+                                    if ref_mask.sum() > 0 else total_counts_per_feature)
+            pyro.deterministic("zero_cat_mask", zero_cat_mask)
             # Count active categories after masking
             active_k = (~zero_cat_mask).sum(dim=-1)  # [T]
             
@@ -249,139 +248,148 @@ class TechnicalFitter:
                 bad = torch.nonzero(active_k <= 1, as_tuple=False).squeeze(-1).tolist()
                 raise RuntimeError(
                     "Multinomial QC mismatch: feature(s) with ≤1 active category reached "
-                    f"_model_technical (indices in T_fit: {bad}). "
-                    "These should have been filtered out in fit_technical()."
+                    f"_model_ntc (indices in T_fit: {bad}). "
+                    "These should have been filtered out in fit_ntc()."
                 )
         
-            # ---- Cell-line logits α for NON-baseline groups (baseline=0 implicit) ----
-            with pyro.plate("c_plate_multi", C - 1, dim=-3), \
-                 pyro.plate("f_plate_multi", T, dim=-2), \
-                 pyro.plate("k_plate", K, dim=-1):
-                alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=self._t(0.0), scale=self._t(20.0)))
-        
-            # Force α to 0 where category is structurally absent
-            alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-
-            # Center over ACTIVE categories only.
-            # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
-            # Dividing by n_active (not K) gives the correct softmax centering constraint
-            # (sum of active alphas = 0).  Dividing by K would leave a residual constant
-            # shift in the active alphas, breaking identifiability for features with
-            # many phantom categories.
-            n_active = (~zero_cat_mask).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
-            active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active             # [C-1, T, 1]
-            alpha_logits_y = alpha_logits_y - active_mean
-            alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask.unsqueeze(0), 0.0)
-            alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
-        
-            # Build full [C, T, K] (or [S, C, T, K]) with baseline=0
-            if alpha_logits_y.dim() == 3:
-                alpha_full_add_logits = torch.cat(
-                    [torch.zeros(1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
-                     alpha_logits_y.to(self.model.device)], dim=0
-                )
-            elif alpha_logits_y.dim() == 4:
-                S = alpha_logits_y.size(0)
-                alpha_full_add_logits = torch.cat(
-                    [torch.zeros(S, 1, T, K, device=self.model.device, dtype=alpha_logits_y.dtype),
-                     alpha_logits_y.to(self.model.device)], dim=1
-                )
+            if C == 1:
+                # No group effects to estimate — trivial correction
+                alpha_full_mul = None
+                alpha_full_add = torch.zeros(1, T, K, device=self.model.device)
             else:
-                raise ValueError(f"Unexpected alpha_logits_y shape: {tuple(alpha_logits_y.shape)}")
-        
-            alpha_full_mul = None
-            alpha_full_add = alpha_full_add_logits
+                # ---- Cell-line logits α for NON-baseline groups (baseline=0 implicit) ----
+                with pyro.plate("c_plate_multi", C - 1, dim=-3), \
+                     pyro.plate("f_plate_multi", T, dim=-2), \
+                     pyro.plate("k_plate", K, dim=-1):
+                    alpha_logits_y = pyro.sample("alpha_logits_y", dist.StudentT(df=self._t(3), loc=self._t(0.0), scale=self._t(20.0)))
 
-            #print(f'[DEBUG], alpha_logits_y shape = {alpha_logits_y.shape}, expect [C-1={C-1}, T={T}, K={K}')
-            #print(f'[DEBUG], alpha_full_add shape = {alpha_full_add.shape}')
+                # During CPU-offloaded Predictive, guide params stay on CUDA while model
+                # inputs (including zero_cat_mask) are on CPU.  Align the mask to the
+                # sampled tensor's device so masked_fill / arithmetic don't crash.
+                _alpha_dev = alpha_logits_y.device
+                zero_cat_mask_dev = zero_cat_mask.to(_alpha_dev)
+
+                # Force α to 0 where category is structurally absent
+                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask_dev.unsqueeze(0), 0.0)
+
+                # Center over ACTIVE categories only.
+                # Phantoms are already 0, so sum(alpha, dim=-1) = sum over active categories.
+                # Dividing by n_active (not K) gives the correct softmax centering constraint
+                # (sum of active alphas = 0).  Dividing by K would leave a residual constant
+                # shift in the active alphas, breaking identifiability for features with
+                # many phantom categories.
+                n_active = (~zero_cat_mask_dev).float().sum(dim=-1, keepdim=True).clamp_min(1.0)  # [T, 1]
+                active_mean = alpha_logits_y.sum(dim=-1, keepdim=True) / n_active                 # [C-1, T, 1]
+                alpha_logits_y = alpha_logits_y - active_mean
+                alpha_logits_y = alpha_logits_y.masked_fill(zero_cat_mask_dev.unsqueeze(0), 0.0)
+                alpha_logits_y = pyro.deterministic("alpha_logits_y_centered", alpha_logits_y)
+
+                # Build full [C, T, K] (or [S, C, T, K]) with baseline=0
+                if alpha_logits_y.dim() == 3:
+                    alpha_full_add_logits = torch.cat(
+                        [torch.zeros(1, T, K, device=_alpha_dev, dtype=alpha_logits_y.dtype),
+                         alpha_logits_y], dim=0
+                    )
+                elif alpha_logits_y.dim() == 4:
+                    S = alpha_logits_y.size(0)
+                    alpha_full_add_logits = torch.cat(
+                        [torch.zeros(S, 1, T, K, device=_alpha_dev, dtype=alpha_logits_y.dtype),
+                         alpha_logits_y], dim=1
+                    )
+                else:
+                    raise ValueError(f"Unexpected alpha_logits_y shape: {tuple(alpha_logits_y.shape)}")
+
+                alpha_full_mul = None
+                alpha_full_add = alpha_full_add_logits
+
         else:
             # ----------------------------
             # Shared cell-line effects for non-multinomial dists
             # ----------------------------
-            if distribution in ("normal", "studentt"):
-                # For Normal we want additive shifts on the ORIGINAL scale,
-                # with a width that reflects the data:
-                #   alpha ~ StudentT(ν=3, loc=0, scale ~ robust_SD / sqrt(N))
-                #
-                # mu_x_sd_tensor is [T] and encodes robust SD (MAD-based) / sqrt(N).
-                alpha_scale = mu_x_sd_tensor.clamp_min(epsilon_tensor)
-            
-                with f_plate:
-                    with c_plate:  # [C-1, T]
-                        # Name kept as log2_alpha_y for backwards compatibility;
-                        # for Normal it is *literally* the additive shift in y-units.
-                        log2_alpha_y = pyro.sample(
-                            "log2_alpha_y",
-                            dist.StudentT(
-                                df=self._t(3),
-                                loc=self._t(0.0),
-                                scale=alpha_scale,        # [T], broadcast to [C-1, T]
-                            ),
-                        )
-            
-                        # For Normal we don't *use* multiplicative effects at all:
-                        # keep alpha_y_mul around for API compatibility, but fix it to 1.
-                        alpha_y_mul = pyro.deterministic(
-                            "alpha_y_mul",
-                            torch.ones_like(log2_alpha_y)
-                        )
-            
-                        # Additive shift on the mean
-                        delta_y_add = pyro.deterministic(
-                            "delta_y_add",
-                            log2_alpha_y          # direct additive shift on mean
-                        )
-
-
+            if C == 1:
+                # No group effects to estimate — trivial correction tensors
+                alpha_full_mul = torch.ones(1, T, device=self.model.device)
+                alpha_full_add = torch.zeros(1, T, device=self.model.device)
             else:
-                # Original behaviour for negbinom / binomial, etc.
-                with f_plate:
-                    with c_plate:  # [C-1, T]
-                        log2_alpha_y = pyro.sample(
-                            "log2_alpha_y",
-                            dist.StudentT(
-                                df=self._t(3),
-                                loc=self._t(0.0),
-                                scale=self._t(20.0),
-                            ),
-                        )
-                        alpha_y_mul = pyro.deterministic(
-                            "alpha_y_mul", self._t(2.0) ** log2_alpha_y
-                        )
-                        delta_y_add = pyro.deterministic(
-                            "delta_y_add", log2_alpha_y
-                        )
+                c_plate = pyro.plate("c_plate", C - 1, dim=-2)
+                if distribution in ("normal", "studentt"):
+                    # For Normal we want additive shifts on the ORIGINAL scale,
+                    # with a width that reflects the data:
+                    #   alpha ~ StudentT(ν=3, loc=0, scale ~ robust_SD / sqrt(N))
+                    #
+                    # mu_x_sd_tensor is [T] and encodes robust SD (MAD-based) / sqrt(N).
+                    alpha_scale = mu_x_sd_tensor.clamp_min(epsilon_tensor)
 
-            if alpha_y_mul.ndim == 2:
-                alpha_full_mul = torch.cat(
-                    [torch.ones(1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
-                    dim=0
-                )
-                alpha_full_add = torch.cat(
-                    [torch.zeros(1, T, device=self.model.device), delta_y_add.to(self.model.device)],
-                    dim=0
-                )
-            elif alpha_y_mul.ndim == 3:
-                S = alpha_y_mul.size(0)
-                alpha_full_mul = torch.cat(
-                    [torch.ones(S, 1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
-                    dim=1
-                )
-                alpha_full_add = torch.cat(
-                    [torch.zeros(S, 1, T, device=self.model.device), delta_y_add.to(self.model.device)],
-                    dim=1
-                )
-            else:
-                raise ValueError(f"Unexpected alpha/log2 shapes: {alpha_y_mul.shape}, {delta_y_add.shape}")
+                    with f_plate:
+                        with c_plate:  # [C-1, T]
+                            # For Normal, log2_alpha_y is *literally* the additive shift in y-units.
+                            log2_alpha_y = pyro.sample(
+                                "log2_alpha_y",
+                                dist.StudentT(
+                                    df=self._t(3),
+                                    loc=self._t(0.0),
+                                    scale=alpha_scale,        # [T], broadcast to [C-1, T]
+                                ),
+                            )
 
-        #print(f'[DEBUG], alpha_full_add shape = {alpha_full_add.shape}')
-    
+                            # For Normal, multiplicative effects are not used; alpha_y_mul is fixed to 1.
+                            alpha_y_mul = pyro.deterministic(
+                                "alpha_y_mul",
+                                torch.ones_like(log2_alpha_y)
+                            )
+
+                            # Additive shift on the mean
+                            delta_y_add = pyro.deterministic(
+                                "delta_y_add",
+                                log2_alpha_y          # direct additive shift on mean
+                            )
+
+                else:
+                    # Original behaviour for negbinom / binomial, etc.
+                    with f_plate:
+                        with c_plate:  # [C-1, T]
+                            log2_alpha_y = pyro.sample(
+                                "log2_alpha_y",
+                                dist.StudentT(
+                                    df=self._t(3),
+                                    loc=self._t(0.0),
+                                    scale=self._t(20.0),
+                                ),
+                            )
+                            alpha_y_mul = pyro.deterministic(
+                                "alpha_y_mul", self._t(2.0) ** log2_alpha_y
+                            )
+                            delta_y_add = pyro.deterministic(
+                                "delta_y_add", log2_alpha_y
+                            )
+
+                if alpha_y_mul.ndim == 2:
+                    alpha_full_mul = torch.cat(
+                        [torch.ones(1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
+                        dim=0
+                    )
+                    alpha_full_add = torch.cat(
+                        [torch.zeros(1, T, device=self.model.device), delta_y_add.to(self.model.device)],
+                        dim=0
+                    )
+                elif alpha_y_mul.ndim == 3:
+                    S = alpha_y_mul.size(0)
+                    alpha_full_mul = torch.cat(
+                        [torch.ones(S, 1, T, device=self.model.device), alpha_y_mul.to(self.model.device)],
+                        dim=1
+                    )
+                    alpha_full_add = torch.cat(
+                        [torch.zeros(S, 1, T, device=self.model.device), delta_y_add.to(self.model.device)],
+                        dim=1
+                    )
+                else:
+                    raise ValueError(f"Unexpected alpha/log2 shapes: {alpha_y_mul.shape}, {delta_y_add.shape}")
+
         # --------------------------------
         # Dispersion / variance priors
         # --------------------------------
-        phi_y       = None  # NB overdispersion (as total_count)
-        sigma_y     = None  # Normal per-feature std
-        sigma_y_mv  = None  # MVN per-(feature,dim) std
+        phi_y   = None  # NB overdispersion (as total_count)
+        sigma_y = None  # Normal per-feature std
     
         if distribution == 'negbinom':
             beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
@@ -422,41 +430,37 @@ class TechnicalFitter:
                     # Matches the convention used by fit_trans for Vmax/K parameters.
                     # Floor on log_sigma prevents the prior from collapsing to a point mass
                     # when σ << μ (very stably expressed genes).
-                    log_sigma = torch.sqrt(
-                        torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
-                    ).clamp(min=0.1)
-                    log_mu = torch.log(mu_x_mean_tensor) - 0.5 * log_sigma ** 2
+                    if log_mu_ntc is not None and log_sigma_ntc is not None:
+                        _log_mu = log_mu_ntc
+                        _log_sigma = log_sigma_ntc
+                    else:
+                        _log_sigma = torch.sqrt(
+                            torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
+                        ).clamp(min=0.1)
+                        _log_mu = torch.log(mu_x_mean_tensor) - 0.5 * _log_sigma ** 2
                     mu_ntc = pyro.sample(
                         "mu_ntc",
-                        dist.LogNormal(log_mu, log_sigma)
+                        dist.LogNormal(_log_mu, _log_sigma)
                     )
             mu_y = mu_ntc  # [T]
     
         elif distribution == 'binomial':
-            # Empirical-Bayes Beta with bounded concentration (stable when denom >> counts)
-            # Use reference group (group 0) only for more accurate baseline
-            ref_mask = (groups_ntc_tensor == 0)
-
-            if ref_mask.sum() > 0:
-                # Compute from reference group only
-                y_sum_ref  = y_obs_ntc_tensor[ref_mask, :].sum(dim=0).float()    # [T]
-                den_sum_ref = denominator_ntc_tensor[ref_mask, :].sum(dim=0).float()  # [T]
+            if beta_a_precomp is not None:
+                a = beta_a_precomp
+                b = beta_b_precomp
             else:
-                # Fallback to all data if no reference group
-                y_sum_ref  = y_obs_ntc_tensor.sum(dim=0).float()    # [T]
-                den_sum_ref = denominator_ntc_tensor.sum(dim=0).float()  # [T]
-
-            # Smooth p-hat to keep it off 0/1 even if den_sum==0
-            p_hat = (y_sum_ref + 0.5) / (den_sum_ref + 1.0)         # [T] in (0,1)
-            p_hat = torch.clamp(p_hat, 1e-6, 1 - 1e-6)
-
-            # Cap effective sample size: informative but not razor-sharp
-            # tune these if needed (e.g., 20..100)
-            kappa = torch.clamp(den_sum_ref, min=20.0, max=200.0)
-
-            # Tiny floor to avoid exactly 0 concentration parameters
-            a = p_hat * kappa + 1e-3
-            b = (1.0 - p_hat) * kappa + 1e-3
+                # Empirical-Bayes Beta with bounded concentration (stable when denom >> counts)
+                ref_mask = (groups_ntc_tensor == 0)
+                if ref_mask.sum() > 0:
+                    y_sum_ref   = y_obs_ntc_tensor[ref_mask, :].sum(dim=0).float()
+                    den_sum_ref = denominator_ntc_tensor[ref_mask, :].sum(dim=0).float()
+                else:
+                    y_sum_ref   = y_obs_ntc_tensor.sum(dim=0).float()
+                    den_sum_ref = denominator_ntc_tensor.sum(dim=0).float()
+                p_hat = torch.clamp((y_sum_ref + 0.5) / (den_sum_ref + 1.0), 1e-6, 1 - 1e-6)
+                kappa = torch.clamp(den_sum_ref, min=20.0, max=200.0)
+                a = p_hat * kappa + 1e-3
+                b = (1.0 - p_hat) * kappa + 1e-3
 
             with f_plate:
                 mu_ntc = pyro.sample("mu_ntc", dist.Beta(a, b))  # [T]
@@ -468,16 +472,29 @@ class TechnicalFitter:
             concentration = total_counts_ref + 1.0  # [T, K], strictly > 0
             # Zero concentration for phantom categories (masked in zero_cat_mask) so the
             # Dirichlet prior doesn't leak mass to padding positions and bias real categories.
+            # Use concentration=1 (flat/uniform) for zero-masked categories.
+            # concentration < 1 makes Dirichlet improper at the boundary: log_prob(p→0) = +inf
+            # when (concentration-1)*log(p) = negative * (-inf) = +inf, which breaks the ELBO.
+            # Since the model hard-zeros and renormalizes these categories anyway (lines below),
+            # the prior on them doesn't affect fitted values — it just needs to be finite.
             concentration = torch.where(
                 zero_cat_mask,
-                torch.full_like(concentration, 1e-6),
+                torch.ones_like(concentration),
                 concentration,
             )
+            # During CPU-offloaded Predictive, input tensors (concentration, zero_cat_mask) are
+            # on CPU but the conditioned guide sample (probs_baseline_raw) comes back on CUDA.
+            # Move concentration to the guide's device so Dirichlet.log_prob doesn't see a
+            # device mismatch.  self._multinomial_zero_cat_mask was built before the CPU offload
+            # and reliably reflects the guide's device.
+            _guide_dev = self._multinomial_zero_cat_mask.device
+            concentration = concentration.to(_guide_dev)
             with f_plate:
                 probs0 = pyro.sample("probs_baseline_raw", dist.Dirichlet(concentration))  # [T, K]
 
             # Hard-zero masked categories and renormalize across active ones
-            probs_masked = probs0 * (~zero_cat_mask).to(probs0.dtype)                 # [T, K]
+            # .to(probs0) copies both dtype AND device (probs0 may be on CUDA during Predictive)
+            probs_masked = probs0 * (~zero_cat_mask).to(probs0)                      # [T, K]
             row_sums = probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             probs_baseline = probs_masked / row_sums                                   # [T, K]
             probs_baseline = pyro.deterministic("probs_baseline", probs_baseline)
@@ -488,9 +505,6 @@ class TechnicalFitter:
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
     
-        # --------------------------------
-        # Call distribution-specific sampler
-        # --------------------------------
         # --------------------------------
         # Call distribution-specific sampler
         # --------------------------------
@@ -567,6 +581,25 @@ class TechnicalFitter:
             raise ValueError(f"Unknown distribution: {distribution}")
     
     def set_technical_groups(self, covariates: list[str]):
+        """
+        Assign a technical-group code to every cell based on covariate combinations.
+
+        Must be called before ``fit_ntc()`` so the model knows how many technical
+        groups (C) exist.  The resulting ``technical_group_code`` column is an integer
+        index (0-based) used internally; index 0 is the reference group.
+
+        Cells in technical groups that have no NTC representation are automatically
+        dropped with a warning, because overdispersion estimation for those groups
+        requires at least some NTC cells.
+
+        Parameters
+        ----------
+        covariates : list of str
+            Column names in ``meta`` whose combinations define technical groups
+            (e.g., ``['cell_line']`` or ``['cell_line', 'lane']``).  Pass an empty
+            list ``[]`` to create a single technical group for the whole dataset (no
+            batch correction).
+        """
         # Allow empty covariates list to create a single technical group
         if not covariates:
             print("[INFO] No covariates specified - creating single technical group (C=1)")
@@ -578,6 +611,7 @@ class TechnicalFitter:
             raise ValueError(f"Missing columns in meta: {missing_cols}")
 
         self.model.meta["technical_group_code"] = self.model.meta.groupby(covariates).ngroup()
+        self.model._technical_group_covariates = list(covariates)
         print(f"[INFO] Set technical_group_code with {self.model.meta['technical_group_code'].nunique()} groups based on {covariates}")
     
         # ---- SAFEGUARD: ensure every technical group is represented among NTCs ----
@@ -602,14 +636,13 @@ class TechnicalFitter:
     ########################################################
     # Step 1: Optional Prefit for alpha_y (NTC only)
     ########################################################
-    def fit_technical(
+    def fit_ntc(
         self,
         sum_factor_col: str = 'sum_factor',
         lr: float = 1e-3,
         niters: int = None,
         nsamples: int = 1_000,
         alpha_ewma: float = 0.05,
-        tolerance: float = 1e-4,   # recommended to keep based on cell2location
         beta_o_beta: float = 3,    # recommended to keep based on cell2location
         beta_o_alpha: float = 9,   # recommended to keep based on cell2location
         epsilon: float = 1e-6,
@@ -617,36 +650,103 @@ class TechnicalFitter:
         distribution: str = None,
         denominator: np.ndarray = None,
         modality_name: str = None,
-        use_all_cells: bool = False,
+        use_all_cells: bool = None,
         force_iaf: bool = False,
         **kwargs
     ):
         """
-        Prefit cell-line technical effects for a given modality.
-        Stores both multiplicative ('alpha_y_mult') and additive/logit ('alpha_y_add') effects.
+        Estimate technical batch effects and per-gene overdispersion from NTC cells.
+
+        Fits a Bayesian negative-binomial model to NTC (non-targeting control) cells,
+        estimating multiplicative cell-line/batch scale factors (``alpha_y_mult``) and
+        additive logit-scale corrections (``alpha_y_add``) per technical group.
+        Results are stored on the primary modality as point estimates and are used by
+        ``fit_trans()`` to correct for batch effects.
+
+        Call ``set_technical_groups()`` before this method.
 
         Parameters
         ----------
-        use_all_cells : bool, default False
-            If False (default): Fit using NTC cells only (standard approach).
-            If True: Fit using all cells in the dataset.
+        sum_factor_col : str, default 'sum_factor'
+            Column in ``meta`` (or the primary modality's ``sum_factors`` DataFrame)
+            containing size factors for normalisation.
+        lr : float, default 1e-3
+            Adam optimiser learning rate for SVI.
+        niters : int, optional
+            Number of SVI iterations.  Default: 50,000 for most distributions;
+            100,000 for multinomial (which has a larger parameter space).
+        nsamples : int, default 1000
+            Number of posterior samples drawn after SVI for point-estimate summaries.
+        alpha_ewma : float, default 0.05
+            Smoothing weight for the exponential moving average of the ELBO loss used
+            in convergence checking.  Smaller values give a smoother (but slower-
+            reacting) estimate.
+        beta_o_beta : float, default 3
+            Beta parameter of the Gamma prior on the overdispersion ``o_y``.
+            Matches the cell2location prior; change with care.
+        beta_o_alpha : float, default 9
+            Alpha parameter of the Gamma prior on ``o_y``.
+            Matches the cell2location prior; change with care.
+        epsilon : float, default 1e-6
+            Small constant added for numerical stability.
+        minibatch_size : int, optional
+            Number of features to use per Predictive minibatch when sampling posteriors.
+            If ``None`` (default), auto-computed from available RAM via ``psutil``.
+        distribution : str, optional
+            Likelihood distribution.  If ``None`` (default), auto-detected from the
+            modality (e.g., ``'negbinom'``, ``'multinomial'``, ``'binomial'``).
+        denominator : np.ndarray, optional
+            Denominator array for binomial distributions.  If ``None``, auto-detected
+            from the modality.
+        modality_name : str, optional
+            Modality to fit.  If ``None`` (default), uses the primary modality.
+        use_all_cells : bool, optional
+            If ``False``: fit using NTC cells only (standard approach).
+            If ``True``: fit using all cells, regardless of target.
+            If ``None`` (default): resolves to ``True`` when in high-MOI mode with
+            ``cis_gene`` not yet set (deferred — see ``add_cis_gene()``), since cell
+            classification into NTC/cis/other isn't possible yet; otherwise ``False``.
 
-            **When to use use_all_cells=True:**
-            - High MOI experiments where technical effects are batch/lane specific
-            - Technical variation is independent of perturbation effects
-            - Saves compute: fit_technical only needs to run once per dataset (not per cis gene)
+            **When to use** ``use_all_cells=True``:
 
-            **When NOT to use use_all_cells=True (use default NTC-only):**
-            - Technical groups correlate with cis gene expression
-              Example: cell lines that differ in perturbation type
-            - Low MOI experiments with clear NTC vs perturbed distinction
-            - When technical correction should be based solely on unperturbed cells
+            - High-MOI experiments where batch effects are independent of perturbation.
+            - When a single technical fit covers all cis genes (saves compute).
+
+            **When NOT to use** ``use_all_cells=True``:
+
+            - Technical groups correlate with cis expression (e.g., different cell
+              lines have different perturbation efficiencies).
+            - Low-MOI experiments with a clear NTC vs. perturbed cell distinction.
+        force_iaf : bool, default False
+            Applies to negbinom (and other non-multinomial) distributions. By
+            default, ``fit_ntc`` uses ``AutoNormal`` (mean-field) — robust across
+            dataset sizes and sparsity levels. Pass ``True`` to use ``AutoIAFNormal``
+            (a jointly-coupled autoregressive flow) instead, which can give a more
+            expressive posterior for small, deeply-sequenced datasets with few
+            near-zero-count features. Not recommended when any feature has very low
+            NTC counts (e.g. single-digit total reads across NTC cells): IAF's single
+            shared network couples all features together, so one such feature's
+            exploding gradient can corrupt every other feature's parameters in one
+            SVI step.
 
         Warnings
         --------
-        Using use_all_cells=True when technical effects correlate with cis expression
-        may lead to over-correction and spurious trans effects.
+        Using ``use_all_cells=True`` when technical effects correlate with cis
+        expression can lead to over-correction and spurious trans-effect calls.
         """
+
+        # ---------------------------
+        # Resolve use_all_cells default
+        # ---------------------------
+        if use_all_cells is None:
+            if self.model.is_high_moi and self.model.cis_gene is None:
+                use_all_cells = True
+                print(
+                    "[INFO] cis_gene not yet set (deferred, high-MOI mode): "
+                    "defaulting use_all_cells=True for fit_ntc()."
+                )
+            else:
+                use_all_cells = False
 
         # ---------------------------
         # Resolve modality/distribution
@@ -657,6 +757,22 @@ class TechnicalFitter:
 
         if distribution is None:
             distribution = modality.distribution
+
+        # cis_only models (see bayesDREAM.__init__'s cis_only docstring
+        # entry) have ~0 trans genes in the primary modality by design --
+        # fitting fit_ntc() FRESH here estimates per-gene overdispersion
+        # from a single gene's NTC expression, which is very unstable.
+        # Prefer load_ntc_fit() from a fuller-panel run's saved output
+        # instead (works fine regardless of the current panel's size --
+        # feature alignment on load doesn't require matching shapes).
+        if modality_name == self.model.primary_modality and getattr(self.model, 'cis_only', False):
+            warnings.warn(
+                "fit_ntc() called on a cis_only model (primary modality has ~0 trans "
+                "genes) -- per-gene overdispersion estimation from a single gene's NTC "
+                "expression is very unstable. Prefer load_ntc_fit() from a fuller-panel "
+                "run's saved output instead of fitting fresh here.",
+                UserWarning,
+            )
 
         # ---------------------------
         # Set conditional default for niters
@@ -747,7 +863,7 @@ class TechnicalFitter:
                 print(f"[INFO] Converting COO sparse matrix to CSR for efficient row indexing")
                 counts_to_fit = counts_to_fit.tocsr()
 
-        print(f"[INFO] Fitting technical model for modality '{modality_name}' (distribution: {distribution})")
+        print(f"[INFO] Fitting NTC model for modality '{modality_name}' (distribution: {distribution})")
     
         # ---------------------------
         # Validate requirements
@@ -756,17 +872,26 @@ class TechnicalFitter:
     
         if requires_sum_factor(distribution) and sum_factor_col is None:
             raise ValueError(f"Distribution '{distribution}' requires sum_factor_col parameter")
-    
+
+        if requires_sum_factor(distribution) and modality.sum_factors is None:
+            raise ValueError(
+                f"Modality '{modality_name}' has distribution '{distribution}' but no sum_factors "
+                f"DataFrame has been set. Assign a cell-indexed DataFrame to "
+                f"modality.sum_factors before calling fit_ntc()."
+            )
+
         if requires_denominator(distribution) and denominator is None:
             raise ValueError(f"Distribution '{distribution}' requires denominator parameter")
     
         if "technical_group_code" not in self.model.meta.columns:
-            raise ValueError(
-                "technical_group_code not set. Call set_technical_groups(covariates) before fit_technical().\n"
-                "Example: model.set_technical_groups(['cell_line'])"
+            warnings.warn(
+                "technical_group_code not set — assuming single group (no technical covariate correction). "
+                "Call set_technical_groups(['cell_line', ...]) before fit_ntc() if you have multiple batches or cell lines.",
+                UserWarning,
             )
+            self.model.meta["technical_group_code"] = 0
     
-        print("Running prefit_cellline...")
+        print("[INFO] Running NTC prefit...")
     
         # ---------------------------
         # Subset to NTC cells (or use all cells if requested)
@@ -868,14 +993,12 @@ class TechnicalFitter:
                             _negbinom_nonref_patch[int(g)] = patchable
 
         if distribution == 'multinomial':
-            for f_idx in range(counts_ntc_array.shape[0]):
-                feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
-                totals = feature_counts.sum(axis=1, keepdims=True)
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    ratios = np.where(totals > 0, feature_counts / totals, 0)
-                ratio_stds = ratios.std(axis=0)
-                if np.all(ratio_stds == 0):
-                    zero_std_mask[f_idx] = True
+            # counts_ntc_array: [F, N, K] — vectorise over F
+            totals = counts_ntc_array.sum(axis=2, keepdims=True)  # [F, N, 1]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratios = np.where(totals > 0, counts_ntc_array / totals, 0.0)  # [F, N, K]
+            ratio_stds = ratios.std(axis=1)  # [F, K]
+            zero_std_mask = np.all(ratio_stds == 0, axis=1)  # [F]
     
         elif distribution == 'binomial':
             if denominator is None:
@@ -884,123 +1007,80 @@ class TechnicalFitter:
                         denominator[ntc_indices, :] if denominator.ndim == 2 else \
                         denominator[:, ntc_indices, :]
 
-            # Get technical group assignments for NTC cells
             groups_ntc_codes = meta_ntc['technical_group_code'].values
 
-            for f_idx in range(counts_ntc_array.shape[0]):
-                if modality.cells_axis == 0:
-                    numer = counts_ntc_array[:, f_idx]
-                    denom = denom_ntc[:, f_idx]
-                else:
-                    numer = counts_ntc_array[f_idx, :]
-                    denom = denom_ntc[f_idx, :]
+            # Arrange as [T, N] (features × cells) for vectorised operations
+            if modality.cells_axis == 0:
+                numer_all = counts_ntc_array.astype(float).T  # [N, T] -> [T, N]
+                denom_all = denom_ntc.astype(float).T
+            else:
+                numer_all = counts_ntc_array.astype(float)    # [T, N]
+                denom_all = denom_ntc.astype(float)
 
-                # Global check: all denominators zero
-                valid = denom > 0
-                if valid.sum() == 0:
-                    zero_std_mask[f_idx] = True
-                    continue
+            valid = denom_all > 0  # [T, N]
 
-                # Global check: zero std across all valid cells
-                ratios = numer[valid] / denom[valid]
-                if ratios.std() == 0:
-                    zero_std_mask[f_idx] = True
-                    continue
+            # Features where every cell has zero denominator
+            all_denom_zero = ~valid.any(axis=1)  # [T]
+            zero_std_mask = all_denom_zero.copy()
 
-                # Per-group boundary checks
-                # Exclude if ANY group has all cells at a boundary (PSI=0, PSI=1, or denom=0)
-                exclude_feature = False
-                for g in np.unique(groups_ntc_codes):
-                    group_mask = (groups_ntc_codes == g)
-                    group_numer = numer[group_mask]
-                    group_denom = denom[group_mask]
+            # Global PSI std (NaN where denominator is zero)
+            psi = np.where(valid, numer_all / np.where(valid, denom_all, 1.0), np.nan)  # [T, N]
+            with np.errstate(invalid='ignore'):
+                global_std = np.nanstd(psi, axis=1)  # [T]
+            zero_std_mask[~all_denom_zero] |= (global_std[~all_denom_zero] == 0)
 
-                    # Check 1: All denominators zero in this group
-                    if (group_denom == 0).all():
-                        exclude_feature = True
-                        break
+            # Per-group boundary checks (vectorised over T)
+            for g in np.unique(groups_ntc_codes):
+                g_mask = (groups_ntc_codes == g)
+                group_numer = numer_all[:, g_mask]  # [T, Ng]
+                group_denom = denom_all[:, g_mask]  # [T, Ng]
+                group_valid = group_denom > 0        # [T, Ng]
 
-                    # Check 2: Among cells with valid denominators, check for boundary PSI
-                    group_valid = group_denom > 0
-                    if group_valid.sum() > 0:
-                        group_numer_valid = group_numer[group_valid]
-                        group_denom_valid = group_denom[group_valid]
+                has_valid = group_valid.any(axis=1)  # [T]
 
-                        # All PSI=0 in this group (all numerators zero)
-                        if (group_numer_valid == 0).all():
-                            exclude_feature = True
-                            break
+                numer_valid_sum = np.where(group_valid, group_numer, 0.0).sum(axis=1)  # [T]
+                denom_valid_sum = np.where(group_valid, group_denom, 0.0).sum(axis=1)  # [T]
 
-                        # All PSI=1 in this group (all numerator==denominator)
-                        if (group_numer_valid == group_denom_valid).all():
-                            exclude_feature = True
-                            break
+                # All PSI=0: valid cells exist but all numerators are 0
+                all_psi_zero = has_valid & (numer_valid_sum == 0)
+                # All PSI=1: sum(numer)==sum(denom) (valid since 0<=numer<=denom per cell)
+                all_psi_one = has_valid & (numer_valid_sum == denom_valid_sum)
 
-                if exclude_feature:
-                    zero_std_mask[f_idx] = True
+                zero_std_mask |= ~has_valid | all_psi_zero | all_psi_one
         
         elif distribution in ("normal", "studentt"):
-            # ---------------------------------------------
-            # NORMAL: exclude features that
-            #  - have zero variance globally (ignoring NaNs), OR
-            #  - are all-NaN in *any* technical group
-            # ---------------------------------------------
             if counts_ntc_array.ndim != 2:
                 raise ValueError(
                     f"Unexpected dims for distribution '{distribution}': {counts_ntc_array.ndim}"
                 )
 
+            # Arrange as [N, F] (cells × features) for vectorised operations
             y_np = counts_ntc_array.astype(float)
-
-            # Figure out which axis is features vs cells
-            if modality.cells_axis == 1:
-                # counts_ntc_array: [features, cells]
-                F = y_np.shape[0]
-                def get_feat_vals(f_idx):
-                    return y_np[f_idx, :]   # [cells]
-            else:
-                # counts_ntc_array: [cells, features]
-                F = y_np.shape[1]
-                def get_feat_vals(f_idx):
-                    return y_np[:, f_idx]   # [cells]
+            y_2d = y_np.T if modality.cells_axis == 1 else y_np  # [N, F]
+            F = y_2d.shape[1]
 
             groups_ntc_codes = meta_ntc['technical_group_code'].values
             unique_groups = np.unique(groups_ntc_codes)
 
-            zero_std_mask = np.zeros(F, dtype=bool)
-            all_nan_any_group_mask = np.zeros(F, dtype=bool)
+            finite_global = np.isfinite(y_2d)            # [N, F]
+            no_finite_mask = ~finite_global.any(axis=0)  # [F]: True if no finite vals anywhere
 
-            for f_idx in range(F):
-                feat_vals = get_feat_vals(f_idx)          # [cells]
-                finite_global = np.isfinite(feat_vals)
+            # Global NaN-aware std
+            with np.errstate(invalid='ignore'):
+                y_2d_nan = np.where(finite_global, y_2d, np.nan)
+                global_std = np.nanstd(y_2d_nan, axis=0)  # [F]
 
-                # If *no* finite values at all across NTC cells:
-                #   feature is hopeless -> exclude
-                if not finite_global.any():
-                    zero_std_mask[f_idx] = True
-                    all_nan_any_group_mask[f_idx] = True
+            zero_std_mask = no_finite_mask | (~no_finite_mask & (global_std == 0))
+
+            # Per-group all-NaN check: feature excluded if any group has no finite values
+            all_nan_any_group_mask = no_finite_mask.copy()
+            for g in unique_groups:
+                g_mask = (groups_ntc_codes == g)
+                if not g_mask.any():
                     continue
+                group_finite = finite_global[g_mask, :]  # [Ng, F]
+                all_nan_any_group_mask |= ~group_finite.any(axis=0)
 
-                # Global std ignoring NaNs
-                if np.nanstd(feat_vals[finite_global]) == 0:
-                    zero_std_mask[f_idx] = True
-
-                # Per-group all-NaN check
-                for g in unique_groups:
-                    g_mask = (groups_ntc_codes == g)
-                    if not g_mask.any():
-                        continue  # shouldn't happen, but safe
-
-                    group_vals = feat_vals[g_mask]
-                    group_finite = np.isfinite(group_vals)
-
-                    # If *within this group* there are no finite values,
-                    # mark feature for exclusion.
-                    if not group_finite.any():
-                        all_nan_any_group_mask[f_idx] = True
-                        break  # no need to check other groups
-
-            # A feature is excluded if it has zero variance OR is all-NaN in any group
             zero_std_mask = zero_std_mask | all_nan_any_group_mask
     
         else:
@@ -1029,32 +1109,24 @@ class TechnicalFitter:
 
             F, _, K = counts_ntc_array.shape  # [features, cells, categories]
 
-            for f_idx in range(F):
-                feature_counts = counts_ntc_array[f_idx, :, :]  # (cells, K)
-
-                shared_present = None  # will become boolean [K]
-                for g in unique_groups:
-                    g_mask = (groups_ntc_codes == g)
-                    if not np.any(g_mask):
-                        continue  # should not happen, but just in case
-
-                    counts_g = feature_counts[g_mask, :].sum(axis=0)  # [K]
-                    present_g = counts_g > 0                          # category present in this group?
-
-                    if shared_present is None:
-                        shared_present = present_g
-                    else:
-                        shared_present &= present_g  # intersection across groups
-
+            # Vectorise over F: O(G) passes over [F, N, K] instead of O(F*G) Python loops
+            shared_present = None  # [F, K] bool
+            for g in unique_groups:
+                g_mask = (groups_ntc_codes == g)
+                if not np.any(g_mask):
+                    continue
+                group_counts = counts_ntc_array[:, g_mask, :].sum(axis=1)  # [F, K]
+                present_g = group_counts > 0                                # [F, K]
                 if shared_present is None:
-                    n_shared = 0
+                    shared_present = present_g
                 else:
-                    n_shared = int(shared_present.sum())
+                    shared_present &= present_g
 
-                # If 0 or 1 categories survive the "present in all groups" criterion,
-                # the feature cannot support a multinomial cell-line effect.
-                if n_shared <= 1:
-                    only_one_category_mask[f_idx] = True
+            if shared_present is None:
+                n_shared = np.zeros(F, dtype=int)
+            else:
+                n_shared = shared_present.sum(axis=1)  # [F]
+            only_one_category_mask = (n_shared <= 1)
 
     
         needs_filtering_mask = zero_std_mask | only_one_category_mask
@@ -1136,9 +1208,8 @@ class TechnicalFitter:
         C = meta_ntc['technical_group_code'].nunique()
         groups_ntc = meta_ntc['technical_group_code'].values
     
-        # Detect K/D
+        # Detect K (multinomial categories)
         K = None
-        D = None
         if is_3d_distribution(distribution):
             if distribution == 'multinomial':
                 K = y_obs_ntc.shape[2]
@@ -1305,12 +1376,17 @@ class TechnicalFitter:
         del y_obs_ntc  # Free the 2.5 GB numpy array immediately
         gc.collect()  # Force garbage collection
 
-        # TODO: PERFORMANCE OPTIMIZATION
-        # Pre-compute sums that are currently recomputed in every _model_technical call:
-        # - For multinomial: total_counts_per_feature, per_group_counts, ref_counts
-        # - For binomial: ref_y_sum, ref_denom_sum
-        # These should be computed once here and passed as parameters to _model_technical
-    
+        # Precompute invariants once and pass to _model_ntc so they are not recomputed
+        # on every SVI step (50,000-100,000 calls).
+        _model_precomp = {}
+
+        if distribution == 'negbinom':
+            _log_sigma_pc = torch.sqrt(
+                torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
+            ).clamp(min=0.1)
+            _model_precomp['log_sigma_ntc'] = _log_sigma_pc
+            _model_precomp['log_mu_ntc'] = torch.log(mu_x_mean_tensor) - 0.5 * _log_sigma_pc ** 2
+
         denominator_ntc_tensor = None
         if denominator_ntc_for_fit is not None:
             if modality.cells_axis == 1:
@@ -1328,12 +1404,25 @@ class TechnicalFitter:
             denominator_ntc_tensor = torch.from_numpy(denom_for_tensor.astype(np.float32)).to(self.model.device)
             del denom_for_tensor  # Free numpy array immediately
             gc.collect()
+
+        if distribution == 'binomial' and denominator_ntc_tensor is not None:
+            _ref_m = (groups_ntc_tensor == 0)
+            if _ref_m.sum() > 0:
+                _y_sum = y_obs_ntc_tensor[_ref_m].sum(dim=0).float()
+                _d_sum = denominator_ntc_tensor[_ref_m].sum(dim=0).float()
+            else:
+                _y_sum = y_obs_ntc_tensor.sum(dim=0).float()
+                _d_sum = denominator_ntc_tensor.sum(dim=0).float()
+            _p_hat = torch.clamp((_y_sum + 0.5) / (_d_sum + 1.0), 1e-6, 1 - 1e-6)
+            _kappa = torch.clamp(_d_sum, min=20.0, max=200.0)
+            _model_precomp['beta_a_precomp'] = _p_hat * _kappa + 1e-3
+            _model_precomp['beta_b_precomp'] = (1.0 - _p_hat) * _kappa + 1e-3
     
         # ---------------------------
         # Multinomial precomputations (done once, before guide + SVI)
         # ---------------------------
         if distribution == 'multinomial':
-            # Replicate the zero-category mask from _model_technical so we can use it here.
+            # Replicate the zero-category mask from _model_ntc so we can use it here.
             _total_all = y_obs_ntc_tensor.sum(dim=0)                          # [T, K]
             _zmask = (_total_all == 0)
             for _g in range(C):
@@ -1352,6 +1441,13 @@ class TechnicalFitter:
             # Store for the guide closure
             self._multinomial_zero_cat_mask = _zmask                         # [T, K]
             self._multinomial_log_p_init    = _log_p_init                    # [T, K]
+            # Reuse precomputed masks/counts in the model to avoid per-step recomputation
+            _model_precomp['zero_cat_mask_precomp'] = _zmask
+            _ref_m_multi = (groups_ntc_tensor == 0)
+            _model_precomp['ref_counts_precomp'] = (
+                y_obs_ntc_tensor[_ref_m_multi].sum(dim=0).float()
+                if _ref_m_multi.sum() > 0 else y_obs_ntc_tensor.sum(dim=0).float()
+            )
 
         # ---------------------------
         # Guide + init functions
@@ -1514,15 +1610,21 @@ class TechnicalFitter:
 
             # AutoNormal for alpha_logits_y (all sites except probs_baseline_raw)
             _guide_alpha = AutoNormal(
-                poutine.block(self._model_technical, hide=["probs_baseline_raw"]),
+                poutine.block(self._model_ntc, hide=["probs_baseline_raw"]),
                 init_loc_fn=init_loc_fn,
             )
 
-            def guide_cellline(*args, **kwargs):
+            def ntc_guide(*args, **kwargs):
                 # ---- probs_baseline_raw: softmax-parameterised point estimate ----
                 log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
                 log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
                 probs = torch.softmax(log_p_masked, dim=-1)                  # [T, K]
+                # Clamp masked categories away from exact 0.0 (float32 underflow of
+                # softmax(-1e9)).  xlogy(concentration-1, probs) backward = 0/0 = NaN
+                # when concentration=1 (masked) and probs=0.  Any probs>0 gives finite
+                # gradient = 0.  1e-30 >> float32 subnormal floor (~1.2e-38).
+                probs = probs.clamp_min(1e-30)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
                 with pyro.plate(_plate_name, _T_guide, dim=-1):
                     pyro.sample("probs_baseline_raw", dist.Delta(probs, event_dim=1))
                 # ---- everything else: AutoNormal ----
@@ -1530,11 +1632,22 @@ class TechnicalFitter:
 
         elif distribution in ['binomial', 'normal', 'studentt']:
             # Calmer guide for these distributions
-            guide_cellline = AutoNormalMessenger(self._model_technical, init_loc_fn=init_loc_fn)
+            ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
         else:
-            # For negbinom and other distributions: check if IAF is feasible
-            # Estimate number of latent variables
+            # AutoNormal (mean-field) is the default guide for negbinom/other
+            # distributions, regardless of device or dataset size -- it's robust
+            # across dataset sizes and sparsity levels. AutoIAFNormal (a single
+            # jointly-coupled autoregressive flow over ALL T features) is opt-in via
+            # force_iaf=True: it can give a more expressive posterior for small,
+            # deeply-sequenced datasets, but its shared network means one sparse
+            # gene's exploding gradient (near-zero mu_final -> huge d/dx log(x+eps)
+            # as x->0) can corrupt every other feature's parameters in a single step.
+            # A prior memory-based auto-selection (IAF whenever estimated memory fit
+            # the budget, which is almost always true at realistic gene counts)
+            # silently exposed every user to this failure mode without them asking
+            # for IAF or knowing the risk -- see docs/SIMULATION_STUDY_PLAN.md's
+            # fit_ntc NaN diagnosis for the full trace.
             if distribution == 'negbinom':
                 # log2_alpha_y: (C-1) × T_fit
                 # o_y: T_fit
@@ -1544,60 +1657,44 @@ class TechnicalFitter:
                 # Conservative estimate for unknown distributions
                 n_latent = C * T_fit
 
-            # IAF memory estimate (rough approximation):
+            # IAF memory estimate (rough approximation), informational only now that
+            # the choice is explicit rather than memory-driven:
             # - Transformation matrices: n_latent × n_latent × 4 bytes (float32)
             # - Hidden states: ~2× the matrix size
             # - Safety margin: 1.5×
             iaf_memory_gb = (n_latent ** 2 * 4 * 3 * 1.5) / 1e9
 
-            # Check available VRAM
-            use_iaf = False
-            if self.model.device.type == 'cuda':
-                try:
-                    # torch is already imported at module level
-                    total_memory_gb = torch.cuda.get_device_properties(self.model.device).total_memory / 1e9
-                    # Reserve 10 GB for data, gradients, and other operations
-                    available_for_guide_gb = total_memory_gb - 10.0
-
-                    if force_iaf:
-                        use_iaf = True
+            use_iaf = force_iaf
+            if use_iaf:
+                if self.model.device.type == 'cuda':
+                    try:
+                        # torch is already imported at module level
+                        total_memory_gb = torch.cuda.get_device_properties(self.model.device).total_memory / 1e9
+                        # Reserve 10 GB for data, gradients, and other operations
+                        available_for_guide_gb = total_memory_gb - 10.0
+                        oom_note = (" — OOM risk if estimate is accurate"
+                                    if iaf_memory_gb >= available_for_guide_gb else "")
                         print(f"[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_memory_gb:.1f} GB, "
-                              f"{available_for_guide_gb:.1f} GB available — OOM risk if estimate is accurate)")
-                    elif iaf_memory_gb < available_for_guide_gb:
-                        use_iaf = True
-                        print(f"[INFO] Using AutoIAFNormal guide (estimated {iaf_memory_gb:.1f} GB < {available_for_guide_gb:.1f} GB available)")
-                    else:
-                        print(f"[WARNING] AutoIAFNormal would require ~{iaf_memory_gb:.1f} GB VRAM (>{available_for_guide_gb:.1f} GB available)")
-                        print(f"[WARNING] Falling back to AutoNormal (mean-field approximation) for {n_latent} latent variables")
-                        # Increase niters for AutoNormal if using default (AutoNormal needs more iterations)
-                        if niters_was_default and niters < 100_000:
-                            old_niters = niters
-                            niters = 100_000
-                            print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
-                except Exception as e:
-                    print(f"[WARNING] Could not check VRAM ({e}), using AutoNormal for safety")
-                    # Increase niters for AutoNormal if using default
-                    if niters_was_default and niters < 100_000:
-                        old_niters = niters
-                        niters = 100_000
-                        print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
-            else:
-                # CPU: always use AutoNormal for large models
-                if n_latent > 5000:
-                    print(f"[INFO] Using AutoNormal for CPU fitting with {n_latent} latent variables")
-                    # Increase niters for AutoNormal if using default
-                    if niters_was_default and niters < 100_000:
-                        old_niters = niters
-                        niters = 100_000
-                        print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
+                              f"{available_for_guide_gb:.1f} GB available{oom_note})")
+                    except Exception as e:
+                        print(f"[WARNING] force_iaf=True but could not check VRAM ({e})")
                 else:
-                    use_iaf = True
+                    print(f"[INFO] force_iaf=True: using AutoIAFNormal ({n_latent} latent variables, "
+                          f"estimated {iaf_memory_gb:.1f} GB) on CPU")
+            else:
+                print(f"[INFO] Using AutoNormal (default; pass force_iaf=True for AutoIAFNormal) "
+                      f"for {n_latent} latent variables")
+                # Increase niters for AutoNormal if using default (AutoNormal needs more iterations)
+                if niters_was_default and niters < 100_000:
+                    old_niters = niters
+                    niters = 100_000
+                    print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
 
             if use_iaf:
-                guide_cellline = AutoIAFNormal(self._model_technical, init_loc_fn=init_loc_fn)
+                ntc_guide = AutoIAFNormal(self._model_ntc, init_loc_fn=init_loc_fn)
                 # Initialize the guide by calling it once with the model
                 with torch.no_grad():
-                    guide_cellline(
+                    ntc_guide(
                         N, T_fit, C,
                         groups_ntc_tensor,
                         y_obs_ntc_tensor,
@@ -1609,16 +1706,17 @@ class TechnicalFitter:
                         epsilon_tensor,
                         distribution,
                         denominator_ntc_tensor,
-                        K, D,
+                        K,
                         sigma_hat_tensor,
+                        **_model_precomp,
                     )
-                guide_cellline.to(self.model.device)
+                ntc_guide.to(self.model.device)
             else:
                 # Fallback to memory-efficient AutoNormal
-                guide_cellline = AutoNormalMessenger(self._model_technical, init_loc_fn=init_loc_fn)
+                ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
         # Choose ELBO based on guide type
-        if isinstance(guide_cellline, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
+        if isinstance(ntc_guide, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
             # lower-variance estimator for mean-field Normal
             elbo = pyro.infer.TraceMeanField_ELBO(num_particles=1)
         else:
@@ -1626,7 +1724,7 @@ class TechnicalFitter:
 
         # Use OneCycleLR scheduler for stable convergence
         from torch.optim.lr_scheduler import OneCycleLR
-        base_lr = 1e-3 if lr is None else lr
+        base_lr = lr
 
         # OneCycleLR requires pct_start * total_steps > 1 to avoid ZeroDivisionError.
         # With pct_start=0.1, minimum total_steps is 11 (0.1*11-1=0.1>0).
@@ -1653,12 +1751,14 @@ class TechnicalFitter:
             clip_args={"clip_norm": 10.0},  # gradient clipping
         )
 
-        svi = pyro.infer.SVI(self._model_technical, guide_cellline, optimizer, loss=elbo)
-        guide_cellline.to(self.model.device)
+        svi = pyro.infer.SVI(self._model_ntc, ntc_guide, optimizer, loss=elbo)
+        if hasattr(ntc_guide, 'to'):
+            ntc_guide.to(self.model.device)
     
         # ---------------------------
         # Optimize
         # ---------------------------
+        import math
         losses = []
         smoothed_loss = None
         for step in range(niters):
@@ -1674,17 +1774,17 @@ class TechnicalFitter:
                 epsilon_tensor,
                 distribution,
                 denominator_ntc_tensor,
-                K, D,
-                sigma_hat_tensor,   # ← ADD HERE
+                K,
+                sigma_hat_tensor,
+                **_model_precomp,
             )
             losses.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {mu_x_mean_tensor.device}")
             # Detect NaN/Inf loss early and give an actionable message
-            import math
             if not math.isfinite(loss):
                 raise RuntimeError(
-                    f"fit_technical: loss became {loss} at step {step}. "
+                    f"fit_ntc: loss became {loss} at step {step}. "
                     "This usually indicates numerical instability. Try: "
                     "(1) lower learning rate (e.g. lr=1e-4), "
                     "(2) check for extreme values in sum_factor, "
@@ -1693,18 +1793,16 @@ class TechnicalFitter:
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
-    
+
         # ---------------------------
         # Predictive (optionally on CPU)
         # ---------------------------
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
         run_on_cpu = self.model.device.type != "cpu"
         if run_on_cpu:
-            guide_cellline.to("cpu")
+            if hasattr(ntc_guide, 'to'):
+                ntc_guide.to("cpu")
             self.model.device = torch.device("cpu")
     
             model_inputs = {
@@ -1719,8 +1817,9 @@ class TechnicalFitter:
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "distribution": distribution,
                 "denominator_ntc_tensor": self._to_cpu(denominator_ntc_tensor),
-                "K": K, "D": D,
+                "K": K,
                 "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor),
+                **{k: self._to_cpu(v) for k, v in _model_precomp.items()},
             }
         else:
             model_inputs = {
@@ -1735,8 +1834,9 @@ class TechnicalFitter:
                 "epsilon_tensor": epsilon_tensor,
                 "distribution": distribution,
                 "denominator_ntc_tensor": denominator_ntc_tensor,
-                "K": K, "D": D,
+                "K": K,
                 "sigma_hat_tensor": sigma_hat_tensor,
+                **_model_precomp,
             }
     
         if self.model.device.type == "cuda":
@@ -1773,7 +1873,7 @@ class TechnicalFitter:
 
         if minibatch_size is not None:
             predictive_technical = pyro.infer.Predictive(
-                self._model_technical, guide=guide_cellline, num_samples=minibatch_size,
+                self._model_ntc, guide=ntc_guide, num_samples=minibatch_size,
                 parallel=use_parallel
             )
 
@@ -1788,7 +1888,7 @@ class TechnicalFitter:
                     if current_batch_size < minibatch_size:
                         # Last batch might be smaller
                         predictive_batch = pyro.infer.Predictive(
-                            self._model_technical, guide=guide_cellline, num_samples=current_batch_size,
+                            self._model_ntc, guide=ntc_guide, num_samples=current_batch_size,
                             parallel=use_parallel
                         )
                         samples = predictive_batch(**model_inputs_with_skip)
@@ -1822,7 +1922,7 @@ class TechnicalFitter:
                     gc.collect()
         else:
             predictive_technical = pyro.infer.Predictive(
-                self._model_technical, guide=guide_cellline, num_samples=nsamples,
+                self._model_ntc, guide=ntc_guide, num_samples=nsamples,
                 parallel=use_parallel
             )
             with torch.no_grad():
@@ -1841,10 +1941,26 @@ class TechnicalFitter:
         # Reconstruct full α (all original T)
         # multiplicative baseline=1; additive baseline=0
         # ----------------------------------------
-        # Back-compat: some guides name the mult version "alpha_y_mul"
+        # alpha_y_mul is the Pyro site name; normalise to alpha_y
         if "alpha_y" not in posterior_samples and "alpha_y_mul" in posterior_samples:
             posterior_samples["alpha_y"] = posterior_samples["alpha_y_mul"]
-    
+
+        # C == 1: no group effects were sampled — synthesise trivial posterior entries so
+        # the reconstruction code below sees consistent shapes.
+        if C == 1:
+            _ref_tensor = posterior_samples.get("o_y", posterior_samples.get("mu_ntc"))
+            _S = _ref_tensor.shape[0] if _ref_tensor is not None else 1
+            if distribution != "multinomial":
+                posterior_samples.setdefault("log2_alpha_y", torch.zeros(_S, 0, T_fit))
+                posterior_samples.setdefault("alpha_y_mul",  torch.ones( _S, 0, T_fit))
+                posterior_samples.setdefault("delta_y_add",  torch.zeros(_S, 0, T_fit))
+                posterior_samples.setdefault("alpha_y",      torch.ones( _S, 0, T_fit))
+            else:
+                _K_local = K if K is not None else 1
+                posterior_samples.setdefault("alpha_logits_y",          torch.zeros(_S, 0, T_fit, _K_local))
+                posterior_samples.setdefault("alpha_logits_y_centered", torch.zeros(_S, 0, T_fit, _K_local))
+                posterior_samples.setdefault("alpha_y",                 torch.zeros(_S, 0, T_fit, _K_local))
+
         def _reconstruct_full_2d(alpha_fit, baseline_value, fit_mask_bool):
             fit_idx = np.where(fit_mask_bool)[0]
             if alpha_fit.dim() == 3:           # [S, C-1, T_fit]
@@ -2101,14 +2217,14 @@ class TechnicalFitter:
             trans_idx    = list(range(cis_idx_orig))  # 0 .. n_trans_features-1
             T_all_with_cis = n_trans_features + 1
 
-            # alpha_x_prefit: mean over posterior samples → [C]
-            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].mean(dim=0)
+            # alpha_x_prefit: median over posterior samples → [C]
+            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].median(dim=0).values
 
-            # Modality alpha_y: trans genes only → mean → [C, T]
+            # Modality alpha_y: trans genes only → median → [C, T]
             if modality.distribution == 'negbinom':
-                modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].mean(dim=0)
+                modality.alpha_y_prefit_mult = full_alpha_y_mult[..., trans_idx].median(dim=0).values
             else:
-                modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].mean(dim=0)
+                modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
 
             # ---- Store cis gene posteriors in cis modality ----
             cis_modality = self.model.get_modality('cis')
@@ -2136,7 +2252,7 @@ class TechnicalFitter:
                     cis_posterior['alpha_x_add'] = torch.cat(
                         [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
 
-            cis_modality.posterior_samples_technical = cis_posterior
+            cis_modality.posterior_samples_ntc = cis_posterior
             print(f"[INFO] Stored cis gene posteriors in 'cis' modality: {list(cis_posterior.keys())}")
 
             # ---- Trim cis gene from ALL primary-modality posteriors ----
@@ -2159,17 +2275,17 @@ class TechnicalFitter:
         else:
             # No cis gene appended (non-primary modality, or no cis_gene set)
             if modality.distribution == 'negbinom':
-                modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].mean(dim=0)
+                modality.alpha_y_prefit_mult = posterior_samples["alpha_y_mult"].median(dim=0).values
             else:
-                modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].mean(dim=0)
+                modality.alpha_y_prefit_add = posterior_samples["alpha_y_add"].median(dim=0).values
 
-        modality.posterior_samples_technical = posterior_samples
+        modality.posterior_samples_ntc = posterior_samples
 
         if modality.is_exon_skipping():
             modality.mark_technical_fit_complete()
 
         # Store losses on the modality (always)
-        modality.loss_technical = losses
+        modality.loss_ntc = losses
 
         print(f"[INFO] Stored technical fit results in modality '{modality_name}'")
     
@@ -2178,5 +2294,5 @@ class TechnicalFitter:
         pyro.clear_param_store()
         import gc; gc.collect()
     
-        print("Finished fit_technical.")
+        print("Finished fit_ntc.")
 

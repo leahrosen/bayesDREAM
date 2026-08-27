@@ -5,6 +5,7 @@ This module contains the trans model and fitting logic.
 """
 
 import os
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -21,7 +22,6 @@ from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
 import pyro.poutine as poutine
-import pyro.distributions as dist
 
 from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
 
@@ -50,6 +50,29 @@ def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Te
 
 class TransFitter:
     """Handles trans effects fitting."""
+
+    def _save_checkpoint_atomic(self, checkpoint_path: str, data: dict) -> None:
+        """Write checkpoint atomically (tmp → rename) and keep previous as .bak.
+
+        Three-step protocol:
+          1. torch.save  →  <path>.tmp        (new data, not yet visible)
+          2. os.replace  old <path>  →  .bak  (old data safely preserved)
+          3. os.replace  .tmp  →  <path>      (atomic on POSIX; new data visible)
+
+        Failure modes:
+          Die in step 1 (during write): .tmp corrupt, <path> unchanged → resume loads <path>.
+          Die between 1 and 2: .tmp complete, <path> unchanged → resume loads <path>.
+          Die between 2 and 3: .tmp complete, <path> gone (→ .bak) → resume tries .tmp
+                                first (complete), falls back to .bak (one interval behind).
+          Die during step 3:  os.replace is atomic on POSIX → either completes or not,
+                              leaving either <path> or .tmp visible; .bak always intact.
+        """
+        backup_path = checkpoint_path + '.bak'
+        tmp_path = checkpoint_path + '.tmp'
+        torch.save(data, tmp_path)
+        if os.path.exists(checkpoint_path):
+            os.replace(checkpoint_path, backup_path)
+        os.replace(tmp_path, checkpoint_path)
 
     def __init__(self, model):
         """
@@ -376,7 +399,6 @@ class TransFitter:
         sum_factor_tensor,
         beta_o_alpha_tensor,
         beta_o_beta_tensor,
-        alpha_alpha_mu_tensor,
         K_max_tensor,
         K_alpha_tensor,
         Vmax_mean_tensor,
@@ -386,7 +408,6 @@ class TransFitter:
         p_n_logits_tensor,
         epsilon_tensor,
         x_true_sample,
-        log2_x_true_sample,
         nmin,
         nmax,
         alpha_y_sample=None,
@@ -400,15 +421,17 @@ class TransFitter:
         distribution='negbinom',
         denominator_tensor=None,
         K=None,
-        D=None,
-        mean_within_guide_var=None,
         x_true_CV=None,
         x_ntc_mean=None,
-        use_data_driven_priors=True,
         use_epsilon=True,
         vmax_log_sigma_floor_tensor=None,
         k_log_sigma_min_tensor=None,
         k_center_tensor=None,
+        y_ntc_tensor=None,
+        mean_y_corrected_tensor=None,
+        o_y_ntc_tensor=None,
+        sigma_hat_tensor=None,
+        alpha_n_coupling: float = 10.0,
         latents_only=False,
     ):
 
@@ -420,7 +443,6 @@ class TransFitter:
         ##########
         ## x_true (Now Fully Observed) ##
         ##########
-        #x_true = pyro.deterministic("x_true", x_true_sample)
         x_true = x_true_sample
     
         ####################
@@ -429,39 +451,44 @@ class TransFitter:
         alpha_y = None
         if alpha_y_sample is not None:
             alpha_y = alpha_y_sample
-        elif groups_tensor is not None:
-            with pyro.plate("technical_groups_plate", C-1, dim=-2):  # **Now correctly uses C-1**
-                with trans_plate:
-                    alpha_alpha = pyro.sample("alpha_alpha", dist.Exponential(1 / alpha_alpha_mu_tensor))  # shape = [C-1, T]
-                    alpha_mu = pyro.sample("alpha_mu", dist.Gamma(1, 1))  # shape = [C-1, T]
-                    alpha_y = pyro.sample("alpha_y", dist.Gamma(alpha_alpha, alpha_alpha / alpha_mu))  # shape = [C-1, T]
     
-        ####################
-        ## Overdispersion ##
-        ####################
-        beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
-        with trans_plate:
-            o_y = pyro.sample("o_y", dist.Exponential(beta_o))
-            phi_y = 1 / (o_y**2)
-        phi_y_used = phi_y.unsqueeze(-2)
+        ##############################################
+        ## Feature-level variance (distribution-specific)
+        ##############################################
+        phi_y_used = None  # NB dispersion; None for other distributions
+        sigma_y    = None  # noise scale for normal/studentt
 
-        # Per-gene overdispersion weight for the adaptive negbinom A prior.
-        # weight → 1 for noisier genes (o_y >> prior mean), → 0 for quieter genes.
-        # Computed here (outside the second trans_plate) since o_y is already a [T] tensor.
-        # prior_mean_o_y = E[o_y] ≈ beta_o_beta / beta_o_alpha (marginal prior mean).
-        _prior_mean_o_y = (beta_o_beta_tensor / beta_o_alpha_tensor).clamp_min(epsilon_tensor)
-        _o_y_weight = o_y / (o_y + _prior_mean_o_y)  # [T], values in (0, 1)
-
-        # Degrees of freedom for Student-t distribution (nu_y)
-        # Only needed if using studentt distribution
-        nu_y = None
-        if distribution == 'studentt':
-            # Two options (must match fit_technical choice):
-            # Option 1: Fixed value (simpler, faster) - COMMENTED OUT FOR NOW
-            # nu_y = self._t(3.0)
-            # Option 2: Sample per-feature (more flexible, slower) - ACTIVE
+        if distribution == 'negbinom':
+            beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
             with trans_plate:
-                nu_y = pyro.sample("nu_y", dist.Gamma(self._t(10.0), self._t(2.0)))  # mean~5, ensures df>2
+                o_y = pyro.sample("o_y", dist.Exponential(beta_o))
+                phi_y = 1 / (o_y**2)
+            phi_y_used = phi_y.unsqueeze(-2)
+            # A-prior weight: noisier genes get stronger pull toward NTC anchor.
+            # Use NTC-estimated o_y when available (sampled o_y is near-unidentifiable
+            # in fit_trans, so its posterior stays close to the prior mean for all genes).
+            _prior_mean_o_y = (beta_o_beta_tensor / beta_o_alpha_tensor).clamp_min(epsilon_tensor)
+            if o_y_ntc_tensor is not None:
+                _o_y_weight = o_y_ntc_tensor / (o_y_ntc_tensor + _prior_mean_o_y)  # [T], fixed
+            else:
+                _o_y_weight = o_y / (o_y + _prior_mean_o_y)  # [T], sampled (fallback)
+
+        elif distribution in ('normal', 'studentt'):
+            with trans_plate:
+                if sigma_hat_tensor is not None:
+                    sigma_y = pyro.sample("sigma_y", dist.HalfNormal(2.0 * sigma_hat_tensor))
+                    # A-prior weight: features with larger NTC sigma pulled more toward NTC anchor.
+                    _sigma_ref = sigma_hat_tensor.mean().clamp_min(epsilon_tensor)
+                    _o_y_weight = sigma_hat_tensor / (sigma_hat_tensor + _sigma_ref)  # [T], fixed
+                else:
+                    sigma_y = pyro.sample("sigma_y", dist.HalfCauchy(self._t(10.0)))
+                    _o_y_weight = self._t(0.5)  # neutral without NTC data
+
+        else:  # binomial, multinomial — variance fully determined by count totals
+            _o_y_weight = self._t(0.5)  # neutral; no per-feature noise parameter
+
+        # Degrees of freedom: Student-t only, fixed at 3 to match fit_ntc
+        nu_y = self._t(3.0) if distribution == 'studentt' else None
     
         #################
         ## Hill-based: ##
@@ -482,22 +509,23 @@ class TransFitter:
             # - negbinom: positive count
             # - binomial/multinomial: probability in [0,1], using NEW reparameterization
             if distribution in ['normal', 'studentt']:
-                # A prior: Normal with noise-adaptive shift, matching negbinom's 13.5% criterion.
+                # A prior: NTC-anchored Normal (analogous to negbinom LogNormal, but in linear
+                # space since normal/studentt values can be negative).
                 #
-                # delta_A = amplitude = Vmax_mean − Amean (≈ Q95 − 2·Q05)
-                # sigma_A = delta_A  (Option B: 1× amplitude — wider than the old 0.5×,
-                #                     so the prior allows A to be well above Q05 if data
-                #                     support it; a gene with range 0.2 gets sigma=0.2
-                #                     rather than 0.1)
-                # shift   = (1 − o_y_weight) × 0.55  ∈ [0, 0.55]
-                #   o_y_weight → 0 (quiet gene): shift = 0.55  → P(A ≥ Q05) ≈ 13.5%
-                #   o_y_weight → 1 (noisy gene):  shift = 0     → P(A ≥ Q05) = 50%  (uninformative)
-                # Note: for normal/studentt, o_y IS the residual standard deviation (sigma_y = o_y),
-                # so _o_y_weight is the natural noise measure (already computed above).
+                # When y_ntc available (fit_ntc has been run):
+                #   w → 0 (quiet feature): prior centred at Amean; y_ntc is 1σ above
+                #   w → 1 (noisy feature): prior centred at y_ntc
+                #   sigma = |y_ntc − Amean| floored at 10% of response amplitude
+                #
+                # Fallback (no NTC posterior): fixed-shift approach using response amplitude.
                 delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
-                sigma_A = delta_A  # 1× amplitude (wider than old 0.5×)
-                _shift_A = (1.0 - _o_y_weight) * 0.55  # [T]: 0.55 quiet → 0 noisy
-                mean_A  = Amean_tensor - _shift_A * delta_A
+                if y_ntc_tensor is not None:
+                    sigma_A = (y_ntc_tensor - Amean_tensor).abs().clamp_min(delta_A * 0.1)
+                    mean_A  = (1.0 - _o_y_weight) * Amean_tensor + _o_y_weight * y_ntc_tensor
+                else:
+                    sigma_A = delta_A
+                    _shift_A = (1.0 - _o_y_weight) * 0.55
+                    mean_A  = Amean_tensor - _shift_A * delta_A
                 A = pyro.sample("A", dist.Normal(mean_A, sigma_A))
 
             elif distribution in ['binomial', 'multinomial']:
@@ -542,27 +570,35 @@ class TransFitter:
                         obs_total = y_obs_tensor.sum(dim=0)  # [T, K]
                         phantom_conc_mask = (obs_total == 0)  # [T, K]
 
-                    # Logit-space prior mean
-                    if use_data_driven_priors:
-                        # Shift A mean to 0.5×Q05 (→ P(A ≥ Q05) ≈ 13.5%, consistent with
-                        # the negbinom A prior), normalise, then take log as the logit mean.
-                        A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
-                        A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
-                        A_logit_mean = torch.log(A_mean_normalized.clamp(min=1e-10))  # [T, K]
+                    # Logit-space prior mean (base: from Q05)
+                    A_mean_clamped = (0.5 * Amean_tensor).clamp(min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                    A_mean_normalized = A_mean_clamped / A_mean_clamped.sum(dim=-1, keepdim=True)  # [T, K]
+                    A_logit_mean_base = torch.log(A_mean_normalized.clamp(min=1e-10))              # [T, K]
+
+                    # A prior: w-interpolated LogisticNormal anchored between data-driven
+                    # lower anchor and y_ntc. Mode at (1-w)*A_logit_mean_base + w*logit(y_ntc),
+                    # where w = o_y_ntc / (o_y_ntc + prior_mean_o_y).
+                    if y_ntc_tensor is not None:
+                        if y_ntc_tensor.ndim != 2 or y_ntc_tensor.shape[0] != T or y_ntc_tensor.shape[1] != K_dim:
+                            raise ValueError(
+                                f"y_ntc_tensor shape {tuple(y_ntc_tensor.shape)} does not match "
+                                f"expected multinomial shape [{T}, {K_dim}]."
+                            )
+                        logit_y_ntc       = torch.log(y_ntc_tensor.clamp(min=1e-10))      # [T, K], log-simplex
+                        A_logit_mean_base = torch.maximum(A_logit_mean_base, logit_y_ntc - 4.0)
+                        w_expanded        = _o_y_weight.unsqueeze(-1)                      # [T, 1]
+                        A_logit_mean      = (1.0 - w_expanded) * A_logit_mean_base + w_expanded * logit_y_ntc  # [T, K]
+                        sigma_A_logit     = (logit_y_ntc - A_logit_mean_base).abs().clamp_min(1.0)             # [T, K]
                     else:
-                        # Uniform prior: equal logits → uniform simplex after softmax
-                        A_logit_mean = torch.zeros(T, K_dim, device=self.model.device)
+                        A_logit_mean  = A_logit_mean_base
+                        sigma_A_logit = self._t(1.0)
 
                     # Push phantom categories to -inf in prior mean so the guide learns
                     # to assign them zero probability.
                     if phantom_conc_mask is not None:
                         A_logit_mean = A_logit_mean.masked_fill(phantom_conc_mask, -1e4)
 
-                    # σ=1.0 in logit space ≈ weakly informative (comparable to Dirichlet α≈1)
-                    sigma_A_logit = self._t(1.0)
-
-                    # Sample in unconstrained logit space — the autoguide uses Normal here,
-                    # no simplex constraint, no stick-breaking transform.
+                    # Sample in unconstrained logit space — no simplex constraint, no stick-breaking.
                     A_logit = pyro.sample("A", dist.Normal(A_logit_mean, sigma_A_logit).to_event(1))  # [T, K]
 
                     # Softmax with phantom masking → valid probability vector [T, K]
@@ -571,37 +607,64 @@ class TransFitter:
                     A = torch.softmax(A_logit, dim=-1)  # [T, K]
 
                 else:
-                    # For binomial: Beta priors
-                    if use_data_driven_priors:
-                        # A ~ Beta(1, β) with mean = 0.5×Q05.
-                        # Gives P(A ≥ Q05) ≈ 13.5%, consistent with the negbinom A prior.
-                        # (The previous 0.1× gave P(A ≥ Q05) ≈ 0%, causing false positives
-                        # by forcing A near 0 and inflating effective Vmax.)
-                        A_mean_shifted = (0.5 * Amean_tensor).clamp_min(epsilon_tensor)
-                        beta_A = (1.0 - A_mean_shifted) / A_mean_shifted  # [T]
-                        alpha_A = self._t(1.0)
-
+                    # For binomial: Logit-Normal prior when y_ntc available (analogous to negbinom
+                    # LogNormal, adapted to the [0,1] simplex via logit transform).
+                    #
+                    # When y_ntc available:
+                    #   Lower anchor: logit(Amean/2); upper anchor: logit(y_ntc)
+                    #   w → 0 (quiet feature): centred at logit(Amean/2); y_ntc is 1σ above
+                    #   w → 1 (noisy feature): centred at logit(y_ntc)
+                    #   sigma = (logit(y_ntc) − logit(Amean/2)).clamp_min(1 logit unit)
+                    #
+                    # Fallback (no NTC posterior): Beta(1, β) with mean = 0.5×Q05.
+                    if y_ntc_tensor is not None:
+                        # Lift upper anchor to mean(y_corrected) when y_ntc < mean.
+                        if mean_y_corrected_tensor is not None:
+                            effective_y_ntc = torch.maximum(y_ntc_tensor, mean_y_corrected_tensor)
+                        else:
+                            effective_y_ntc = y_ntc_tensor
+                        logit_Amean_half = torch.logit((0.5 * Amean_tensor).clamp(1e-6, 1.0 - 1e-6))      # [T]
+                        logit_y_ntc      = torch.logit(effective_y_ntc.clamp(1e-6, 1.0 - 1e-6))            # [T]
+                        logit_Amean_half = torch.maximum(logit_Amean_half, logit_y_ntc - 4.0)              # cap: sigma ≤ 4
+                        sigma_logit = (logit_y_ntc - logit_Amean_half).clamp_min(1.0)                      # [T]
+                        mu_logit    = (1.0 - _o_y_weight) * logit_Amean_half + _o_y_weight * logit_y_ntc  # [T]
+                        logit_A = pyro.sample("logit_A", dist.Normal(mu_logit, sigma_logit))            # [T]
+                        A = pyro.deterministic("A", torch.sigmoid(logit_A))                             # [T]
                     else:
-                        # Uniform priors: Beta(1, 1) for A
-                        alpha_A = self._t(1.0)
-                        beta_A = self._t(1.0)
-
-                    # Sample per-feature [T]
-                    A = pyro.sample("A", dist.Beta(alpha_A, beta_A).expand([T]))  # [T]
+                        A_mean_shifted = (0.5 * Amean_tensor).clamp_min(epsilon_tensor)
+                        beta_A = (1.0 - A_mean_shifted) / A_mean_shifted                               # [T]
+                        A = pyro.sample("A", dist.Beta(self._t(1.0), beta_A).expand([T]))              # [T]
 
             else:
-                # For negbinom: adaptive Exponential prior on A driven by per-gene overdispersion.
-                # rate = (2 - _o_y_weight) / Q05, where _o_y_weight ∈ (0, 1).
+                # For negbinom: LogNormal A prior (Normal in log2 space) with noise-adaptive mean.
+                # log2(A) ~ Normal(mu_log2_A, sigma_log2_A), so A = 2^log2(A).
                 #
-                # For quiet genes (o_y → 0, weight → 0): rate → 2/Q05, P(A ≥ Q05) ≈ 13.5%.
-                #   Likelihood is informative about the floor → allow A to go well below Q05.
-                # For noisy genes (o_y >> prior_mean, weight → 1): rate → 1/Q05, P(A ≥ Q05) ≈ 36.8%.
-                #   Likelihood is weak → stay near the original less-aggressive prior.
+                # mu_log2_A interpolates in log2 space between two gene-specific anchors:
+                #   w → 0 (quiet gene, informative likelihood): log2(Amean/2)
+                #   w → 1 (noisy gene, weak likelihood):        log2(y_ntc)
                 #
-                # This replaces the old Vmax-blending approach (which inflated A for large-range
-                # genes) with a rate-based interpolation that never pushes A above Q05.
-                rate_A = (2.0 - _o_y_weight) / Amean_tensor
-                A = pyro.sample("A", dist.Exponential(rate_A))
+                # sigma_log2_A = log2(y_ntc) - lower_anchor, floored at 1 octave, capped at 4.
+                if y_ntc_tensor is not None:
+                    log2_y_ntc = torch.log2(y_ntc_tensor)
+                    # Lift upper anchor to mean(y_corrected) when y_ntc < mean — prevents
+                    # both anchors collapsing to the floor for genes absent in NTC but
+                    # expressed in perturbed conditions.
+                    if mean_y_corrected_tensor is not None:
+                        log2_upper_anchor = torch.maximum(log2_y_ntc, torch.log2(mean_y_corrected_tensor))
+                    else:
+                        log2_upper_anchor = log2_y_ntc
+                    log2_Amean_half = torch.maximum(
+                        torch.log2(Amean_tensor / 2.0),
+                        log2_upper_anchor - 4.0,
+                    )
+                    sigma_log2_A = (log2_upper_anchor - log2_Amean_half).clamp_min(1.0)  # ≤ 4 octaves
+                    mu_log2_A    = (1.0 - _o_y_weight) * log2_Amean_half + _o_y_weight * log2_upper_anchor
+                else:
+                    log2_Amean_half = torch.log2(Amean_tensor / 2.0)
+                    sigma_log2_A    = self._t(4.0)
+                    mu_log2_A       = log2_Amean_half
+                log2_A = pyro.sample("log2_A", dist.Normal(mu_log2_A, sigma_log2_A))
+                A = pyro.deterministic("A", torch.pow(self._t(2.0), log2_A))
 
             if use_alpha:
                 # Relaxed Bernoulli: alpha ~ (0,1), becomes more discrete as temperature -> 0
@@ -669,7 +732,18 @@ class TransFitter:
                         "n_a",
                         _soft_clamp(n_a_raw, nmin, nmax)
                     )
-                
+
+                # Identifiability coupling: when n_a≈0 the Hill is flat and alpha·Vmax is
+                # just a constant offset, indistinguishable from A.  Penalise alpha by
+                # exp(-|n_a|): coupling=1 at n=0, 0.37 at n=1, 0.14 at n=2.
+                # This keeps alpha near 0 until the data pushes n_a away from 0.
+                if use_alpha and alpha_n_coupling > 0.0:
+                    _flatness_a = torch.exp(-torch.abs(n_a))  # [T] or [T, K-1]
+                    if distribution == 'multinomial' and K is not None:
+                        pyro.factor("alpha_n_coupling_a", -(alpha * _flatness_a * alpha_n_coupling).sum(dim=-1))
+                    else:
+                        pyro.factor("alpha_n_coupling_a", -(alpha * _flatness_a * alpha_n_coupling))
+
                 # Scale for Vmax, K is multiplied by alpha
                 #eff_Vmax_sigma = alpha * Vmaxa_sigma + epsilon_tensor
                 #eff_Ka_sigma   = alpha * Ka_sigma    + epsilon_tensor
@@ -691,16 +765,15 @@ class TransFitter:
                                     else self._t(5.0 * 0.6931 / 2.0))
 
                 if x_ntc_mean is not None:
-                    # Centre K prior at NTC mean with ±5 log2FC (95% CI) coverage.
-                    # Note: for one-sided fits (single technical group), K is not
-                    # identifiable from the data when the true EC50 lies outside the observed
-                    # x-range.  The NTC-centred prior then dominates and will under/over-shoot
-                    # the true K.  This is a data limitation, not a code bug — the full dataset
-                    # should be used for reliable EC50 estimation.
-                    K_log_sigma = _K_log_sigma_min  # = 5*ln(2)/2
-                    K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor)) - 0.5 * K_log_sigma ** 2
+                    # K prior: log-normal with MEDIAN at x_ntc_mean (= log2FC 0).
+                    # In log2FC space: log2(K_a) ~ Normal(0, sigma_log2²) where
+                    # sigma_log2 = K_log_sigma / ln(2) = 2.5, giving a 95% CI of ±5 log2FC.
+                    # Setting K_log_mu = log(x_ntc_mean) centres the median (not the mean)
+                    # at NTC, which is the natural reference in log2FC space.
+                    K_log_sigma = _K_log_sigma_min  # = 5*ln(2)/2 → sigma_log2 = 2.5
+                    K_log_mu = torch.log(x_ntc_mean.clamp_min(epsilon_tensor))
                 else:
-                    # Fallback: centre at user-specified quantile of x_true (k_prior_center).
+                    # Fallback: centre median at user-specified quantile of x_true (k_prior_center).
                     # Default: middle of observed range (K_max/2). Width from CV.
                     # Floor sigma so the prior always spans at least ±5 log2FC.
                     _k_fallback = (k_center_tensor if k_center_tensor is not None
@@ -712,7 +785,7 @@ class TransFitter:
                         K_std_prior = K_max_tensor / (self._t(2.0) * torch.sqrt(K_alpha_tensor))
                     ratio_K = (K_std_prior / K_mean_prior).clamp_min(self._t(1e-6))
                     K_log_sigma = torch.sqrt(torch.log1p(ratio_K ** 2)).clamp_min(_K_log_sigma_min)
-                    K_log_mu = torch.log(K_mean_prior) - 0.5 * K_log_sigma ** 2
+                    K_log_mu = torch.log(K_mean_prior)
 
                 if distribution in ['binomial', 'multinomial']:
                     # For binomial/multinomial: Sample Vmax_a INDEPENDENTLY (like BCD1C4F)
@@ -789,6 +862,14 @@ class TransFitter:
                             _soft_clamp(n_b_raw, nmin, nmax)
                         )
 
+                    # Identifiability coupling for beta/n_b (same logic as alpha/n_a above).
+                    if use_alpha and alpha_n_coupling > 0.0:
+                        _flatness_b = torch.exp(-torch.abs(n_b))  # [T] or [T, K-1]
+                        if distribution == 'multinomial' and K is not None:
+                            pyro.factor("alpha_n_coupling_b", -(beta * _flatness_b * alpha_n_coupling).sum(dim=-1))
+                        else:
+                            pyro.factor("alpha_n_coupling_b", -(beta * _flatness_b * alpha_n_coupling))
+
                     # Vmax_b and K_b: same structure as Vmax_a and K_a
                     if distribution in ['binomial', 'multinomial']:
                         if distribution == 'multinomial' and K is not None:
@@ -838,7 +919,8 @@ class TransFitter:
 
                     K_dim = K
                     K_minus_1 = K - 1
-                    x_expanded = x_true.unsqueeze(-1)  # [N, 1]
+                    # x_3d: [N, 1, 1] broadcasts over [1, T, K-1] parameter tensors
+                    x_3d = x_true.unsqueeze(1).unsqueeze(2)  # [N, 1, 1]
 
                     # A is [T, K] from Dirichlet
                     # Extract K-1 for fitting Hills (Kth doesn't get a Hill function)
@@ -848,55 +930,41 @@ class TransFitter:
                     A_kminus1_expanded = A_kminus1.unsqueeze(0)  # [1, T, K-1]
 
                     if function_type == 'single_hill':
-                        # Compute Hills for K-1 categories using log_K_a (numerically stable)
-                        Hilla_list = []
-                        for k in range(K_minus_1):
-                            hill_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                              logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
-                            Hilla_list.append(hill_k.unsqueeze(-1))  # [N, T, 1]
-                        Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
-
-                        # Combine: y = A + alpha_k * Hill_a_k(Vmax=Vmax_a_k)
-                        # alpha is [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        # Vectorized over K-1: Vmax_a/log_K_a/n_a all [T, K-1]
+                        Hilla_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_a.unsqueeze(0), A=0,
+                            logK=log_K_a.unsqueeze(0), n=n_a.unsqueeze(0)
+                        )  # [N, T, K-1]
                         combined_hill = alpha.unsqueeze(0) * Hilla_kminus1  # [N, T, K-1]
-                        y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
+                        y_kminus1 = A_kminus1_expanded + combined_hill      # [N, T, K-1]
 
                     elif function_type == 'additive_hill':
-                        # Compute Hills for K-1 categories using log_K_a/log_K_b (numerically stable)
-                        Hilla_list = []
-                        Hillb_list = []
-                        for k in range(K_minus_1):
-                            hill_a_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                                logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
-                            hill_b_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_b[:, k], A=0,
-                                                                logK=log_K_b[:, k], n=n_b[:, k])  # [N, T]
-                            Hilla_list.append(hill_a_k.unsqueeze(-1))  # [N, T, 1]
-                            Hillb_list.append(hill_b_k.unsqueeze(-1))  # [N, T, 1]
-                        Hilla_kminus1 = torch.cat(Hilla_list, dim=-1)  # [N, T, K-1]
-                        Hillb_kminus1 = torch.cat(Hillb_list, dim=-1)  # [N, T, K-1]
-
-                        # Combine: y = A + (alpha_k * Hill_a_k) + (beta_k * Hill_b_k)
-                        # alpha, beta are [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        # Vectorized over K-1 for both Hill_a and Hill_b
+                        Hilla_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_a.unsqueeze(0), A=0,
+                            logK=log_K_a.unsqueeze(0), n=n_a.unsqueeze(0)
+                        )  # [N, T, K-1]
+                        Hillb_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_b.unsqueeze(0), A=0,
+                            logK=log_K_b.unsqueeze(0), n=n_b.unsqueeze(0)
+                        )  # [N, T, K-1]
                         combined_hill = (alpha.unsqueeze(0) * Hilla_kminus1 +
-                                       beta.unsqueeze(0) * Hillb_kminus1)  # [N, T, K-1]
-                        y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
+                                         beta.unsqueeze(0) * Hillb_kminus1)  # [N, T, K-1]
+                        y_kminus1 = A_kminus1_expanded + combined_hill         # [N, T, K-1]
 
                     elif function_type == 'nested_hill':
-                        # Compute nested Hills for K-1 categories
-                        # First Hill uses log_K_a (stable); second Hill feeds Hilla output as x
-                        Hillb_list = []
-                        for k in range(K_minus_1):
-                            hill_a_k = Hill_based_positive_logK(x_expanded, Vmax=Vmax_a[:, k], A=0,
-                                                                logK=log_K_a[:, k], n=n_a[:, k])  # [N, T]
-                            hill_b_k = Hill_based_positive(hill_a_k.unsqueeze(-1), Vmax=Vmax_b[:, k], A=0,
-                                                          K=K_b[:, k], n=n_b[:, k],
-                                                          epsilon=epsilon_tensor)  # [N, T]
-                            Hillb_list.append(hill_b_k.unsqueeze(-1))  # [N, T, 1]
-                        Hillb_kminus1 = torch.cat(Hillb_list, dim=-1)  # [N, T, K-1]
-
-                        # alpha is [T, K-1] (per-category); unsqueeze(0) -> [1, T, K-1]
+                        # First Hill vectorized over K-1; its output feeds the second Hill
+                        Hilla_kminus1 = Hill_based_positive_logK(
+                            x_3d, Vmax=Vmax_a.unsqueeze(0), A=0,
+                            logK=log_K_a.unsqueeze(0), n=n_a.unsqueeze(0)
+                        )  # [N, T, K-1]
+                        Hillb_kminus1 = Hill_based_positive(
+                            Hilla_kminus1, Vmax=Vmax_b.unsqueeze(0), A=0,
+                            K=K_b.unsqueeze(0), n=n_b.unsqueeze(0),
+                            epsilon=epsilon_tensor
+                        )  # [N, T, K-1]
                         combined_hill = alpha.unsqueeze(0) * Hillb_kminus1  # [N, T, K-1]
-                        y_kminus1 = A_kminus1_expanded + combined_hill  # [N, T, K-1]
+                        y_kminus1 = A_kminus1_expanded + combined_hill      # [N, T, K-1]
 
                     # Clamp K-1 probabilities to [epsilon, 1-epsilon] to ensure valid residual
                     y_kminus1 = torch.clamp(y_kminus1, min=epsilon_tensor, max=1.0 - epsilon_tensor)
@@ -1202,8 +1270,6 @@ class TransFitter:
                 C=C
             )
         elif distribution == 'normal':
-            # For normal, we need sigma_y (standard deviation)
-            sigma_y = 1.0 / torch.sqrt(phi_y)  # Convert from precision to std dev
             observation_sampler(
                 y_obs_tensor=y_obs_tensor,
                 mu_y=mu_y,
@@ -1215,8 +1281,6 @@ class TransFitter:
                 C=C
             )
         elif distribution == 'studentt':
-            # For studentt, we need sigma_y (standard deviation) and nu_y (degrees of freedom)
-            sigma_y = 1.0 / torch.sqrt(phi_y)  # Convert from precision to std dev
             observation_sampler(
                 y_obs_tensor=y_obs_tensor,
                 mu_y=mu_y,
@@ -1243,10 +1307,8 @@ class TransFitter:
         niters: int = None,
         nsamples: int = 1000,
         alpha_ewma: float = 0.05,
-        tolerance: float = 1e-4, # recommended to keep based on cell2location
         beta_o_beta: float = 3, # recommended to keep based on cell2location
         beta_o_alpha: float = 9, # recommended to keep based on cell2location
-        alpha_alpha_mu: float = 5.8,
         K_alpha: float = 2,
         Vmax_alpha: float = 2,
         n_mu: float = 0,
@@ -1260,15 +1322,18 @@ class TransFitter:
         denominator: np.ndarray = None,
         modality_name: str = None,
         min_denominator: int = None,
-        use_data_driven_priors: bool = True,
-        correct_priors_for_technical: bool = True,
-        use_archive_prior_computation: bool = False,
         use_epsilon: bool = False,
         warmup: bool = True,
         warmup_T_min: float = 0.5,
         vmax_log_sigma_floor: float = 1.5,
         k_log_sigma_min: float = None,
         k_prior_center: str = 'middle',
+        checkpoint_interval: int = 10_000,
+        checkpoint_dir: str = None,
+        predictive_checkpoint: str = None,
+        restart_from_checkpoint: bool = True,
+        alpha_n_coupling: float = 10.0,
+        debug: bool = False,
         **kwargs
     ):
         """
@@ -1290,21 +1355,6 @@ class TransFitter:
             Minimum denominator value for binomial observations. Observations where
             denominator < min_denominator are masked (excluded from fitting).
             Useful for filtering low-coverage splicing junctions. Default: None (no filtering).
-        use_data_driven_priors : bool, optional
-            If True (default), use Beta priors for A and upper_limit based on data percentiles.
-            If False, use uniform priors (Beta(1, 1)). Useful for testing if data-driven
-            priors are too strong or causing issues. Default: True.
-        correct_priors_for_technical : bool, optional
-            If True (default), correct data for technical effects before computing priors (Amean, Vmax_mean).
-            If False (archive behavior), compute priors from raw sum_factor-normalized data.
-            Technical effects are still corrected during model fitting via alpha_y_sample.
-        use_archive_prior_computation : bool, optional
-            If True, compute Amean and Vmax_mean using archive method:
-            - Amean = min(guide_means) per feature
-            - Vmax_mean = max(guide_means) per feature
-            If False (default), use percentile-based method:
-            - Amean = 5th percentile of guide means
-            - Vmax_mean = 95th percentile - 5th percentile (range)
         use_epsilon : bool, optional
             If True, add 1e-8 epsilon for numerical stability in NegativeBinomial logits.
             If False (default), use log(mu) - log(phi) directly.
@@ -1345,15 +1395,55 @@ class TransFitter:
             - 'upper'  : 95th percentile of x_true guide means. Use when the EC50 is
                          expected near the top of the observed range (e.g. repressors
                          where the effect only kicks in at high cis expression).
+        predictive_checkpoint : str, optional
+            Path to a checkpoint file to use for Predictive sampling only.  When set,
+            all prior-computation setup runs as normal (same arguments as the original
+            fit_trans call), but the training loop is skipped and the param_store is
+            loaded from the checkpoint instead.  Use this to draw posterior samples
+            from any intermediate checkpoint without re-running training.
+
+            **function_type is auto-detected**: every checkpoint stores
+            ``effective_function_type`` — the function that was *actually being
+            fitted* when that checkpoint was written (``'single_hill'`` during
+            warmup, the target type afterwards).  ``fit_trans`` reads this value
+            before initialising the guide, so the guide architecture always matches
+            the checkpoint.  ``warmup`` is also forced to ``False`` automatically.
+            You therefore only need to pass ``sum_factor_col`` (and any other
+            data-access arguments from the original call)::
+
+                model.fit_trans(
+                    sum_factor_col='sum_factor_adj',
+                    predictive_checkpoint='outdir/label/trans_checkpoint_gene_warmup.pt',
+                )
+
+            The same minimal call works for any checkpoint — mid-warmup, post-warmup,
+            or complete.
+
+            To inspect a checkpoint manually::
+
+                import torch
+                ckpt = torch.load('trans_checkpoint_gene_step0030000.pt',
+                                  map_location='cpu', weights_only=False)
+                # Was this step in warmup?
+                print(ckpt['effective_function_type'])  # 'single_hill' → yes, 'additive_hill' → no
+                print(ckpt['phase2_announced'])         # False → in warmup, True → past it
+
+            Structural mismatches (N, T, K, C) raise an error; ``distribution``
+            mismatches produce a warning.
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
+        debug : bool, optional
+            If True, run the slow debug SVI step that checks all parameters for
+            non-finite values at every iteration and prints detailed diagnostics
+            when NaN/Inf are detected. Default False (uses fast svi.step path).
+            Enable when chasing NaN gradients or divergent parameters.
         **kwargs
             Additional parameters for specific distributions
 
         Notes
         -----
         Each modality stores its own fitting results.
-        Primary modality results are also stored at model level for backward compatibility.
+        Primary modality results are also stored at model level as ``model.posterior_samples_trans``.
         Trans fitting requires that technical fit has been performed for the modality.
 
         If technical_group_code is set (via set_technical_groups()), it will be used for
@@ -1363,10 +1453,6 @@ class TransFitter:
         --------
         >>> model.set_technical_groups(['cell_line'])  # Optional, for correction
         >>> model.fit_trans(sum_factor_col='sum_factor', function_type='additive_hill')
-
-        >>> # Test without data-driven priors
-        >>> model.fit_trans(sum_factor_col='sum_factor', function_type='additive_hill',
-        ...                 use_data_driven_priors=False)
         """
 
         if self.model.x_true is None:
@@ -1396,13 +1482,40 @@ class TransFitter:
             # niters always means Phase 2 (additive/nested hill) steps.
             if distribution == 'multinomial':
                 niters = 200_000
-                print(f"[INFO] Using default niters=200,000 for multivariate distribution '{distribution}'")
+                if predictive_checkpoint is None:
+                    print(f"[INFO] Using default niters=200,000 for multivariate distribution '{distribution}'")
             elif function_type == 'polynomial':
                 niters = 200_000
-                print(f"[INFO] Using default niters=200,000 for polynomial function")
+                if predictive_checkpoint is None:
+                    print(f"[INFO] Using default niters=200,000 for polynomial function")
             else:
                 niters = 100_000
-                print(f"[INFO] Using default niters=100,000 for distribution '{distribution}' and function_type '{function_type}'")
+                if predictive_checkpoint is None:
+                    print(f"[INFO] Using default niters=100,000 for distribution '{distribution}' and function_type '{function_type}'")
+
+        # ---------------------------
+        # When predictive_checkpoint is given, read function_type directly from
+        # the checkpoint's effective_function_type so the caller doesn't have to
+        # specify it.  This must happen before _do_warmup and guide initialisation,
+        # both of which depend on function_type.
+        # ---------------------------
+        if predictive_checkpoint is not None:
+            try:
+                _peek = torch.load(predictive_checkpoint, map_location='cpu', weights_only=False)
+                _peek_ft = _peek.get('effective_function_type', _peek.get('function_type'))
+                if _peek_ft is not None:
+                    if _peek_ft != function_type:
+                        print(f"[INFO] predictive_checkpoint: overriding "
+                              f"function_type={function_type!r} → {_peek_ft!r} "
+                              f"(read from checkpoint)")
+                    function_type = _peek_ft
+                # Suppress warmup — there's nothing to warm up when loading from a checkpoint
+                warmup = False
+            except Exception as e:
+                warnings.warn(
+                    f"Could not peek at predictive_checkpoint for function_type: {e}. "
+                    f"Using caller-provided function_type={function_type!r}."
+                )
 
         # ---------------------------
         # Curriculum warmup: compute warmup_steps so Phase 1 cools at the same
@@ -1435,20 +1548,11 @@ class TransFitter:
             warmup_steps = 0
             total_steps = niters
         
-        #if lr is None:
-        #    # Default: 100,000 unless multinomial OR polynomial function, then 200,000
-        #    if distribution in ['binomial', 'multinomial']:
-        #        lr = 1e-4
-        #        print(f"[INFO] Using default niters=200,000 for distribution '{distribution}'")
-        #    else:
-        #        lr = 1e-3
-        #        print(f"[INFO] Using default lr=1e-3 for distribution '{distribution}'")
-
         if (modality.alpha_y_prefit is None
                 and 'technical_group_code' in self.model.meta.columns):
             raise ValueError(
-                f"Modality '{modality_name}' has not been fit with fit_technical(). "
-                f"Please run fit_technical(modality_name='{modality_name}') first."
+                f"Modality '{modality_name}' has not been fit with fit_ntc(). "
+                f"Please run fit_ntc(modality_name='{modality_name}') first."
             )
 
         # Get counts from modality (densify if sparse)
@@ -1482,7 +1586,7 @@ class TransFitter:
             alpha_y_prefit = modality.alpha_y_prefit
             print(f"[WARNING] Distribution-specific alpha_y not found, falling back to generic alpha_y_prefit. "
                   f"This may be incorrect if using old technical fit results. "
-                  f"Consider re-running fit_technical with current code.")
+                  f"Consider re-running fit_ntc with current code.")
 
         print(f"[INFO] Fitting trans model for modality '{modality_name}' (distribution: {distribution})")
 
@@ -1499,6 +1603,13 @@ class TransFitter:
 
         if requires_sum_factor(distribution) and sum_factor_col is None:
             raise ValueError(f"Distribution '{distribution}' requires sum_factor_col parameter")
+
+        if requires_sum_factor(distribution) and modality.sum_factors is None:
+            raise ValueError(
+                f"Modality '{modality_name}' has distribution '{distribution}' but no sum_factors "
+                f"DataFrame has been set. Assign a cell-indexed DataFrame to "
+                f"modality.sum_factors before calling fit_trans()."
+            )
 
         if requires_denominator(distribution) and denominator is None:
             raise ValueError(f"Distribution '{distribution}' requires denominator parameter")
@@ -1544,7 +1655,6 @@ class TransFitter:
         _cell_indices = [_cell_index_map[c] for c in modality_cells]
         _cell_idx_tensor = torch.tensor(_cell_indices, dtype=torch.long, device=self.model.device)
         x_true_subset = self.model.x_true[_cell_idx_tensor]
-        log2_x_true_subset = torch.log2(x_true_subset)
 
         N = len(modality_cells)
 
@@ -1627,7 +1737,6 @@ class TransFitter:
         # Detect data dimensions (for multinomial)
         from .distributions import is_3d_distribution
         K = None
-        D = None
         if is_3d_distribution(distribution):
             if y_obs.ndim == 3:
                 if distribution == 'multinomial':
@@ -1637,7 +1746,6 @@ class TransFitter:
         x_true_mean = x_true_subset
         beta_o_alpha_tensor = torch.tensor(beta_o_alpha, dtype=torch.float32, device=self.model.device)
         beta_o_beta_tensor = torch.tensor(beta_o_beta, dtype=torch.float32, device=self.model.device)
-        alpha_alpha_mu_tensor = torch.tensor(alpha_alpha_mu, dtype=torch.float32, device=self.model.device)
         K_alpha_tensor = torch.tensor(K_alpha, dtype=torch.float32, device=self.model.device)
         Vmax_alpha_tensor = torch.tensor(Vmax_alpha, dtype=torch.float32, device=self.model.device)
         n_mu_tensor = torch.tensor(n_mu, dtype=torch.float32, device=self.model.device)
@@ -1709,7 +1817,7 @@ class TransFitter:
             y_obs_factored = y_obs_tensor
             y_obs_for_prior = y_obs_factored
 
-        # ---- Multinomial zero-category mask (analogous to fit_technical zero_cat_mask) ----
+        # ---- Multinomial zero-category mask (analogous to fit_ntc zero_cat_mask) ----
         # Identifies categories structurally absent across ALL trans cells.
         # These phantom positions are already masked inline inside _model_y; this block
         # performs an early diagnostic check and warns when features have ≤1 active
@@ -1736,13 +1844,8 @@ class TransFitter:
         # ===================================================================
         # CORRECT FOR TECHNICAL EFFECTS BEFORE COMPUTING PRIORS
         # ===================================================================
-        # The observed data includes technical batch effects. To compute unbiased
-        # priors for A and Vmax (baseline parameters), we can optionally remove these effects
-        # using the inverse transformation.
-        # NOTE: Archive code does NOT correct priors - it uses raw sum_factor-normalized data.
-        # Technical effects are only applied during model fitting via alpha_y_sample.
-        # Setting correct_priors_for_technical=False (default) matches archive behavior.
-        if correct_priors_for_technical and alpha_y_prefit is not None and groups_tensor is not None:
+        # Remove technical batch effects from observed data before computing A and Vmax priors.
+        if alpha_y_prefit is not None and groups_tensor is not None:
             print(f"[INFO] Correcting for technical effects before computing priors (distribution: {distribution})")
 
             # alpha_y_prefit is always [C, T] (point estimate/mean), index groups dimension
@@ -1751,32 +1854,29 @@ class TransFitter:
             # alpha_y_expanded is now [N, T] (or [N, T, K] for multinomial), matching y_obs_for_prior
             # NO TRANSPOSE NEEDED - both are [N, T]
 
-            # Diagnostic: Check alpha_y_expanded for issues
+            # Check alpha_y_expanded for issues
             if not torch.isfinite(alpha_y_expanded).all():
                 n_invalid_alpha = (~torch.isfinite(alpha_y_expanded)).sum().item()
                 print(f"[WARNING] alpha_y_expanded contains {n_invalid_alpha} non-finite values before correction")
-            else:
-                # Check if values look like multiplicative (around 1.0) vs additive (logit scale)
+            elif distribution == 'binomial':
                 alpha_mean = alpha_y_expanded.mean().item()
-                alpha_std = alpha_y_expanded.std().item()
-                print(f"[DEBUG] alpha_y_expanded stats: mean={alpha_mean:.4f}, std={alpha_std:.4f}")
-                if distribution == 'binomial' and abs(alpha_mean - 1.0) < 0.5:
+                if abs(alpha_mean - 1.0) < 0.5:
                     print(f"[WARNING] alpha_y_expanded looks like multiplicative correction (mean~1.0). "
                           f"For binomial, expected additive correction on logit scale (mean~0, range~[-5,5]). "
                           f"You may be using technical fit results from old (buggy) code. "
-                          f"Re-run fit_technical with the fixed code.")
+                          f"Re-run fit_ntc with the fixed code.")
 
             if distribution == 'negbinom':
                 # Technical effect: multiplicative (mu_corrected = mu * alpha_y_mult)
                 # Inverse: divide by alpha_y_mult to get baseline
-                # alpha_y_prefit for negbinom is multiplicative (from fit_technical)
+                # alpha_y_prefit for negbinom is multiplicative (from fit_ntc)
                 y_obs_for_prior = y_obs_for_prior / alpha_y_expanded.clamp_min(epsilon_tensor)
                 print(f"[INFO] negbinom: Applied inverse multiplicative correction (divide by alpha_y_mult)")
 
             elif distribution in ['normal', 'studentt']:
                 # Technical effect: additive (mu_corrected = mu + alpha_y_add)
                 # Inverse: subtract alpha_y_add to get baseline
-                # alpha_y_prefit for normal/studentt is additive (from fit_technical)
+                # alpha_y_prefit for normal/studentt is additive (from fit_ntc)
                 y_obs_for_prior = y_obs_for_prior - alpha_y_expanded
                 print(f"[INFO] {distribution}: Applied inverse additive correction (subtract alpha_y_add)")
 
@@ -1789,15 +1889,8 @@ class TransFitter:
                 p_obs_clamped = torch.clamp(y_obs_for_prior, min=epsilon_tensor, max=1.0 - epsilon_tensor)
                 logit_obs = torch.log(p_obs_clamped) - torch.log(1.0 - p_obs_clamped)
 
-                # Diagnostic: Check logit_obs range
-                print(f"[DEBUG] logit_obs range: [{logit_obs.min().item():.2f}, {logit_obs.max().item():.2f}]")
-                print(f"[DEBUG] alpha_y_expanded range: [{alpha_y_expanded.min().item():.4f}, {alpha_y_expanded.max().item():.4f}]")
-
                 # Apply inverse correction on logit scale
                 logit_baseline = logit_obs - alpha_y_expanded
-
-                # Diagnostic: Check logit_baseline range and finite values
-                print(f"[DEBUG] logit_baseline range: [{logit_baseline.min().item():.2f}, {logit_baseline.max().item():.2f}]")
                 if not torch.isfinite(logit_baseline).all():
                     n_invalid = (~torch.isfinite(logit_baseline)).sum().item()
                     print(f"[WARNING] logit_baseline contains {n_invalid} non-finite values after correction")
@@ -1805,25 +1898,6 @@ class TransFitter:
                 # Convert back to probability scale
                 y_obs_for_prior = torch.sigmoid(logit_baseline)
                 print(f"[INFO] binomial: Applied inverse logit correction (subtract alpha_y_add on logit scale)")
-
-                # DIAGNOSTIC: Check correction for specific feature
-                sj_check_idx = 1298  # User's specific SJ position
-                if sj_check_idx < T:
-                    # Get uncorrected values (observed PSI)
-                    y_uncorrected = y_obs_factored[:, sj_check_idx]
-
-                    # Get corrected values (baseline PSI)
-                    y_corrected = y_obs_for_prior[:, sj_check_idx]
-
-                    # Check by group
-                    print(f"[DEBUG] Checking inverse correction for feature {sj_check_idx} (chr6:34236964:34237203):")
-                    for grp in range(C):
-                        grp_mask = groups_tensor == grp
-                        if grp_mask.sum() > 0:
-                            uncorr_mean = y_uncorrected[grp_mask].mean().item()
-                            corr_mean = y_corrected[grp_mask].mean().item()
-                            alpha_val = alpha_y_prefit[grp, sj_check_idx].item() if alpha_y_prefit.ndim == 2 else alpha_y_prefit[0, grp, sj_check_idx].mean().item()
-                            print(f"  Group {grp} (n={grp_mask.sum()}): α={alpha_val:.4f}, Observed PSI={uncorr_mean:.4f}, Baseline PSI={corr_mean:.4f}")
 
             elif distribution == 'multinomial':
                 # Technical effect: log scale (log(probs_corrected) = log(probs) + alpha_y_add)
@@ -1886,169 +1960,97 @@ class TransFitter:
 
         unique_guides = torch.unique(guides_tensor)
 
-        # nanmean and nanvar helpers (in case torch.nanmean/nanvar isn't available)
-        if hasattr(torch, "nanmean"):
-            def nanmean(x, dim):
-                return torch.nanmean(x, dim=dim)
-        else:
-            def nanmean(x, dim):
-                mask = ~torch.isnan(x)
-                num = torch.where(mask, x, torch.zeros_like(x)).sum(dim=dim)
-                den = mask.sum(dim=dim).clamp_min(1)
-                return num / den
-
-        if hasattr(torch, "nanvar"):
-            def nanvar(x, dim):
-                return torch.var(x, dim=dim)  # Note: torch.var ignores NaN in older versions
-        else:
-            def nanvar(x, dim):
-                mask = ~torch.isnan(x)
-                n = mask.sum(dim=dim).clamp_min(2)  # Need at least 2 values for variance
-                x_mean = nanmean(x, dim=dim)
-                # Expand mean to match x shape for broadcasting
-                if dim == 0:
-                    x_mean_expanded = x_mean.unsqueeze(0)
-                else:
-                    x_mean_expanded = x_mean
-                sq_diff = torch.where(mask, (x - x_mean_expanded) ** 2, torch.zeros_like(x))
-                return sq_diff.sum(dim=dim) / (n - 1)  # Unbiased variance
-
-        # nanquantile helper
-        def nanquantile(x, q, dim):
-            """Compute quantile ignoring NaN values."""
-            if x.ndim == 2:  # [G, T]
-                result = []
-                for t in range(x.shape[1]):
-                    vals = x[:, t]
-                    valid = vals[~torch.isnan(vals)]
-                    if valid.numel() > 0:
-                        result.append(torch.quantile(valid, q))
+        # Pre-extract q01 of NTC posterior means for the Q05=0 floor below.
+        # Only needed for negbinom/binomial; full NTC anchor extraction happens later.
+        _q01_ntc_for_floor = None
+        if distribution in ('negbinom', 'binomial'):
+            _post_tech_pre = getattr(modality, 'posterior_samples_ntc', None)
+            if _post_tech_pre is not None and 'mu_ntc' in _post_tech_pre:
+                try:
+                    _mu_ntc_pre = _post_tech_pre['mu_ntc']
+                    if not torch.is_tensor(_mu_ntc_pre):
+                        _mu_ntc_pre = torch.tensor(_mu_ntc_pre, dtype=torch.float32, device=self.model.device)
                     else:
-                        result.append(torch.tensor(float('nan'), device=x.device))
-                return torch.stack(result)  # [T]
-            elif x.ndim == 3:  # [G, T, K]
-                result = []
-                for t in range(x.shape[1]):
-                    result_k = []
-                    for k in range(x.shape[2]):
-                        vals = x[:, t, k]
-                        valid = vals[~torch.isnan(vals)]
-                        if valid.numel() > 0:
-                            result_k.append(torch.quantile(valid, q))
-                        else:
-                            result_k.append(torch.tensor(float('nan'), device=x.device))
-                    result.append(torch.stack(result_k))
-                return torch.stack(result)  # [T, K]
-            else:
-                raise ValueError(f"Unsupported ndim for nanquantile: {x.ndim}")
+                        _mu_ntc_pre = _mu_ntc_pre.float().to(self.model.device)
+                    _mu_ntc_pre_flat = _mu_ntc_pre
+                    while _mu_ntc_pre_flat.ndim > 1:
+                        _mu_ntc_pre_flat = _mu_ntc_pre_flat.median(dim=0).values
+                    _finite_pre = _mu_ntc_pre_flat[(_mu_ntc_pre_flat > 0) & ~torch.isnan(_mu_ntc_pre_flat)]
+                    if _finite_pre.numel() > 0:
+                        _q01_ntc_for_floor = torch.quantile(_finite_pre, 0.01)
+                except Exception:
+                    pass
 
-        # Compute priors: use percentiles from guide means (works with or without guides)
-        if 'guide_code' in self.model.meta.columns and len(unique_guides) > 1:
-            # WITH GUIDES: Compute guide-level statistics
-            guide_means = []
-            guide_vars = []
-            for g in unique_guides:
-                vals_g = y_obs_for_prior[guides_tensor == g, ...]  # [Ng, T] or [Ng, T, K]
-                guide_means.append(nanmean(vals_g, dim=0))         # [T] or [T, K]
-                guide_vars.append(nanvar(vals_g, dim=0))           # [T] or [T, K]
+        # Compute cell-level Q05/Q95 for Amean/Vmax priors (always, regardless of guide count)
+        _q05_was_zero = None
+        mean_y_corrected_tensor = None  # [T]; set below for 2D distributions (negbinom, binomial)
+        if y_obs_for_prior.ndim == 2:  # [N, T]
+            Amean_tensor = torch.nanquantile(y_obs_for_prior, 0.05, dim=0)  # [T]
+            Vmax_raw     = torch.nanquantile(y_obs_for_prior, 0.95, dim=0)  # [T]
+            _y_mean  = torch.nanmean(y_obs_for_prior, dim=0)                # [T]
+            _y_dev   = y_obs_for_prior - _y_mean.unsqueeze(0)               # [N, T]
+            _n_valid = (~torch.isnan(y_obs_for_prior)).sum(dim=0).clamp_min(2)  # [T]
+            cell_var = torch.where(
+                _n_valid >= 2,
+                torch.nansum(_y_dev ** 2, dim=0) / (_n_valid - 1).float(),
+                torch.full((T,), float('nan'), device=self.model.device)
+            )  # [T]
 
-            guide_means = torch.stack(guide_means, dim=0)  # [G, T] or [G, T, K]
-            guide_vars = torch.stack(guide_vars, dim=0)    # [G, T] or [G, T, K]
+            # Q05=0 floor: for count/proportion distributions (negbinom, binomial), Q05=0
+            # means the gene is sparse and needs a small positive lower bound because the
+            # negbinom A prior uses log2(Amean/2), which requires Amean > 0.
+            # Use a fixed small constant (2^-10 ≈ 1e-3 normalized counts) rather than the
+            # data-driven min non-zero Q05, which can be inflated (~0.5–1 count) and would
+            # wrongly pull the prior lower bound above the NTC expression level for sparse genes.
+            # The y_ntc anchor provides the upper reference; Amean just needs a valid lower bound.
+            #
+            # For normal/studentt, Q05 can legitimately be ≤ 0 (e.g. negative SpliZ scores),
+            # and the linear-space prior works fine with negative Amean — so only floor NaNs.
+            # NaN Amean values (no valid observations) are handled by the fallback below.
+            if distribution in ('negbinom', 'binomial'):
+                _q05_was_zero = (Amean_tensor <= 0) | torch.isnan(Amean_tensor)
+            else:  # normal, studentt: Q05 can be ≤ 0; only catch NaN
+                _q05_was_zero = torch.isnan(Amean_tensor)
+            if _q05_was_zero.any():
+                n_q05_zero = _q05_was_zero.sum().item()
+                _amean_floor = self._t(2.0 ** -10)
+                if _q01_ntc_for_floor is not None:
+                    _amean_floor = torch.minimum(_q01_ntc_for_floor, _amean_floor)
+                Amean_tensor = torch.where(_q05_was_zero, _amean_floor.expand_as(Amean_tensor), Amean_tensor)
+                print(f"[INFO] Q05 floor: {n_q05_zero} features raised to {_amean_floor.item():.3e} (min(q01_ntc, 2^-10))")
+            Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))
+            Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
 
-            # Helper: minimum of strictly-positive (non-zero, non-NaN) guide means
-            def min_nonzero(x, dim):
-                """Minimum of positive, non-NaN values; returns NaN if all non-positive."""
-                x_filled = torch.where(
-                    (x > 0) & ~torch.isnan(x),
-                    x,
-                    torch.full_like(x, float('inf'))
-                )
-                result = torch.min(x_filled, dim=dim)[0]
-                all_nonpositive = ~((x > 0) & ~torch.isnan(x)).any(dim=dim)
-                return torch.where(all_nonpositive, torch.full_like(result, float('nan')), result)
+            # Mean across all cells — used as a data-driven floor for the A prior upper
+            # anchor. When y_ntc ≈ 0 (gene absent in NTC but expressed in perturbations),
+            # this prevents both anchors collapsing to the same floor value.
+            mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0).clamp_min(self._t(1e-12))  # [T]
 
-            Q05 = nanquantile(guide_means, 0.05, dim=0)  # [T] or [T, K]
-            Q95 = nanquantile(guide_means, 0.95, dim=0)  # [T] or [T, K]
-            min_nz = min_nonzero(guide_means, dim=0)     # [T] or [T, K]
-
-            # Amean: Q05 if positive; fall back to min nonzero for sparse genes where Q05=0
-            q05_positive = (Q05 > 0) & ~torch.isnan(Q05)
-            Amean_tensor = torch.where(q05_positive, Q05, min_nz)
-
-            # Vmax: Q95 - Q05 normally (when Q05=0, this equals Q95 — no min_nonzero subtracted)
-            # Fall back to min nonzero when Q95=0 (gene unexpressed in all guides)
-            q95_positive = (Q95 > 0) & ~torch.isnan(Q95)
-            Vmax_mean_tensor = torch.where(q95_positive, Q95 - Q05, min_nz)
-
-            # Absolute safety floor
-            Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-            Vmax_mean_tensor = Vmax_mean_tensor.clamp_min(self._t(1e-3))
-
-            if use_archive_prior_computation:
-                print(f"[INFO] Using guide-based priors (archive method): {len(unique_guides)} guides, Q05-fallback/Q95-Q05")
-            else:
-                print(f"[INFO] Using guide-based priors (percentile method): {len(unique_guides)} guides, Q05-fallback/Q95-Q05")
-
-            # For variances: use mean variance across guides (average within-guide variability)
-            # This captures how much variability exists around each guide's mean
-            mean_within_guide_var = nanmean(guide_vars, dim=0)  # [T] or [T, K]
-
-        else:
-            # WITHOUT GUIDES: Use overall percentiles
-            print("[INFO] No guides found or only 1 guide. Using overall data percentiles for priors.")
-
-            # Compute 5th and 95th percentiles across all cells for each feature
-            if y_obs_for_prior.ndim == 2:  # [N, T]
-                Amean_tensor = []
-                Vmax_mean_tensor = []
-                overall_vars = []
-                for t in range(y_obs_for_prior.shape[1]):
-                    vals_t = y_obs_for_prior[:, t]
-                    valid_t = vals_t[~torch.isnan(vals_t)]
-                    if valid_t.numel() > 0:
-                        Amean_tensor.append(torch.quantile(valid_t, 0.05))
-                        Vmax_mean_tensor.append(torch.quantile(valid_t, 0.95))
-                        overall_vars.append(torch.var(valid_t))
-                    else:
-                        Amean_tensor.append(torch.tensor(float('nan'), device=self.model.device))
-                        Vmax_mean_tensor.append(torch.tensor(float('nan'), device=self.model.device))
-                        overall_vars.append(torch.tensor(float('nan'), device=self.model.device))
-
-                Amean_tensor = torch.stack(Amean_tensor)  # [T]
-                Vmax_mean_tensor = torch.stack(Vmax_mean_tensor)  # [T]
-                mean_within_guide_var = torch.stack(overall_vars)  # [T]
-
-            elif y_obs_for_prior.ndim == 3:  # [N, T, K]
-                Amean_tensor = []
-                Vmax_mean_tensor = []
-                overall_vars = []
-                for t in range(y_obs_for_prior.shape[1]):
-                    Amean_k = []
-                    Vmax_k = []
-                    var_k = []
-                    for k in range(y_obs_for_prior.shape[2]):
-                        vals_tk = y_obs_for_prior[:, t, k]
-                        valid_tk = vals_tk[~torch.isnan(vals_tk)]
-                        if valid_tk.numel() > 0:
-                            Amean_k.append(torch.quantile(valid_tk, 0.05))
-                            Vmax_k.append(torch.quantile(valid_tk, 0.95))
-                            var_k.append(torch.var(valid_tk))
-                        else:
-                            Amean_k.append(torch.tensor(float('nan'), device=self.model.device))
-                            Vmax_k.append(torch.tensor(float('nan'), device=self.model.device))
-                            var_k.append(torch.tensor(float('nan'), device=self.model.device))
-                    Amean_tensor.append(torch.stack(Amean_k))
-                    Vmax_mean_tensor.append(torch.stack(Vmax_k))
-                    overall_vars.append(torch.stack(var_k))
-
-                Amean_tensor = torch.stack(Amean_tensor)  # [T, K]
-                Vmax_mean_tensor = torch.stack(Vmax_mean_tensor)  # [T, K]
-                mean_within_guide_var = torch.stack(overall_vars)  # [T, K]
-
-            # Ensure A_mean >= 1e-12 (small floor allows A prior to explore near-zero)
-            Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
-
-            Vmax_mean_tensor = (Vmax_mean_tensor - Amean_tensor).clamp_min(self._t(1e-3))
+        elif y_obs_for_prior.ndim == 3:  # [N, T, K] — multinomial
+            K_obs = y_obs_for_prior.shape[2]
+            _y3   = y_obs_for_prior.reshape(N, T * K_obs)             # [N, T*K]
+            _Amean_flat = torch.nanquantile(_y3, 0.05, dim=0)         # [T*K]
+            _Vmax_flat  = torch.nanquantile(_y3, 0.95, dim=0)         # [T*K]
+            _y3_mean    = torch.nanmean(_y3, dim=0)                   # [T*K]
+            _y3_dev     = _y3 - _y3_mean.unsqueeze(0)                 # [N, T*K]
+            _n3_valid   = (~torch.isnan(_y3)).sum(dim=0).clamp_min(2) # [T*K]
+            _var3_flat  = torch.where(
+                _n3_valid >= 2,
+                torch.nansum(_y3_dev ** 2, dim=0) / (_n3_valid - 1).float(),
+                torch.full((T * K_obs,), float('nan'), device=self.model.device)
+            )  # [T*K]
+            Amean_tensor = _Amean_flat.reshape(T, K_obs)  # [T, K]
+            Vmax_raw     = _Vmax_flat.reshape(T, K_obs)   # [T, K]
+            cell_var     = _var3_flat.reshape(T, K_obs)   # [T, K]
+            # Q05=0 floor: use fixed small constant (proportions clamped at 1e-3 below anyway).
+            _q05_was_zero = (Amean_tensor <= 0) | torch.isnan(Amean_tensor)
+            if _q05_was_zero.any():
+                n_q05_zero = _q05_was_zero.sum().item()
+                _amean_floor_mn = self._t(2.0 ** -10)
+                Amean_tensor = torch.where(_q05_was_zero, _amean_floor_mn.expand_as(Amean_tensor), Amean_tensor)
+                print(f"[INFO] Q05=0 floor (multinomial): {n_q05_zero} (feature, category) cells raised to 2^-10={2.0**-10:.3e}")
+            Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))   # [T, K]
+            Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
 
         # For binomial/multinomial: clamp Vmax_mean to valid Beta range
         if distribution in ['binomial', 'multinomial']:
@@ -2056,82 +2058,344 @@ class TransFitter:
             Amean_tensor = Amean_tensor.clamp(min=self._t(1e-3), max=self._t(1.0 - 1e-6))
 
         # Handle NaN values (features where ALL observations were filtered out)
-        # For binomial/multinomial with denominator filtering, some features may have no valid observations
         nan_mask = torch.isnan(Amean_tensor) | torch.isnan(Vmax_mean_tensor)
         if nan_mask.any():
             n_nan = nan_mask.sum().item() if nan_mask.ndim == 1 else nan_mask.any(dim=-1).sum().item()
             print(f"[WARNING] {n_nan} features have all observations filtered (denominator < {min_denominator}). Using fallback values.")
 
-            # Fallback: use global mean/var across all valid features
+            # Fallback: median of valid Amean/cell_var across features
             if distribution in ['binomial', 'multinomial']:
-                # Compute fallback from valid (non-NaN) entries only
-                valid_means = guide_means[~torch.isnan(guide_means)]
-                valid_vars = guide_vars[~torch.isnan(guide_vars)]
-
-                if valid_means.numel() > 0:
-                    # Use median for robustness
-                    valid_mean = torch.median(valid_means)
-                    valid_var = torch.median(valid_vars) if valid_vars.numel() > 0 else self._t(0.1)
+                valid_A   = Amean_tensor[~torch.isnan(Amean_tensor)]
+                valid_var = cell_var[~torch.isnan(cell_var)]
+                if valid_A.numel() > 0:
+                    valid_mean    = torch.median(valid_A)
+                    valid_var_val = torch.median(valid_var) if valid_var.numel() > 0 else self._t(0.1)
                 else:
-                    # Last resort: use generic defaults for PSI data
-                    print("[WARNING] No valid observations found! Using generic defaults: A=0.1, Vmax=0.5, var=0.1")
-                    valid_mean = self._t(0.3)  # Midpoint for PSI
-                    valid_var = self._t(0.1)  # Reasonable variance for PSI
-
-                print(f"[INFO] Using fallback: mean={valid_mean.item():.3f}, var={valid_var.item():.3f}")
-
-                # Replace NaN with fallback
-                # Assume range from 50% to 150% of typical value
-                fallback_A = valid_mean * 0.5  # A = 50% of mean (minimum)
-                fallback_max = valid_mean * 1.5  # Upper bound (maximum)
-                fallback_Vmax = fallback_max - fallback_A  # Vmax = RANGE (not maximum!)
-                fallback_A = torch.clamp(fallback_A, min=0.01, max=0.99)  # Keep in valid Beta range
-                fallback_Vmax = torch.clamp(fallback_Vmax, min=0.01, max=0.99)
-
-                Amean_tensor = torch.where(torch.isnan(Amean_tensor),
-                                          torch.full_like(Amean_tensor, fallback_A),
-                                          Amean_tensor)
-                Vmax_mean_tensor = torch.where(torch.isnan(Vmax_mean_tensor),
-                                              torch.full_like(Vmax_mean_tensor, fallback_Vmax),
-                                              Vmax_mean_tensor)
-                mean_within_guide_var = torch.where(torch.isnan(mean_within_guide_var),
-                                                   torch.full_like(mean_within_guide_var, valid_var),
-                                                   mean_within_guide_var)
-
+                    print("[WARNING] No valid observations found! Using generic defaults: A=0.3, var=0.1")
+                    valid_mean    = self._t(0.3)
+                    valid_var_val = self._t(0.1)
+                print(f"[INFO] Using fallback: mean={valid_mean.item():.3f}, var={valid_var_val.item():.3f}")
+                fallback_A    = torch.clamp(valid_mean * 0.5, min=0.01, max=0.99)
+                fallback_Vmax = torch.clamp(valid_mean,       min=0.01, max=0.99)
             else:  # negbinom, normal, studentt
-                # Compute fallback from valid (non-NaN) entries only
-                valid_means = guide_means[~torch.isnan(guide_means)]
-                valid_vars = guide_vars[~torch.isnan(guide_vars)]
-
-                if valid_means.numel() > 0:
-                    # Use median for robustness
-                    valid_mean = torch.median(valid_means)
-                    valid_var = torch.median(valid_vars) if valid_vars.numel() > 0 else valid_mean * 0.5
+                valid_A   = Amean_tensor[~torch.isnan(Amean_tensor)]
+                valid_var = cell_var[~torch.isnan(cell_var)]
+                if valid_A.numel() > 0:
+                    valid_mean    = torch.median(valid_A)
+                    valid_var_val = torch.median(valid_var) if valid_var.numel() > 0 else valid_mean * 0.5
                 else:
-                    # Last resort: use generic defaults for count/continuous data
-                    print("[WARNING] No valid observations found! Using generic defaults: A=1.0, Vmax=10.0, var=5.0")
-                    valid_mean = self._t(5.0)  # Midpoint for log-space counts
-                    valid_var = self._t(5.0)  # Reasonable variance
+                    print("[WARNING] No valid observations found! Using generic defaults: A=5.0, var=5.0")
+                    valid_mean    = self._t(5.0)
+                    valid_var_val = self._t(5.0)
+                print(f"[INFO] Using fallback: mean={valid_mean.item():.3f}, var={valid_var_val.item():.3f}")
+                fallback_A    = torch.clamp(valid_mean * 0.5, min=1e-3)
+                fallback_Vmax = torch.clamp(valid_mean,       min=1e-3)
 
-                print(f"[INFO] Using fallback: mean={valid_mean.item():.3f}, var={valid_var.item():.3f}")
+            Amean_tensor = torch.where(
+                torch.isnan(Amean_tensor), torch.full_like(Amean_tensor, fallback_A), Amean_tensor)
+            Vmax_mean_tensor = torch.where(
+                torch.isnan(Vmax_mean_tensor), torch.full_like(Vmax_mean_tensor, fallback_Vmax), Vmax_mean_tensor)
 
-                # Replace NaN with fallback
-                # Assume range from 50% to 150% of typical value
-                fallback_A = valid_mean * 0.5  # A = 50% of mean (minimum)
-                fallback_max = valid_mean * 1.5  # Upper bound (maximum)
-                fallback_Vmax = fallback_max - fallback_A  # Vmax = RANGE (not maximum!)
-                fallback_A = torch.clamp(fallback_A, min=1e-3)  # Ensure positive
-                fallback_Vmax = torch.clamp(fallback_Vmax, min=1e-3)
+        # --- A prior: NTC anchor (all distributions) ---
+        # Extract y_ntc_tensor (posterior mean of NTC expression per feature) to anchor the
+        # noisy-feature end of the A prior in _model_y, preventing A-collapse.
+        # For negbinom: also floors Amean at q01(mu_ntc) to prevent near-zero Q05 estimates.
+        # Keys per distribution:
+        #   negbinom/normal/studentt/binomial: posterior_samples_ntc['mu_ntc']  → [S, T]
+        #   multinomial:                       posterior_samples_ntc['probs_baseline'] → [S, T, K]
+        y_ntc_tensor = None
 
-                Amean_tensor = torch.where(torch.isnan(Amean_tensor),
-                                          torch.full_like(Amean_tensor, fallback_A),
-                                          Amean_tensor)
-                Vmax_mean_tensor = torch.where(torch.isnan(Vmax_mean_tensor),
-                                              torch.full_like(Vmax_mean_tensor, fallback_Vmax),
-                                              Vmax_mean_tensor)
-                mean_within_guide_var = torch.where(torch.isnan(mean_within_guide_var),
-                                                   torch.full_like(mean_within_guide_var, valid_var),
-                                                   mean_within_guide_var)
+        # --- Pooled-NTC fallback for y_ntc when mu_ntc / probs_baseline is NaN ---
+        # For binomial/normal/studentt/multinomial, "missing" NTC data does NOT imply
+        # "low" the way it does for negbinom counts (no reads ⇒ probably low expression
+        # is a defensible RNA-seq assumption; no read *coverage*, a NaN continuous score,
+        # or a category missing in one technical group says nothing about the true rate
+        # or value). So instead of borrowing an unrelated feature's low percentile
+        # (q01_ntc_global, kept below as negbinom's fallback), pool this feature's own
+        # NTC data across all technical groups (ignoring which group individually caused
+        # the fitting exclusion — see fitting/ntc.py's zero_std_mask/only_one_category_mask
+        # logic) and shrink toward the dataset's typical value with a single
+        # pseudo-observation. This reduces to the raw pooled estimate when the feature has
+        # plenty of its own NTC data, and to the dataset median only when it truly has none.
+        _ntc_mask_pool = None
+        if 'target' in meta_subset.columns:
+            _ntc_mask_pool = torch.tensor(
+                (meta_subset['target'].str.lower() == 'ntc').values,
+                dtype=torch.bool, device=self.model.device
+            )
+
+        # Binomial: (y_sum_ntc + median_pooled_proportion) / (denom_sum_ntc + 1.0)
+        # Normal/studentt: (y_sum_ntc + median_pooled_mean) / (n_valid_ntc + 1.0)
+        _y_ntc_pooled_fallback = None  # [T]
+        if _ntc_mask_pool is not None and _ntc_mask_pool.any():
+            if distribution == 'binomial':
+                _y_sum_ntc = y_obs_tensor[_ntc_mask_pool, :].sum(dim=0)            # [T]
+                _denom_sum_ntc = denominator_tensor[_ntc_mask_pool, :].sum(dim=0)  # [T]
+                _valid_pool = _denom_sum_ntc > 0
+                _median_pooled = (_y_sum_ntc[_valid_pool] / _denom_sum_ntc[_valid_pool]).median() \
+                    if _valid_pool.any() else self._t(0.5)
+                _y_ntc_pooled_fallback = (_y_sum_ntc + _median_pooled) / (_denom_sum_ntc + 1.0)  # [T]
+
+            elif distribution in ('normal', 'studentt'):
+                _y_ntc_cells = y_obs_tensor[_ntc_mask_pool, :]                    # [N_ntc, T]
+                _finite_mask = torch.isfinite(_y_ntc_cells)                       # [N_ntc, T]
+                _n_valid_ntc = _finite_mask.sum(dim=0).float()                    # [T]
+                _y_sum_ntc = torch.where(
+                    _finite_mask, _y_ntc_cells, torch.zeros_like(_y_ntc_cells)
+                ).sum(dim=0)                                                      # [T]
+                _valid_pool = _n_valid_ntc > 0
+                _median_pooled = (_y_sum_ntc[_valid_pool] / _n_valid_ntc[_valid_pool]).median() \
+                    if _valid_pool.any() else self._t(0.0)
+                _y_ntc_pooled_fallback = (_y_sum_ntc + _median_pooled) / (_n_valid_ntc + 1.0)  # [T]
+
+        # Multinomial: (cat_sum_ntc + median_pooled_probs) / (total_sum_ntc + 1.0), a
+        # Dirichlet-style pseudocount split according to the typical category-usage
+        # pattern across features rather than a single scalar median.
+        _y_ntc_multinomial_pooled_fallback = None  # [T, K]
+        if (distribution == 'multinomial' and _ntc_mask_pool is not None
+                and _ntc_mask_pool.any() and y_obs_tensor.ndim == 3):
+            _cat_sum_ntc = y_obs_tensor[_ntc_mask_pool, :, :].sum(dim=0)          # [T, K]
+            _total_ntc = _cat_sum_ntc.sum(dim=-1, keepdim=True)                  # [T, 1]
+            _valid_pool = (_total_ntc.squeeze(-1) > 0)
+            if _valid_pool.any():
+                _median_probs = (_cat_sum_ntc[_valid_pool] / _total_ntc[_valid_pool]).median(dim=0).values  # [K]
+                _median_probs = _median_probs / _median_probs.sum().clamp_min(1e-10)
+            else:
+                _K_dim = _cat_sum_ntc.shape[-1]
+                _median_probs = torch.ones(_K_dim, device=self.model.device) / _K_dim
+            _y_ntc_multinomial_pooled_fallback = (_cat_sum_ntc + _median_probs.unsqueeze(0)) / (_total_ntc + 1.0)  # [T, K]
+
+        _post_tech = getattr(modality, 'posterior_samples_ntc', None)
+        if _post_tech is not None:
+            try:
+                if distribution in ('negbinom', 'normal', 'studentt', 'binomial') and 'mu_ntc' in _post_tech:
+                    _mu_ntc = _post_tech['mu_ntc']
+                    if not torch.is_tensor(_mu_ntc):
+                        _mu_ntc = torch.tensor(_mu_ntc, dtype=torch.float32, device=self.model.device)
+                    else:
+                        _mu_ntc = _mu_ntc.float().to(self.model.device)
+                    # Collapse any leading dimensions (samples, groups, etc.) so that
+                    # _mu_ntc ends up as [T] regardless of whether it is stored as
+                    # [S, T], [S, C, T], or already [T].
+                    if _mu_ntc.ndim > 1 and _mu_ntc.shape[-1] == T:
+                        # Flatten all leading dims by successive mean over dim=0
+                        _mu_ntc_flat = _mu_ntc
+                        while _mu_ntc_flat.ndim > 1:
+                            _mu_ntc_flat = _mu_ntc_flat.median(dim=0).values
+                        if distribution == 'negbinom':
+                            n_nonpos = (_mu_ntc_flat <= 0).sum().item()
+                            if n_nonpos > 0:
+                                print(f"[DEBUG] {n_nonpos}/{T} genes have mean mu_ntc ≤ 0 "
+                                      f"(min={_mu_ntc_flat.min().item():.3e}); possible float32 underflow in NTC posterior")
+                        y_ntc_tensor = _mu_ntc_flat  # [T]
+                        # Compute q01_ntc_global BEFORE NaN fill: 1st percentile of per-gene NTC means
+                        # across genes where fit_ntc was run (ignores NaN genes).
+                        _finite_ntc = _mu_ntc_flat[~torch.isnan(_mu_ntc_flat)]
+                        q01_ntc_global = torch.quantile(_finite_ntc, 0.01) if _finite_ntc.numel() > 0 else None
+                        # NaN fill: genes where fit_ntc was not run get q01_ntc_global as anchor
+                        _ntc_nan_mask = torch.isnan(y_ntc_tensor)
+                        if _ntc_nan_mask.any():
+                            n_ntc_nan = _ntc_nan_mask.sum().item()
+                            if distribution in ('binomial', 'normal', 'studentt') and _y_ntc_pooled_fallback is not None:
+                                print(f"[INFO] {n_ntc_nan}/{T} {distribution} features have NaN mu_ntc; "
+                                      f"using pooled-NTC fallback (shrunk toward a dataset-median "
+                                      f"pseudo-observation) as y_ntc anchor")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, _y_ntc_pooled_fallback, y_ntc_tensor)
+                            elif q01_ntc_global is not None:
+                                print(f"[WARNING] {n_ntc_nan}/{T} genes have NaN mu_ntc (fit_ntc not run); "
+                                      f"using q01_ntc_global={q01_ntc_global.item():.3e} as y_ntc anchor")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, q01_ntc_global.expand_as(y_ntc_tensor), y_ntc_tensor)
+                            else:
+                                print(f"[WARNING] {n_ntc_nan}/{T} genes have NaN mu_ntc and no finite NTC posterior; "
+                                      f"using Amean as y_ntc fallback")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, Amean_tensor, y_ntc_tensor)
+                        if distribution == 'negbinom':
+                            if (y_ntc_tensor <= 0).any():
+                                raise ValueError(
+                                    f"y_ntc_tensor contains non-positive values "
+                                    f"(min={y_ntc_tensor.min().item():.3e}). "
+                                    f"mu_ntc posterior has strictly positive support — this should not occur."
+                                )
+                    elif _mu_ntc.ndim == 1 and _mu_ntc.shape[0] == T:
+                        y_ntc_tensor = _mu_ntc
+                        _finite_ntc_1d = _mu_ntc[~torch.isnan(_mu_ntc)]
+                        q01_ntc_global = torch.quantile(_finite_ntc_1d, 0.01) if _finite_ntc_1d.numel() > 0 else None
+                        _ntc_nan_mask = torch.isnan(y_ntc_tensor)
+                        if _ntc_nan_mask.any():
+                            n_ntc_nan = _ntc_nan_mask.sum().item()
+                            if distribution in ('binomial', 'normal', 'studentt') and _y_ntc_pooled_fallback is not None:
+                                print(f"[INFO] {n_ntc_nan}/{T} {distribution} features have NaN mu_ntc; "
+                                      f"using pooled-NTC fallback (shrunk toward a dataset-median "
+                                      f"pseudo-observation) as y_ntc anchor")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, _y_ntc_pooled_fallback, y_ntc_tensor)
+                            elif q01_ntc_global is not None:
+                                print(f"[WARNING] {n_ntc_nan}/{T} genes have NaN mu_ntc (fit_ntc not run); "
+                                      f"using q01_ntc_global={q01_ntc_global.item():.3e} as y_ntc anchor")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, q01_ntc_global.expand_as(y_ntc_tensor), y_ntc_tensor)
+                            else:
+                                print(f"[WARNING] {n_ntc_nan}/{T} genes have NaN mu_ntc and no finite NTC posterior; "
+                                      f"using Amean as y_ntc fallback")
+                                y_ntc_tensor = torch.where(_ntc_nan_mask, Amean_tensor, y_ntc_tensor)
+                        if distribution == 'negbinom':
+                            if (y_ntc_tensor <= 0).any():
+                                raise ValueError(
+                                    f"y_ntc_tensor contains non-positive values "
+                                    f"(min={y_ntc_tensor.min().item():.3e}). "
+                                    f"mu_ntc posterior has strictly positive support — this should not occur."
+                                )
+                    else:
+                        print(f"[WARNING] mu_ntc shape {tuple(_mu_ntc.shape)} doesn't match T={T}; skipping A prior NTC anchor")
+                elif distribution == 'multinomial' and 'probs_baseline' in _post_tech:
+                    _probs = _post_tech['probs_baseline']
+                    if not torch.is_tensor(_probs):
+                        _probs = torch.tensor(_probs, dtype=torch.float32, device=self.model.device)
+                    else:
+                        _probs = _probs.float().to(self.model.device)
+                    # Predictive can introduce extra singleton broadcast dims beyond the
+                    # expected [S, T, K] (e.g. from nested plates), such as [S, 1, 1, 1, T, K].
+                    # Squeeze out singleton dims between the leading sample dim and the
+                    # trailing [T, K] pair so the ndim checks below can match.
+                    if _probs.ndim > 3:
+                        _squeeze_dims = [d for d in range(1, _probs.ndim - 2) if _probs.shape[d] == 1]
+                        for d in reversed(_squeeze_dims):
+                            _probs = _probs.squeeze(d)
+                    _probs_flat = None
+                    if _probs.ndim == 3 and _probs.shape[1] == T:
+                        _probs_flat = _probs.median(dim=0).values  # [T, K]
+                    elif _probs.ndim == 2 and _probs.shape[0] == T:
+                        _probs_flat = _probs              # [T, K]
+                    else:
+                        print(f"[WARNING] probs_baseline shape {tuple(_probs.shape)} doesn't match T={T}; skipping multinomial NTC anchor")
+                    if _probs_flat is not None:
+                        # q01_ntc_global for multinomial: q01 across non-NaN features per category → [K], normalized
+                        _valid_rows = ~torch.isnan(_probs_flat).any(dim=-1)  # [T]
+                        if _valid_rows.any():
+                            _probs_valid = _probs_flat[_valid_rows]  # [T_valid, K]
+                            q01_ntc_global_probs = torch.quantile(_probs_valid, 0.01, dim=0)  # [K]
+                            q01_ntc_global_probs = q01_ntc_global_probs / q01_ntc_global_probs.sum().clamp_min(1e-10)
+                        else:
+                            _K_dim = _probs_flat.shape[1]
+                            q01_ntc_global_probs = torch.ones(_K_dim, device=self.model.device) / _K_dim
+                        # NaN fill: features where fit_ntc excluded this feature (a category
+                        # missing in one technical group, etc.) get the pooled-NTC Dirichlet-
+                        # style fallback (this feature's own category counts pooled across all
+                        # NTC cells, shrunk toward the dataset's typical category-usage pattern)
+                        # rather than a cross-feature q01 percentile, which assumes unrelated
+                        # features' category structures are comparable.
+                        _ntc_nan_mask = torch.isnan(_probs_flat).all(dim=-1)  # [T]
+                        if _ntc_nan_mask.any():
+                            n_ntc_nan = _ntc_nan_mask.sum().item()
+                            if (_y_ntc_multinomial_pooled_fallback is not None
+                                    and _y_ntc_multinomial_pooled_fallback.shape == _probs_flat.shape):
+                                print(f"[INFO] {n_ntc_nan}/{T} multinomial features have NaN probs_baseline; "
+                                      f"using pooled-NTC category-count fallback (Dirichlet-style, "
+                                      f"dataset-median pseudo-observation) as y_ntc anchor")
+                                fill = _y_ntc_multinomial_pooled_fallback
+                            else:
+                                print(f"[WARNING] {n_ntc_nan}/{T} features have NaN probs_baseline (fit_ntc not run); "
+                                      f"using q01_ntc_global probability vector as y_ntc anchor")
+                                fill = q01_ntc_global_probs.unsqueeze(0).expand_as(_probs_flat)
+                            mask = _ntc_nan_mask.unsqueeze(-1).expand_as(_probs_flat)
+                            _probs_flat = torch.where(mask, fill, _probs_flat)
+                        y_ntc_tensor = _probs_flat  # [T, K]
+                else:
+                    print(f"[INFO] No NTC posterior available for distribution='{distribution}'; A prior uses Q05 anchor only")
+            except Exception as _e:
+                print(f"[WARNING] Could not compute y_ntc anchor from technical posterior: {_e}")
+
+        # --- o_y NTC anchor: pre-fit overdispersion for adaptive A prior weight ---
+        # Uses o_y from fit_ntc rather than the sampled o_y from fit_trans.
+        # The sampled o_y is unidentified (posterior ≈ prior mean for all genes), so
+        # _o_y_weight would be ~0.6 for every gene regardless of true noisiness.
+        # The NTC-estimated o_y is gene-specific and reflects actual count dispersion.
+        # Only used for negbinom (where o_y is meaningfully estimated in fit_ntc).
+        o_y_ntc_tensor = None
+        if distribution == 'negbinom' and _post_tech is not None and 'o_y' in _post_tech:
+            try:
+                _o_y_ntc = _post_tech['o_y']
+                if not torch.is_tensor(_o_y_ntc):
+                    _o_y_ntc = torch.tensor(_o_y_ntc, dtype=torch.float32, device=self.model.device)
+                else:
+                    _o_y_ntc = _o_y_ntc.float().to(self.model.device)
+                # Collapse leading sample/group dims → [T]
+                if _o_y_ntc.ndim > 1 and _o_y_ntc.shape[-1] == T:
+                    while _o_y_ntc.ndim > 1:
+                        _o_y_ntc = _o_y_ntc.median(dim=0).values
+                elif _o_y_ntc.ndim == 1 and _o_y_ntc.shape[0] == T:
+                    pass  # already [T]
+                else:
+                    print(f"[WARNING] o_y from NTC posterior has unexpected shape "
+                          f"{tuple(_post_tech['o_y'].shape if hasattr(_post_tech['o_y'], 'shape') else [])}; "
+                          f"falling back to sampled o_y for A prior weight")
+                    _o_y_ntc = None
+
+                if _o_y_ntc is not None:
+                    # NaN fill: genes where fit_ntc wasn't run get prior_mean_o_y (w=0.5)
+                    _o_y_ntc_prior_mean = (beta_o_beta_tensor / beta_o_alpha_tensor).clamp_min(self._t(1e-12))
+                    _o_y_nan_mask = torch.isnan(_o_y_ntc) | (_o_y_ntc <= 0)
+                    if _o_y_nan_mask.any():
+                        n_nan = _o_y_nan_mask.sum().item()
+                        print(f"[INFO] o_y NTC anchor: {n_nan}/{T} genes have NaN/zero o_y; "
+                              f"using prior mean ({_o_y_ntc_prior_mean.item():.3f}) → w=0.5 for those genes")
+                        _o_y_ntc = torch.where(_o_y_nan_mask, _o_y_ntc_prior_mean.expand_as(_o_y_ntc), _o_y_ntc)
+                    _o_y_ntc = _o_y_ntc.clamp_min(self._t(1e-6))
+                    o_y_ntc_tensor = _o_y_ntc  # [T], fixed weight for A prior
+                    print(f"[INFO] o_y NTC anchor: using pre-fit o_y for A prior weight "
+                          f"(min={o_y_ntc_tensor.min().item():.3f}, "
+                          f"median={o_y_ntc_tensor.median().item():.3f}, "
+                          f"max={o_y_ntc_tensor.max().item():.3f})")
+            except Exception as _e:
+                print(f"[WARNING] Could not extract o_y from NTC posterior: {_e}; "
+                      f"falling back to sampled o_y for A prior weight")
+
+        # For normal/studentt: extract sigma_y posterior median from fit_ntc as HalfNormal prior scale.
+        # Mirrors the negbinom o_y_ntc_tensor approach: the NTC-estimated sigma is feature-specific
+        # and data-driven, whereas a fixed prior would be uninformative across features.
+        sigma_hat_tensor = None
+        if distribution in ('normal', 'studentt') and _post_tech is not None and 'sigma_y' in _post_tech:
+            try:
+                _sigma_ntc = _post_tech['sigma_y']
+                if not torch.is_tensor(_sigma_ntc):
+                    _sigma_ntc = torch.tensor(_sigma_ntc, dtype=torch.float32, device=self.model.device)
+                else:
+                    _sigma_ntc = _sigma_ntc.float().to(self.model.device)
+                # Collapse leading sample dims → [T]
+                if _sigma_ntc.ndim > 1 and _sigma_ntc.shape[-1] == T:
+                    while _sigma_ntc.ndim > 1:
+                        _sigma_ntc = _sigma_ntc.median(dim=0).values
+                if _sigma_ntc.ndim == 1 and _sigma_ntc.shape[0] == T:
+                    # NaN fill: features excluded from fit_ntc (same mask that leaves
+                    # mu_ntc NaN) also have NaN sigma_y here. Unlike y_ntc's location
+                    # anchor, a noise/dispersion scale is reasonably shared across
+                    # features (same logic as o_y_ntc_tensor's fallback above), so
+                    # median-of-other-features is well-justified — and required, since
+                    # dist.HalfNormal(2.0 * sigma_hat_tensor) needs every entry finite.
+                    _sigma_nan_mask = torch.isnan(_sigma_ntc)
+                    if _sigma_nan_mask.any():
+                        _finite_sigma = _sigma_ntc[~_sigma_nan_mask]
+                        n_sigma_nan = _sigma_nan_mask.sum().item()
+                        if _finite_sigma.numel() > 0:
+                            _median_sigma = _finite_sigma.median()
+                            print(f"[INFO] {n_sigma_nan}/{T} {distribution} features have NaN sigma_y "
+                                  f"(excluded from fit_ntc); using median sigma_y across other features "
+                                  f"({_median_sigma.item():.3f}) as HalfNormal scale")
+                            _sigma_ntc = torch.where(_sigma_nan_mask, _median_sigma.expand_as(_sigma_ntc), _sigma_ntc)
+                        else:
+                            print(f"[WARNING] All {T} {distribution} features have NaN sigma_y; "
+                                  f"falling back to HalfCauchy prior")
+                            _sigma_ntc = None
+                    if _sigma_ntc is not None:
+                        _sigma_ntc = _sigma_ntc.clamp_min(self._t(1e-6))
+                    sigma_hat_tensor = _sigma_ntc
+                    if sigma_hat_tensor is not None:
+                        print(f"[INFO] sigma_y NTC anchor: using pre-fit sigma_y as HalfNormal scale "
+                              f"(median={sigma_hat_tensor.median().item():.3f})")
+                else:
+                    print(f"[WARNING] sigma_y from NTC posterior has unexpected shape "
+                          f"{tuple(_sigma_ntc.shape)}; using fallback HalfCauchy prior")
+            except Exception as _e:
+                print(f"[WARNING] Could not extract sigma_y from NTC posterior: {_e}; "
+                      f"using fallback HalfCauchy prior")
 
         # For K: use CV (coefficient of variation) of x_true (works with or without guides)
         # CV = std(x_true) / mean(x_true) - scale-invariant measure of variability
@@ -2141,7 +2405,15 @@ class TransFitter:
 
         # K_max: max of x_true (or max of guide means if guides exist)
         if 'guide_code' in self.model.meta.columns and len(unique_guides) > 1:
-            guide_x_means = torch.stack([x_true_mean[guides_tensor == g].mean() for g in torch.unique(guides_tensor)])
+            G = len(unique_guides)
+            g_max = int(unique_guides.max().item())
+            g_remap = torch.full((g_max + 1,), 0, dtype=torch.long, device=self.model.device)
+            g_remap[unique_guides] = torch.arange(G, device=self.model.device)
+            g_idx = g_remap[guides_tensor]  # [N]
+            g_sum_x = torch.zeros(G, device=self.model.device).scatter_add_(0, g_idx, x_true_mean)
+            g_cnt_x = torch.zeros(G, device=self.model.device).scatter_add_(
+                0, g_idx, torch.ones(N, device=self.model.device))
+            guide_x_means = g_sum_x / g_cnt_x.clamp_min(1.0)
             K_max_tensor = guide_x_means.max()
         else:
             K_max_tensor = x_true_mean.max()
@@ -2169,13 +2441,6 @@ class TransFitter:
         else:  # 'middle'
             k_center_tensor = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
 
-        print("[DEBUG] Amean:", Amean_tensor.min().item(), Amean_tensor.max().item())
-        print("[DEBUG] Vmax_mean:", Vmax_mean_tensor.min().item(), Vmax_mean_tensor.max().item())
-        print("[DEBUG] Mean within-guide variance:", mean_within_guide_var.min().item(), mean_within_guide_var.max().item())
-        print("[DEBUG] x_true CV:", x_true_CV.item(), "K_max:", K_max_tensor.item(),
-              "x_ntc_mean:", x_ntc_mean.item() if x_ntc_mean is not None else "N/A",
-              "k_center:", k_center_tensor.item(), f"(k_prior_center={k_prior_center!r})")
-
         # Diagnostic: Verify alpha_y_prefit is correctly structured
         if alpha_y_prefit is not None and groups_tensor is not None:
             print(f"[INFO] Technical correction setup: alpha_y_prefit.shape={alpha_y_prefit.shape}, C={C}")
@@ -2192,10 +2457,8 @@ class TransFitter:
 
         def init_loc_fn(site):
             name = site["name"]
-        
             if "poly_coeff" in name:
                 return torch.zeros(T)
-        
             return pyro.infer.autoguide.initialization.init_to_median(site)
         
         from torch.optim.lr_scheduler import OneCycleLR
@@ -2209,7 +2472,6 @@ class TransFitter:
                 sum_factor_tensor,
                 beta_o_alpha_tensor,
                 beta_o_beta_tensor,
-                alpha_alpha_mu_tensor,
                 K_max_tensor,
                 K_alpha_tensor,
                 Vmax_mean_tensor,
@@ -2219,7 +2481,6 @@ class TransFitter:
                 p_n_logits_tensor,
                 epsilon_tensor,
                 x_true_sample = x_true_subset,
-                log2_x_true_sample = log2_x_true_subset,
                 nmin = nmin,
                 nmax = nmax,
                 alpha_y_sample = alpha_y_prefit,
@@ -2233,15 +2494,18 @@ class TransFitter:
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
-                D=D,
-                mean_within_guide_var=mean_within_guide_var,
                 x_true_CV=x_true_CV,
                 x_ntc_mean=x_ntc_mean,
-                use_data_driven_priors=use_data_driven_priors,
+
                 use_epsilon=use_epsilon,
                 vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
                 k_log_sigma_min_tensor=k_log_sigma_min_tensor,
                 k_center_tensor=k_center_tensor,
+                y_ntc_tensor=y_ntc_tensor,
+                mean_y_corrected_tensor=mean_y_corrected_tensor,
+                o_y_ntc_tensor=o_y_ntc_tensor,
+                sigma_hat_tensor=sigma_hat_tensor,
+                alpha_n_coupling=alpha_n_coupling,
             )
             # OneCycleLR for polynomial only
             base_lr = 1e-3 if lr is None else lr
@@ -2291,7 +2555,139 @@ class TransFitter:
         self.losses_trans = []
         smoothed_loss = None
         _phase2_announced = False
-        for step in range(total_steps):
+        start_step = 0
+        # Cumulative wall-clock across all resume attempts (not just this process's own
+        # timer) -- restored from the checkpoint being resumed from, if any, so a job
+        # killed and resubmitted multiple times still ends up with an accurate total.
+        # Written into every checkpoint dict below; the caller (e.g. run_recovery_fit.py)
+        # reads it back from the final/latest checkpoint rather than timing fit_trans()
+        # itself, since a single process's timer can't see time spent in prior attempts.
+        _cumulative_elapsed_baseline = 0.0
+
+        # ── Checkpoint setup ──────────────────────────────────────────────────
+        # Metadata stored in every checkpoint; validated on reload to catch
+        # mismatches (e.g. different gene set, different number of cells).
+        _ckpt_metadata = dict(
+            N=N, T=T, K=K, C=C,
+            modality_name=modality_name,
+            function_type=function_type,
+            distribution=distribution,
+        )
+
+        def _load_and_validate_ckpt(path, context="loading checkpoint"):
+            """Load checkpoint and validate structural metadata against current call."""
+            try:
+                ckpt = torch.load(path, map_location=self.model.device, weights_only=False)
+            except Exception as e:
+                print(f"[WARNING] Could not load checkpoint ({e}): {path}")
+                return None
+            # Structural mismatches → error (param shapes won't match)
+            _bad = []
+            for key, expected, label in [
+                ('N', N, 'number of cells'),
+                ('T', T, 'number of features'),
+                ('K', K, 'number of categories (K)'),
+                ('C', C, 'number of technical groups (C)'),
+            ]:
+                stored = ckpt.get(key)
+                if stored is not None and stored != expected:
+                    _bad.append(f"  {label}: checkpoint={stored}, current call={expected}")
+            if _bad:
+                raise ValueError(
+                    f"[{context}] Checkpoint metadata mismatch — cannot resume "
+                    f"(parameter shapes differ):\n" + "\n".join(_bad)
+                )
+            # Non-structural mismatches → warn only
+            # Use effective_function_type when available (warmup checkpoints store
+            # 'single_hill' even though target function_type may be 'additive_hill').
+            _stored_ft = ckpt.get('effective_function_type', ckpt.get('function_type'))
+            if _stored_ft is not None and _stored_ft != function_type:
+                warnings.warn(
+                    f"[{context}] function_type mismatch: checkpoint effective={_stored_ft!r}, "
+                    f"current call={function_type!r}. Ensure model and guide are compatible."
+                )
+            _stored_dist = ckpt.get('distribution')
+            if _stored_dist is not None and _stored_dist != distribution:
+                warnings.warn(
+                    f"[{context}] distribution mismatch: checkpoint={_stored_dist!r}, "
+                    f"current call={distribution!r}."
+                )
+            return ckpt
+
+        _predictive_only_mode = predictive_checkpoint is not None
+        checkpoint_path = None
+
+        if _predictive_only_mode:
+            # ── Predictive-only: load specified checkpoint, skip training ──────
+            print(f"[INFO] Predictive-only mode: loading checkpoint {predictive_checkpoint}")
+            ckpt = _load_and_validate_ckpt(predictive_checkpoint, context="predictive_checkpoint")
+            if ckpt is None:
+                raise FileNotFoundError(
+                    f"Could not load predictive checkpoint: {predictive_checkpoint}"
+                )
+            self.losses_trans = ckpt.get('losses', [])
+            smoothed_loss = ckpt.get('smoothed_loss')
+            _phase2_announced = ckpt.get('phase2_announced', False)
+            pyro.get_param_store().set_state(ckpt['param_store'])
+            start_step = total_steps  # skip training loop entirely
+            print(f"[INFO] Loaded checkpoint: step={ckpt['step']}, "
+                  f"complete={ckpt.get('complete', False)}, "
+                  f"phase2_announced={_phase2_announced}")
+
+        elif checkpoint_interval is not None:
+            # ── Normal checkpoint resume ──────────────────────────────────────
+            _ckpt_dir = (checkpoint_dir if checkpoint_dir is not None
+                         else os.path.join(self.model.output_dir, self.model.label))
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            checkpoint_path = os.path.join(_ckpt_dir, f'trans_checkpoint_{modality_name}_latest.pt')
+            _backup_path = checkpoint_path + '.bak'
+            _tmp_path = checkpoint_path + '.tmp'
+            _ckpt = None
+            if not restart_from_checkpoint:
+                print(f"[INFO] restart_from_checkpoint=False — skipping checkpoint resume, starting from step 0.")
+            else:
+                # Try candidates in priority order:
+                #   1. _latest.pt  — normal case
+                #   2. _latest.pt.tmp  — process died after torch.save but before renames;
+                #                        .tmp may be a complete, valid checkpoint
+                #   3. _latest.pt.bak  — previous interval; always valid but one step behind
+                for _cand, _label in [
+                    (checkpoint_path, 'primary (_latest.pt)'),
+                    (_tmp_path,       '.tmp (rename interrupted)'),
+                    (_backup_path,    '.bak (previous interval)'),
+                ]:
+                    if os.path.exists(_cand):
+                        print(f"[INFO] Attempting to load {_label}: {os.path.basename(_cand)}")
+                        _ckpt = _load_and_validate_ckpt(_cand, context="resume")
+                        if _ckpt is not None:
+                            break
+                        print(f"[WARNING] {_label} failed to load; trying next fallback…")
+            if _ckpt is not None:
+                if _ckpt.get('complete', False):
+                    print(f"[INFO] Checkpoint is marked complete — training already finished. "
+                          f"Skipping to Predictive sampling.")
+                start_step = _ckpt['step'] + 1
+                self.losses_trans = _ckpt['losses']
+                smoothed_loss = _ckpt['smoothed_loss']
+                _phase2_announced = _ckpt.get('phase2_announced', False)
+                # .get(..., 0.0): checkpoints written before this field existed just
+                # start the cumulative count from 0 (undercounts prior attempts, but
+                # degrades gracefully rather than erroring on old checkpoints).
+                _cumulative_elapsed_baseline = _ckpt.get('cumulative_elapsed_sec', 0.0)
+                pyro.get_param_store().set_state(_ckpt['param_store'])
+                try:
+                    optimizer.set_state(_ckpt['optimizer_state'])
+                except Exception as e:
+                    print(f"[WARNING] Could not restore optimizer state: {e}. "
+                          f"Continuing with fresh optimizer.")
+                print(f"[INFO] Resumed from step {start_step} / {total_steps}")
+
+        # Wall-clock for *this* process only; combined with _cumulative_elapsed_baseline
+        # (restored above from the resumed checkpoint, if any) at every checkpoint write.
+        _fit_trans_loop_start_time = time.time()
+
+        prev_finite = None  # only used in debug mode; kept here so checkpoint-resume works
+        for step in range(start_step, total_steps):
             # ── Curriculum: choose effective function type and temperature ──
             if _do_warmup and step < warmup_steps:
                 effective_function_type = 'single_hill'
@@ -2303,6 +2699,25 @@ class TransFitter:
                 if _do_warmup and not _phase2_announced:
                     print(f"[INFO] Warmup complete at step {step}. Switching to {function_type}.")
                     _phase2_announced = True
+                    if checkpoint_path is not None:
+                        _warmup_data = {
+                            'step': step,
+                            'losses': self.losses_trans,
+                            'smoothed_loss': smoothed_loss,
+                            'phase2_announced': True,
+                            'param_store': pyro.get_param_store().get_state(),
+                            'optimizer_state': optimizer.get_state(),
+                            'complete': False,
+                            # effective_function_type='single_hill' lets the user pass
+                            # function_type='single_hill' to predictive_checkpoint= without a warning
+                            'effective_function_type': 'single_hill',
+                            'cumulative_elapsed_sec': (_cumulative_elapsed_baseline +
+                                                        (time.time() - _fit_trans_loop_start_time)),
+                            **_ckpt_metadata,
+                        }
+                        _warmup_path = checkpoint_path.replace('_latest.pt', '_warmup.pt')
+                        self._save_checkpoint_atomic(_warmup_path, _warmup_data)
+                        print(f"[CKPT] Warmup checkpoint saved at step {step} → {os.path.basename(_warmup_path)}")
                 # Phase 2: restart from init_temp, cool to final_temp over niters steps
                 phase_step = step - warmup_steps if _do_warmup else step
                 phase_fraction = phase_step / float(niters) if niters > 0 else 1.0
@@ -2313,45 +2728,24 @@ class TransFitter:
                 else:
                     raise ValueError(f"Unknown function_type: {effective_function_type}")
                 
-            #if step < 0.7 * niters:
-            #    # First 70% of training: linearly decrease from 1.0 to 0.1
-            #    current_temp = 1.0 - (0.9 * (step / (0.7 * niters)))
-            #else:
-            #    # Last 30% of training: exponentially cool down to 0.0005
-            #    current_temp = 0.1 * (final_temp/0.1) ** ((step - 0.7 * niters) / (0.3 * niters))
+            # Anneal coupling from 0 → target over first half of total training.
+            # Lets alpha and n co-explore freely early on; identifiability constraint
+            # ramps in gradually rather than blocking from step 0.
+            _coupling_frac = min(1.0, 2.0 * step / total_steps) if total_steps > 0 else 1.0
+            current_coupling = alpha_n_coupling * _coupling_frac
 
-
-            # x_true, log2_x_true, alpha_y_prefit are always point estimates (means)
+            # x_true and alpha_y_prefit are always point estimates (means)
             x_true_sample = x_true_subset
-            log2_x_true_sample = log2_x_true_subset
             alpha_y_sample = alpha_y_prefit  # [C, T] point estimate or None
 
-            #use_straight_through = step >= int(0.7 * niters)
             use_straight_through = False
 
-            '''
-            loss = svi.step(
-                N,
-                T,
-                y_obs_tensor,
-                sum_factor_tensor,
-                beta_o_alpha_tensor,
-                beta_o_beta_tensor,
-                alpha_alpha_mu_tensor,
-                K_max_tensor,
-                K_alpha_tensor,
-                Vmax_mean_tensor,
-                Vmax_alpha_tensor,
-                n_mu_tensor,
-                Amean_tensor,
-                p_n_logits_tensor,
-                epsilon_tensor,
-                x_true_sample = x_true_sample,
-                log2_x_true_sample = log2_x_true_sample,
-                nmin = nmin,
-                nmax = nmax,
-                alpha_y_sample = alpha_y_sample,
-                C = C,
+            _svi_kwargs = dict(
+                x_true_sample=x_true_sample,
+                nmin=nmin,
+                nmax=nmax,
+                alpha_y_sample=alpha_y_sample,
+                C=C,
                 groups_tensor=groups_tensor,
                 temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
                 use_straight_through=use_straight_through,
@@ -2361,50 +2755,38 @@ class TransFitter:
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
-                D=D,
-                mean_within_guide_var=mean_within_guide_var,
                 x_true_CV=x_true_CV,
                 x_ntc_mean=x_ntc_mean,
-                use_data_driven_priors=use_data_driven_priors,
-                use_epsilon=use_epsilon,
-            )
-            '''
 
-            if step == 0:
-                prev_finite = None  # initialize tracker
-            try:
-                loss, prev_finite = self._debug_svi_step(
-                    svi, step, prev_finite,
+                use_epsilon=use_epsilon,
+                vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
+                k_log_sigma_min_tensor=k_log_sigma_min_tensor,
+                k_center_tensor=k_center_tensor,
+                y_ntc_tensor=y_ntc_tensor,
+                mean_y_corrected_tensor=mean_y_corrected_tensor,
+                o_y_ntc_tensor=o_y_ntc_tensor,
+                sigma_hat_tensor=sigma_hat_tensor,
+                alpha_n_coupling=current_coupling,
+            )
+            if debug:
+                try:
+                    loss, prev_finite = self._debug_svi_step(
+                        svi, step, prev_finite,
+                        N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
+                        K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
+                        n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor,
+                        **_svi_kwargs,
+                    )
+                except FloatingPointError as e:
+                    print(f"[STOP] {e} at step {step}")
+                    break
+            else:
+                loss = svi.step(
                     N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
-                    alpha_alpha_mu_tensor, K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
+                    K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
                     n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor,
-                    x_true_sample=x_true_sample,
-                    log2_x_true_sample=log2_x_true_sample,
-                    nmin=nmin,
-                    nmax=nmax,
-                    alpha_y_sample=alpha_y_sample,
-                    C=C,
-                    groups_tensor=groups_tensor,
-                    temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
-                    use_straight_through=use_straight_through,
-                    function_type=effective_function_type,
-                    polynomial_degree=polynomial_degree,
-                    use_alpha=True if effective_function_type != 'polynomial' else True if phase_fraction>=0.5 else False,
-                    distribution=distribution,
-                    denominator_tensor=denominator_tensor,
-                    K=K,
-                    D=D,
-                    mean_within_guide_var=mean_within_guide_var,
-                    x_true_CV=x_true_CV,
-                    use_data_driven_priors=use_data_driven_priors,
-                    use_epsilon=use_epsilon,
-                    vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
-                    k_log_sigma_min_tensor=k_log_sigma_min_tensor,
-                    k_center_tensor=k_center_tensor,
+                    **_svi_kwargs,
                 )
-            except FloatingPointError as e:
-                print(f"[STOP] {e} at step {step}")
-                break
 
 
             # NaN detection and early stopping
@@ -2422,13 +2804,54 @@ class TransFitter:
             self.losses_trans.append(loss)
             if step % 1000 == 0:
                 print(f"Step {step} : loss = {loss:.5e}, device: {Vmax_mean_tensor.device}")
+            if checkpoint_path is not None and step > 0 and step % checkpoint_interval == 0:
+                _eff_ft = ('single_hill' if (_do_warmup and step < warmup_steps)
+                           else function_type)
+                _interval_data = {
+                    'step': step,
+                    'losses': self.losses_trans,
+                    'smoothed_loss': smoothed_loss,
+                    'phase2_announced': _phase2_announced,
+                    'param_store': pyro.get_param_store().get_state(),
+                    'optimizer_state': optimizer.get_state(),
+                    'complete': False,
+                    'effective_function_type': _eff_ft,
+                    'cumulative_elapsed_sec': (_cumulative_elapsed_baseline +
+                                                (time.time() - _fit_trans_loop_start_time)),
+                    **_ckpt_metadata,
+                }
+                # Rolling checkpoint (overwrites previous; used for crash-resume)
+                self._save_checkpoint_atomic(checkpoint_path, _interval_data)
+                # Numbered checkpoint (persistent; named by step for analysis)
+                _numbered_path = checkpoint_path.replace('_latest.pt', f'_step{step:07d}.pt')
+                self._save_checkpoint_atomic(_numbered_path, _interval_data)
+                print(f"[CKPT] Checkpoint saved at step {step} → {os.path.basename(_numbered_path)}")
             if smoothed_loss is None:
                 smoothed_loss = loss
             else:
-                if abs(alpha_ewma * (loss - smoothed_loss)) < tolerance:
-                    print(f"Converged at step {step}! Loss = {loss:.5e}")
-                    break
                 smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+
+        # Save complete=True checkpoint so Predictive can be retried if it OOMs.
+        # Also save a named _complete.pt that persists after the rolling checkpoint
+        # is cleaned up, so the fitted state is always recoverable.
+        if checkpoint_path is not None and not _predictive_only_mode:
+            _complete_data = {
+                'step': total_steps - 1,
+                'losses': self.losses_trans,
+                'smoothed_loss': smoothed_loss,
+                'phase2_announced': _phase2_announced,
+                'param_store': pyro.get_param_store().get_state(),
+                'optimizer_state': optimizer.get_state(),
+                'complete': True,
+                'effective_function_type': function_type,
+                'cumulative_elapsed_sec': (_cumulative_elapsed_baseline +
+                                            (time.time() - _fit_trans_loop_start_time)),
+                **_ckpt_metadata,
+            }
+            self._save_checkpoint_atomic(checkpoint_path, _complete_data)
+            _complete_path = checkpoint_path.replace('_latest.pt', '_complete.pt')
+            self._save_checkpoint_atomic(_complete_path, _complete_data)
+            print(f"[CKPT] Final checkpoint saved (complete=True) → {os.path.basename(_complete_path)}")
 
         # Move to CPU if using too much GPU memory for Predictive
         _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
@@ -2445,7 +2868,6 @@ class TransFitter:
                 "sum_factor_tensor": self._to_cpu(sum_factor_tensor),
                 "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
                 "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
-                "alpha_alpha_mu_tensor": self._to_cpu(alpha_alpha_mu_tensor),
                 "K_max_tensor": self._to_cpu(K_max_tensor),
                 "K_alpha_tensor": self._to_cpu(K_alpha_tensor),
                 "Vmax_mean_tensor": self._to_cpu(Vmax_mean_tensor),
@@ -2455,7 +2877,6 @@ class TransFitter:
                 "p_n_logits_tensor": self._to_cpu(p_n_logits_tensor),
                 "epsilon_tensor": self._to_cpu(epsilon_tensor),
                 "x_true_sample": self._to_cpu(x_true_subset),
-                "log2_x_true_sample": self._to_cpu(log2_x_true_subset),
                 "nmin": self._to_cpu(nmin),
                 "nmax": self._to_cpu(nmax),
                 "alpha_y_sample": self._to_cpu(alpha_y_prefit) if alpha_y_prefit is not None else None,
@@ -2470,14 +2891,16 @@ class TransFitter:
                 "distribution": distribution,
                 "denominator_tensor": self._to_cpu(denominator_tensor) if denominator_tensor is not None else None,
                 "K": K,
-                "D": D,
-                "mean_within_guide_var": self._to_cpu(mean_within_guide_var) if mean_within_guide_var is not None else None,
                 "x_true_CV": self._to_cpu(x_true_CV) if x_true_CV is not None else None,
-                "use_data_driven_priors": use_data_driven_priors,
                 "use_epsilon": use_epsilon,
                 "vmax_log_sigma_floor_tensor": self._to_cpu(vmax_log_sigma_floor_tensor),
                 "k_log_sigma_min_tensor": self._to_cpu(k_log_sigma_min_tensor),
                 "k_center_tensor": self._to_cpu(k_center_tensor),
+                "y_ntc_tensor": self._to_cpu(y_ntc_tensor) if y_ntc_tensor is not None else None,
+                "x_ntc_mean": self._to_cpu(x_ntc_mean) if x_ntc_mean is not None else None,
+                "o_y_ntc_tensor": self._to_cpu(o_y_ntc_tensor) if o_y_ntc_tensor is not None else None,
+                "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor) if sigma_hat_tensor is not None else None,
+                "alpha_n_coupling": alpha_n_coupling,
             }
         else:
             model_inputs = {
@@ -2487,7 +2910,6 @@ class TransFitter:
                 "sum_factor_tensor": sum_factor_tensor,
                 "beta_o_alpha_tensor": beta_o_alpha_tensor,
                 "beta_o_beta_tensor": beta_o_beta_tensor,
-                "alpha_alpha_mu_tensor": alpha_alpha_mu_tensor,
                 "K_max_tensor": K_max_tensor,
                 "K_alpha_tensor": K_alpha_tensor,
                 "Vmax_mean_tensor": Vmax_mean_tensor,
@@ -2497,7 +2919,6 @@ class TransFitter:
                 "p_n_logits_tensor": p_n_logits_tensor,
                 "epsilon_tensor": epsilon_tensor,
                 "x_true_sample": x_true_subset,
-                "log2_x_true_sample": log2_x_true_subset,
                 "nmin": nmin,
                 "nmax": nmax,
                 "alpha_y_sample": alpha_y_prefit,
@@ -2511,14 +2932,15 @@ class TransFitter:
                 "distribution": distribution,
                 "denominator_tensor": denominator_tensor if denominator_tensor is not None else None,
                 "K": K,
-                "D": D,
-                "mean_within_guide_var": mean_within_guide_var,
                 "x_true_CV": x_true_CV,
-                "use_data_driven_priors": use_data_driven_priors,
                 "use_epsilon": use_epsilon,
                 "vmax_log_sigma_floor_tensor": vmax_log_sigma_floor_tensor,
                 "k_log_sigma_min_tensor": k_log_sigma_min_tensor,
                 "k_center_tensor": k_center_tensor,
+                "y_ntc_tensor": y_ntc_tensor,
+                "o_y_ntc_tensor": o_y_ntc_tensor,
+                "sigma_hat_tensor": sigma_hat_tensor,
+                "alpha_n_coupling": alpha_n_coupling,
             }
 
         if self.model.device.type == "cuda":
@@ -2639,6 +3061,14 @@ class TransFitter:
             # Vmax prior (log-normal): Vmax_log_sigma is the same for all genes
             # because sigma/mean = 1/sqrt(Vmax_alpha) regardless of Vmax_mean.
             # Apply the same floor that _model_y uses (parameterized via vmax_log_sigma_floor).
+            #
+            # Binomial/multinomial use a different family (Beta, matches _model_y lines
+            # 789-816: Vmax_a/Vmax_b ~ Beta(Vmax_mean*conc, (1-Vmax_mean)*conc), conc=2.0,
+            # Vmax_mean clamped to [0.01, 0.99]). Multinomial's Vmax_mean_tensor is [T, K]
+            # (per-category), which doesn't reduce to the plotting panel's per-feature
+            # scalar violins, so it's left unset here (same limitation as the 'A' prior).
+            Vmax_beta_alpha_p = None
+            Vmax_beta_beta_p  = None
             if distribution not in ['binomial', 'multinomial']:
                 Vmax_alpha_val   = float(Vmax_alpha_tensor.item())
                 _Vmax_log_sigma_floor_p = float(vmax_log_sigma_floor_tensor.item())
@@ -2651,12 +3081,18 @@ class TransFitter:
             else:
                 Vmax_log_sigma_p = None
                 Vmax_log_mu_p    = None
+                if distribution == 'binomial':
+                    _Vmax_mean_clamped_p = Vmax_mean_tensor.clamp(min=0.01, max=0.99)
+                    _concentration_vmax_p = 2.0
+                    Vmax_beta_alpha_p = (_Vmax_mean_clamped_p * _concentration_vmax_p).cpu().numpy()        # [T]
+                    Vmax_beta_beta_p  = ((1.0 - _Vmax_mean_clamped_p) * _concentration_vmax_p).cpu().numpy()  # [T]
 
-            # K prior (log-normal): usually scalar (NTC-centred or K_max/2 fallback)
+            # K prior (log-normal): median centred at x_ntc_mean or k_center fallback.
+            # K_log_mu = log(centre) with no -0.5*sigma² correction, so the MEDIAN of
+            # K_a equals the centre (log2FC = 0 for the NTC-centred case).
             if x_ntc_mean is not None:
                 K_log_sigma_p = _K_log_sigma_min_val
-                K_log_mu_p    = float(torch.log(x_ntc_mean.clamp_min(epsilon_tensor)).item()
-                                      - 0.5 * K_log_sigma_p ** 2)
+                K_log_mu_p    = float(torch.log(x_ntc_mean.clamp_min(epsilon_tensor)).item())
             else:
                 _K_mean_p  = k_center_tensor.clamp_min(epsilon_tensor)
                 _K_std_p   = (_K_mean_p * x_true_CV if x_true_CV is not None
@@ -2664,7 +3100,7 @@ class TransFitter:
                 _ratio_K_p = (_K_std_p / _K_mean_p).clamp_min(self._t(1e-6))
                 K_log_sigma_p = float(torch.sqrt(torch.log1p(_ratio_K_p ** 2))
                                       .clamp_min(self._t(_K_log_sigma_min_val)).item())
-                K_log_mu_p    = float(torch.log(_K_mean_p).item() - 0.5 * K_log_sigma_p ** 2)
+                K_log_mu_p    = float(torch.log(_K_mean_p).item())
 
             trans_prior_params = {
                 'function_type':    function_type,
@@ -2674,20 +3110,115 @@ class TransFitter:
                 'nmax':             float(nmax.item()),
                 'n_mu_raw':         n_mu_raw_prior,
                 'sigma_n_prior_rate': 1.0,           # Exp(1) prior per gene → mean sigma = 1
-                # Vmax_a / Vmax_b (log-normal)
+                # Vmax_a / Vmax_b (log-normal for negbinom/normal/studentt)
                 'Vmax_log_mu':      Vmax_log_mu_p,   # [T] numpy array or None
                 'Vmax_log_sigma':   Vmax_log_sigma_p, # scalar or None
+                # Vmax_a / Vmax_b (Beta, for binomial; multinomial not yet supported here)
+                'Vmax_beta_alpha':  Vmax_beta_alpha_p,  # [T] numpy array or None
+                'Vmax_beta_beta':   Vmax_beta_beta_p,   # [T] numpy array or None
                 # K_a / K_b (log-normal)
                 'K_log_mu':         K_log_mu_p,      # scalar
                 'K_log_sigma':      K_log_sigma_p,   # scalar
-                # A (Exponential, negbinom only)
+                # A prior (negbinom: log2-Normal; binomial: logit-Normal or Beta fallback; multinomial: None)
+                # A_log2_mu / A_log2_sigma: per-gene anchors in log2 space, matching _model_y.
+                # mu = lower anchor (log2(Amean/2), capped so sigma ≤ 4 octaves).
+                # sigma = log2(y_ntc) - lower_anchor, clamped to [1, 4] octaves.
+                # Without y_ntc: sigma = 4 (flat fallback), mu = log2(Amean/2).
                 'Amean':            (Amean_tensor.cpu().numpy()
-                                     if distribution not in ['binomial', 'multinomial']
-                                     else None),      # [T] or None
+                                     if distribution != 'multinomial'
+                                     else None),      # [T] or None (multinomial: not applicable)
+                'A_log2_mu':        None,             # [T] or None — set below for negbinom
+                'A_log2_sigma':     None,             # [T] or None — set below for negbinom
+                'A_logit_mu':       None,             # [T] or None — set below for binomial (with y_ntc)
+                'A_logit_sigma':    None,             # [T] or None — set below for binomial (with y_ntc)
+                'A_beta_beta':      None,             # [T] or None — set below for binomial (no y_ntc; Beta(1, beta) fallback)
+                'A_mean':           None,             # [T] or None — set below for normal/studentt
+                'A_sigma':          None,             # [T] or None — set below for normal/studentt
                 # alpha / beta (RelaxedBernoulli)
                 'p_n_logits':       float(p_n_logits_tensor.item()),
                 'temperature_prior': 1.0,
             }
+
+            # Fill A_log2_mu / A_log2_sigma for negbinom (matches _model_y lines 658-671).
+            # Replicate the exact weight used inside _model_y so the violin is accurate.
+            if distribution == 'negbinom':
+                _Amean_np = Amean_tensor.cpu().numpy()
+                if y_ntc_tensor is not None:
+                    _y_ntc_np = y_ntc_tensor.cpu().numpy()
+                    # Mirror _model_y: lift upper anchor to mean(y_corrected) when y_ntc < mean.
+                    if mean_y_corrected_tensor is not None:
+                        _mean_ycorr_np = mean_y_corrected_tensor.cpu().numpy()
+                        _upper_np = np.maximum(_y_ntc_np, _mean_ycorr_np)
+                    else:
+                        _upper_np = _y_ntc_np
+                    _log2_upper = np.log2(np.maximum(_upper_np, 1e-12))
+                    _log2_lower = np.maximum(
+                        np.log2(np.maximum(_Amean_np / 2.0, 1e-12)),
+                        _log2_upper - 4.0,
+                    )
+                    _sigma_log2_A = np.clip(_log2_upper - _log2_lower, 1.0, 4.0)
+                    if o_y_ntc_tensor is not None:
+                        _prior_mean_oy = float((beta_o_beta_tensor / beta_o_alpha_tensor)
+                                               .clamp_min(epsilon_tensor).item())
+                        _w = (o_y_ntc_tensor / (o_y_ntc_tensor + _prior_mean_oy)).cpu().numpy()
+                    else:
+                        _w = np.zeros_like(_Amean_np)
+                    _mu_log2_A = (1.0 - _w) * _log2_lower + _w * _log2_upper
+                else:
+                    _mu_log2_A    = np.log2(np.maximum(_Amean_np / 2.0, 1e-12))
+                    _sigma_log2_A = np.full_like(_mu_log2_A, 4.0)
+                trans_prior_params['A_log2_mu']    = _mu_log2_A    # [T]
+                trans_prior_params['A_log2_sigma'] = _sigma_log2_A  # [T]
+
+            # Fill A_logit_mu / A_logit_sigma (or A_beta_beta fallback) for binomial
+            # (matches _model_y lines 609-635). _o_y_weight is fixed at 0.5 for binomial
+            # (no per-feature o_y noise parameter), matching the model.
+            elif distribution == 'binomial':
+                _Amean_np = Amean_tensor.cpu().numpy()
+                if y_ntc_tensor is not None:
+                    _y_ntc_np = y_ntc_tensor.cpu().numpy()
+                    if mean_y_corrected_tensor is not None:
+                        _mean_ycorr_np = mean_y_corrected_tensor.cpu().numpy()
+                        _effective_y_ntc_np = np.maximum(_y_ntc_np, _mean_ycorr_np)
+                    else:
+                        _effective_y_ntc_np = _y_ntc_np
+                    _clip_Amean_half = np.clip(0.5 * _Amean_np, 1e-6, 1.0 - 1e-6)
+                    _clip_y_ntc = np.clip(_effective_y_ntc_np, 1e-6, 1.0 - 1e-6)
+                    _logit_Amean_half = np.log(_clip_Amean_half / (1.0 - _clip_Amean_half))
+                    _logit_y_ntc = np.log(_clip_y_ntc / (1.0 - _clip_y_ntc))
+                    _logit_Amean_half = np.maximum(_logit_Amean_half, _logit_y_ntc - 4.0)
+                    _sigma_logit = np.maximum(_logit_y_ntc - _logit_Amean_half, 1.0)
+                    _mu_logit = 0.5 * _logit_Amean_half + 0.5 * _logit_y_ntc  # _o_y_weight = 0.5
+                    trans_prior_params['A_logit_mu']    = _mu_logit     # [T]
+                    trans_prior_params['A_logit_sigma'] = _sigma_logit  # [T]
+                else:
+                    _A_mean_shifted = np.maximum(0.5 * _Amean_np, 1e-12)
+                    trans_prior_params['A_beta_beta'] = (1.0 - _A_mean_shifted) / _A_mean_shifted  # [T]
+
+            # Fill A_mean / A_sigma for normal/studentt (matches _model_y lines 510-528).
+            # A lives in natural (possibly negative) value space, so the prior is a plain
+            # Normal rather than log/logit-transformed. _o_y_weight mirrors the model:
+            # NTC-estimated sigma_hat_tensor when available, else neutral 0.5.
+            elif distribution in ('normal', 'studentt'):
+                _Amean_np = Amean_tensor.cpu().numpy()
+                _Vmax_mean_np = Vmax_mean_tensor.cpu().numpy()
+                _delta_A_np = np.maximum(_Vmax_mean_np - _Amean_np, epsilon)
+                if sigma_hat_tensor is not None:
+                    _sigma_hat_np = sigma_hat_tensor.cpu().numpy()
+                    _sigma_ref = max(float(_sigma_hat_np.mean()), epsilon)
+                    _w = _sigma_hat_np / (_sigma_hat_np + _sigma_ref)
+                else:
+                    _w = np.full_like(_Amean_np, 0.5)
+                if y_ntc_tensor is not None:
+                    _y_ntc_np = y_ntc_tensor.cpu().numpy()
+                    _sigma_A = np.maximum(np.abs(_y_ntc_np - _Amean_np), _delta_A_np * 0.1)
+                    _mean_A  = (1.0 - _w) * _Amean_np + _w * _y_ntc_np
+                else:
+                    _sigma_A = _delta_A_np
+                    _shift_A = (1.0 - _w) * 0.55
+                    _mean_A  = _Amean_np - _shift_A * _delta_A_np
+                trans_prior_params['A_mean']  = _mean_A   # [T]
+                trans_prior_params['A_sigma'] = _sigma_A  # [T]
 
         # Store results
         # Store in modality
@@ -2695,11 +3226,7 @@ class TransFitter:
         modality.trans_prior_params = trans_prior_params
         modality.losses_trans = self.losses_trans  # Store loss history
 
-        # Update alpha_y_prefit in modality if it was None and alpha_y was sampled
-        if modality.alpha_y_prefit is None and groups_tensor is not None and "alpha_y" in posterior_samples_y:
-            modality.alpha_y_prefit = posterior_samples_y["alpha_y"].mean(dim=0)
-
-        # If primary modality, also store at model level (backward compatibility)
+        # For primary modality, also store at model level for direct access via model.posterior_samples_trans
         if modality_name == self.model.primary_modality:
             self.model.posterior_samples_trans = posterior_samples_y
             self.model.losses_trans = self.losses_trans
@@ -2714,6 +3241,17 @@ class TransFitter:
         import gc
         gc.collect()
         pyro.clear_param_store()
+
+        # Remove the rolling checkpoint (_latest.pt) and its temporaries now that
+        # results are stored on the model.  Numbered (_step*.pt), warmup, and
+        # complete checkpoints are retained for post-hoc analysis.
+        if checkpoint_path is not None and not _predictive_only_mode:
+            for _p in [checkpoint_path, checkpoint_path + '.bak', checkpoint_path + '.tmp']:
+                if os.path.exists(_p):
+                    os.remove(_p)
+            print(f"[INFO] Rolling checkpoint removed; "
+                  f"numbered/warmup/complete checkpoints retained in "
+                  f"{os.path.dirname(checkpoint_path)}")
 
         print("Finished fit_trans.")
 

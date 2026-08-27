@@ -1,0 +1,155 @@
+# Morris dataset -- orchestration config, consumed by generate_slurm.py.
+# High-MOI. NOT the bayesdream-CLI-schema config -- see
+# publication_runs/README.md and morris/README.md (the latter explains the
+# shared-fit_ntc deferred-cis_gene pattern this dataset relies on -- now
+# built directly into bayesDREAM's add_cis_gene(), no workaround needed --
+# and the preprocessing this config assumes has already been run, see
+# morris/preprocess.py).
+
+dataset: morris
+label_prefix: morris_20260806
+
+paths:
+  repo_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/CRISPRmodelling/BayesianModelling/bayesDREAM_forClaude
+  python_env_cpu: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_cpu/bin/python
+  python_env_gpu: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/software/miniconda3/envs/bayesdream_rocm/bin/python
+
+  # Raw inputs (as given) and where preprocess.py writes cleaned/aligned outputs.
+  raw_data_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Morris2023/processed_Leah/for_bayesDREAM
+  data_dir: "{raw_data_dir}/preprocessed"
+  stats_csv: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Morris2023/processed_Leah/for_bayesDREAM/Morris_gRNA2target_stats.csv
+
+  output_dir: /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/CRISPRmodelling/BayesianModelling/Morris_GEX/output
+  meta: "{data_dir}/meta.csv"
+  counts: "{data_dir}/gene_counts.npz"
+  feature_meta: "{data_dir}/gene_meta.csv"
+  guide_assignment: "{data_dir}/guide_assignment.npy"
+  guide_meta: "{data_dir}/guide_meta.csv"
+  guide_target: "{data_dir}/guide_target.csv"
+
+cluster:
+  account: naiss2025-5-479
+  partition_cpu: shared
+  # GPU steps (ntc_shared, trans, permutation, recapitulation): NOT confirmed
+  # against your account -- check `sinfo -p gpu -o "%P %G %c %N"` before
+  # submitting.
+  partition_gpu: gpu
+  # Each Dardel GPU node has 8 GPUs (per project instruction) -- used for two
+  # different things below, both currently unconfirmed against real Dardel
+  # syntax/limits:
+  #   gpu_single_sbatch_lines: standalone single-task GPU jobs (ntc_shared).
+  #   gpu_node_sbatch_lines: packed jobs (04_trans_packed.sh,
+  #     05_permutation_packed.sh, 06_recapitulation_packed.sh -- see
+  #     generate_slurm.py's "GPU node packing" docstring section) that run
+  #     several primary_genes' fits concurrently on ONE whole node via
+  #     common/slurm/run_node_queue.sh, so they request the FULL node's 8
+  #     GPUs rather than 1. concurrency for those jobs is min(n_tasks, 8) --
+  #     also confirm the node's CPU core count covers concurrency *
+  #     resources.cores for each packed stage (see generate_slurm.py).
+  gpu_single_sbatch_lines: ["#SBATCH --gpus=1"]
+  gpu_node_sbatch_lines: ["#SBATCH -N 1", "#SBATCH --gpus=8"]
+
+model_defaults:
+  modality_name: gene
+  # Both the original scripts' set_technical_groups call and
+  # adjust_ntc_sum_factor/refit_sumfactor/scran batch_col were inconsistent
+  # about 'experiment' vs 'lane' (one script literally commented
+  # "# or ['lane'], or both" on its own set_technical_groups call). Defaulted
+  # to 'lane' everywhere here for internal consistency (matches every OTHER
+  # sum-factor-related call in the reference scripts) -- confirm/override if
+  # 'experiment' (or both) is actually what you want.
+  guide_covariates: [lane]
+  guide_covariates_ntc: [lane]
+  min_count: 10
+
+# Guides to drop everywhere, regardless of cis gene (e.g. a known-bad
+# guide/batch) -- distinct from the per-cis-gene SNP exclusion table below.
+# Applied both at the shared ntc build AND at every per-gene cis build
+# (exclude_guides is a bayesDREAM CONSTRUCTOR-time filter, so it has to be
+# reapplied on every fresh model construction -- see
+# common/run_cis_deferred.py's module docstring).
+global_exclude_guides: []   # TODO: e.g. [sgFOO_1, sgFOO_2]
+
+sum_factor:
+  # batch_col is NOT read by generate_slurm.py -- scran now runs ONCE, in
+  # preprocess.py (its own --batch-col flag, also defaulting to 'lane'; keep
+  # the two in sync manually), not per-gene here anymore. See morris/README.md's
+  # "sum_factor: scran, computed once, shared everywhere" section. Left here
+  # for reference/documentation only.
+  batch_col: lane
+  covariates: [lane]         # adjust_ntc_sum_factor's covariates
+
+# Cis-gene selection, from Morris_gRNA2target_stats.csv: cis_genes = every
+# gene_use with padj<0.05, minus primary_genes (which get the fuller
+# pipeline below, not the cis-only sweep). Ensembl IDs (gene_use) are
+# resolved to gene NAMES via feature_meta (gene_id<->gene_name) at
+# generate_slurm.py time -- high-MOI cell classification matches cis_gene
+# against guide_targets_dict by NAME, not Ensembl ID (see morris/README.md).
+gene_selection:
+  gene_use_col: gene_use
+  padj_col: padj
+  padj_threshold: 0.05
+  primary_genes: [GFI1B, NFE2, IKZF1, HHEX, RUNX1]
+
+# Shared fit_ntc over the full gene panel, cis_gene deferred (add_cis_gene()
+# now supports high-MOI directly -- no placeholder gene needed).
+ntc_shared:
+  set_technical_groups: [lane]
+  resources: {cores: 16}
+
+# Per-gene data subsetting (see generate_slurm.py's "Per-gene data
+# subsetting" section): pays bayesDREAM.__init__'s full-dataset-load +
+# high-MOI-classification cost ONCE per gene. Shared by BOTH
+# 01b_subset_<gene>.sh (primary_genes) AND 01c_subset_sweep.sh
+# (sweep_genes) -- both read the SAME raw full dataset (data_block), not a
+# precomputed subset, so they pay the identical cost regardless of which
+# gene set. NOT cis_sweep.resources.cores below -- that's sized for
+# 07_cis_sweep.sh's actual cheap fit_cis() call on the already-subsetted
+# data, a much smaller job.
+subset:
+  resources: {cores: 25}   # from real profiling, 2026-08-11
+
+cis:
+  resources: {cores: 5}   # from real profiling, 2026-08-11
+  # independent_mu_sigma=True per the reference GFI1B fit_cis() call.
+  # KNOWN PRE-EXISTING ISSUE: fit_cis() in high-MOI mode currently raises
+  # "RuntimeError: expected scalar type Float but found Double" (dtype
+  # mismatch in bayesDREAM/fitting/cis.py's _model_x) -- see morris/README.md.
+  # Not something this config or run_cis_deferred.py can work around.
+  # Primary genes normally do NOT get force=True on the low-NTC-expression
+  # guard (see generate_slurm.py's render_cis_stage_config) -- they feed the
+  # full trans pipeline and should fail loudly by default. List a gene here
+  # ONLY after confirming (e.g. via plot_ntc_expression()) that proceeding
+  # past the guard is acceptable for it specifically.
+  force_low_ntc_primary_genes: [RUNX1]   # log2 mu_ntc = -1.13 < -1, confirmed 2026-08-18
+
+compensation:
+  resources: {cores: 20}   # from real profiling, 2026-08-11
+  padj_threshold: 0.05   # NTC + cells whose targeting guide's padj < this, for that gene
+
+trans:
+  resources: {cores: 16}
+  function_type: additive_hill
+  # model.exclude_trans_genes(min_log2_mu_ntc=...) before fit_trans, all datasets
+  exclude_trans_genes: {min_log2_mu_ntc: -4.0}
+
+  # n_reps: 1 each per explicit instruction (was 5, an arbitrary
+  # placeholder not derived from a power calculation or benchmark).
+  # permutation/simulation no longer carry their own resources.cores --
+  # generate_slurm.py now reuses trans.resources.cores directly for both
+  # (same data/model shape as the real trans fit, just a different fit
+  # target -- no reason for them to diverge).
+  permutation:
+    n_reps: 1
+
+  simulation:
+    n_reps: 1
+
+# fit_cis ONLY (no compensation/trans) for every padj-significant gene that
+# is NOT in primary_genes, reusing the shared ntc fit. "fit_cis always CPU."
+# resources.cores here is ONLY for 07_cis_sweep.sh (the actual fit_cis()
+# call on already-subsetted data) -- 01c_subset_sweep.sh uses subset.
+# resources.cores above instead (same full-dataset-load cost as 01b).
+cis_sweep:
+  resources: {cores: 5}   # matches cis (same fit_cis call, just via the deferred sweep path), 2026-08-11
+  array_max_concurrent: 100

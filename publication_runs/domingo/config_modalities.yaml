@@ -1,0 +1,124 @@
+# Domingo dataset -- additional (non-primary) modalities, fit per cis gene
+# after that gene's fit_cis has run. Consumed by generate_slurm.py and
+# load_modalities.py.
+#
+# `stype` is the subdirectory name under the shared loader_inputs/ directory
+# (config.yaml's modalities.data_dir -- the SAME directory for every gene;
+# per-gene cell subsetting happens inside the loader by aligning against
+# that gene's model.meta['L_cell_barcode'], not via a per-gene directory).
+# `name` = f'{name_prefix}_{stype}' is the resulting bayesDREAM modality
+# name, used for fit_trans.
+#
+# Confirmed from real loader code (6 worked examples): sj, exon_skip,
+# intron_retention, gene_velocity, mxe (binomial) and donor_choice
+# (multinomial). `acceptor_choice` is added below as the natural multinomial
+# counterpart to donor_choice (same splicing-site-choice pattern, opposite
+# end of the intron) but has NOT been confirmed against a real
+# loader_inputs/acceptor_choice/ directory -- verify it exists (or remove
+# this entry) before running. `donor_efficiency`/`acceptor_efficiency` are
+# binomial, analogous to exon_skip/intron_retention/mxe/gene_velocity (own
+# denominator.npz file, gene_name aliasing) per explicit confirmation --
+# their loader_inputs/ directories are assumed to exist and follow the same
+# layout; not independently verified against real files the way the other
+# six were.
+#
+# gene_alias_col: feature_meta column aliased to 'gene' inside the loader
+# (varies by modality -- 'gene_for_denominator' for sj, 'gene_name' for the
+# rest; donor_choice/acceptor_choice don't use gene aliasing at all).
+#
+# denominator_mode:
+#   file            -- separate denominator.npz in the same stype directory
+#                       (exon_skip, intron_retention, gene_velocity, mxe)
+#   gene_expression -- denominator = primary (+cis) modality's gene counts,
+#                       features filtered to genes present in the model,
+#                       counts>denominator violations optionally clipped
+#                       (sj only)
+#   null            -- multinomial modalities (no denominator)
+#
+# function_type: additive_hill everywhere except multinomial, where the
+# per-category dose-response is fit as single_hill (per user instruction).
+#
+# min_denominator: required by fit_trans() for binomial/multinomial
+# (bayesDREAM/fitting/trans.py) -- 0 means no additional filtering beyond
+# what add_custom_modality() already applies.
+
+modalities:
+  # `cores:` (2026-08-11, from real profiling) sizes this modality's OWN
+  # fit job (and its permutation/recapitulation jobs, for binomial entries
+  # -- see domingo/config.yaml's modalities.trans comment) -- overrides
+  # modalities.resources.cores in config.yaml for this stype only. Absent
+  # on donor_choice/acceptor_choice (multinomial, GPU-packed) on purpose --
+  # those fall back to modalities.resources.cores for thread-pinning.
+  # `subset_cores:` (2026-08-12, from real OOM evidence) overrides
+  # modalities.subset_resources.cores in config.yaml for THIS stype's
+  # 07a_modality_subset_<gene>_<mod>.sh only -- intron_retention's raw
+  # loader_inputs file is bigger than the shared 25-core (21.7GB) estimate
+  # covers (OOM'd for every gene even after that bump); every other
+  # modality's subset step is fine at the shared value, so this is the only
+  # entry that needs it.
+  - stype: sj
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_for_denominator
+    denominator_mode: gene_expression
+    clip_violations: true
+    save_diagnostic_plot: true
+    min_denominator: 0
+    cores: 8   # bumped from 4, 2026-08-14 -- several fit jobs TIMEOUT'd at 24h on 4 cores
+  - stype: exon_skip
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_name
+    denominator_mode: file
+    min_denominator: 0
+    cores: 2
+  - stype: intron_retention
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_name
+    denominator_mode: file
+    min_denominator: 0
+    cores: 2
+    subset_cores: 75   # bumped again, 2026-08-14 -- still OOM'd for MYB/NFE2 at 50 cores; GFI1B/MYB/TET2 all fine at 75
+    # NFE2 alone is STILL a confirmed genuine OOM at 75 (ReqMem=66600M, real
+    # oom_kill event) -- its raw loader_inputs file is bigger than every
+    # other gene's, so give it its own override rather than raising the
+    # shared 75 for GFI1B/MYB/TET2 too, which don't need it.
+    subset_cores_by_gene:
+      NFE2: 150
+  - stype: mxe
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_name
+    denominator_mode: file
+    min_denominator: 0
+    cores: 2
+  - stype: gene_velocity
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_name
+    denominator_mode: file
+    min_denominator: 0
+    cores: 2
+  - stype: donor_efficiency
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_name
+    denominator_mode: file
+    min_denominator: 0
+    cores: 8   # bumped from 4, 2026-08-14 -- TIMEOUT (not OOM) at 24h on 4 cores
+  - stype: acceptor_efficiency
+    distribution: binomial
+    function_type: additive_hill
+    gene_alias_col: gene_name
+    denominator_mode: file
+    min_denominator: 0
+    cores: 8   # bumped from 4, 2026-08-14 -- TIMEOUT (not OOM) at 24h on 4 cores
+  - stype: donor_choice
+    distribution: multinomial
+    function_type: single_hill
+    min_denominator: 0
+  - stype: acceptor_choice   # TODO: confirm loader_inputs/acceptor_choice/ actually exists
+    distribution: multinomial
+    function_type: single_hill
+    min_denominator: 0

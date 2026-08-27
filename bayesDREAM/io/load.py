@@ -7,6 +7,8 @@ import pickle
 import torch
 import pandas as pd
 
+from ..utils import make_names_unique, LEAN_POSTERIOR_KEY
+
 
 # ---------------------------------------------------------------------------
 # Alignment helpers
@@ -36,8 +38,19 @@ def _align_tensor(tensor, saved_names, target_names, dim):
     if dim < 0:
         dim = tensor.ndim + dim
 
-    saved_idx = {n: i for i, n in enumerate(saved_names)}
     n_target = len(target_names)
+
+    # Legacy fit saved before feature-name deduplication was introduced:
+    # saved_names may still contain raw duplicate names (e.g. Ensembl gene_name
+    # collisions), which the current modality now disambiguates
+    # (name, name-1, name-2, ...). If re-running the same dedup transform on
+    # saved_names reproduces target_names exactly, the underlying feature
+    # order/identity is unchanged -- only the strings were disambiguated --
+    # so positions correspond 1:1 and no reindexing is needed.
+    if list(saved_names) != list(target_names) and make_names_unique(saved_names) == list(target_names):
+        return tensor, torch.ones(n_target, dtype=torch.bool)
+
+    saved_idx = {n: i for i, n in enumerate(saved_names)}
     mapping = [saved_idx.get(n, -1) for n in target_names]
     mask = torch.tensor([i >= 0 for i in mapping], dtype=torch.bool)
 
@@ -85,6 +98,12 @@ def _align_posterior_features(posterior_dict, saved_names, target_names, n_featu
         return posterior_dict, None
     if list(saved_names) == list(target_names):
         return posterior_dict, torch.ones(len(target_names), dtype=torch.bool)
+
+    # Guard: n_features_saved must match len(saved_names) to correctly identify feature
+    # dimensions. If they differ (e.g., save.py picked the wrong tensor to infer the
+    # feature count), fall back to len(saved_names) which is always authoritative.
+    if n_features_saved is not None and n_features_saved != len(saved_names):
+        n_features_saved = len(saved_names)
 
     aligned = {}
     mask = None
@@ -157,20 +176,20 @@ def _check_nan_features(feat_mask, mod_name, mask_features):
             f"[LOAD] {mod_name}: {n_missing} feature(s) in the current modality were not present "
             f"in the saved technical fit and would be filled with NaN.\n"
             f"Options:\n"
-            f"  • load_technical_fit(..., mask_features=True)  — fill missing features with "
+            f"  • load_ntc_fit(..., mask_features=True)  — fill missing features with "
             f"the baseline alpha_y value (1.0 for negbinom, 0.0 for other distributions), "
-            f"exactly as fit_technical does for zero-count features; they are marked in "
+            f"exactly as fit_ntc does for zero-count features; they are marked in "
             f"modality.fitted_feature_mask.\n"
             f"  • load_trans_fit(..., subset_features=True)  — after loading, subset the "
             f"modality to only features present in the saved fit.\n"
-            f"  • Rerun fit_technical() on the current feature set to produce a matching fit."
+            f"  • Rerun fit_ntc() on the current feature set to produce a matching fit."
         )
 
 
 def _fill_nan_with_baseline(tensor, feat_mask, distribution):
     """
     Replace NaN positions (where feat_mask is False) with the baseline alpha_y value,
-    matching what fit_technical's _reconstruct_full_2d does for excluded features:
+    matching what fit_ntc's _reconstruct_full_2d does for excluded features:
       - negbinom (multiplicative): baseline = 1.0
       - all others (additive: normal, binomial, multinomial): baseline = 0.0
 
@@ -284,6 +303,57 @@ def _torch_load(path, map_location=None):
             return torch.load(path, map_location=map_location, weights_only=False)
         raise
 
+
+def _reduce_posterior_samples(posterior: dict) -> dict:
+    """
+    Collapse every leading-sample-dimension tensor in a posterior_samples dict
+    (as produced by fit_ntc/fit_cis via pyro.infer.Predictive) down to a point
+    estimate, for `lean=True` loading.
+
+    Each tensor's sample axis (dim 0) is replaced by the posterior **median**,
+    kept as a singleton dim (`keepdim=True`) rather than squeezed away. This
+    makes the reduced tensor a transparent drop-in for the `.median(dim=0)` /
+    `.mean(dim=0)` / `ndim>=3` collapsing idioms already used throughout
+    model.py, fitting/cis.py and io/summary.py to extract point estimates from
+    raw posteriors (median-of-1 == mean-of-1 == that value) — so pipeline
+    continuation (add_cis_gene, fit_cis, refit_sumfactor) and point-estimate
+    summary columns work unchanged on lean-loaded data.
+
+    For callers that need genuine uncertainty, two sibling keys are added per
+    tensor: `<key>_lower` / `<key>_upper` (2.5% / 97.5% quantiles, no leading
+    dim). These are the ONLY source of real credible-interval width once the
+    raw samples are discarded here.
+
+    IMPORTANT: this is a lossy, one-way reduction — the discarded per-draw
+    samples cannot be recovered. Any code that reads a reduced key directly
+    for per-draw uncertainty (e.g. `torch.quantile(ps['alpha_y'], ...)`) will
+    silently see a zero-width interval, since only one "sample" remains. Most
+    of `bayesDREAM.plotting` does this — lean-loaded posteriors are intended
+    for summary export (io/summary.py) and pipeline continuation, not
+    posterior visualization. Use `lean=False` for that.
+
+    Non-tensor entries and tensors without a real sample axis (shape[0] <= 1)
+    pass through unchanged.
+    """
+    reduced = {}
+    for key, v in posterior.items():
+        if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] > 1:
+            v_float = v.float()
+            # Use quantile(0.5) rather than torch's .median() for the point
+            # estimate: torch.median() picks the lower of the two middle
+            # values for an even sample count instead of averaging them,
+            # which disagrees with np.median() (used throughout io/summary.py
+            # to re-derive point estimates from posterior_samples_ntc/cis) —
+            # quantile(0.5) with linear interpolation matches np.median exactly.
+            reduced[key] = torch.quantile(v_float, 0.5, dim=0, keepdim=True)
+            reduced[f'{key}_lower'] = torch.quantile(v_float, 0.025, dim=0)
+            reduced[f'{key}_upper'] = torch.quantile(v_float, 0.975, dim=0)
+        else:
+            reduced[key] = v
+    reduced[LEAN_POSTERIOR_KEY] = True
+    return reduced
+
+
 class ModelLoader:
     """Handles loading fitted parameters."""
 
@@ -298,10 +368,11 @@ class ModelLoader:
         """
         self.model = model
 
-    def load_technical_fit(self, input_dir: str = None,
+    def load_ntc_fit(self, input_dir: str = None,
                           modalities: list = None, verbose: bool = False,
                           load_model_level: bool = None,
-                          mask_features: bool = False):
+                          mask_features: bool = False,
+                          lean: bool = False):
         """
         Load fitted technical parameters.
 
@@ -314,6 +385,25 @@ class ModelLoader:
             Example: ['gene', 'atac']
         verbose : bool
             If True, print detailed loading information. Default False (summary only).
+        lean : bool
+            If True, collapse each modality's posterior_samples_ntc to point
+            estimates (median, plus `<key>_lower`/`<key>_upper` 2.5%/97.5%
+            sibling keys) instead of keeping the full multi-sample tensors —
+            the raw samples are what makes these files huge (e.g. all 1000
+            posterior draws x every technical group x every feature). Safe for
+            summary export (save_ntc_summary) and pipeline continuation
+            (add_cis_gene, fit_cis, refit_sumfactor), which already only ever
+            read point estimates from posterior_samples_ntc. NOT safe for most
+            of bayesDREAM.plotting, which reads raw per-draw samples for
+            uncertainty bands — those will silently see zero-width intervals.
+            See `bayesDREAM.io.load._reduce_posterior_samples` for details.
+            If save_ntc_fit() wrote a `posterior_samples_ntc_<modality>_lean.pt`
+            companion file (automatic since it started doing so), that small
+            file is read directly instead of the full multi-sample file —
+            cutting peak memory/disk I/O during this call too, not just the
+            steady-state footprint afterward. Falls back to loading the full
+            file and reducing in-memory for fits saved before that existed.
+            Default False (full load, unchanged behavior).
 
         Returns
         -------
@@ -347,7 +437,7 @@ class ModelLoader:
             # Load alpha_x_prefit
             alpha_x_path = os.path.join(input_dir, 'alpha_x_prefit.pt')
             if os.path.exists(alpha_x_path):
-                alpha_x = _torch_load(alpha_x_path)
+                alpha_x = _torch_load(alpha_x_path, map_location=self.model.device)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_x, torch.Tensor) and alpha_x.ndim >= 2 and alpha_x.shape[0] > 1:
                     alpha_x = alpha_x.mean(dim=0)
@@ -360,7 +450,7 @@ class ModelLoader:
             # Load alpha_y_prefit (legacy model-level file → primary modality)
             alpha_y_path = os.path.join(input_dir, 'alpha_y_prefit.pt')
             if os.path.exists(alpha_y_path):
-                alpha_y = _torch_load(alpha_y_path)
+                alpha_y = _torch_load(alpha_y_path, map_location=self.model.device)
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_y, torch.Tensor) and alpha_y.ndim >= 3:
                     alpha_y = alpha_y.mean(dim=0)
@@ -370,7 +460,7 @@ class ModelLoader:
                 if verbose:
                     print(f"[LOAD] alpha_y_prefit → {self.model.primary_modality} modality ← {alpha_y_path}")
 
-        # Load per-modality alpha_y_prefit and posterior_samples_technical
+        # Load per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_load:
             mod = self.model.modalities[mod_name]
             mod_loaded = []
@@ -381,13 +471,34 @@ class ModelLoader:
                                      else (list(mod.feature_meta.index)
                                            if mod.feature_meta is not None else None))
 
-            # ── posterior_samples_technical (load first to get saved feature names) ──
+            # ── posterior_samples_ntc (load first to get saved feature names) ──
             saved_feature_names = None
             n_features_saved = None
 
-            posterior_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
+            posterior_path = os.path.join(input_dir, f'posterior_samples_ntc_{mod_name}.pt')
+            if not os.path.exists(posterior_path):
+                # Backward compat: try old filename
+                legacy_path = os.path.join(input_dir, f'posterior_samples_technical_{mod_name}.pt')
+                if os.path.exists(legacy_path):
+                    posterior_path = legacy_path
+
+            # lean=True: prefer the small precomputed companion file (written
+            # automatically by save_ntc_fit) so we never have to deserialize
+            # the full multi-sample file at all — this is what actually cuts
+            # peak memory/disk I/O during loading, not just the steady-state
+            # footprint (see io.save.ModelSaver.save_ntc_fit). Falls back to
+            # loading the full file and reducing in-memory (old behavior) for
+            # fits saved before this existed.
+            _used_precomputed_lean = False
+            if lean:
+                lean_posterior_path = os.path.join(
+                    input_dir, f'posterior_samples_ntc_{mod_name}_lean.pt')
+                if os.path.exists(lean_posterior_path):
+                    posterior_path = lean_posterior_path
+                    _used_precomputed_lean = True
+
             if os.path.exists(posterior_path):
-                loaded_data = _torch_load(posterior_path)
+                loaded_data = _torch_load(posterior_path, map_location=self.model.device)
                 n_features = None
 
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
@@ -396,19 +507,24 @@ class ModelLoader:
                     saved_feature_names = loaded_data.get('feature_names')
                     n_features_saved = n_features
 
-                    # Align posteriors to current modality's feature set
+                    # Align posteriors to current modality's feature set. Works
+                    # unchanged on precomputed-lean tensors: _detect_feature_dim
+                    # locates the feature axis by size, not by assuming a
+                    # leading sample dim, so it's correct whether or not one
+                    # is present (point estimates keep a singleton; the
+                    # <key>_lower/<key>_upper siblings don't have one at all).
                     if (current_feature_names is not None and saved_feature_names is not None
                             and current_feature_names != saved_feature_names):
                         posterior_raw, feat_mask = _align_posterior_features(
                             posterior_raw, saved_feature_names, current_feature_names, n_features_saved)
-                        _report_alignment(f"{mod_name} technical posterior",
+                        _report_alignment(f"{mod_name} NTC posterior",
                                           saved_feature_names, current_feature_names, feat_mask)
                         _check_nan_features(feat_mask, mod_name, mask_features)
                         if feat_mask is not None:
                             mod.fitted_feature_mask = feat_mask
                             if mask_features and not feat_mask.all():
                                 # Fill NaN positions with baseline alpha_y — same treatment as
-                                # zero-NTC-count features in fit_technical's _reconstruct_full_2d:
+                                # zero-NTC-count features in fit_ntc's _reconstruct_full_2d:
                                 # 1.0 for negbinom (multiplicative), 0.0 for all other distributions.
                                 for k in list(posterior_raw.keys()):
                                     if isinstance(posterior_raw[k], torch.Tensor):
@@ -417,37 +533,45 @@ class ModelLoader:
                                 n_missing = int((~feat_mask).sum())
                                 print(f"[LOAD] {mod_name}: {n_missing} missing feature(s) filled "
                                       f"with baseline alpha_y (mask_features=True).")
-                    mod.posterior_samples_technical = posterior_raw
+                    if lean and not _used_precomputed_lean:
+                        print(f"[LOAD] {mod_name}: no precomputed lean file found "
+                              f"(posterior_samples_ntc_{mod_name}_lean.pt) — this fit was saved "
+                              f"before automatic lean-file writing was added. Falling back to a "
+                              f"full load + in-memory reduction (same steady-state result, but "
+                              f"does not reduce peak memory/disk I/O during this load). Re-run "
+                              f"save_ntc_fit() to write the lean file for next time.")
+                        posterior_raw = _reduce_posterior_samples(posterior_raw)
+                    mod.posterior_samples_ntc = posterior_raw
 
                     # Reconstruct feature_meta DataFrame if present
                     if loaded_data.get('feature_meta') is not None:
                         _ = pd.DataFrame(loaded_data['feature_meta'])  # available if needed
 
-                    loaded[f'posterior_samples_technical_{mod_name}_metadata'] = {
+                    loaded[f'posterior_samples_ntc_{mod_name}_metadata'] = {
                         'modality_name': loaded_data.get('modality_name'),
                         'distribution': loaded_data.get('distribution'),
                         'n_features': n_features
                     }
 
-                    if loaded_data.get('loss_technical') is not None:
-                        mod.loss_technical = loaded_data['loss_technical']
-                        mod_loaded.append(f'loss({len(mod.loss_technical)})')
+                    if loaded_data.get('loss_ntc') is not None:
+                        mod.loss_ntc = loaded_data['loss_ntc']
+                        mod_loaded.append(f'loss({len(mod.loss_ntc)})')
 
                     if verbose:
-                        print(f"[LOAD] {mod_name}.posterior_samples_technical ({n_features} features) ← {posterior_path}")
+                        print(f"[LOAD] {mod_name}.posterior_samples_ntc ({n_features} features) ← {posterior_path}")
                 else:
-                    # Old format (backward compatibility) — no alignment possible
-                    mod.posterior_samples_technical = loaded_data
+                    # Old format without feature metadata — no alignment possible
+                    mod.posterior_samples_ntc = loaded_data
                     if verbose:
-                        print(f"[LOAD] {mod_name}.posterior_samples_technical (legacy format) ← {posterior_path}")
+                        print(f"[LOAD] {mod_name}.posterior_samples_ntc (old format) ← {posterior_path}")
 
-                loaded[f'posterior_samples_technical_{mod_name}'] = True
+                loaded[f'posterior_samples_ntc_{mod_name}'] = True
                 mod_loaded.append(f'posterior({n_features or "?"} features)')
 
                 # Extract and set specific alpha attributes from posterior_samples
-                if 'alpha_y_add' in mod.posterior_samples_technical:
+                if 'alpha_y_add' in mod.posterior_samples_ntc:
                     if not hasattr(mod, 'alpha_y_prefit_add') or mod.alpha_y_prefit_add is None:
-                        alpha_y_add = mod.posterior_samples_technical['alpha_y_add']
+                        alpha_y_add = mod.posterior_samples_ntc['alpha_y_add']
                         if isinstance(alpha_y_add, torch.Tensor):
                             collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
                             if alpha_y_add.ndim >= collapse_threshold:
@@ -457,12 +581,12 @@ class ModelLoader:
                             if mod.distribution != 'negbinom':
                                 mod.alpha_y_prefit = alpha_y_add
                         if verbose:
-                            print(f"[LOAD] {mod_name}.alpha_y_prefit_add ← extracted from posterior_samples_technical")
+                            print(f"[LOAD] {mod_name}.alpha_y_prefit_add ← extracted from posterior_samples_ntc")
 
-                if 'alpha_y_mult' in mod.posterior_samples_technical or 'alpha_y' in mod.posterior_samples_technical:
-                    alpha_y_mult_key = 'alpha_y_mult' if 'alpha_y_mult' in mod.posterior_samples_technical else 'alpha_y'
+                if 'alpha_y_mult' in mod.posterior_samples_ntc or 'alpha_y' in mod.posterior_samples_ntc:
+                    alpha_y_mult_key = 'alpha_y_mult' if 'alpha_y_mult' in mod.posterior_samples_ntc else 'alpha_y'
                     if not hasattr(mod, 'alpha_y_prefit_mult') or mod.alpha_y_prefit_mult is None:
-                        alpha_y_mult = mod.posterior_samples_technical[alpha_y_mult_key]
+                        alpha_y_mult = mod.posterior_samples_ntc[alpha_y_mult_key]
                         if isinstance(alpha_y_mult, torch.Tensor) and alpha_y_mult.ndim >= 3:
                             alpha_y_mult = alpha_y_mult.mean(dim=0)
                         mod.alpha_y_prefit_mult = alpha_y_mult
@@ -470,12 +594,12 @@ class ModelLoader:
                             if mod.distribution == 'negbinom':
                                 mod.alpha_y_prefit = alpha_y_mult
                         if verbose:
-                            print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ← extracted from posterior_samples_technical")
+                            print(f"[LOAD] {mod_name}.alpha_y_prefit_mult ← extracted from posterior_samples_ntc")
 
             # ── alpha_y_prefit standalone file (align using names from posterior file) ──
             mod_path = os.path.join(input_dir, f'alpha_y_prefit_{mod_name}.pt')
             if os.path.exists(mod_path):
-                alpha_y_to_set = _torch_load(mod_path)
+                alpha_y_to_set = _torch_load(mod_path, map_location=self.model.device)
                 if isinstance(alpha_y_to_set, torch.Tensor):
                     collapse_threshold = 4 if mod.distribution == 'multinomial' else 3
                     if alpha_y_to_set.ndim >= collapse_threshold:
@@ -514,9 +638,14 @@ class ModelLoader:
                 loaded_summary.append(f"{mod_name}: {', '.join(mod_loaded)}")
 
         # Print summary
-        print(f"[LOAD] Technical fit from {input_dir}")
+        print(f"[LOAD] NTC fit from {input_dir}" + (" (lean=True)" if lean else ""))
         if loaded_summary:
             print(f"[LOAD] Loaded: {'; '.join(loaded_summary)}")
+        if lean:
+            print("[LOAD] lean=True: posterior_samples_ntc holds point estimates "
+                  "(median + 95% CI) only, not full posterior draws. Safe for "
+                  "save_ntc_summary() and pipeline continuation; NOT safe for most "
+                  "of bayesDREAM.plotting (will raise). Check modality.is_ntc_lean.")
 
         # Warn if alpha_y_prefit was not loaded for modalities that need it
         # Note: 'cis' modality doesn't need alpha_y_prefit (it uses alpha_x instead)
@@ -537,15 +666,15 @@ class ModelLoader:
                 f"Check that the following files exist in {input_dir}:\n"
                 f"  - alpha_y_prefit.pt (legacy format for primary modality)\n"
                 f"  - alpha_y_prefit_<modality>.pt (per-modality format)\n"
-                f"  - posterior_samples_technical_<modality>.pt (contains alpha_y in posterior samples)\n"
-                f"If files are in a different directory, use load_technical_fit(input_dir='path/to/saved/fit')",
+                f"  - posterior_samples_ntc_<modality>.pt (contains alpha_y in posterior samples)\n"
+                f"If files are in a different directory, use load_ntc_fit(input_dir='path/to/saved/fit')",
                 UserWarning
             )
 
         return loaded
 
     def load_cis_fit(self, input_dir: str = None, verbose: bool = False,
-                     subset_cells: bool = False):
+                     subset_cells: bool = False, lean: bool = False):
         """
         Load fitted cis parameters.
 
@@ -555,6 +684,21 @@ class ModelLoader:
             Directory to load from. If None, uses self.model.output_dir.
         verbose : bool
             If True, print detailed loading information. Default False (summary only).
+        lean : bool
+            If True, collapse posterior_samples_cis to point estimates (median,
+            plus `<key>_lower`/`<key>_upper` 2.5%/97.5% sibling keys) instead of
+            keeping the full multi-sample tensors (e.g. x_true is `[n_samples,
+            n_cells]` — the dominant cost for large cell counts). Safe for
+            summary export (save_cis_summary) and pipeline continuation. NOT
+            safe for most of bayesDREAM.plotting. See
+            `bayesDREAM.io.load._reduce_posterior_samples` for details.
+            If save_cis_fit() wrote a `posterior_samples_cis_lean.pt` companion
+            file (automatic since it started doing so), that small file is read
+            directly instead of the full multi-sample file — cutting peak
+            memory/disk I/O during this call too, not just the steady-state
+            footprint afterward. Falls back to loading the full file and
+            reducing in-memory for fits saved before that existed.
+            Default False (full load, unchanged behavior).
 
         Returns
         -------
@@ -576,8 +720,18 @@ class ModelLoader:
         cis_gene = None
 
         posterior_path = os.path.join(input_dir, 'posterior_samples_cis.pt')
+
+        # lean=True: prefer the small precomputed companion file (written
+        # automatically by save_cis_fit), same rationale as load_ntc_fit above.
+        _used_precomputed_lean = False
+        if lean:
+            lean_posterior_path = os.path.join(input_dir, 'posterior_samples_cis_lean.pt')
+            if os.path.exists(lean_posterior_path):
+                posterior_path = lean_posterior_path
+                _used_precomputed_lean = True
+
         if os.path.exists(posterior_path):
-            loaded_data = _torch_load(posterior_path)
+            loaded_data = _torch_load(posterior_path, map_location=self.model.device)
 
             if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                 posterior_raw = loaded_data['posterior_samples']
@@ -619,6 +773,14 @@ class ModelLoader:
                                               saved_cell_names, current_cell_names, cell_mask)
                             self.model.fitted_cell_mask = cell_mask
 
+                if lean and not _used_precomputed_lean:
+                    print("[LOAD] posterior_samples_cis: no precomputed lean file found "
+                          "(posterior_samples_cis_lean.pt) — this fit was saved before "
+                          "automatic lean-file writing was added. Falling back to a full "
+                          "load + in-memory reduction (same steady-state result, but does "
+                          "not reduce peak memory/disk I/O during this load). Re-run "
+                          "save_cis_fit() to write the lean file for next time.")
+                    posterior_raw = _reduce_posterior_samples(posterior_raw)
                 self.model.posterior_samples_cis = posterior_raw
 
                 if loaded_data.get('feature_meta') is not None:
@@ -636,10 +798,10 @@ class ModelLoader:
                 if verbose:
                     print(f"[LOAD] posterior_samples_cis (cis_gene: {cis_gene}) ← {posterior_path}")
             else:
-                # Old format (backward compatibility) — no alignment possible
+                # Old format without feature metadata — no alignment possible
                 self.model.posterior_samples_cis = loaded_data
                 if verbose:
-                    print(f"[LOAD] posterior_samples_cis (legacy format) ← {posterior_path}")
+                    print(f"[LOAD] posterior_samples_cis (old format) ← {posterior_path}")
 
             loaded['posterior_samples_cis'] = True
             loaded_summary.append("posterior_cis" + (f" ({cis_gene})" if cis_gene else ""))
@@ -648,7 +810,7 @@ class ModelLoader:
         # Note: if subset_cells=True was applied above, current_cell_names is already reduced
         x_true_path = os.path.join(input_dir, 'x_true.pt')
         if os.path.exists(x_true_path):
-            x_true = _torch_load(x_true_path)
+            x_true = _torch_load(x_true_path, map_location=self.model.device)
             if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
                 x_true = x_true.mean(dim=0)
             if (current_cell_names is not None and saved_cell_names is not None
@@ -671,7 +833,7 @@ class ModelLoader:
         # Load log2_x_true (standalone file — align by cell if names available)
         log2_x_true_path = os.path.join(input_dir, 'log2_x_true.pt')
         if os.path.exists(log2_x_true_path):
-            log2_x_true = _torch_load(log2_x_true_path)
+            log2_x_true = _torch_load(log2_x_true_path, map_location=self.model.device)
             if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
                 log2_x_true = log2_x_true.mean(dim=0)
             if (current_cell_names is not None and saved_cell_names is not None
@@ -703,15 +865,20 @@ class ModelLoader:
                     print(f"[LOAD] log2_x_true ← computed from x_true")
 
         # Print summary
-        print(f"[LOAD] Cis fit from {input_dir}")
+        print(f"[LOAD] Cis fit from {input_dir}" + (" (lean=True)" if lean else ""))
         if loaded_summary:
             print(f"[LOAD] Loaded: {', '.join(loaded_summary)}")
+        if lean:
+            print("[LOAD] lean=True: posterior_samples_cis holds point estimates "
+                  "(median + 95% CI) only, not full posterior draws. Safe for "
+                  "save_cis_summary() and pipeline continuation; NOT safe for most "
+                  "of bayesDREAM.plotting (will raise). Check model.is_cis_lean.")
 
         return loaded
 
 
     def load_trans_fit(self, input_dir: str = None, modalities: list = None, verbose: bool = False,
-                       subset_features: bool = False):
+                       subset_features: bool = False, lean: bool = False):
         """
         Load fitted trans parameters.
 
@@ -729,12 +896,36 @@ class ModelLoader:
             that were not present in the saved trans fit (would introduce NaN posteriors).
             If True, subset the modality in-place to only the features present in the saved
             fit so that loading proceeds without NaNs.
+        lean : bool
+            Not yet implemented. Unlike posterior_samples_ntc/posterior_samples_cis,
+            nearly every column save_trans_summary() produces (Hill/derivative
+            evaluations, inflection points, log2fc, Bayesian FDR/q-values) is
+            computed by evaluating a nonlinear function of several Hill
+            parameters *per posterior draw* and only taking quantiles at the
+            end — collapsing alpha/Vmax/K/n/A/beta to marginal medians+CI
+            first would silently give wrong CIs and wrong FDR (they depend on
+            the joint per-draw correlation across parameters, not just their
+            marginals). A correct lean mode here would need to precompute the
+            full save_trans_summary() output at load time and keep only that
+            table, which is a larger, separate piece of work. Raises
+            NotImplementedError if True.
 
         Returns
         -------
         dict
             Loaded parameters (keys only, not full tensors)
         """
+        if lean:
+            raise NotImplementedError(
+                "load_trans_fit(lean=True) is not implemented. Nearly all "
+                "save_trans_summary() columns (Hill evaluations, derivative "
+                "roots, inflection points, log2fc, Bayesian FDR/q-values) "
+                "require the full joint per-draw posterior samples of alpha, "
+                "beta, Vmax_a, Vmax_b, K_a, K_b, n_a, n_b, A, etc. — collapsing "
+                "them to marginal medians/CI first would silently produce "
+                "incorrect CIs and FDR. Use lean=False (full load) for trans."
+            )
+
         if input_dir is None:
             input_dir = os.path.join(self.model.output_dir, self.model.label)
 
@@ -805,6 +996,19 @@ class ModelLoader:
                                 # Subset the modality in-place to fitted features only
                                 import numpy as _np
                                 mask_np = feat_mask.numpy()
+                                # alpha_y_prefit_mult/_add and posterior_samples_ntc were
+                                # loaded earlier via load_ntc_fit() and are still sized to
+                                # the FULL (pre-subset) feature count -- without this, a
+                                # later fit_trans() call divides a [..., n_kept]-shaped
+                                # tensor by a [..., T]-shaped alpha_y_expanded and crashes
+                                # with a shape mismatch. exclude_trans_genes() already
+                                # solves this exact problem via the same helper (see
+                                # model.py's _trim_feature_axis_in_posteriors); this branch
+                                # just never called it. Confirmed via a real
+                                # "RuntimeError: The size of tensor a (89) must match the
+                                # size of tensor b (91)" traceback, 2026-08-14.
+                                self.model._trim_feature_axis_in_posteriors(
+                                    mod, _np.where(mask_np)[0], mask_np.shape[0])
                                 # Subset counts
                                 if mod.counts is not None:
                                     if hasattr(mod.counts, 'toarray'):
@@ -862,7 +1066,7 @@ class ModelLoader:
                 posterior_path = os.path.join(input_dir, 'posterior_samples_trans.pt')
 
             if os.path.exists(posterior_path):
-                loaded_data = _torch_load(posterior_path)
+                loaded_data = _torch_load(posterior_path, map_location=self.model.device)
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                     posterior_dict, n_features, _, extra = _load_trans_posterior(
                         loaded_data, f"trans {self.model.primary_modality}")
@@ -886,7 +1090,7 @@ class ModelLoader:
         for mod_name in modalities_to_load:
             mod_path = os.path.join(input_dir, f'posterior_samples_trans_{mod_name}.pt')
             if os.path.exists(mod_path):
-                loaded_data = _torch_load(mod_path)
+                loaded_data = _torch_load(mod_path, map_location=self.model.device)
                 mod_loaded = []
                 n_features = None
 

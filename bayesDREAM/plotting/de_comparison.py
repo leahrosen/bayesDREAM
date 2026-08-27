@@ -10,28 +10,7 @@ from matplotlib.lines import Line2D
 
 from .helpers import to_np
 from .colors import lighten, darken, ColorScheme
-
-
-def dependency_mask_from_n(n_samps, ci=95.0):
-    """
-    Dependency mask based on n: 95% CI excludes 0.
-
-    Parameters
-    ----------
-    n_samps : array-like, shape (n_samples, n_features)
-        Posterior samples of n parameter
-    ci : float
-        Confidence interval percentage
-
-    Returns
-    -------
-    mask : np.ndarray, shape (n_features,)
-        Boolean mask: True if CI excludes 0
-    """
-    lo_q = (100 - ci) / 2.0
-    hi_q = 100 - lo_q
-    lo, hi = np.percentile(n_samps, [lo_q, hi_q], axis=0)
-    return (lo > 0) | (hi < 0)
+from .utils import dependency_mask_from_n
 
 
 def compute_log2fc_metrics(A_samps, alpha_samps, Vmax_samps, K_samps, n_samps,
@@ -249,8 +228,9 @@ def prepare_de_for_cg(model, de_df, cis_gene=None, color_scheme=None):
     dep_mask = dependency_mask_from_n(n_samps)  # [T] bool
     T        = n_mean.shape[0]
 
-    # gene names aligned to posterior arrays
-    gene_names = np.array(model.get_modality('gene').feature_meta['gene'])
+    # gene names aligned to posterior arrays — modality.feature_names is the
+    # single source of truth (resolved + deduped in Modality.__init__).
+    gene_names = np.array(model.get_modality('gene').feature_names)
     if len(gene_names) != T:
         print(f"[{cis_gene}] WARNING: len(gene_names)={len(gene_names)} != T={T}. "
               "Trimming gene_names to first T entries.")

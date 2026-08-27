@@ -10,15 +10,16 @@ detected.
 Supported distributions
 -----------------------
 - negbinom    : Negative-Binomial GAM with log offset (size factors).
-                Dispersion phi = 1/o_y^2 taken from posterior_samples_trans (preferred)
-                or posterior_samples_technical.
-- normal      : Gaussian GAM with fixed scale sigma = o_y taken from
-                posterior_samples_trans (preferred) or posterior_samples_technical.
+                Dispersion phi = 1/o_y^2, o_y taken from posterior_samples_ntc
+                (preferred) or posterior_samples_trans.
+- normal      : Gaussian GAM with fixed scale sigma = sigma_y taken from
+                posterior_samples_ntc (preferred) or posterior_samples_trans.
                 Using the model-estimated sigma makes the LRT calibrated; without it
                 the Gaussian GLM estimates scale from the window data.
-- studentt    : Proper Student-t GAM with fixed sigma = o_y and fixed nu = posterior
-                mean of nu_y (per-feature degrees of freedom), both from
-                posterior_samples_trans (preferred) or posterior_samples_technical.
+- studentt    : Proper Student-t GAM with fixed sigma = sigma_y (from
+                posterior_samples_ntc, preferred, or posterior_samples_trans) and
+                fixed nu = posterior median of nu_y (per-feature degrees of freedom,
+                from posterior_samples_trans -- nu_y is only fit there).
                 Optimised via scipy.optimize (L-BFGS-B) over the Student-t log-likelihood
                 with a B-spline basis. Falls back to Gaussian if either parameter is
                 unavailable.
@@ -28,8 +29,14 @@ Supported distributions
 Theta / sigma extraction priority
 ----------------------------------
 1. User-supplied ``theta`` argument.
-2. ``modality.posterior_samples_trans['o_y']`` (fitted alongside the dose-response).
-3. ``modality.posterior_samples_technical['o_y']`` (NTC-only fit, used as fallback).
+2. ``modality.posterior_samples_ntc['o_y']`` (negbinom) or ``['sigma_y']``
+   (normal/studentt) -- the pre-fit technical estimate.
+3. ``modality.posterior_samples_trans`` (same keys), used as fallback.
+
+NTC is preferred over trans because fit_trans() itself anchors its likelihood to
+the NTC-derived o_y/sigma_y rather than its own resampled value, which is only
+weakly identified per feature (see fitting/trans.py). Using the same anchor here
+keeps this test's dispersion consistent with what fit_trans actually relied on.
 
 Requires: statsmodels >= 0.14
 """
@@ -40,6 +47,7 @@ import pandas as pd
 from typing import Optional, Union, List
 from scipy.stats import chi2, combine_pvalues, t as t_dist
 from scipy.optimize import minimize
+from tqdm import tqdm
 
 try:
     from statsmodels.gam.api import GLMGam, BSplines
@@ -607,6 +615,9 @@ def _compute_nll_per_cell(y_obs, mu_final, distribution, o_y, nu_y, denom):
 # Mixin class
 # ---------------------------------------------------------------------------
 
+__pdoc__ = {"DiagnosticsMixin": False}
+
+
 class DiagnosticsMixin:
     """
     Mixin providing post-fitting diagnostic tests for bayesDREAM models.
@@ -625,21 +636,38 @@ class DiagnosticsMixin:
         df_spline: int = 6,
         degree: int = 3,
         theta: Optional[Union[dict, np.ndarray, pd.Series]] = None,
+        exclude_cells: Optional[List[str]] = None,
+        verbose: bool = True,
     ) -> pd.DataFrame:
         """
-        Test for systematic expression shifts between NTC and targeted cells.
+        Test for systematic expression shifts between NTC and targeted cells,
+        matched on cis expression (x_true).
 
-        For each feature × technical-group pair the test fits two GAMs:
+        For each feature × group (grouped by ``tech_col``, cells are first
+        restricted to a matched x_true window (see "Matching window" below),
+        then two GAMs are fit:
 
-          Null: response ~ s(x_true) [+ offset]
-          Alt : response ~ s(x_true) + targeted [+ offset]
+          Null: response ~ s(log2 x_true) [+ offset]
+          Alt : response ~ s(log2 x_true) + targeted [+ offset]
 
-        and computes a likelihood-ratio test (1 df). The smooth on x_true
-        accounts for any covariation driven by the cis perturbation itself,
-        so only residual shifts are flagged.
+        and a likelihood-ratio test (1 df) is computed. The smooth absorbs
+        any covariation driven by the cis perturbation itself, so only
+        residual shifts (not explained by dose-response) are flagged.
 
         Requires ``fit_cis()`` (and ideally ``refit_sumfactor()``) to have
-        been called so that ``self.x_true`` is set.
+        been called so that ``self.x_true`` is set, and ``len(self.x_true)``
+        must equal ``len(self.meta)``.
+
+        Matching window
+        ----------------
+        Within each group, NTC cells' ``log2(x_true)`` mean and SD are
+        computed, and *both* NTC and targeted cells are restricted to
+        ``ntc_mean ± ntc_sd`` (a fixed ±1 SD window; not configurable)
+        before fitting. This is what makes the comparison "matched" rather
+        than a naive NTC-vs-targeted test across the full dose range. Groups
+        with fewer than 2 NTC cells (can't compute an SD), a zero/invalid
+        NTC SD, or fewer than ``min_cells_per_group`` cells of either type
+        remaining after windowing are skipped (see ``reason`` below).
 
         Parameters
         ----------
@@ -647,10 +675,21 @@ class DiagnosticsMixin:
             Name of the modality to test (default: primary modality, usually 'gene').
         sum_factor_col : str
             Column in ``self.meta`` to use as normalisation offset (negbinom only).
+            Defaults to the raw ``'sum_factor'`` column set at init -- this will
+            usually NOT match what ``fit_cis()``/``fit_trans()`` actually used if
+            you ran ``adjust_ntc_sum_factor()``/``refit_sumfactor()`` (which create
+            ``'sum_factor_adj'``/``'sum_factor_refit'``). Pass the same
+            ``sum_factor_col`` you used for ``fit_trans()`` so the offset here is
+            consistent with the model whose residuals you're testing.
         target_col : str
-            Column in ``self.meta`` with perturbation labels.
+            Column in ``self.meta`` with perturbation labels. Cells are first
+            filtered to ``target_col`` in ``{ntc_label, targeted_label}``.
         tech_col : str
-            Column in ``self.meta`` with integer technical-group codes.
+            Column in ``self.meta`` to group by (default: integer technical-group
+            codes, but any categorical column works, e.g. ``'cell_line'``). The
+            output DataFrame's group column is named after ``tech_col`` itself
+            (not hardcoded to ``'technical_group_code'``). To pool all cells
+            into a single group, pass a column with one unique value.
         ntc_label : str
             Value in ``target_col`` identifying NTC cells.
         targeted_label : str or None
@@ -658,24 +697,36 @@ class DiagnosticsMixin:
             Defaults to ``self.cis_gene``.
         min_cells_per_group : int
             Minimum number of NTC **and** targeted cells required within the
-            matched x_true window; groups with fewer are skipped.
+            matched x_true window (see "Matching window" above); groups with
+            fewer are skipped.
         df_spline : int
-            Degrees of freedom for the B-spline smooth on x_true.
+            Degrees of freedom for the B-spline smooth on log2(x_true).
         degree : int
             Polynomial degree of the B-spline.
         theta : dict, array, or Series, optional
-            Per-feature dispersion parameter override.
+            Per-feature dispersion parameter override. Ignored for
+            ``binomial``/``multinomial`` distributions (no dispersion
+            parameter applies there), even if supplied.
             - negbinom: NB total_count phi = 1/o_y^2
-            - normal/studentt: sigma_y = o_y (residual std dev)
-            If None, extracted automatically from ``modality.posterior_samples_trans``
-            (preferred; requires ``fit_trans()`` to have been called) or from
-            ``modality.posterior_samples_technical`` as a fallback.
+            - normal/studentt: sigma_y (residual std dev)
+            If None, extracted automatically from ``modality.posterior_samples_ntc``
+            (preferred -- the same pre-fit estimate fit_trans() itself anchors to) or
+            from ``modality.posterior_samples_trans`` as a fallback.
+        exclude_cells : list of str, optional
+            Cell names (matched against ``self.meta['cell']``) to drop before
+            windowing/fitting, e.g. cells carrying a guide you want excluded
+            from the comparison. Applied globally, before the per-group NTC
+            mean/SD window is computed, so excluded cells also don't
+            contribute to that window.
+        verbose : bool, default True
+            Show a ``tqdm`` progress bar over features while fitting.
 
         Returns
         -------
         pd.DataFrame
-            One row per (feature × technical_group) with columns:
-            ``feature``, ``technical_group_code``, ``ok``, ``reason``,
+            One row per (feature × group) with columns:
+            ``feature``, ``<tech_col>`` (named after the ``tech_col`` argument,
+            e.g. ``technical_group_code`` by default), ``ok``, ``reason``,
             ``n_ntc``, ``n_targeted``, ``theta``, ``pval``, ``p_lrt``,
             ``p_adj`` (BH-corrected), ``shift_est``, ``shift_se``,
             ``shift_p``, ``shift_p_adj``, ``shift_fc``, ``lrt_stat``,
@@ -683,30 +734,87 @@ class DiagnosticsMixin:
             For multinomial data an additional ``n_categories_tested`` column
             is included.
 
+            ``pval``/``p_lrt``/``p_adj`` and ``shift_p``/``shift_p_adj`` are two
+            different tests of the same null hypothesis, not duplicates:
+
+            * ``pval`` == ``p_lrt`` -- likelihood-ratio test comparing the null
+              (``s(x)``) and alt (``s(x) + targeted``) model fits:
+              ``2*(llf_alt - llf_null) ~ chi2(1 df)``. Tests whether adding the
+              ``targeted`` term improves the fit at all.
+            * ``shift_p`` -- Wald test on the fitted ``targeted`` coefficient
+              itself (estimate / ``shift_se``, from the alt model only).
+              For multinomial, both are combined across categories via Fisher's
+              method rather than being a single coefficient's Wald test.
+
+            They usually agree, but the Wald SE underlying ``shift_p`` can be
+            unstable when the coefficient is large or near a boundary; prefer
+            ``p_adj`` (LRT) if they disagree. ``shift_est``/``shift_fc`` (the
+            effect size) come from the same Wald-tested coefficient regardless
+            of which p-value you use for significance.
+
+            When ``ok`` is False, most other columns are absent/NaN for that
+            row and ``reason`` is one of: ``"missing_theta"`` (negbinom only,
+            dispersion unavailable), ``"too_few_ntc_for_sd_window"`` (fewer
+            than 2 NTC cells in the group), ``"too_few_cells_before_subsetting"``
+            (fewer than ``min_cells_per_group`` NTC or targeted cells in the
+            group *before* windowing), ``"all_denominators_zero"`` (binomial
+            only), ``"invalid_ntc_sd"`` (NTC SD is zero/non-finite),
+            ``"too_few_cells_after_subsetting"`` (fewer than
+            ``min_cells_per_group`` NTC or targeted cells remain *after*
+            windowing), ``"zero_variance_window"`` (negbinom/normal/studentt:
+            response is constant, e.g. all-zero counts, within the matched
+            window -- no shift is fittable), ``"zero_counts_in_window"`` /
+            ``"single_category_in_window"`` (multinomial: no counts, or only
+            one category observed, within the window), ``"zero_denom_in_window"``
+            (binomial: denominator is zero for every cell in the window),
+            ``"quasi_separation_one_arm_all_zero"`` (negbinom: all counts are
+            zero within the NTC or targeted arm specifically, even though the
+            pooled window has nonzero variance -- the arm coefficient has no
+            finite MLE and any returned ``shift_est`` is a numerical-underflow
+            artifact, not a real effect size),
+            ``"quasi_separation_one_arm_boundary"`` (binomial: the NTC or
+            targeted arm's ratio is pinned at 0 or 1 for every cell),
+            ``"quasi_separation_category_absent_in_one_arm"`` (multinomial: an
+            observed category has zero counts within one arm), or
+            ``"fit_failed: <ExceptionType>: <message>"``.
+
+        Raises
+        ------
+        RuntimeError
+            If ``self.x_true`` is not set (``fit_cis()`` hasn't been run).
+        ValueError
+            If ``targeted_label`` is None and ``self.cis_gene`` is also None;
+            if ``target_col``, ``tech_col``, or (for negbinom) ``sum_factor_col``
+            are missing from ``self.meta``; or if ``len(self.meta) != len(self.x_true)``.
+
         Notes
         -----
         Distribution-specific behaviour:
 
         * **negbinom** – NB-GAM with log-offset = log(sum_factor).
           Requires theta (phi = 1/o_y^2 = NB total_count). Auto-extracted from
-          ``posterior_samples_trans`` (preferred) or ``posterior_samples_technical``.
-        * **normal** – Gaussian GAM with fixed scale = sigma^2 = o_y^2
-          (since sigma_y = o_y in the trans model). Auto-extracted from
-          ``posterior_samples_trans`` (preferred) or ``posterior_samples_technical``.
+          ``posterior_samples_ntc['o_y']`` (preferred) or ``posterior_samples_trans['o_y']``.
+        * **normal** – Gaussian GAM with fixed scale = sigma_y. Auto-extracted from
+          ``posterior_samples_ntc['sigma_y']`` (preferred) or ``posterior_samples_trans['sigma_y']``.
           If sigma is not available the GAM estimates it from the window data.
           No offset.
         * **studentt** – Proper Student-t GAM optimised via scipy with fixed
-          sigma = o_y and nu = posterior mean of nu_y, both from
-          ``posterior_samples_trans`` (preferred) or ``posterior_samples_technical``.
+          sigma = sigma_y (from ``posterior_samples_ntc``, preferred, or
+          ``posterior_samples_trans``) and nu = posterior median of nu_y (from
+          ``posterior_samples_trans`` only -- nu_y is not fit during ``fit_ntc()``).
           Falls back to Gaussian GAM if either parameter is unavailable.
         * **binomial** – Binomial GAM (logit link). Denominator from
           ``modality.denominator``.
         * **multinomial** – Per-category Binomial GAM; p-values combined
           via Fisher's method.
 
-        **Single technical group**: if all cells belong to one technical group
-        (i.e. ``technical_group_code`` has a single unique value), the test
-        runs as normal and returns one row per feature.
+        **Single group**: if ``tech_col`` has a single unique value across
+        all cells, the test runs as normal and returns one row per feature.
+
+        **High-MOI**: not MOI-aware — cells are grouped purely by ``target_col``
+        (collapsed to a single label per cell upstream in high-MOI cell
+        classification), so a "targeted" cell that also carries guides for
+        other genes is still counted as targeted here.
         """
         _require_statsmodels()
 
@@ -739,6 +847,7 @@ class DiagnosticsMixin:
             ntc_label=ntc_label,
             targeted_label=targeted_label,
             distribution=distribution,
+            exclude_cells=exclude_cells,
         )
         if base is None or len(base) == 0:
             warnings.warn("No valid cells found after filtering. Returning empty result.")
@@ -746,6 +855,17 @@ class DiagnosticsMixin:
 
         # ---- Extract counts array ----------------------------------------------
         counts_arr = self._get_counts_array(modality)  # [T, N] or [T, N, K]
+
+        # Densify the denominator once up front (was previously redone inside
+        # the per-feature loop, i.e. once per feature instead of once total).
+        denom_arr = None
+        if distribution == "binomial":
+            if modality.denominator is None:
+                raise ValueError(
+                    "modality.denominator is None but distribution is 'binomial'. "
+                    "Denominator is required for binomial shift test."
+                )
+            denom_arr = self._get_dense_array(modality.denominator)
 
         # ---- Feature names / indices -------------------------------------------
         feature_names = modality.feature_names
@@ -759,82 +879,118 @@ class DiagnosticsMixin:
                 f"counts first dimension ({T})"
             )
 
+        # ---- Precompute the matched NTC window once per tech_col group --------
+        # The window (and every check leading up to it) depends only on `x`,
+        # `target_col`, and `tech_col` -- none of which vary by feature -- so
+        # computing it here instead of inside the feature loop turns an O(T)
+        # repeat of the same pandas filtering into a single O(1) pass per group.
+        group_windows = self._compute_shift_group_windows(
+            base=base,
+            tech_col=tech_col,
+            target_col=target_col,
+            targeted_label=targeted_label,
+            min_cells_per_group=min_cells_per_group,
+        )
+
         # ---- Loop over features × technical groups -----------------------------
         results = []
-        for g_idx, feature in enumerate(feature_names):
+        _iter = tqdm(
+            enumerate(feature_names), total=T,
+            desc="check_systematic_shift", disable=not verbose,
+        )
+        for g_idx, feature in _iter:
             # Get per-feature dispersion (sigma for studentt; phi for negbinom)
             t_val = self._lookup_theta(theta_array, feature, g_idx, distribution)
             # For studentt: also get per-feature degrees of freedom
             nu_val = self._lookup_theta(nu_array, feature, g_idx, "studentt") \
                 if nu_array is not None else float("nan")
 
-            # Attach feature-specific counts to base
-            dt_feature = self._attach_feature_counts(
-                base=base,
-                counts_arr=counts_arr,
-                g_idx=g_idx,
-                modality=modality,
-                distribution=distribution,
-            )
+            if distribution == "negbinom" and not (np.isfinite(t_val) and t_val > 0):
+                for tech in group_windows:
+                    results.append({
+                        "feature": feature, tech_col: tech, "theta": t_val,
+                        "ok": False, "reason": "missing_theta",
+                    })
+                continue
 
-            for tech, dt_sub in dt_feature.groupby(tech_col, sort=True):
+            for tech, gw in group_windows.items():
                 row_base = {
                     "feature": feature,
-                    "technical_group_code": tech,
+                    tech_col: tech,
                     "theta": t_val,
                 }
 
-                # --- Skip checks ---
-                skip_reason = self._shift_skip_reason(
-                    dt_sub=dt_sub,
-                    target_col=target_col,
-                    ntc_label=ntc_label,
-                    targeted_label=targeted_label,
-                    min_cells_per_group=min_cells_per_group,
-                    t_val=t_val,
-                    distribution=distribution,
-                )
-                if skip_reason is not None:
-                    results.append({**row_base, "ok": False, "reason": skip_reason})
+                # --- Skip checks that don't depend on this feature ---
+                if gw["early_skip_reason"] is not None:
+                    results.append({**row_base, "ok": False, "reason": gw["early_skip_reason"]})
                     continue
 
-                # --- Subset to matched x window ---
-                x_ntc = dt_sub.loc[dt_sub[target_col] == ntc_label, "x"]
-                if len(x_ntc) < 2:
-                    results.append({**row_base, "ok": False,
-                                    "reason": "too_few_ntc_for_sd_window"})
+                # --- Binomial-only: this feature's denominator within the ---
+                # --- pre-window group (still feature-specific) -------------
+                if distribution == "binomial":
+                    denom_pre = denom_arr[g_idx, gw["cell_pos_pre"]]
+                    if not np.any(denom_pre > 0):
+                        results.append({**row_base, "ok": False, "reason": "all_denominators_zero"})
+                        continue
+
+                if gw["late_skip_reason"] is not None:
+                    row = {**row_base, "ok": False, "reason": gw["late_skip_reason"]}
+                    if gw["late_skip_reason"] == "too_few_cells_after_subsetting":
+                        row["n_ntc"] = gw["n_ntc_after"]
+                        row["n_targeted"] = gw["n_tgt_after"]
+                    results.append(row)
                     continue
-                ntc_mean, ntc_sd = x_ntc.mean(), x_ntc.std(ddof=1)
-                if not (np.isfinite(ntc_sd) and ntc_sd > 0):
-                    results.append({**row_base, "ok": False, "reason": "invalid_ntc_sd"})
-                    continue
 
-                dt_win = dt_sub[
-                    (dt_sub["x"] > ntc_mean - ntc_sd) &
-                    (dt_sub["x"] < ntc_mean + ntc_sd)
-                ].copy()
+                n_ntc = gw["n_ntc_after"]
+                n_tgt = gw["n_tgt_after"]
 
-                n_ntc = int((dt_win[target_col] == ntc_label).sum())
-                n_tgt = int((dt_win[target_col] == targeted_label).sum())
+                # --- Attach this feature's response for the (already ---
+                # --- computed) matched window only, not the full base ---
+                cell_pos_win = gw["cell_pos_win"]
+                dt_win = pd.DataFrame({
+                    "x": gw["x_win"],
+                    "targeted": gw["targeted_win"],
+                })
+                if gw["offset_win"] is not None:
+                    dt_win["offset"] = gw["offset_win"]
 
-                if n_ntc < min_cells_per_group or n_tgt < min_cells_per_group:
+                if distribution == "multinomial":
+                    feat_counts = counts_arr[g_idx, cell_pos_win, :]
+                    dt_win["y_total"] = feat_counts.sum(axis=1)
+                    for k in range(feat_counts.shape[1]):
+                        dt_win[f"y_{k}"] = feat_counts[:, k]
+                elif distribution == "binomial":
+                    dt_win["y"] = counts_arr[g_idx, cell_pos_win]
+                    dt_win["denom"] = denom_arr[g_idx, cell_pos_win]
+                else:
+                    dt_win["y"] = counts_arr[g_idx, cell_pos_win]
+
+                # --- Skip windows with no usable response signal (avoids ---
+                # --- GLM divergence, which is slow and warning-heavy) -----
+                degenerate_reason = self._shift_window_degenerate_reason(dt_win, distribution)
+                if degenerate_reason is not None:
                     results.append({
                         **row_base, "ok": False,
-                        "reason": "too_few_cells_after_subsetting",
+                        "reason": degenerate_reason,
                         "n_ntc": n_ntc, "n_targeted": n_tgt,
                     })
                     continue
 
                 # --- Fit GAM ---
                 try:
-                    out = self._run_shift_gam(
-                        dt=dt_win,
-                        distribution=distribution,
-                        t_val=t_val,
-                        nu_val=nu_val,
-                        df_spline=df_spline,
-                        degree=degree,
-                    )
+                    with warnings.catch_warnings():
+                        # statsmodels' IRLS internals emit RuntimeWarnings for
+                        # numerically marginal (but not fully degenerate) fits;
+                        # genuine failures still raise and are caught below.
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        out = self._run_shift_gam(
+                            dt=dt_win,
+                            distribution=distribution,
+                            t_val=t_val,
+                            nu_val=nu_val,
+                            df_spline=df_spline,
+                            degree=degree,
+                        )
                     results.append({
                         **row_base,
                         "ok": True,
@@ -877,6 +1033,103 @@ class DiagnosticsMixin:
 
         return res
 
+    def get_shift_window_cells(
+        self,
+        tech_col: str = "technical_group_code",
+        target_col: str = "target",
+        ntc_label: str = "ntc",
+        targeted_label: Optional[str] = None,
+        exclude_cells: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        Return the cells within the matched NTC window ``check_systematic_shift()``
+        actually used to test each ``tech_col`` group.
+
+        ``check_systematic_shift()`` restricts NTC and targeted cells to a
+        fixed ±1 SD window around the NTC mean of ``log2(x_true)`` before
+        fitting (see its docstring's "Matching window" section). That window
+        depends only on ``x_true``, ``target_col``, ``tech_col``, and
+        ``exclude_cells`` -- not on the feature being tested -- so it is the
+        *same* set of cells for every feature within a given ``tech_col``
+        group. This method reconstructs that set directly (reusing
+        ``_build_shift_base``, so it's guaranteed consistent with
+        ``check_systematic_shift()``), for use in follow-up plots that
+        should show exactly the cells the test actually saw rather than all
+        NTC/targeted cells across the full ``x_true`` range.
+
+        Pass the same ``tech_col``/``target_col``/``ntc_label``/
+        ``targeted_label``/``exclude_cells`` you used for
+        ``check_systematic_shift()`` -- this does not read them back from a
+        results DataFrame, so a mismatch will silently give the wrong window.
+
+        Parameters
+        ----------
+        tech_col : str, default ``'technical_group_code'``
+            Column in ``self.meta`` to group by.
+        target_col : str, default ``'target'``
+            Column in ``self.meta`` with perturbation labels.
+        ntc_label : str, default ``'ntc'``
+            Value in ``target_col`` identifying NTC cells.
+        targeted_label : str or None
+            Value in ``target_col`` identifying targeted cells. Defaults to
+            ``self.cis_gene``.
+        exclude_cells : list of str, optional
+            Cell names to drop before computing the window, matching
+            ``check_systematic_shift(exclude_cells=...)``.
+
+        Returns
+        -------
+        dict[group_value, list[str]]
+            Cell names (``self.meta['cell']``) within the matched window,
+            keyed by ``tech_col`` group value. Groups with fewer than 2 NTC
+            cells (can't compute an SD) or an invalid NTC SD are omitted,
+            matching ``check_systematic_shift()``'s own skip conditions.
+
+        Raises
+        ------
+        RuntimeError
+            If ``self.x_true`` is not set (``fit_cis()`` hasn't been run).
+        ValueError
+            If ``targeted_label`` is None and ``self.cis_gene`` is also None;
+            or (via ``_build_shift_base``) if ``target_col``/``tech_col`` are
+            missing from ``self.meta``, or ``exclude_cells`` was given but
+            ``self.meta`` has no ``'cell'`` column.
+        """
+        if not hasattr(self, "x_true") or self.x_true is None:
+            raise RuntimeError(
+                "x_true is not set. Run fit_cis() before get_shift_window_cells()."
+            )
+        if targeted_label is None:
+            targeted_label = self.cis_gene
+        if targeted_label is None:
+            raise ValueError("targeted_label must be specified (or set self.cis_gene).")
+
+        base = self._build_shift_base(
+            modality=None,
+            sum_factor_col=None,
+            target_col=target_col,
+            tech_col=tech_col,
+            ntc_label=ntc_label,
+            targeted_label=targeted_label,
+            distribution="normal",  # skips the negbinom-only sum_factor/offset requirement
+            exclude_cells=exclude_cells,
+        )
+
+        windows = {}
+        for tech, dt_sub in base.groupby(tech_col, sort=True):
+            x_ntc = dt_sub.loc[dt_sub[target_col] == ntc_label, "x"]
+            if len(x_ntc) < 2:
+                continue
+            ntc_mean, ntc_sd = x_ntc.mean(), x_ntc.std(ddof=1)
+            if not (np.isfinite(ntc_sd) and ntc_sd > 0):
+                continue
+            dt_win = dt_sub[
+                (dt_sub["x"] > ntc_mean - ntc_sd) & (dt_sub["x"] < ntc_mean + ntc_sd)
+            ]
+            windows[tech] = dt_win["cell"].tolist()
+
+        return windows
+
     # ------------------------------------------------------------------
     # Private helper methods
     # ------------------------------------------------------------------
@@ -885,14 +1138,21 @@ class DiagnosticsMixin:
         """
         Build a feature-indexed array of dispersion parameters.
 
-        For negbinom:       theta = phi_y = 1/o_y^2  (NB total_count; statsmodels alpha = 1/theta)
-        For normal/studentt: theta = sigma_y = o_y   (since phi_y = 1/o_y^2 → sigma = 1/√phi = o_y)
+        For negbinom:        theta = phi_y = 1/o_y^2  (NB total_count; statsmodels alpha = 1/theta)
+        For normal/studentt: theta = sigma_y           (posterior site 'sigma_y', not 'o_y')
         For binomial/multinomial: None (not needed)
 
         Extraction priority:
           1. User-supplied ``user_theta``.
-          2. modality.posterior_samples_trans  (fitted jointly with dose-response).
-          3. modality.posterior_samples_technical  (NTC-only fallback).
+          2. modality.posterior_samples_ntc  (pre-fit technical estimate).
+          3. modality.posterior_samples_trans  (fallback if NTC posteriors unavailable).
+
+        NTC is preferred over trans: fit_trans() itself anchors its likelihood to the
+        NTC-derived o_y/sigma_y (see fitting/trans.py's o_y_ntc_tensor / sigma_hat_tensor
+        construction) because the o_y/sigma_y *resampled inside* fit_trans is only weakly
+        identified per feature (fitting/trans.py explicitly notes the sampled o_y posterior
+        collapses toward the prior mean for every gene). Using the same NTC anchor here
+        keeps this test's dispersion consistent with what fit_trans actually relied on.
 
         If user_theta is supplied it overrides the posterior estimate.
         """
@@ -902,32 +1162,36 @@ class DiagnosticsMixin:
         if distribution in ("binomial", "multinomial"):
             return None
 
-        # Try trans posteriors first, then technical
+        site_key = "o_y" if distribution == "negbinom" else "sigma_y"
+
         posterior = None
-        for attr in ("posterior_samples_trans", "posterior_samples_technical"):
+        for attr in ("posterior_samples_ntc", "posterior_samples_trans"):
             cand = getattr(modality, attr, None)
-            if cand is not None and "o_y" in cand:
+            if cand is not None and site_key in cand:
                 posterior = cand
                 break
 
         if posterior is None:
             return None
 
-        o_y = posterior["o_y"]
-        if hasattr(o_y, "cpu"):
-            o_y = o_y.detach().cpu().numpy()
+        val = posterior[site_key]
+        if hasattr(val, "cpu"):
+            val = val.detach().cpu().numpy()
         else:
-            o_y = np.asarray(o_y)
-        # o_y shape: [S, T] or [T]
-        if o_y.ndim > 1:
-            o_y = o_y.mean(axis=0)  # [T]
+            val = np.asarray(val)
+        # Collapse all leading sample/batch dims via median, keeping the last
+        # (feature) axis -- mirrors fitting/trans.py's o_y_ntc_tensor/sigma_hat_tensor
+        # extraction, which loops rather than collapsing a single axis (site tensors can
+        # carry an extra size-1 batch dim, e.g. shape [S, 1, T]).
+        while val.ndim > 1:
+            val = np.median(val, axis=0)
 
         if distribution == "negbinom":
             # theta = phi_y = 1/o_y^2  (statsmodels NB total_count)
-            theta_arr = 1.0 / (o_y ** 2)
+            theta_arr = 1.0 / (val ** 2)
         else:
-            # normal / studentt: sigma_y = o_y (since sigma = 1/sqrt(phi) = 1/sqrt(1/o_y^2) = o_y)
-            theta_arr = o_y
+            # normal / studentt: theta = sigma_y directly
+            theta_arr = val
 
         feature_names = modality.feature_names
         if feature_names is not None and len(theta_arr) == len(feature_names):
@@ -941,7 +1205,7 @@ class DiagnosticsMixin:
         Returns a pd.Series indexed by feature name, or a numpy array, or None.
         Only applies to studentt distribution; always prefers trans posteriors.
         """
-        for attr in ("posterior_samples_trans", "posterior_samples_technical"):
+        for attr in ("posterior_samples_trans", "posterior_samples_ntc"):
             cand = getattr(modality, attr, None)
             if cand is not None and "nu_y" in cand:
                 nu_y = cand["nu_y"]
@@ -949,8 +1213,8 @@ class DiagnosticsMixin:
                     nu_y = nu_y.detach().cpu().numpy()
                 else:
                     nu_y = np.asarray(nu_y)
-                if nu_y.ndim > 1:
-                    nu_y = nu_y.mean(axis=0)  # [T]
+                while nu_y.ndim > 1:
+                    nu_y = np.median(nu_y, axis=0)  # collapse to [T]
                 feature_names = modality.feature_names
                 if feature_names is not None and len(nu_y) == len(feature_names):
                     return pd.Series(nu_y, index=feature_names)
@@ -982,6 +1246,7 @@ class DiagnosticsMixin:
         ntc_label,
         targeted_label,
         distribution,
+        exclude_cells=None,
     ):
         """
         Build the cell-level DataFrame used for all GAM fits.
@@ -1012,6 +1277,15 @@ class DiagnosticsMixin:
 
         base["x"] = np.log2(np.clip(x_true, 1e-12, None))
 
+        # Drop explicitly excluded cells
+        if exclude_cells:
+            if "cell" not in base.columns:
+                raise ValueError(
+                    "exclude_cells was provided but 'cell' column not found in meta."
+                )
+            exclude_set = set(exclude_cells)
+            base = base[~base["cell"].isin(exclude_set)].copy()
+
         # Filter to NTC and targeted only
         if target_col not in base.columns:
             raise ValueError(f"Column '{target_col}' not found in meta.")
@@ -1036,93 +1310,188 @@ class DiagnosticsMixin:
         if tech_col not in base.columns:
             raise ValueError(
                 f"Column '{tech_col}' not in meta. "
-                "Run set_technical_groups() or fit_technical() first."
+                "Run set_technical_groups() or fit_ntc() first."
             )
 
         base["targeted"] = (base[target_col] == targeted_label).astype(int)
         return base
 
+    def _get_dense_array(self, arr) -> np.ndarray:
+        """Densify a (possibly sparse) array once. Used for counts/denominator."""
+        from scipy import sparse
+        if sparse.issparse(arr):
+            arr = arr.toarray()
+        return np.asarray(arr, dtype=float)
+
     def _get_counts_array(self, modality) -> np.ndarray:
         """Return counts as a dense numpy array [T, N] or [T, N, K]."""
-        from scipy import sparse
-        counts = modality.counts
-        if sparse.issparse(counts):
-            counts = counts.toarray()
-        return np.asarray(counts, dtype=float)
+        return self._get_dense_array(modality.counts)
 
-    def _attach_feature_counts(
+    def _compute_shift_group_windows(
         self,
         base: pd.DataFrame,
-        counts_arr: np.ndarray,
-        g_idx: int,
-        modality,
-        distribution: str,
-    ) -> pd.DataFrame:
+        tech_col: str,
+        target_col: str,
+        targeted_label,
+        min_cells_per_group: int,
+    ) -> dict:
         """
-        Add count column(s) for feature g_idx to a copy of base.
+        Precompute, once per ``tech_col`` group, everything about the matched
+        NTC window that does not depend on which feature is being tested.
 
-        The base DataFrame has integer RangeIndex 0..N-1 matching the cell
-        axis of counts_arr.
+        The window (``ntc_mean``/``ntc_sd``/the resulting boolean mask) is a
+        function of ``x`` (shared across every feature) and ``target_col``
+        only -- see ``check_systematic_shift``'s "Matching window" docstring
+        section -- so this replaces what used to be an O(features) repeat of
+        the same pandas filtering with a single O(1)-per-group pass. Only the
+        checks that genuinely depend on the feature (``missing_theta``,
+        binomial's ``all_denominators_zero``) are left to the caller's
+        per-feature loop.
+
+        Returns
+        -------
+        dict[group_value, dict]
+            Per-group dict with keys:
+            - ``early_skip_reason``: ``"too_few_ntc_for_sd_window"`` /
+              ``"too_few_cells_before_subsetting"`` / None. Mirrors the
+              checks that used to run before the binomial denominator check.
+            - ``n_ntc_before``/``n_tgt_before``: counts prior to windowing.
+            - ``cell_pos_pre``: integer positions (into the counts array's
+              cell axis) of all NTC+targeted cells in this group, before
+              windowing -- used for the per-feature binomial denominator check.
+            - ``late_skip_reason``: ``"invalid_ntc_sd"`` /
+              ``"too_few_cells_after_subsetting"`` / None. Only meaningful
+              when ``early_skip_reason`` is None.
+            - ``n_ntc_after``/``n_tgt_after``: counts after windowing (only
+              when ``late_skip_reason`` is not ``"invalid_ntc_sd"``).
+            - ``cell_pos_win``/``x_win``/``targeted_win``/``offset_win``:
+              arrays for cells inside the matched window (only when
+              ``late_skip_reason`` is None). ``offset_win`` is None unless
+              ``"offset"`` is a column in ``base`` (negbinom only).
         """
-        dt = base.copy()
-        cell_pos = dt.index.to_numpy()  # integer positions into counts
+        has_offset = "offset" in base.columns
+        out = {}
+        for tech, dt_sub in base.groupby(tech_col, sort=True):
+            cell_pos_pre = dt_sub.index.to_numpy()
+            is_tgt_pre = (dt_sub[target_col].to_numpy() == targeted_label)
+            n_ntc_before = int((~is_tgt_pre).sum())
+            n_tgt_before = int(is_tgt_pre.sum())
+
+            entry = {
+                "n_ntc_before": n_ntc_before,
+                "n_tgt_before": n_tgt_before,
+                "cell_pos_pre": cell_pos_pre,
+                "early_skip_reason": None,
+                "late_skip_reason": None,
+            }
+
+            if n_ntc_before < 2:
+                entry["early_skip_reason"] = "too_few_ntc_for_sd_window"
+                out[tech] = entry
+                continue
+            if n_ntc_before < min_cells_per_group or n_tgt_before < min_cells_per_group:
+                entry["early_skip_reason"] = "too_few_cells_before_subsetting"
+                out[tech] = entry
+                continue
+
+            x_pre = dt_sub["x"].to_numpy(dtype=float)
+            ntc_mean = x_pre[~is_tgt_pre].mean()
+            ntc_sd = x_pre[~is_tgt_pre].std(ddof=1)
+            if not (np.isfinite(ntc_sd) and ntc_sd > 0):
+                entry["late_skip_reason"] = "invalid_ntc_sd"
+                out[tech] = entry
+                continue
+
+            win_mask = (x_pre > ntc_mean - ntc_sd) & (x_pre < ntc_mean + ntc_sd)
+            is_tgt_win = is_tgt_pre[win_mask]
+            n_ntc_after = int((~is_tgt_win).sum())
+            n_tgt_after = int(is_tgt_win.sum())
+            entry["n_ntc_after"] = n_ntc_after
+            entry["n_tgt_after"] = n_tgt_after
+
+            if n_ntc_after < min_cells_per_group or n_tgt_after < min_cells_per_group:
+                entry["late_skip_reason"] = "too_few_cells_after_subsetting"
+                out[tech] = entry
+                continue
+
+            entry["cell_pos_win"] = cell_pos_pre[win_mask]
+            entry["x_win"] = x_pre[win_mask]
+            entry["targeted_win"] = is_tgt_win.astype(int)
+            entry["offset_win"] = (
+                dt_sub["offset"].to_numpy(dtype=float)[win_mask] if has_offset else None
+            )
+            out[tech] = entry
+        return out
+
+    def _shift_window_degenerate_reason(
+        self,
+        dt_win: pd.DataFrame,
+        distribution: str,
+    ) -> Optional[str]:
+        """
+        Return a skip reason if the matched x-window has no usable response
+        signal for a GAM fit (e.g. all-zero/constant counts), else None.
+
+        These are exactly the windows that make statsmodels' IRLS diverge
+        (mu -> 0 or inf), which is expensive and floods the console with
+        RuntimeWarnings without ever producing a usable fit -- cheaper to
+        catch them here before calling GLMGam at all.
+
+        Beyond the pooled (both arms combined) checks, this also catches
+        *per-arm* quasi-complete separation: cases where the pooled response
+        has some variance (so the pooled check above passes) but one arm
+        (``targeted == 0`` or ``targeted == 1``) sits entirely on a link-scale
+        boundary (all-zero counts for negbinom's log link; ratio pinned at
+        0 or 1 for binomial's logit link; a category entirely absent from one
+        arm for multinomial). In these cases the "alt" model's arm coefficient
+        has no finite MLE -- IRLS still returns a number, but it's an
+        artifact of where the optimizer's numerical underflow happens to
+        stop (e.g. log-scale estimates clustering near -20), not a real
+        effect size.
+        """
+        targeted = dt_win["targeted"].to_numpy(dtype=float)
 
         if distribution == "multinomial":
-            # counts_arr shape: [T, N, K]
-            feat_counts = counts_arr[g_idx, cell_pos, :]  # [n_cells, K]
-            dt["y_total"] = feat_counts.sum(axis=1)
-            K = feat_counts.shape[1]
-            for k in range(K):
-                dt[f"y_{k}"] = feat_counts[:, k]
-        elif distribution == "binomial":
-            dt["y"] = counts_arr[g_idx, cell_pos]
-            # Denominator
-            denom = modality.denominator
-            if denom is None:
-                raise ValueError(
-                    "modality.denominator is None but distribution is 'binomial'. "
-                    "Denominator is required for binomial shift test."
-                )
-            from scipy import sparse as sp
-            if sp.issparse(denom):
-                denom = denom.toarray()
-            denom_arr = np.asarray(denom, dtype=float)
-            dt["denom"] = denom_arr[g_idx, cell_pos]
-        else:
-            dt["y"] = counts_arr[g_idx, cell_pos]
+            y_cols = [c for c in dt_win.columns if c.startswith("y_") and c != "y_total"]
+            counts = dt_win[y_cols].to_numpy(dtype=float)
+            totals = counts.sum(axis=0)
+            if totals.sum() == 0:
+                return "zero_counts_in_window"
+            if (totals > 0).sum() < 2:
+                return "single_category_in_window"
+            present = totals > 0
+            totals_ntc = counts[targeted == 0].sum(axis=0)
+            totals_tgt = counts[targeted == 1].sum(axis=0)
+            if np.any(present & ((totals_ntc == 0) | (totals_tgt == 0))):
+                return "quasi_separation_category_absent_in_one_arm"
+            return None
 
-        return dt
-
-    def _shift_skip_reason(
-        self,
-        dt_sub,
-        target_col,
-        ntc_label,
-        targeted_label,
-        min_cells_per_group,
-        t_val,
-        distribution,
-    ):
-        """Return a reason string if this (feature, tech_group) should be skipped, else None."""
-        # Check theta for distributions that need it
-        if distribution == "negbinom":
-            if not (np.isfinite(t_val) and t_val > 0):
-                return "missing_theta"
-
-        # Minimum cell counts (before window subsetting)
-        n_ntc = int((dt_sub[target_col] == ntc_label).sum())
-        n_tgt = int((dt_sub[target_col] == targeted_label).sum())
-        if n_ntc < 2:
-            return "too_few_ntc_for_sd_window"
-        if n_ntc < min_cells_per_group or n_tgt < min_cells_per_group:
-            return "too_few_cells_before_subsetting"
-
-        # Distribution-specific checks
         if distribution == "binomial":
-            if "denom" in dt_sub.columns:
-                if (dt_sub["denom"] <= 0).all():
-                    return "all_denominators_zero"
+            denom = dt_win["denom"].to_numpy(dtype=float)
+            if not np.any(denom > 0):
+                return "zero_denom_in_window"
+            ratio = dt_win["y"].to_numpy(dtype=float) / np.where(denom > 0, denom, np.nan)
+            valid = np.isfinite(ratio)
+            if not valid.any() or np.ptp(ratio[valid]) == 0:
+                return "zero_variance_window"
+            for arm_val in (0.0, 1.0):
+                arm_mask = valid & (targeted == arm_val)
+                if not arm_mask.any():
+                    continue
+                arm_ratio = ratio[arm_mask]
+                if np.all(arm_ratio == 0) or np.all(arm_ratio == 1):
+                    return "quasi_separation_one_arm_boundary"
+            return None
 
+        # negbinom / normal / studentt
+        y = dt_win["y"].to_numpy(dtype=float)
+        if np.ptp(y) == 0:
+            return "zero_variance_window"
+        if distribution == "negbinom":
+            for arm_val in (0.0, 1.0):
+                arm_y = y[targeted == arm_val]
+                if arm_y.size > 0 and np.all(arm_y == 0):
+                    return "quasi_separation_one_arm_all_zero"
         return None
 
     def _run_shift_gam(
