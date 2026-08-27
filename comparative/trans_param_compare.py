@@ -42,7 +42,7 @@ Design notes
 import os
 import re
 from itertools import combinations
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,7 +50,9 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 from scipy import stats as scipy_stats
 
-from .datasets import DatasetSpec
+from bayesDREAM.plotting.xy_plots import predict_hill_from_summary_row
+
+from .datasets import DatasetSpec, GENE_SYMBOL_SYNONYMS, REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID
 
 
 # ── Logical parameter name -> candidate raw column names (first match wins) ──
@@ -65,6 +67,9 @@ PARAM_ALIASES: Dict[str, List[str]] = {
     'Vmax_b':                  ['Vmax_b_median', 'Vmax_b_mean'],
     'inflection_a_log2fc':     ['inflection_a_log2fc_median'],
     'y_ntc':                   ['y_ntc'],
+    # log2(y_ntc) -- see load_trans_summary(), computed there (not a raw
+    # column, so no candidate list to try).
+    'log2_y_ntc':              ['log2_y_ntc'],
     # From comparative/hill_eval.py's add_log2fc_at_columns() (x_log2fc=-1.0,
     # i.e. the fitted curve's y-log2FC at 50% cis-gene knockdown) -- only
     # present once comparative/reconstruct_export.py has backfilled a given
@@ -77,8 +82,61 @@ PARAM_ALIASES: Dict[str, List[str]] = {
 }
 
 # Sensible default grid for "everything besides observed_log2fc" -- edit
-# freely per call via the `params=` argument.
-DEFAULT_GRID_PARAMS = ['full_log2fc', 'y_log2fc_at_xm1', 'EC50_a_log2fc', 'n_a', 'Vmax_a']
+# freely per call via the `params=` argument. log2_y_ntc (not Vmax_a): NTC
+# baseline expression is usually more directly comparable/interpretable
+# across two independently-fit models than the raw Hill amplitude Vmax_a,
+# which is on each model's own fitted scale.
+DEFAULT_GRID_PARAMS = ['full_log2fc', 'y_log2fc_at_xm1', 'EC50_a_log2fc', 'n_a', 'log2_y_ntc']
+
+
+def _log2fc_sign(row: pd.Series) -> float:
+    """+1.0 / -1.0 / 0.0 for whether the fitted trans-gene curve nets higher,
+    lower, or unchanged at x_obs_max vs x_obs_min (the observed cis-gene
+    expression range) -- reconstructed from the row's own fitted-parameter
+    columns via predict_hill_from_summary_row() (the same function-type-
+    agnostic reconstruction dose_response_panels.py's cross-dataset curve
+    overlay already relies on, so it's already exercised against Domingo/
+    Morris/Replogle's real column sets).
+
+    bayesDREAM/io/summary.py's own observed_log2fc/full_log2fc_median are
+    UNSIGNED magnitudes by design (log2(y_max/y_min), always >= 0 -- see
+    _compute_observed_log2fc_fitted) -- deliberately not changed there,
+    since that's the definition other code may rely on. This sign is
+    applied only to the in-memory DataFrame load_trans_summary() returns
+    (never written back to the CSV).
+
+    Falls back to +1.0 (i.e. leaves the unsigned magnitude as-is) if the
+    row's fitted-parameter columns are missing/invalid, so a failed sign
+    lookup never zeroes out or NaNs a real magnitude.
+    """
+    try:
+        x_lo, x_hi = float(row.get('x_obs_min')), float(row.get('x_obs_max'))
+    except (TypeError, ValueError):
+        return 1.0
+    if not (np.isfinite(x_lo) and np.isfinite(x_hi) and x_lo > 0 and x_hi > 0):
+        return 1.0
+    y = predict_hill_from_summary_row(row, np.array([x_lo, x_hi]))
+    if y is None or not np.all(np.isfinite(y)):
+        return 1.0
+    diff = y[1] - y[0]
+    if diff == 0:
+        return 0.0
+    return 1.0 if diff > 0 else -1.0
+
+
+def _resolve_color_col(merged: pd.DataFrame, color_by_param: Optional[str],
+                        color_dataset: str) -> Optional[str]:
+    """A column name already suffixed/cross-dataset (e.g.
+    'min_abs_observed_log2fc', added by merge_pair()) is used as-is; else
+    `color_by_param` is treated as a logical param name and suffixed with
+    `color_dataset` (the pre-existing behavior, e.g. 'observed_log2fc' ->
+    'observed_log2fc_Morris').
+    """
+    if not color_by_param:
+        return None
+    if color_by_param in merged.columns:
+        return color_by_param
+    return _col(color_by_param, color_dataset)
 
 
 def _standardize_params(df: pd.DataFrame, aliases: Dict[str, List[str]] = PARAM_ALIASES) -> pd.DataFrame:
@@ -122,6 +180,12 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
             f"(columns: {list(df.columns)[:15]}...)"
         )
     df['gene_symbol'] = df[spec.symbol_col].astype(str)
+    # Canonicalize known cross-dataset symbol synonyms (e.g. Domingo's
+    # 'CFAP210' == Morris's 'CCDC173') BEFORE anything downstream uses
+    # gene_symbol -- so a plain symbol-based merge sees the same string
+    # from both datasets instead of two "different" genes. See
+    # comparative.datasets.GENE_SYMBOL_SYNONYMS's docstring.
+    df['gene_symbol'] = df['gene_symbol'].replace(GENE_SYMBOL_SYNONYMS)
 
     # 'gene_id': a stable Ensembl-style id, if this dataset has one.
     #   - Replogle: spec.symbol_col != 'feature' means 'feature' ITSELF is
@@ -159,15 +223,32 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
     if spec.symbol_col != 'feature' and 'feature' in df.columns:
         dupe_symbols = df.loc[df['gene_symbol'].duplicated(keep=False), 'gene_symbol'].unique()
         if len(dupe_symbols):
-            n_ambig = df['gene_symbol'].isin(dupe_symbols).sum()
-            # Null out (not drop the row) -- gene_id-based merges still need
-            # these rows; only a symbol-based merge (merge_pair's fallback
-            # for datasets with no gene_id, e.g. Domingo) can't safely use them.
-            df.loc[df['gene_symbol'].isin(dupe_symbols), 'gene_symbol'] = np.nan
-            print(f"[{spec.name}] {len(dupe_symbols)} ambiguous gene_symbol value(s) map to >1 distinct "
-                  f"'feature' id in this dataset (e.g. {sorted(dupe_symbols)[:5]}) -- {n_ambig} row(s) "
-                  f"excluded from symbol-based cross-dataset comparison only (their gene_id, if any, "
-                  f"is unaffected).")
+            # For a symbol with a known-correct Ensembl ID (see
+            # comparative.datasets.REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID's
+            # docstring), null out only the OTHER row(s) sharing that
+            # symbol -- keeping the correct one usable for a symbol-based
+            # merge -- instead of nulling every row sharing it.
+            resolved = [s for s in dupe_symbols if s in REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID]
+            for sym in resolved:
+                correct_id = REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID[sym]
+                wrong_rows = (df['gene_symbol'] == sym) & (df['feature'] != correct_id)
+                df.loc[wrong_rows, 'gene_symbol'] = np.nan
+
+            still_ambiguous = [s for s in dupe_symbols if s not in resolved]
+            if still_ambiguous:
+                n_ambig = df['gene_symbol'].isin(still_ambiguous).sum()
+                # Null out (not drop the row) -- gene_id-based merges still need
+                # these rows; only a symbol-based merge (merge_pair's fallback
+                # for datasets with no gene_id, e.g. Domingo) can't safely use them.
+                df.loc[df['gene_symbol'].isin(still_ambiguous), 'gene_symbol'] = np.nan
+                print(f"[{spec.name}] {len(still_ambiguous)} ambiguous gene_symbol value(s) map to >1 "
+                      f"distinct 'feature' id in this dataset (e.g. {sorted(still_ambiguous)[:5]}) -- "
+                      f"{n_ambig} row(s) excluded from symbol-based cross-dataset comparison only "
+                      f"(their gene_id, if any, is unaffected). Add a REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID "
+                      f"entry in comparative/datasets.py to resolve one instead of excluding it.")
+            if resolved:
+                print(f"[{spec.name}] resolved {len(resolved)} ambiguous gene_symbol value(s) via "
+                      f"REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID: {resolved}")
 
     if 'is_cis_gene' in df.columns:
         df = df.loc[~df['is_cis_gene'].fillna(False).astype(bool)].copy()
@@ -178,6 +259,21 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
         df['is_dependent'] = False
 
     df = _standardize_params(df)
+
+    # log2(y_ntc) -- see DEFAULT_GRID_PARAMS's comment for why this replaced
+    # Vmax_a as the default grid parameter.
+    if 'y_ntc' in df.columns:
+        df['log2_y_ntc'] = np.log2(df['y_ntc'].clip(lower=1e-12))
+
+    # Sign observed_log2fc/full_log2fc (see _log2fc_sign()'s docstring for
+    # why this is done here, on the in-memory df, rather than in
+    # bayesDREAM/io/summary.py itself).
+    if {'observed_log2fc', 'x_obs_min', 'x_obs_max'}.issubset(df.columns):
+        signs = df.apply(_log2fc_sign, axis=1)
+        df['observed_log2fc'] = df['observed_log2fc'] * signs
+        if 'full_log2fc' in df.columns:
+            df['full_log2fc'] = df['full_log2fc'] * signs
+
     df['dataset'] = spec.name
     df['cis_gene'] = cis_gene
     return df
@@ -233,6 +329,30 @@ def merge_pair(df_a: pd.DataFrame, df_b: pd.DataFrame, name_a: str, name_b: str,
         elif sym_b in merged.columns:
             merged['gene_symbol'] = merged[sym_b]
 
+    # min(|observed_log2fc_a|, |observed_log2fc_b|) -- the weaker of the two
+    # datasets' signed effect sizes (see load_trans_summary()'s signing of
+    # observed_log2fc), used as the default coloring metric in the grid
+    # plots below: a gene only reads as "strong" here if BOTH datasets show
+    # a sizeable effect, not just whichever of the two happens to be larger.
+    oa, ob = f'observed_log2fc_{name_a}', f'observed_log2fc_{name_b}'
+    if oa in merged.columns and ob in merged.columns:
+        merged['min_abs_observed_log2fc'] = np.minimum(merged[oa].abs(), merged[ob].abs())
+
+    # Categorical dependency status -- the default coloring metric (see
+    # scatter_param()'s `exclude_categories`): name_a, name_b, 'both', or
+    # 'neither', from the 2x2 partition of is_dependent_{name_a} x
+    # is_dependent_{name_b} (same partition plot_param_grid_by_dependency()
+    # uses for its 4 rows).
+    dep_a_col, dep_b_col = f'is_dependent_{name_a}', f'is_dependent_{name_b}'
+    if dep_a_col in merged.columns and dep_b_col in merged.columns:
+        dep_a = merged[dep_a_col].fillna(False).astype(bool)
+        dep_b = merged[dep_b_col].fillna(False).astype(bool)
+        merged['dependency_category'] = np.select(
+            [dep_a & dep_b, dep_a & ~dep_b, ~dep_a & dep_b],
+            ['both', name_a, name_b],
+            default='neither',
+        )
+
     return merged
 
 
@@ -258,6 +378,8 @@ def scatter_param(
     alpha: float = 0.7,
     diag: bool = True,
     annotate_corr: bool = True,
+    lims: Optional[Tuple[float, float]] = None,
+    exclude_categories: Optional[Sequence[str]] = None,
 ) -> plt.Axes:
     """Scatter one fitted parameter, dataset A (x) vs dataset B (y), across
     genes shared between the two.
@@ -268,14 +390,39 @@ def scatter_param(
         A logical parameter name from PARAM_ALIASES (or any column present
         in both, un-suffixed, e.g. 'observed_log2fc').
     color_by : str, optional
-        A column in `merged` (already suffixed, e.g. 'observed_log2fc_Morris')
-        to color points by. Points are drawn in order of increasing
-        |color_by - vcenter|, so the strongest-effect genes are drawn last
-        (on top) rather than buried under a sea of near-zero points.
+        A column in `merged` (already suffixed for a per-dataset logical
+        name, e.g. 'observed_log2fc_Morris' -- or unsuffixed for a column
+        merge_pair() already computed across both, e.g.
+        'dependency_category'/'min_abs_observed_log2fc') to color points by.
+        Numeric columns get a continuous colormap (points drawn in order of
+        increasing |color_by - vcenter| so the strongest-effect genes are
+        drawn last/on top). A non-numeric column (e.g. 'dependency_category'
+        -- see merge_pair()) gets categorical coloring instead: one color
+        per distinct value, with a proper legend instead of a colorbar.
+    exclude_categories : sequence of str, optional
+        Only meaningful with a non-numeric `color_by` -- drop rows whose
+        `color_by` value is in this list before plotting AND before the
+        correlation annotation (so both reflect only what's actually shown).
+        E.g. `exclude_categories=['neither']` with `color_by=
+        'dependency_category'` to show only genes dependent in at least one
+        of the two datasets.
     highlight_col : str, optional
         A boolean column in `merged` (e.g. 'is_dependent_Morris') -- matching
         points get a black outline, to show where a well-powered dataset's
-        hits land in the other (typically under-powered) dataset.
+        hits land in the other (typically under-powered) dataset. Redundant
+        with (and will fight the legend of) categorical dependency coloring
+        -- the grid-level functions below skip auto-setting it when
+        color_by_param='dependency_category'.
+    lims : (float, float), optional
+        Fixed (xlim, ylim) -- both axes, same range, so the diagonal stays a
+        true 45-degree line. If None (default), computed from this call's
+        own `merged` (i.e. just the genes shared with THIS particular
+        partner dataset). Callers plotting the same dataset against several
+        partners in one figure (plot_pairwise_grid(), plot_param_grid_by_
+        dependency()) pass a shared `lims` instead -- otherwise the same
+        dataset's axis silently differs panel to panel, since each panel's
+        auto-range only reflects whichever (possibly different) gene subset
+        that particular pair/category happens to share.
     """
     colA, colB = _col(param, name_a), _col(param, name_b)
     for c in (colA, colB):
@@ -295,20 +442,57 @@ def scatter_param(
         keep_cols.append(color_by)
     sub = merged[keep_cols].replace([np.inf, -np.inf], np.nan).dropna(subset=[colA, colB]).copy()
 
+    is_categorical = (color_by and color_by in sub.columns
+                       and not pd.api.types.is_numeric_dtype(sub[color_by]))
+    if exclude_categories and is_categorical:
+        sub = sub[~sub[color_by].isin(exclude_categories)]
+
     if ax is None:
         _, ax = plt.subplots(figsize=(4.2, 4.2))
     fig = ax.figure
 
-    if color_by and color_by in sub.columns and sub[color_by].notna().any():
-        c = sub[color_by].values
-        order = np.argsort(np.abs(np.nan_to_num(c - vcenter, nan=0.0)))
-        sub = sub.iloc[order]
-        c = sub[color_by].values
-        vmax = np.nanmax(np.abs(c))
-        vmax = vmax if (vmax and np.isfinite(vmax) and vmax > 0) else 1.0
-        norm = TwoSlopeNorm(vcenter=vcenter, vmin=-vmax, vmax=vmax)
-        sc = ax.scatter(sub[colA], sub[colB], c=c, cmap=cmap, norm=norm,
-                         s=s, alpha=alpha, edgecolor='none')
+    if is_categorical and sub[color_by].notna().any():
+        # Categorical coloring (e.g. merge_pair()'s dependency_category) --
+        # one color + legend entry per distinct value, not a colorbar.
+        # name_a/name_b (this call's actual dataset names) get fixed slots
+        # in the palette since dependency_category's values ARE name_a/
+        # name_b/'both'/'neither' -- any other categorical column falls
+        # back to a generic palette by first-seen order.
+        palette = {name_a: '#4c72b0', name_b: '#dd8452', 'both': '#55a868', 'neither': '#bbbbbb'}
+        _extra_colors = plt.cm.tab10(np.linspace(0, 1, 10))
+        seen_order = list(dict.fromkeys(sub[color_by].dropna()))
+        for cat in seen_order:
+            if cat not in palette:
+                palette[cat] = _extra_colors[len(palette) % 10]
+        for cat in seen_order:
+            m = (sub[color_by] == cat).values
+            ax.scatter(sub.loc[m, colA], sub.loc[m, colB], color=palette[cat],
+                       s=s, alpha=alpha, edgecolor='none', label=f'{cat} (n={int(m.sum())})')
+        ax.legend(fontsize=7, frameon=False, loc='lower right')
+    elif color_by and color_by in sub.columns and sub[color_by].notna().any():
+        c_all = sub[color_by].values
+        if np.nanmin(c_all) >= 0:
+            # Non-negative color column (e.g. merge_pair()'s
+            # min_abs_observed_log2fc) -- a magnitude, not a signed
+            # quantity, so plain sequential coloring from 0 rather than a
+            # diverging colormap centered at vcenter (which would waste
+            # half its range on data that never goes negative).
+            order = np.argsort(c_all)
+            sub = sub.iloc[order]
+            c = sub[color_by].values
+            vmax = np.nanmax(c)
+            vmax = vmax if (vmax and np.isfinite(vmax) and vmax > 0) else 1.0
+            sc = ax.scatter(sub[colA], sub[colB], c=c, cmap='viridis', vmin=0, vmax=vmax,
+                             s=s, alpha=alpha, edgecolor='none')
+        else:
+            order = np.argsort(np.abs(np.nan_to_num(c_all - vcenter, nan=0.0)))
+            sub = sub.iloc[order]
+            c = sub[color_by].values
+            vmax = np.nanmax(np.abs(c))
+            vmax = vmax if (vmax and np.isfinite(vmax) and vmax > 0) else 1.0
+            norm = TwoSlopeNorm(vcenter=vcenter, vmin=-vmax, vmax=vmax)
+            sc = ax.scatter(sub[colA], sub[colB], c=c, cmap=cmap, norm=norm,
+                             s=s, alpha=alpha, edgecolor='none')
         cbar = fig.colorbar(sc, ax=ax, shrink=0.85)
         cbar.set_label(color_by, fontsize=8)
     else:
@@ -325,11 +509,12 @@ def scatter_param(
             # happily stack the legend right on top of it.
             ax.legend(fontsize=7, frameon=False, loc='lower right')
 
-    if len(sub):
+    if lims is None and len(sub):
         lo = min(sub[colA].min(), sub[colB].min())
         hi = max(sub[colA].max(), sub[colB].max())
         pad = 0.05 * (hi - lo if hi > lo else max(abs(hi), 1.0))
         lims = (lo - pad, hi + pad)
+    if lims is not None:
         if diag:
             ax.plot(lims, lims, ls='--', color='#999999', lw=1, zorder=0)
         ax.set_xlim(lims)
@@ -339,9 +524,11 @@ def scatter_param(
     ax.axvline(0, color='#cccccc', lw=0.8, zorder=0)
 
     if annotate_corr and len(sub) >= 3:
-        r, _ = scipy_stats.pearsonr(sub[colA], sub[colB])
-        rho, _ = scipy_stats.spearmanr(sub[colA], sub[colB])
-        ax.text(0.03, 0.97, f"n={len(sub)}\nPearson r={r:.2f}\nSpearman ρ={rho:.2f}",
+        r, r_p = scipy_stats.pearsonr(sub[colA], sub[colB])
+        rho, rho_p = scipy_stats.spearmanr(sub[colA], sub[colB])
+        _fmt_p = lambda p: f"{p:.1e}" if p < 1e-3 else f"{p:.3f}"  # noqa: E731
+        ax.text(0.03, 0.97,
+                f"n={len(sub)}\nPearson r={r:.2f} (p={_fmt_p(r_p)})\nSpearman ρ={rho:.2f} (p={_fmt_p(rho_p)})",
                 transform=ax.transAxes, va='top', ha='left', fontsize=7.5,
                 bbox=dict(boxstyle='round', fc='white', ec='none', alpha=0.7))
 
@@ -372,24 +559,31 @@ def plot_obs_log2fc(
 def plot_param_grid(
     merged: pd.DataFrame, name_a: str, name_b: str, cis_gene: str,
     *, params: Optional[Iterable[str]] = None,
-    color_by_param: Optional[str] = 'observed_log2fc',
+    color_by_param: Optional[str] = 'dependency_category',
     color_dataset: Optional[str] = None,
     highlight_col: Optional[str] = None,
+    exclude_categories: Optional[Sequence[str]] = ('neither',),
     ncols: int = 2,
     figsize_per: Tuple[float, float] = (3.8, 3.8),
 ) -> plt.Figure:
     """Grid of parameter-comparison scatter plots (one per parameter in
-    `params`), each colored+sorted by `color_by_param` from `color_dataset`
-    (default: dataset A's observed_log2fc) so large-effect genes stand out.
+    `params`), each colored by `color_by_param`. Default 'dependency_category'
+    (see merge_pair()) colors by whether each gene is dependent in `name_a`
+    only, `name_b` only, or both -- and (via `exclude_categories`) drops
+    genes dependent in neither entirely, rather than plotting them uncolored.
+    Pass a numeric logical param name from PARAM_ALIASES instead (e.g.
+    'min_abs_observed_log2fc', resolved against `color_dataset` for a
+    per-dataset one) for continuous coloring -- `exclude_categories` is a
+    no-op there (only applies to categorical `color_by`, see scatter_param()).
     """
     params = list(params) if params is not None else DEFAULT_GRID_PARAMS
     color_dataset = color_dataset or name_a
-    color_col = _col(color_by_param, color_dataset) if color_by_param else None
+    color_col = _resolve_color_col(merged, color_by_param, color_dataset)
     if color_col and color_col not in merged.columns:
         print(f"[plot_param_grid] color_by column {color_col!r} not found -- plotting uncolored.")
         color_col = None
 
-    if highlight_col is None:
+    if highlight_col is None and color_col != 'dependency_category':
         cand = f'is_dependent_{name_a}'
         highlight_col = cand if cand in merged.columns else None
 
@@ -408,7 +602,7 @@ def plot_param_grid(
     for ax, p in zip(axes, avail):
         try:
             scatter_param(merged, p, name_a, name_b, ax=ax, color_by=color_col,
-                          highlight_col=highlight_col, title=p)
+                          highlight_col=highlight_col, title=p, exclude_categories=exclude_categories)
         except KeyError as e:
             ax.text(0.5, 0.5, str(e), ha='center', va='center', wrap=True, fontsize=7)
             ax.axis('off')
@@ -416,19 +610,126 @@ def plot_param_grid(
     for ax in axes[len(avail):]:
         ax.axis('off')
 
-    subtitle = f'colored by {color_by_param} ({color_dataset})' if color_col else 'uncolored'
+    subtitle = (f'colored by {color_col}' if (color_col and color_col == color_by_param)
+                else f'colored by {color_by_param} ({color_dataset})' if color_col else 'uncolored')
     fig.suptitle(f'{cis_gene}: {name_a} vs {name_b} trans-fit parameters ({subtitle})', fontsize=11)
+    return fig
+
+
+def plot_param_grid_by_dependency(
+    merged: pd.DataFrame, name_a: str, name_b: str, cis_gene: str,
+    *, params: Optional[Iterable[str]] = None,
+    color_by_param: Optional[str] = 'min_abs_observed_log2fc',
+    color_dataset: Optional[str] = None,
+    figsize_per: Tuple[float, float] = (3.4, 3.4),
+    shared_lims: bool = True,
+) -> plt.Figure:
+    """Like plot_param_grid(), but split into 4 rows by dependency category
+    instead of one combined scatter per parameter -- the 2x2 partition of
+    is_dependent_{name_a} x is_dependent_{name_b}:
+
+      row 0: dependent in `name_a` only
+      row 1: dependent in `name_b` only
+      row 2: dependent in both
+      row 3: dependent in neither
+
+    Columns are `params` (default: observed_log2fc + DEFAULT_GRID_PARAMS,
+    matching compare_cis_gene_grid()'s convention -- plot_param_grid()
+    itself defaults to DEFAULT_GRID_PARAMS alone since it has a dedicated
+    plot_obs_log2fc() for observed_log2fc; this one folds it in since
+    row-splitting on dependency already makes each panel a fairly different
+    view of it). Each row's y-axis label is prefixed with its category name
+    and gene count. No highlight_col -- the row itself already encodes
+    dependency, so an is_dependent outline would be redundant here.
+
+    shared_lims : bool
+        If True (default), every row uses the SAME axis range for a given
+        parameter (computed from the FULL `merged`, not just that row's
+        category subset) -- same rationale as plot_pairwise_grid()'s
+        `shared_lims`: each row is only ~1/4 of the genes, often skewed
+        toward a very different value range (e.g. "dependent in neither"
+        clusters near 0), so letting each row auto-scale independently would
+        make the SAME parameter's axis silently differ row to row. Pass
+        False for the old independently-scaled-per-row behavior.
+    """
+    params = list(params) if params is not None else ['observed_log2fc'] + DEFAULT_GRID_PARAMS
+    color_dataset = color_dataset or name_a
+
+    dep_a_col, dep_b_col = f'is_dependent_{name_a}', f'is_dependent_{name_b}'
+    for c in (dep_a_col, dep_b_col):
+        if c not in merged.columns:
+            raise KeyError(
+                f"{c!r} not in `merged` -- is_dependent must be present for both {name_a!r} "
+                f"and {name_b!r} (written by save_trans_summary(); see load_trans_summary())."
+            )
+    dep_a = merged[dep_a_col].fillna(False).astype(bool)
+    dep_b = merged[dep_b_col].fillna(False).astype(bool)
+
+    categories = [
+        (f'dependent in {name_a} only', dep_a & ~dep_b),
+        (f'dependent in {name_b} only', ~dep_a & dep_b),
+        ('dependent in both', dep_a & dep_b),
+        ('dependent in neither', ~dep_a & ~dep_b),
+    ]
+
+    avail = [p for p in params if _col(p, name_a) in merged.columns and _col(p, name_b) in merged.columns]
+    missing = [p for p in params if p not in avail]
+    if missing:
+        print(f"[plot_param_grid_by_dependency] {cis_gene}: skipping unavailable params: {missing}")
+
+    ncols = max(len(avail), 1)
+    nrows = len(categories)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows),
+                              constrained_layout=True, squeeze=False)
+
+    # Per-parameter (not per-row) so column j's axis is the same down all 4
+    # rows -- computed from the FULL merged, not each row's own category
+    # subset (see shared_lims's docstring).
+    col_lims = {}
+    if shared_lims:
+        for p in avail:
+            colA, colB = _col(p, name_a), _col(p, name_b)
+            vals = pd.concat([merged[colA], merged[colB]]).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(vals):
+                lo, hi = float(vals.min()), float(vals.max())
+                pad = 0.05 * (hi - lo if hi > lo else max(abs(hi), 1.0))
+                col_lims[p] = (lo - pad, hi + pad)
+
+    for i, (label, mask) in enumerate(categories):
+        sub_merged = merged.loc[mask]
+        n = int(mask.sum())
+        color_col = _resolve_color_col(sub_merged, color_by_param, color_dataset)
+        if color_col and color_col not in sub_merged.columns:
+            color_col = None
+        for j, p in enumerate(avail):
+            ax = axes[i][j]
+            if n == 0:
+                ax.text(0.5, 0.5, 'no genes', ha='center', va='center', fontsize=8, color='#999999')
+                ax.axis('off')
+                continue
+            try:
+                scatter_param(sub_merged, p, name_a, name_b, ax=ax, color_by=color_col,
+                              title=p if i == 0 else None, lims=col_lims.get(p))
+            except KeyError as e:
+                ax.text(0.5, 0.5, str(e), ha='center', va='center', wrap=True, fontsize=7)
+                ax.axis('off')
+        # Harmless no-op if this row's first ax got axis('off') above (n==0
+        # or a KeyError) -- an invisible ylabel on a hidden axis.
+        first_ax = axes[i][0]
+        first_ax.set_ylabel(f'{label} (n={n})\n\n{first_ax.get_ylabel()}', fontsize=8)
+
+    fig.suptitle(f'{cis_gene}: {name_a} vs {name_b} by dependency category', fontsize=11)
     return fig
 
 
 def compare_cis_gene(
     spec_a: DatasetSpec, spec_b: DatasetSpec, cis_gene: str,
     *, out_dir: Optional[str] = None, params: Optional[Iterable[str]] = None,
-    color_by_param: str = 'observed_log2fc', save: bool = True,
+    color_by_param: str = 'dependency_category', save: bool = True,
 ) -> Tuple[pd.DataFrame, plt.Figure, plt.Figure]:
     """Load both datasets' trans summaries for `cis_gene`, merge on gene
     symbol, and produce (1) the observed_log2FC scatter and (2) a grid of
-    other parameters colored/sorted by observed_log2FC.
+    other parameters colored by dependency category (see plot_param_grid()).
 
     Returns (merged_df, fig_obs_log2fc, fig_param_grid).
     """
@@ -443,9 +744,14 @@ def compare_cis_gene(
     fig_obs, ax_obs = plt.subplots(figsize=(4.4, 4.4))
     plot_obs_log2fc(merged, spec_a.name, spec_b.name, cis_gene, ax=ax_obs, highlight_col=highlight_col)
 
+    # highlight_col dropped for the grid specifically when color_by_param is
+    # the categorical dependency coloring -- it would just fight that
+    # legend with a redundant is_dependent outline (plot_param_grid()'s own
+    # auto-skip only applies when highlight_col is left None, not passed
+    # explicitly, so it's handled here instead).
     fig_grid = plot_param_grid(merged, spec_a.name, spec_b.name, cis_gene, params=params,
                                 color_by_param=color_by_param, color_dataset=spec_a.name,
-                                highlight_col=highlight_col)
+                                highlight_col=(None if color_by_param == 'dependency_category' else highlight_col))
 
     if save and out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -492,13 +798,35 @@ def load_all(specs: List[DatasetSpec], cis_gene: str) -> Dict[str, pd.DataFrame]
     return {s.name: load_trans_summary(s, cis_gene) for s in specs}
 
 
+def _global_param_lims(dfs: Dict[str, pd.DataFrame], param: str) -> Optional[Tuple[float, float]]:
+    """(lo, hi) axis range spanning `param`'s FULL values across every
+    dataset in `dfs` -- each dataset's own logical column, before any
+    pairwise merge/intersection. See scatter_param()'s `lims` docstring for
+    why plot_pairwise_grid()/plot_param_grid_by_dependency() anchor every
+    panel to this instead of letting each one size itself from just its own
+    (possibly much smaller, possibly differently-distributed) shared-gene
+    subset.
+    """
+    vals = [d[param].replace([np.inf, -np.inf], np.nan).dropna()
+            for d in dfs.values() if param in d.columns]
+    vals = [v for v in vals if len(v)]
+    if not vals:
+        return None
+    allv = pd.concat(vals)
+    lo, hi = float(allv.min()), float(allv.max())
+    pad = 0.05 * (hi - lo if hi > lo else max(abs(hi), 1.0))
+    return (lo - pad, hi + pad)
+
+
 def plot_pairwise_grid(
     dfs: Dict[str, pd.DataFrame], param: str, cis_gene: str = '',
-    *, color_by_param: Optional[str] = 'observed_log2fc',
+    *, color_by_param: Optional[str] = 'dependency_category',
     color_dataset: Optional[str] = None,
     highlight_by: Optional[str] = 'is_dependent',
+    exclude_categories: Optional[Sequence[str]] = ('neither',),
     ncols: Optional[int] = None,
     figsize_per: Tuple[float, float] = (3.8, 3.8),
+    shared_lims: bool = True,
 ) -> plt.Figure:
     """One scatter_param() subplot per unique pair of datasets in `dfs`
     (e.g. 3 datasets -> 3 subplots: A-B, A-C, B-C), all for the same `param`.
@@ -506,11 +834,25 @@ def plot_pairwise_grid(
     merge_pair() -- a pair not involving Domingo will merge on Ensembl ID,
     so don't expect the same point count in every panel.
 
-    color_by_param/color_dataset/highlight_by are the same idea as
-    plot_param_grid(), applied per-pair -- `color_dataset` defaults to
-    whichever dataset in the pair comes first (alphabetically among the
-    pair, not globally), so it's always one of the two actually being
-    plotted in that panel.
+    color_by_param/color_dataset/highlight_by/exclude_categories are the
+    same idea as plot_param_grid(), applied per-pair -- default
+    'dependency_category' colors by whether each gene is dependent in the
+    pair's first dataset only, second only, or both, dropping "neither"
+    entirely (via `exclude_categories`). Passing a numeric logical param
+    name instead falls back to the old per-pair single-dataset continuous
+    coloring, resolved against whichever dataset in the pair comes first
+    alphabetically (not globally) unless `color_dataset` is set.
+
+    shared_lims : bool
+        If True (default), every subplot uses the SAME axis range (see
+        _global_param_lims()) -- so e.g. Domingo's axis in the Domingo-vs-
+        Morris panel matches its axis in the Domingo-vs-Replogle panel,
+        rather than each panel independently sizing to just the genes THAT
+        pair happens to share (Domingo intersected with Morris covers a
+        different ~88 genes than Domingo intersected with Replogle's ~73,
+        so the "same" dataset's auto-range would otherwise silently differ
+        panel to panel -- actively misleading for a side-by-side read).
+        Pass False for the old independently-scaled-per-panel behavior.
     """
     names = sorted(dfs)
     pairs = list(combinations(names, 2))
@@ -521,18 +863,21 @@ def plot_pairwise_grid(
                               constrained_layout=True, squeeze=False)
     axes = axes.ravel()
 
+    lims = _global_param_lims(dfs, param) if shared_lims else None
+
     for ax, (a, b) in zip(axes, pairs):
         try:
             merged = merge_pair(dfs[a], dfs[b], a, b)
             cd = color_dataset or a
-            color_col = _col(color_by_param, cd) if color_by_param else None
+            color_col = _resolve_color_col(merged, color_by_param, cd)
             if color_col and color_col not in merged.columns:
                 color_col = None
-            highlight_col = f'{highlight_by}_{a}' if highlight_by else None
+            highlight_col = f'{highlight_by}_{a}' if (highlight_by and color_col != 'dependency_category') else None
             if highlight_col and highlight_col not in merged.columns:
                 highlight_col = None
             scatter_param(merged, param, a, b, ax=ax, color_by=color_col,
-                          highlight_col=highlight_col, title=f'{a} vs {b}')
+                          highlight_col=highlight_col, title=f'{a} vs {b}', lims=lims,
+                          exclude_categories=exclude_categories)
         except (KeyError, ValueError) as e:
             ax.text(0.5, 0.5, str(e), ha='center', va='center', wrap=True, fontsize=7)
             ax.axis('off')
@@ -547,11 +892,15 @@ def plot_pairwise_grid(
 def compare_cis_gene_grid(
     specs: List[DatasetSpec], cis_gene: str,
     *, params: Optional[Iterable[str]] = None, out_dir: Optional[str] = None,
-    color_by_param: str = 'observed_log2fc', save: bool = True,
+    color_by_param: str = 'dependency_category', save: bool = True,
+    shared_lims: bool = True,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, plt.Figure]]:
     """N-way version of compare_cis_gene(): load every spec's summary once,
     then produce one pairwise-grid figure per parameter in `params`
     (default: observed_log2fc + DEFAULT_GRID_PARAMS).
+
+    shared_lims : see plot_pairwise_grid()'s docstring -- default True keeps
+    each dataset's axis consistent across every panel it appears in.
 
     Returns (dfs_by_name, {param: figure}).
     """
@@ -563,7 +912,7 @@ def compare_cis_gene_grid(
 
     figs = {}
     for param in params:
-        fig = plot_pairwise_grid(dfs, param, cis_gene, color_by_param=color_by_param)
+        fig = plot_pairwise_grid(dfs, param, cis_gene, color_by_param=color_by_param, shared_lims=shared_lims)
         figs[param] = fig
         if save and out_dir:
             tag = '_'.join(sorted(dfs))
@@ -575,7 +924,8 @@ def compare_cis_gene_grid(
 def compare_all_cis_genes_grid(
     datasets: Optional[List[DatasetSpec]] = None, bounding_dataset: Optional[DatasetSpec] = None,
     *, params: Optional[Iterable[str]] = None, out_dir: Optional[str] = None,
-    color_by_param: str = 'observed_log2fc', save: bool = True, close_figs: bool = True,
+    color_by_param: str = 'dependency_category', save: bool = True, close_figs: bool = True,
+    shared_lims: bool = True,
 ) -> Dict[str, Tuple[Dict[str, pd.DataFrame], Dict[str, plt.Figure]]]:
     """Automates compare_cis_gene_grid() across every cis gene in
     `bounding_dataset.cis_genes` (default: the first of `datasets`, i.e.
@@ -604,7 +954,8 @@ def compare_all_cis_genes_grid(
         print(f"=== {cis_gene}: {[s.name for s in participating]} ===")
         gene_out = os.path.join(out_dir, cis_gene) if out_dir else None
         dfs, figs = compare_cis_gene_grid(participating, cis_gene, params=params,
-                                          out_dir=gene_out, color_by_param=color_by_param, save=save)
+                                          out_dir=gene_out, color_by_param=color_by_param, save=save,
+                                          shared_lims=shared_lims)
         results[cis_gene] = (dfs, figs)
         if close_figs:
             for fig in figs.values():

@@ -22,6 +22,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import pandas as pd
+
 
 # ── Cell-line colour palettes for dose-response data points ──────────────────
 # (passed as `color_palette=` to plot_xy_data's `color_by='cell_line'`)
@@ -162,6 +164,86 @@ REPLOGLE_GENE_TO_ID = {
     'TET2':  'ENSG00000168769',
     'IKZF1': 'ENSG00000185811',
 }
+
+
+# ── Manual identifier corrections ─────────────────────────────────────────────
+# Small, hand-curated fixes for real annotation mismatches found while
+# investigating why a Domingo-vs-Replogle gene overlap was smaller than
+# Domingo-vs-Morris (comparative/trans_param_compare.py's load_trans_summary()
+# applies both of these before any cross-dataset symbol-based merge). Extend
+# as more are found -- e.g. by diffing gene_symbol sets across datasets.
+
+# symbol -> symbol: alternate/historical gene names for the SAME gene that
+# appear as different strings in different datasets' own annotation, so a
+# plain symbol-based merge treats them as two different genes. Confirmed
+# 2026-08-27: Domingo's panel uses 'CFAP210', Morris's uses the newer
+# official symbol 'CCDC173', for the same gene.
+GENE_SYMBOL_SYNONYMS = {
+    'CFAP210': 'CCDC173',
+}
+
+# symbol -> the ONE Ensembl ID it should resolve to, for a symbol that maps
+# to multiple distinct Ensembl IDs within Replogle's own panel (segmental-
+# duplication annotation artifacts). Without this, load_trans_summary()'s
+# ambiguous-symbol guard nulls the symbol out entirely for EVERY row sharing
+# it, dropping a real, resolvable gene from any symbol-based cross-dataset
+# comparison rather than just the genuinely-ambiguous other row(s). Confirmed
+# 2026-08-27 (both previously caused HSPA14/TBCE to drop out of the
+# Domingo-vs-Replogle comparison entirely).
+REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID = {
+    'HSPA14': 'ENSG00000187522',
+    'TBCE':   'ENSG00000284770',
+}
+
+
+# ── Cross-dataset gene identifier map (transcriptome-wide) ───────────────────
+# dose_response_panels.py needs to match trans genes across Domingo/Morris
+# (feature identity IS the gene symbol) and Replogle (feature identity IS the
+# Ensembl gene ID) for its whole shared trans panel, not just the 7 cis genes
+# REPLOGLE_GENE_TO_ID covers above. Built from Morris's own transcriptome-wide
+# gene_meta.csv rather than Domingo's or Replogle's own feature_meta: Ensembl
+# IDs are unique, gene symbols aren't (multiple IDs can share a symbol --
+# pseudogenes, readthrough transcripts), so matching on the unique key and
+# treating ambiguous symbols as unmappable is the safer direction. This
+# mirrors the identical id_to_name/name_to_id pattern already used in
+# publication_runs/morris/generate_slurm.py's _select_cis_genes() (there, for
+# one cis gene at a time); this generalises it to the whole panel and caches
+# it once per process.
+MORRIS_GENE_META_PATH = (
+    '/cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Morris2023/'
+    'processed_Leah/for_bayesDREAM/preprocessed/gene_meta.csv'
+)
+
+_morris_id_symbol_cache: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _load_morris_id_symbol_maps() -> Dict[str, Dict[str, str]]:
+    """Lazily load + cache {'id_to_symbol', 'symbol_to_id'} from
+    MORRIS_GENE_META_PATH. id_to_symbol is unambiguous (gene_id is a unique
+    key). symbol_to_id drops any symbol mapping to more than one distinct
+    gene_id (left unmappable) rather than picking one arbitrarily -- callers
+    should treat a missing symbol as "can't be matched across datasets", not
+    an error.
+    """
+    global _morris_id_symbol_cache
+    if _morris_id_symbol_cache is None:
+        fm = pd.read_csv(MORRIS_GENE_META_PATH)
+        id_to_symbol = dict(zip(fm['gene_id'], fm['gene_name']))
+        symbol_counts = fm['gene_name'].value_counts()
+        ambiguous = set(symbol_counts[symbol_counts > 1].index)
+        symbol_to_id = {sym: gid for gid, sym in id_to_symbol.items() if sym not in ambiguous}
+        _morris_id_symbol_cache = {'id_to_symbol': id_to_symbol, 'symbol_to_id': symbol_to_id}
+    return _morris_id_symbol_cache
+
+
+def morris_symbol_to_id() -> Dict[str, str]:
+    """Gene symbol -> Ensembl gene ID (see _load_morris_id_symbol_maps())."""
+    return _load_morris_id_symbol_maps()['symbol_to_id']
+
+
+def morris_id_to_symbol() -> Dict[str, str]:
+    """Ensembl gene ID -> gene symbol (see _load_morris_id_symbol_maps())."""
+    return _load_morris_id_symbol_maps()['id_to_symbol']
 
 
 # ── Concrete dataset specs ────────────────────────────────────────────────────

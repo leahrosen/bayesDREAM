@@ -48,15 +48,30 @@ from scipy.stats import gaussian_kde
 
 from bayesDREAM import bayesDREAM
 from bayesDREAM.plotting.xy_plots import predict_hill_from_summary_row
-from .datasets import DatasetSpec
+from .datasets import DatasetSpec, morris_symbol_to_id, morris_id_to_symbol
 
 
 # ── Loading ────────────────────────────────────────────────────────────────
 
-def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[str] = None) -> "bayesDREAM":
+def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[str] = None,
+                              lean: bool = False) -> "bayesDREAM":
     """Re-initialise a bayesDREAM model from files written by
     save_model_for_plotting() (save_for_plotting.py) and load the fitted
     NTC/cis/trans parameters.
+
+    lean : bool
+        Passed straight through to load_ntc_fit()/load_cis_fit()/
+        load_trans_fit() -- collapses each posterior to point estimates
+        (median + `<key>_lower`/`<key>_upper`) instead of keeping the full
+        multi-sample tensors, cutting peak memory substantially for Morris/
+        Replogle's large transcriptome-wide panels (real prior OOM kill for
+        exactly this, on Replogle's shared NTC fit -- see
+        reconstruct_export_replogle.py's reconstruct_model() comment).
+        save_trans_summary()'s own extract_param() already degrades
+        gracefully on a lean (no-sample-axis) array -- point estimate used
+        for median/lower/upper alike, i.e. the fitted curve itself is
+        unaffected, but plot_xy_data's shaded uncertainty band around it
+        will render zero-width. Default False (unchanged behavior).
     """
     save_dir = spec.plotting_save_dir(cis_gene)
 
@@ -116,9 +131,9 @@ def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[s
 
     model = bayesDREAM(**model_kwargs)
 
-    model.load_ntc_fit(input_dir=save_dir)
-    model.load_cis_fit(input_dir=save_dir)
-    model.load_trans_fit(input_dir=save_dir)
+    model.load_ntc_fit(input_dir=save_dir, lean=lean)
+    model.load_cis_fit(input_dir=save_dir, lean=lean)
+    model.load_trans_fit(input_dir=save_dir, lean=lean)
 
     sf_path = os.path.join(save_dir, 'sum_factors_plot.csv')
     if os.path.exists(sf_path):
@@ -173,17 +188,33 @@ def resolve_sum_factor_col(spec: DatasetSpec, model: "bayesDREAM") -> str:
     return pick_sum_factor_col(model)
 
 
-def allsig_copy(summary: pd.DataFrame) -> pd.DataFrame:
+def allsig_copy(summary: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     """Copy of a trans summary with FDR columns zeroed (so the Hill shape
-    always draws, not just FDR-significant features) and gene_name forced to
+    always draws, not just FDR-significant features), gene_name forced to
     equal feature (feature_meta merges can otherwise populate gene_name with
     a non-matching identifier, e.g. an Ensembl ID for Replogle, breaking the
-    reference_df lookup used by plot_xy_data's overlay).
+    reference_df lookup used by plot_xy_data's overlay), and a 'gene_id'
+    (Ensembl) column attached for cross-dataset matching.
+
+    'gene_id' is what compare_datasets()/make_panel() actually intersect and
+    look genes up by -- Domingo/Morris's own 'feature' column already IS the
+    gene symbol (spec.symbol_col == 'feature'), so 'gene_id' is translated
+    via comparative.datasets.morris_symbol_to_id() (the master symbol->
+    Ensembl-ID map, built from Morris's transcriptome-wide gene_meta.csv --
+    see its docstring for why that source, not Domingo's or Replogle's own
+    feature_meta). Replogle's 'feature' already IS the Ensembl ID, so
+    'gene_id' is just a copy of it. A Domingo/Morris gene whose symbol isn't
+    in the map (ambiguous, or absent from Morris's panel) gets NaN --
+    excluded from any cross-dataset intersection, same as a real mismatch.
     """
     out = summary.copy()
     for col in [c for c in out.columns if c.startswith('fdr_')]:
         out[col] = 0.0
     out['gene_name'] = out['feature']
+    if spec.symbol_col == 'feature':
+        out['gene_id'] = out['feature'].map(morris_symbol_to_id())
+    else:
+        out['gene_id'] = out['feature']
     return out
 
 
@@ -249,16 +280,34 @@ def _overlay_extra_curve(ax: plt.Axes, ref_row: pd.Series, spec: DatasetSpec,
     return True
 
 
-def _lookup_row(summary_allsig: pd.DataFrame, goi: str) -> Optional[pd.Series]:
-    match = summary_allsig.loc[summary_allsig['gene_name'] == goi]
+def _lookup_row(summary_allsig: pd.DataFrame, gene_id: str) -> Optional[pd.Series]:
+    """`gene_id` is the canonical Ensembl ID (see allsig_copy()) -- matching
+    on this instead of 'gene_name'/'feature' is what makes this work across
+    Domingo/Morris (symbol-indexed) and Replogle (Ensembl-ID-indexed) at
+    once.
+    """
+    match = summary_allsig.loc[summary_allsig['gene_id'] == gene_id]
     return match.iloc[0] if not match.empty else None
+
+
+def _native_feature(summary_allsig: pd.DataFrame, gene_id: str) -> Optional[str]:
+    """This dataset's OWN feature identifier for `gene_id` (Ensembl) -- the
+    symbol for Domingo/Morris, the Ensembl ID itself for Replogle.
+    plot_xy_data()/_get_feature_index() (bayesDREAM/plotting/xy_plots.py)
+    resolve features by a model's own native identifier and explicitly do
+    NOT check 'gene_name'/'gene_id' columns, so the canonical `gene_id` used
+    for cross-dataset matching must be translated back to this before being
+    handed to model.plot_xy_data().
+    """
+    row = _lookup_row(summary_allsig, gene_id)
+    return None if row is None else row['feature']
 
 
 def make_panel(
     goi: str,
     specs: List[DatasetSpec], models: list, summaries_allsig: List[pd.DataFrame], sfcols: List[str],
     *, cis_gene: str, show_param_markers: bool = True, fdr_threshold: float = 0.05,
-    figsize_per: Tuple[float, float] = (3.6, 3.0),
+    figsize_per: Tuple[float, float] = (3.6, 3.0), display_name: Optional[str] = None,
 ) -> Tuple[plt.Figure, Tuple[float, float]]:
     """2xN panel (N = len(specs)): row 0 is each dataset standalone (own data
     + own curve, with fitted-parameter markers if show_param_markers); row 1
@@ -266,12 +315,36 @@ def make_panel(
     dataset's curve overlaid on top (so for N=3, up to 2 extra curves per
     row-1 subplot). For N=2 this reduces to the original 2x2 design.
 
+    `goi` is the canonical gene_id (Ensembl -- see allsig_copy()), not a raw
+    'feature'/symbol: a single shared identifier can't be handed directly to
+    every dataset's model (Domingo/Morris resolve features by symbol,
+    Replogle by Ensembl ID), so it's translated to each dataset's own native
+    identifier via _native_feature() before being passed to plot_xy_data().
+    Raises KeyError if `goi` is missing from any of `specs` -- shouldn't
+    happen when called from compare_datasets() (which only ever passes a
+    gene_id already confirmed present in every participating dataset's
+    summary), but is a real bug (not silently-droppable) if it does.
+
+    `display_name` (defaults to `goi` itself) is used for the figure title
+    only -- pass the human-readable symbol so a panel doesn't show a bare
+    Ensembl ID.
+
     show_param_markers controls whether row-0 standalone panels draw the
     fitted parameter markers (EC50/inflection/etc as small annotated lines)
     -- set False if they read as confusing next to the dataset-colour curves.
     """
     n = len(specs)
     assert n >= 2, "make_panel needs at least 2 datasets to compare"
+
+    native = [_native_feature(summaries_allsig[j], goi) for j in range(n)]
+    missing_j = [j for j, f in enumerate(native) if f is None]
+    if missing_j:
+        raise KeyError(
+            f"gene_id {goi!r} not present in {[specs[j].name for j in missing_j]}'s trans "
+            f"summary. make_panel() expects `goi` to already be a gene_id every dataset in "
+            f"`specs` shares -- compare_datasets() only calls this after intersecting on gene_id."
+        )
+
     fig, axes = plt.subplots(2, n, figsize=(figsize_per[0] * n, figsize_per[1] * 2),
                               constrained_layout=True, squeeze=False)
 
@@ -279,7 +352,7 @@ def make_panel(
 
     # Row 0: standalone (real per-dataset FDR gating, as usual).
     for j in range(n):
-        _plot_into(models[j], goi, axes[0][j], specs[j], sfcols[j], mark_params=mark)
+        _plot_into(models[j], native[j], axes[0][j], specs[j], sfcols[j], mark_params=mark)
         axes[0][j].set_title(specs[j].name)
 
     # Row 1: dataset j's own data + own curve (force-rendered regardless of
@@ -288,7 +361,7 @@ def make_panel(
     # plus every other dataset's curve manually overlaid on top.
     for j in range(n):
         ax = axes[1][j]
-        _plot_into(models[j], goi, ax, specs[j], sfcols[j], mark_params=False,
+        _plot_into(models[j], native[j], ax, specs[j], sfcols[j], mark_params=False,
                    fdr_df=summaries_allsig[j])
         overlaid_names = []
         for k in range(n):
@@ -325,7 +398,7 @@ def make_panel(
         ax.set_xlim(unified_x)
         ax.set_ylim(unified_y)
 
-    fig.suptitle(f'{cis_gene} → {goi}', fontsize=11, fontweight='bold')
+    fig.suptitle(f'{cis_gene} → {display_name or goi}', fontsize=11, fontweight='bold')
 
     # Single shared legend (dedup across all 2N subplots' own legends), then
     # drop the per-subplot ones so it isn't shown twice.
@@ -517,12 +590,20 @@ def compare_datasets(
     specs: List[DatasetSpec], cis_gene: str,
     *, out_dir: str = './dose_response_plots', genes: Optional[List[str]] = None,
     show_param_markers: bool = True, device: Optional[str] = None,
-    panel_figsize_per: Tuple[float, float] = (3.6, 3.0),
+    panel_figsize_per: Tuple[float, float] = (3.6, 3.0), lean: bool = False,
 ) -> List[str]:
     """Full pipeline for N (>=2) datasets: load all N models for `cis_gene`,
     summarise each, find trans genes present in *every* dataset's summary
     (or use `genes` if given), and write one 2xN panel PNG per gene plus one
     guide-density panel to `out_dir`. Panel width auto-scales with N.
+
+    Genes are matched across datasets by Ensembl gene_id, not raw 'feature'
+    -- Domingo/Morris's own 'feature' column already is the gene symbol,
+    Replogle's is the Ensembl ID itself; see allsig_copy()'s docstring for
+    how the two get reconciled via comparative.datasets.morris_symbol_to_id().
+    `genes`, if given, is also treated as a symbol/gene_id list and
+    translated the same way (an already-Ensembl-ID entry passes through
+    unchanged) -- pass real gene_ids directly if you already have them.
 
     Checks that every spec's save_model_for_plotting() export actually
     exists BEFORE loading any model -- so a missing dataset fails immediately
@@ -532,7 +613,13 @@ def compare_datasets(
     compare_all_domingo_cis_genes() (or pre-filter `specs` yourself via
     _missing_exports()).
 
-    Returns the list of trans genes actually plotted.
+    lean : bool
+        Passed through to load_model_for_plotting() for every dataset --
+        see its docstring for the memory/uncertainty-band tradeoff. Default
+        False (unchanged behavior).
+
+    Returns the list of trans genes actually plotted (display symbols, not
+    gene_ids).
     """
     assert len(specs) >= 2, "compare_datasets needs at least 2 datasets"
     names = [s.name for s in specs]
@@ -550,7 +637,7 @@ def compare_datasets(
     models = []
     for spec in specs:
         print(f"[{spec.name}] loading model for {cis_gene}...")
-        models.append(load_model_for_plotting(spec, cis_gene, device=device))
+        models.append(load_model_for_plotting(spec, cis_gene, device=device, lean=lean))
 
     sfcols = [resolve_sum_factor_col(s, m) for s, m in zip(specs, models)]
     for s, sf in zip(specs, sfcols):
@@ -562,27 +649,33 @@ def compare_datasets(
     for spec, model in zip(specs, models):
         print(f"[{spec.name}] summarising trans fit...")
         summaries.append(model.save_trans_summary(compute_lfc_ci=False, compute_derivative_roots=False))
-    summaries_allsig = [allsig_copy(s) for s in summaries]
+    summaries_allsig = [allsig_copy(s, spec) for s, spec in zip(summaries, specs)]
 
     if genes is None:
-        gene_sets = [set(s['feature']) for s in summaries]
-        genes = sorted(set.intersection(*gene_sets))
-    print(f"\n{' vs '.join(names)} ({cis_gene}): {len(genes)} trans genes to plot")
+        gene_sets = [set(s['gene_id'].dropna()) for s in summaries_allsig]
+        gene_ids = sorted(set.intersection(*gene_sets))
+    else:
+        sym_to_id = morris_symbol_to_id()
+        gene_ids = sorted({sym_to_id.get(g, g) for g in genes})
+    id_to_symbol = morris_id_to_symbol()
+    print(f"\n{' vs '.join(names)} ({cis_gene}): {len(gene_ids)} trans genes to plot")
 
     os.makedirs(out_dir, exist_ok=True)
 
     unified_x_all = None
     plotted = []
-    for i, goi in enumerate(genes, 1):
-        print(f"  [{i}/{len(genes)}] {goi}", end='', flush=True)
+    for i, gid in enumerate(gene_ids, 1):
+        display = id_to_symbol.get(gid, gid)
+        print(f"  [{i}/{len(gene_ids)}] {display}", end='', flush=True)
         fig, unified_x = make_panel(
-            goi, specs, models, summaries_allsig, sfcols,
+            gid, specs, models, summaries_allsig, sfcols,
             cis_gene=cis_gene, show_param_markers=show_param_markers, figsize_per=panel_figsize_per,
+            display_name=display,
         )
-        fig.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_{goi}_panel.png'),
+        fig.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_{display}_panel.png'),
                     dpi=150, bbox_inches='tight')
         plt.close(fig)
-        plotted.append(goi)
+        plotted.append(display)
         unified_x_all = unified_x if unified_x_all is None else (
             min(unified_x_all[0], unified_x[0]), max(unified_x_all[1], unified_x[1]))
         print("  done")
