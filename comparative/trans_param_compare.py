@@ -52,7 +52,10 @@ from scipy import stats as scipy_stats
 
 from bayesDREAM.plotting.xy_plots import predict_hill_from_summary_row
 
-from .datasets import DatasetSpec, GENE_SYMBOL_SYNONYMS, REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID
+from .datasets import (
+    DatasetSpec, DATASET_COLORS, DATASET_PAIR_COLORS, pair_color_key,
+    GENE_SYMBOL_SYNONYMS, REPLOGLE_AMBIGUOUS_SYMBOL_TO_ID,
+)
 
 
 # ── Logical parameter name -> candidate raw column names (first match wins) ──
@@ -458,7 +461,21 @@ def scatter_param(
         # in the palette since dependency_category's values ARE name_a/
         # name_b/'both'/'neither' -- any other categorical column falls
         # back to a generic palette by first-seen order.
-        palette = {name_a: '#4c72b0', name_b: '#dd8452', 'both': '#55a868', 'neither': '#bbbbbb'}
+        # Dataset-identity colors (DATASET_COLORS/DATASET_PAIR_COLORS) so
+        # e.g. Morris is always the same color whether it's name_a or
+        # name_b in this particular panel, and "both" is colored by WHICH
+        # pair is being compared (Domingo+Morris vs Domingo+Replogle vs
+        # Morris+Replogle), not one generic "both" color for all three.
+        # Falls back to the old positional blue/orange/green scheme for any
+        # name not in DATASET_COLORS (e.g. a new DatasetSpec not added
+        # there yet).
+        pair_key = pair_color_key(name_a, name_b)
+        palette = {
+            name_a: DATASET_COLORS.get(name_a, '#4c72b0'),
+            name_b: DATASET_COLORS.get(name_b, '#dd8452'),
+            'both': DATASET_PAIR_COLORS.get(pair_key, '#55a868'),
+            'neither': '#bbbbbb',
+        }
         _extra_colors = plt.cm.tab10(np.linspace(0, 1, 10))
         seen_order = list(dict.fromkeys(sub[color_by].dropna()))
         for cat in seen_order:

@@ -40,6 +40,24 @@ DATASET_COLORS = {
     'Replogle': '#a6761d',   # ochre / brown
 }
 
+# Fixed color per unordered pair of dataset names, for trans_param_compare.py's
+# categorical 'dependency_category' coloring (the "dependent in both" value) --
+# keyed by pair_color_key() so lookup doesn't care which dataset is name_a vs
+# name_b. Remaining unused slots from the same colorblind-safe ColorBrewer
+# "Dark2" 8-class palette DATASET_COLORS draws from (#d95f02 orange, #e7298a
+# pink/magenta, #66a61e green, #e6ab02 yellow, #666666 gray -- last one
+# deliberately unused here, reserved to avoid clashing with 'neither's gray).
+DATASET_PAIR_COLORS = {
+    'Domingo+Morris':   '#d95f02',   # orange
+    'Domingo+Replogle': '#e7298a',   # pink / magenta
+    'Morris+Replogle':  '#66a61e',   # green
+}
+
+
+def pair_color_key(name_a: str, name_b: str) -> str:
+    """Order-independent lookup key into DATASET_PAIR_COLORS."""
+    return '+'.join(sorted([name_a, name_b]))
+
 
 @dataclass
 class DatasetSpec:
