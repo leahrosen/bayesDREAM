@@ -37,6 +37,16 @@ Design notes
 - Cross-dataset EC50/inflection comparisons use the "_log2fc" (relative to
   each dataset's own NTC baseline) variants, not raw x_true units -- the
   two datasets' cis gene expression scales are not directly comparable.
+- load_trans_summary() (and everything built on it) defaults to
+  single_hill_only=True: only fit_type == 'single_hill' genes are kept
+  (additive_hill -- both components active -- and not_dependent are
+  dropped, along with polynomial-fit rows, which have no fit_type at all).
+  A Hill-B-only gene isn't dropped -- it's relabeled onto the SAME
+  'a'-suffixed columns a Hill-A-only gene uses (see
+  _swap_hill_ab_columns()), so every single-Hill gene compares via one
+  consistent column set regardless of which component was actually fit.
+  Pass single_hill_only=False to any of these functions for the old
+  unfiltered behavior.
 """
 
 import os
@@ -127,6 +137,52 @@ def _log2fc_sign(row: pd.Series) -> float:
     return 1.0 if diff > 0 else -1.0
 
 
+def _swap_hill_ab_columns(df: pd.DataFrame, mask: pd.Series) -> None:
+    """In-place, for rows where `mask` is True: swap every Hill-component-A
+    column with its component-B sibling (Vmax_a<->Vmax_b, K_a<->K_b,
+    n_a<->n_b, EC50_a_log2fc<->EC50_b_log2fc, inflection_a_*<->
+    inflection_b_*, ... plus the literal alpha/beta-named pairs that don't
+    follow that token pattern: component weight and FDR), then sets
+    'which_active' to 'a' for those rows.
+
+    Used by load_trans_summary()'s single_hill_only handling to relabel a
+    Hill-B-only gene onto the SAME 'a'-suffixed columns a Hill-A-only gene
+    uses, so every single-Hill gene is comparable via one consistent set of
+    columns (matching DEFAULT_GRID_PARAMS/PARAM_ALIASES, which only ever
+    look at "_a").
+
+    Column matching is token-based (split on '_', look for a standalone
+    'a'/'b' segment), not substring-based -- so the baseline 'A_median'/
+    'A_lower'/'A_upper' columns (capital A, the intercept, unrelated to
+    Hill component 'a') are never touched.
+    """
+    if not mask.any():
+        return
+
+    def _sibling(col: str) -> Optional[str]:
+        parts = col.split('_')
+        idx = [i for i, p in enumerate(parts) if p == 'a']
+        if len(idx) == 1:
+            parts[idx[0]] = 'b'
+            return '_'.join(parts)
+        return None
+
+    pairs = [(c, _sibling(c)) for c in df.columns]
+    pairs = [(a, b) for a, b in pairs if b is not None and b in df.columns]
+    pairs += [(a, b) for a, b in
+              [('alpha_median', 'beta_median'), ('alpha_lower', 'beta_lower'),
+               ('alpha_upper', 'beta_upper'), ('fdr_alpha', 'fdr_beta')]
+              if a in df.columns and b in df.columns]
+
+    for colA, colB in pairs:
+        a_vals = df.loc[mask, colA].copy()
+        df.loc[mask, colA] = df.loc[mask, colB].values
+        df.loc[mask, colB] = a_vals.values
+
+    if 'which_active' in df.columns:
+        df.loc[mask, 'which_active'] = 'a'
+
+
 def _resolve_color_col(merged: pd.DataFrame, color_by_param: Optional[str],
                         color_dataset: str) -> Optional[str]:
     """A column name already suffixed/cross-dataset (e.g.
@@ -157,7 +213,8 @@ def _standardize_params(df: pd.DataFrame, aliases: Dict[str, List[str]] = PARAM_
     return df
 
 
-def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional[str] = None) -> pd.DataFrame:
+def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional[str] = None,
+                        *, single_hill_only: bool = True) -> pd.DataFrame:
     """Load and standardize one dataset's trans_feature_summary_{modality}.csv
     for a given cis gene.
 
@@ -169,6 +226,18 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
       - canonical PARAM_ALIASES columns (see module docstring)
     Drops the cis gene's own row if present (is_cis_gene == True) -- it's
     not a trans feature and would otherwise show up as a spurious point.
+
+    single_hill_only : bool
+        If True (default), keep only fit_type == 'single_hill' rows
+        (dropping 'additive_hill' -- both components active -- and
+        'not_dependent', plus polynomial-fit rows, which have no
+        fit_type). A Hill-B-only gene (which_active == 'b') is NOT
+        dropped -- it's relabeled onto the SAME 'a'-suffixed columns a
+        Hill-A-only gene uses (see _swap_hill_ab_columns()), so every
+        single-Hill gene compares via one consistent set of columns
+        (n_a, Vmax_a, EC50_a_log2fc, ...) regardless of which component
+        actually carried the fit. Pass False to keep every fit_type
+        unfiltered and unrelabeled (the old behavior).
 
     Ambiguous symbols (see below) aside, low_memory=False avoids pandas'
     chunked dtype inference spuriously flagging mixed-type columns on a
@@ -260,6 +329,26 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
         df['is_dependent'] = df['is_dependent'].fillna(False).astype(bool)
     else:
         df['is_dependent'] = False
+
+    if single_hill_only:
+        if 'fit_type' not in df.columns or 'which_active' not in df.columns:
+            raise KeyError(
+                f"[{spec.name}] single_hill_only=True but 'fit_type'/'which_active' not found in "
+                f"{path!r} -- this summary predates that column (see bayesDREAM/io/summary.py), or "
+                f"function_type is polynomial (no Hill components at all). Re-run save_trans_summary() "
+                f"or pass single_hill_only=False."
+            )
+        n_before = len(df)
+        # Hill-B-only genes ARE single-Hill, just fit via component B --
+        # relabel onto the 'a' slot BEFORE _standardize_params() below, so
+        # the canonical n_a/Vmax_a/EC50_a_log2fc/... columns it derives
+        # already reflect the swap (see _swap_hill_ab_columns()).
+        b_only = (df['fit_type'] == 'single_hill') & (df['which_active'] == 'b')
+        n_relabeled = int(b_only.sum())
+        _swap_hill_ab_columns(df, b_only)
+        df = df.loc[df['fit_type'] == 'single_hill'].copy()
+        print(f"[{spec.name}] single_hill_only: kept {len(df)}/{n_before} single-Hill genes "
+              f"({n_relabeled} were Hill-B-only, relabeled onto the 'a' columns).")
 
     df = _standardize_params(df)
 
@@ -752,15 +841,18 @@ def compare_cis_gene(
     spec_a: DatasetSpec, spec_b: DatasetSpec, cis_gene: str,
     *, out_dir: Optional[str] = None, params: Optional[Iterable[str]] = None,
     color_by_param: str = 'dependency_category', save: bool = True,
+    single_hill_only: bool = True,
 ) -> Tuple[pd.DataFrame, plt.Figure, plt.Figure]:
     """Load both datasets' trans summaries for `cis_gene`, merge on gene
     symbol, and produce (1) the observed_log2FC scatter and (2) a grid of
     other parameters colored by dependency category (see plot_param_grid()).
 
+    single_hill_only : see load_trans_summary()'s docstring -- default True.
+
     Returns (merged_df, fig_obs_log2fc, fig_param_grid).
     """
-    df_a = load_trans_summary(spec_a, cis_gene)
-    df_b = load_trans_summary(spec_b, cis_gene)
+    df_a = load_trans_summary(spec_a, cis_gene, single_hill_only=single_hill_only)
+    df_b = load_trans_summary(spec_b, cis_gene, single_hill_only=single_hill_only)
     merged = merge_pair(df_a, df_b, spec_a.name, spec_b.name)
     print(f"[{cis_gene}] {spec_a.name}: {len(df_a)} trans genes, {spec_b.name}: {len(df_b)} trans genes, "
           f"shared: {len(merged)}")
@@ -817,11 +909,14 @@ def compare_all_shared_cis_genes(
 
 # ── N-way ("grid of pairwise comparisons") ───────────────────────────────────
 
-def load_all(specs: List[DatasetSpec], cis_gene: str) -> Dict[str, pd.DataFrame]:
+def load_all(specs: List[DatasetSpec], cis_gene: str, *, single_hill_only: bool = True) -> Dict[str, pd.DataFrame]:
     """load_trans_summary() for every spec, keyed by dataset name. A missing
     export for one dataset raises FileNotFoundError immediately (not
-    silently dropped) -- pass a smaller `specs` list if you expect that."""
-    return {s.name: load_trans_summary(s, cis_gene) for s in specs}
+    silently dropped) -- pass a smaller `specs` list if you expect that.
+
+    single_hill_only : see load_trans_summary()'s docstring -- default True.
+    """
+    return {s.name: load_trans_summary(s, cis_gene, single_hill_only=single_hill_only) for s in specs}
 
 
 def _global_param_lims(dfs: Dict[str, pd.DataFrame], param: str) -> Optional[Tuple[float, float]]:
@@ -919,7 +1014,7 @@ def compare_cis_gene_grid(
     specs: List[DatasetSpec], cis_gene: str,
     *, params: Optional[Iterable[str]] = None, out_dir: Optional[str] = None,
     color_by_param: str = 'dependency_category', save: bool = True,
-    shared_lims: bool = True,
+    shared_lims: bool = True, single_hill_only: bool = True,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, plt.Figure]]:
     """N-way version of compare_cis_gene(): load every spec's summary once,
     then produce one pairwise-grid figure per parameter in `params`
@@ -927,10 +1022,11 @@ def compare_cis_gene_grid(
 
     shared_lims : see plot_pairwise_grid()'s docstring -- default True keeps
     each dataset's axis consistent across every panel it appears in.
+    single_hill_only : see load_trans_summary()'s docstring -- default True.
 
     Returns (dfs_by_name, {param: figure}).
     """
-    dfs = load_all(specs, cis_gene)
+    dfs = load_all(specs, cis_gene, single_hill_only=single_hill_only)
     params = list(params) if params is not None else ['observed_log2fc'] + DEFAULT_GRID_PARAMS
 
     if out_dir:
@@ -951,7 +1047,7 @@ def compare_all_cis_genes_grid(
     datasets: Optional[List[DatasetSpec]] = None, bounding_dataset: Optional[DatasetSpec] = None,
     *, params: Optional[Iterable[str]] = None, out_dir: Optional[str] = None,
     color_by_param: str = 'dependency_category', save: bool = True, close_figs: bool = True,
-    shared_lims: bool = True,
+    shared_lims: bool = True, single_hill_only: bool = True,
 ) -> Dict[str, Tuple[Dict[str, pd.DataFrame], Dict[str, plt.Figure]]]:
     """Automates compare_cis_gene_grid() across every cis gene in
     `bounding_dataset.cis_genes` (default: the first of `datasets`, i.e.
@@ -981,7 +1077,7 @@ def compare_all_cis_genes_grid(
         gene_out = os.path.join(out_dir, cis_gene) if out_dir else None
         dfs, figs = compare_cis_gene_grid(participating, cis_gene, params=params,
                                           out_dir=gene_out, color_by_param=color_by_param, save=save,
-                                          shared_lims=shared_lims)
+                                          shared_lims=shared_lims, single_hill_only=single_hill_only)
         results[cis_gene] = (dfs, figs)
         if close_figs:
             for fig in figs.values():
