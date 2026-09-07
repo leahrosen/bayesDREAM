@@ -7,11 +7,13 @@ papermill notebook (10_bayesDREAM_fit_trans_<GENE>.ipynb), not the
 publication_runs/ config system. This module instead re-derives the model
 directly from the raw parquet inputs, PORTED (not imported) from that
 notebook's own load_gene_model_inputs()/build_gene_to_id()/build_trans_model()
-functions, with two deliberate deviations: the final model.fit_trans(...)
+functions, with one deliberate deviation: the final model.fit_trans(...)
 call is swapped for model.load_trans_fit(...) (reload the already-completed
-posterior, don't re-fit), and load_ntc_fit() drops the notebook's own
-lean=True (save_model_for_plotting() needs the full NTC posterior to
-re-save it -- see reconstruct_model()'s comment on this).
+posterior, don't re-fit). load_ntc_fit() KEEPS the notebook's own lean=True
+(loading the full NTC posterior here OOM-kills the kernel -- see
+reconstruct_model()'s comment); save_model_for_plotting() is therefore
+called with save_ntc=False, and _copy_ntc_fit()/_write_ntc_lean_companion()
+supply the NTC fit files directly instead of re-saving through the model.
 
 Also unlike Domingo/Morris, the backfilled trans_feature_summary_gene.csv is
 NOT written in place into OUTDIR/<label>/ -- that directory belongs to
@@ -48,9 +50,11 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import torch
 
 import bayesDREAM as _bayesdream_pkg
 from bayesDREAM import bayesDREAM
+from bayesDREAM.utils import is_lean_posterior
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(_bayesdream_pkg.__file__)))
 if REPO_ROOT not in sys.path:
@@ -96,6 +100,45 @@ def _copy_ntc_fit(save_dir: str) -> None:
             )
         shutil.copy2(src, os.path.join(save_dir, fname))
     print(f"[Replogle] copied NTC fit ({', '.join(_NTC_FIT_FILES)}) -> {save_dir}")
+
+
+def _write_ntc_lean_companion(model, save_dir: str) -> None:
+    """Write posterior_samples_ntc_gene_lean.pt into save_dir from `model`'s
+    already-lean 'gene' posterior_samples_ntc (reconstruct_model() loads NTC
+    with lean=True precisely to avoid a full-panel load -- see its comment).
+
+    Without this, later lean=True reloads of this save_dir (e.g.
+    dose_response_panels.py's load_model_for_plotting()/_get_on_demand_model(),
+    used by ensure_smoothed_curve()'s on-demand smoothing path) find no lean
+    companion next to _copy_ntc_fit()'s FULL posterior_samples_ntc_gene.pt,
+    and fall back to deserializing that full, transcriptome-wide Replogle NTC
+    posterior from scratch -- reproducing the exact kernel-killing OOM
+    reconstruct_model()'s lean=True load was added to avoid in the first
+    place (confirmed 2026-09-07, via this on-demand path for HHEX/Replogle).
+    Cheap to fix: the lean samples are already sitting in memory here, this
+    just re-wraps them in save_ntc_fit()'s on-disk schema (io/save.py) --
+    no extra I/O against the full posterior, no re-reduction.
+    """
+    mod = model.modalities['gene']
+    posterior = mod.posterior_samples_ntc
+    if not is_lean_posterior(posterior):
+        raise ValueError(
+            "_write_ntc_lean_companion() expected model's 'gene' posterior_samples_ntc "
+            "to already be lean (reconstruct_model() loads NTC with lean=True) -- got a "
+            "full posterior instead. Refusing to write a file named '_lean' that isn't."
+        )
+    lean_posterior_with_meta = {
+        'posterior_samples': posterior,
+        'modality_name': 'gene',
+        'distribution': mod.distribution,
+        'feature_names': mod.feature_names,
+        'n_features': mod.dims.get('n_features'),
+        'feature_meta': mod.feature_meta.to_dict('records') if mod.feature_meta is not None else None,
+        'loss_ntc': getattr(mod, 'loss_ntc', None),
+    }
+    path = os.path.join(save_dir, 'posterior_samples_ntc_gene_lean.pt')
+    torch.save(lean_posterior_with_meta, path)
+    print(f"[Replogle] wrote NTC lean companion -> {path}")
 
 
 def _read_parquet(path: str) -> pd.DataFrame:
@@ -305,6 +348,7 @@ def reconstruct_and_export(
     # from NTC_FIT instead, without ever loading the full posterior.
     save_model_for_plotting(model, save_dir=save_dir, save_ntc=False)
     _copy_ntc_fit(save_dir)
+    _write_ntc_lean_companion(model, save_dir)
 
     # Pre-computed smoothed dose-response curves -- see the matching comment
     # in reconstruct_export.py's reconstruct_and_export(). alpha_y_prefit is
@@ -353,3 +397,88 @@ def reconstruct_and_export_all(genes: Optional[List[str]] = None, **kwargs) -> D
     for g in genes:
         results[g] = reconstruct_and_export(g, **kwargs)
     return results
+
+
+def backfill_ntc_lean_companions(genes: Optional[List[str]] = None, force: bool = False) -> List[str]:
+    """One-time repair for save_dirs exported BEFORE _write_ntc_lean_companion()
+    existed: writes the missing posterior_samples_ntc_gene_lean.pt without
+    re-running reconstruct_and_export() (which is expensive -- full model
+    reconstruction + summary + smoothed-curve precompute per gene).
+
+    Two-tier, cheapest-first:
+      1. If NTC_FIT itself already has its own posterior_samples_ntc_gene_lean.pt
+         (i.e. whatever process originally ran save_ntc_fit() there wrote one --
+         reconstruct_model()'s own load_ntc_fit(lean=True) call would have used
+         it too, silently, if present), just copy2() that into each save_dir.
+         Cheap, safe, no full-posterior load at all.
+      2. Otherwise, falls back to loading NTC_FIT's FULL posterior_samples_ntc_gene.pt
+         ONCE (not once per gene -- it's the same shared file for all 7) and
+         reducing it in memory (_reduce_posterior_samples), matching what
+         load_ntc_fit(lean=True)'s own fallback already does per-call in
+         reconstruct_model() (see bayesDREAM/io/load.py) -- this just writes
+         the reduced result to disk once so every later reload of any gene's
+         save_dir (e.g. dose_response_panels.py's on-demand smoothing path --
+         the thing that surfaced this gap: HHEX/Replogle kernel-killed
+         reloading the full panel-wide posterior on 2026-09-07) hits a small
+         lean file directly instead of repeating that full load. Still a
+         one-time full-posterior load, so run this tier somewhere with
+         headroom (not necessarily the same interactive kernel that OOM'd).
+
+    Parameters
+    ----------
+    genes : list of str, optional
+        Defaults to REPLOGLE.cis_genes (all 7).
+    force : bool
+        If True, rewrite the lean companion even if one already exists.
+
+    Returns
+    -------
+    List of save_dirs actually repaired (skips ones already having a lean
+    companion, unless force=True; skips ones with no export yet at all).
+    """
+    from bayesDREAM.io.load import _reduce_posterior_samples, _torch_load
+
+    genes = genes or REPLOGLE.cis_genes
+    targets: Dict[str, str] = {}
+    for g in genes:
+        save_dir = REPLOGLE.save_for_plotting_dir_fn(g)
+        full_path = os.path.join(save_dir, 'posterior_samples_ntc_gene.pt')
+        lean_path = os.path.join(save_dir, 'posterior_samples_ntc_gene_lean.pt')
+        if not os.path.exists(full_path):
+            print(f"[Replogle/{g}] no {full_path!r} -- not exported yet, skipping.")
+            continue
+        if os.path.exists(lean_path) and not force:
+            print(f"[Replogle/{g}] lean companion already exists -- skipping (force=True to redo).")
+            continue
+        targets[g] = save_dir
+    if not targets:
+        return []
+
+    repaired: List[str] = []
+
+    # ── Tier 1: NTC_FIT already has its own lean companion -- just copy it. ──
+    ntc_fit_lean = os.path.join(NTC_FIT, 'posterior_samples_ntc_gene_lean.pt')
+    if os.path.exists(ntc_fit_lean):
+        print(f"[Replogle] found {ntc_fit_lean!r} -- copying to {len(targets)} save_dir(s) "
+              f"(no full-posterior load needed).")
+        for g, save_dir in targets.items():
+            dst = os.path.join(save_dir, 'posterior_samples_ntc_gene_lean.pt')
+            shutil.copy2(ntc_fit_lean, dst)
+            print(f"[Replogle/{g}] wrote {dst}")
+            repaired.append(save_dir)
+        return repaired
+
+    # ── Tier 2: reduce NTC_FIT's full posterior ONCE, write to every target. ──
+    ntc_fit_full = os.path.join(NTC_FIT, 'posterior_samples_ntc_gene.pt')
+    print(f"[Replogle] no lean companion at {ntc_fit_lean!r} -- reducing the shared full "
+          f"posterior ({ntc_fit_full!r}) once for {len(targets)} gene(s): {sorted(targets)}...")
+    loaded_data = dict(_torch_load(ntc_fit_full, map_location='cpu'))
+    loaded_data['posterior_samples'] = _reduce_posterior_samples(loaded_data['posterior_samples'])
+    for g, save_dir in targets.items():
+        lean_path = os.path.join(save_dir, 'posterior_samples_ntc_gene_lean.pt')
+        torch.save(loaded_data, lean_path)
+        print(f"[Replogle/{g}] wrote {lean_path}")
+        repaired.append(save_dir)
+    del loaded_data
+    gc.collect()
+    return repaired
