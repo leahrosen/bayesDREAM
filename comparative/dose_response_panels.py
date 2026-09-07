@@ -48,13 +48,13 @@ from scipy.stats import gaussian_kde
 
 from bayesDREAM import bayesDREAM
 from bayesDREAM.plotting.xy_plots import predict_hill_from_summary_row
-from .datasets import DatasetSpec, morris_symbol_to_id, morris_id_to_symbol
+from .datasets import DatasetSpec, morris_symbol_to_id, morris_id_to_symbol, DOMINGO
 
 
 # ── Loading ────────────────────────────────────────────────────────────────
 
 def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[str] = None,
-                              lean: bool = True) -> "bayesDREAM":
+                              lean: bool = True, load_trans: bool = True) -> "bayesDREAM":
     """Re-initialise a bayesDREAM model from files written by
     save_model_for_plotting() (save_for_plotting.py) and load the fitted
     NTC/cis/trans parameters.
@@ -90,6 +90,18 @@ def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[s
         any Morris/Replogle comparison without it -- see
         reconstruct_export_replogle.py's reconstruct_model() comment for an
         identical prior incident on Replogle's shared NTC fit specifically.
+    load_trans : bool
+        If False, skips model.load_trans_fit() entirely -- this is what
+        makes ensure_smoothed_curve()'s on-demand single-feature smoothing
+        cheap: compute_smoothed_curves() never touches the trans-fit
+        posterior (only x_true, alpha_y_prefit, raw counts, sum_factors),
+        all of which come from load_ntc_fit()/load_cis_fit()/sum_factors_plot.csv
+        alone. Skipping the trans-fit load avoids paying for Morris/
+        Replogle's full ~10-20k-feature joint posterior just to smooth one
+        gene's curve. The returned model's `posterior_samples_trans` is
+        left unset/empty in this case -- do not use it for anything that
+        needs the trans-fit posterior (e.g. plot_xy_data's Hill curve,
+        save_trans_summary()).
     """
     save_dir = spec.plotting_save_dir(cis_gene)
 
@@ -158,7 +170,8 @@ def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[s
     # only ever collapses the NTC/cis posteriors -- see this function's own
     # docstring, corrected 2026-09 after this line originally (wrongly)
     # forwarded `lean` here too.
-    model.load_trans_fit(input_dir=save_dir, lean=False)
+    if load_trans:
+        model.load_trans_fit(input_dir=save_dir, lean=False)
 
     sf_path = os.path.join(save_dir, 'sum_factors_plot.csv')
     if os.path.exists(sf_path):
@@ -262,10 +275,11 @@ def allsig_copy(summary: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
 def compute_smoothed_curves(
     model, modality_name: str = 'gene', color_by: str = 'cell_line',
     sum_factor_col: str = 'sum_factor', window: int = 100, n_points: int = 150,
-    verbose: bool = True,
+    verbose: bool = True, features: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
-    """For every feature in `model`'s `modality_name` modality, compute the
-    SAME alpha_y-corrected, k-NN-smoothed (x_true, y_expr) trend that
+    """For every feature in `model`'s `modality_name` modality (or just
+    `features`, if given -- see below), compute the SAME alpha_y-corrected,
+    k-NN-smoothed (x_true, y_expr) trend that
     model.plot_xy_data(show_correction='corrected') draws -- reusing that
     exact machinery (bayesDREAM.plotting.xy_plots' private
     _align_cells_to_modality/_knn_k/_smooth_knn, imported rather than
@@ -291,16 +305,30 @@ def compute_smoothed_curves(
     already call save_model_for_plotting() -- see save_smoothed_curves().
 
     Cost: dominated by _smooth_knn's per-feature Python loop over ~n_cells
-    windows -- for Morris/Replogle's ~10-20k-feature panels this is tens of
-    minutes, comparable to (or less than) the other backfill steps already
-    run there. A one-time cost, traded for the resulting artifact making
-    every later plot essentially free.
+    windows -- for Morris/Replogle's full ~10-20k-feature panel this is
+    HOURS (confirmed 2026-09-07: ~2.1s/feature on Morris, ~6.5h projected for
+    all 11045). reconstruct_export.py/reconstruct_export_replogle.py's own
+    backfill therefore does NOT default to the full panel for Morris/Replogle
+    -- see their `features=domingo_shared_features(...)` call, which bounds
+    this to the ~89-91 genes Domingo's own (much smaller) panel ever needs
+    for the automated cross-dataset comparison. Anything outside that gets
+    computed on demand instead, at PLOT time, by ensure_smoothed_curve() (a
+    handful of features, not the whole panel -- see its docstring).
 
-    Returns {'feature_names': [F], 'group_labels': [G],
-    'x_log2': float32 [F, G, n_points], 'y_log2': float32 [F, G, n_points]},
-    NaN-padded past each (feature, group)'s actual smoothed-curve length (or
-    entirely, for a group with no valid cells for that feature -- e.g. an
-    all-zero-count gene in one cell_line).
+    features : sequence of str, optional
+        Restrict the loop to just these feature names (a KeyError-free
+        subset -- anything in `features` not actually present in this
+        modality is silently skipped, not an error, since that's the normal
+        case for a Domingo-derived gene list against Morris/Replogle's own,
+        differently-sized panel). None (default) computes every feature in
+        the modality, same as before this parameter existed.
+
+    Returns {'feature_names': [F] (== `features`, filtered to what's actually
+    present, when given), 'group_labels': [G], 'x_log2': float32
+    [F, G, n_points], 'y_log2': float32 [F, G, n_points]}, NaN-padded past
+    each (feature, group)'s actual smoothed-curve length (or entirely, for a
+    group with no valid cells for that feature -- e.g. an all-zero-count gene
+    in one cell_line).
     """
     from bayesDREAM.plotting.xy_plots import _align_cells_to_modality, _knn_k, _smooth_knn
 
@@ -326,7 +354,17 @@ def compute_smoothed_curves(
         alpha_y_full = alpha_y_full.cpu().numpy()
     alpha_y_full = np.asarray(alpha_y_full)  # [C, T] or [S, C, T]
 
-    feature_names = list(modality.feature_names)
+    all_feature_names = list(modality.feature_names)
+    if features is None:
+        selected = list(enumerate(all_feature_names))  # [(fi, name), ...], full panel
+    else:
+        name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
+        selected = [(name_to_idx[f], f) for f in features if f in name_to_idx]
+        n_missing = len(features) - len(selected)
+        if n_missing and verbose:
+            print(f"[{modality_name}] {n_missing}/{len(features)} requested feature(s) not present "
+                  f"in this modality's panel -- skipped (not an error).")
+    feature_names = [f for _, f in selected]
     n_features = len(feature_names)
 
     # Group labels are fixed across every feature (same cell population,
@@ -350,7 +388,8 @@ def compute_smoothed_curves(
         except ImportError:
             print(f"[{modality_name}] precomputing smoothed curves for {n_features} features...")
 
-    for fi in iterator:
+    for out_i in iterator:
+        fi = selected[out_i][0]
         y_obs = modality.counts[fi, :] if modality.cells_axis == 1 else modality.counts[:, fi]
         x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(model, modality, x_true, y_obs)
         sum_factor = modality.sum_factors.loc[meta_aligned['cell'].values, sum_factor_col].values
@@ -391,8 +430,8 @@ def compute_smoothed_curves(
                 # re-derived approximation of them.
                 idx = np.unique(np.linspace(0, len(xl) - 1, n_points).round().astype(int))
                 xl, yl = xl[idx], yl[idx]
-            x_arr[fi, gi, :len(xl)] = xl
-            y_arr[fi, gi, :len(yl)] = yl
+            x_arr[out_i, gi, :len(xl)] = xl
+            y_arr[out_i, gi, :len(yl)] = yl
 
     return {
         'feature_names': feature_names,
@@ -456,10 +495,183 @@ def load_gene_summary(spec: DatasetSpec, cis_gene: str) -> Tuple[pd.DataFrame, p
     return summary, allsig_copy(summary, spec)
 
 
+def domingo_shared_features(spec: DatasetSpec, cis_gene: str) -> List[str]:
+    """The trans genes in Domingo's OWN trans_feature_summary for `cis_gene`,
+    translated into `spec`'s native feature identifier (its own 'feature'
+    column convention -- gene symbol for Domingo/Morris, Ensembl ID for
+    Replogle, via the same morris_symbol_to_id()/morris_id_to_symbol() maps
+    allsig_copy() uses for cross-dataset matching).
+
+    This is the exact gene set compare_all_domingo_cis_genes()'s default
+    (bounding_dataset=DOMINGO, genes=None) can ever need for `cis_gene`, no
+    matter which OTHER datasets end up sharing the panel -- Domingo always
+    participates there, and compare_datasets_lightweight() intersects
+    gene_id across every participating spec, so the true intersection is
+    always a subset of Domingo's own ~89-91-gene panel. reconstruct_export.py/
+    reconstruct_export_replogle.py use this to bound compute_smoothed_curves()'s
+    precompute for Morris/Replogle down from their full ~10-20k-feature
+    transcriptome-wide panel (hours) to just this shared subset (seconds) --
+    anything outside it is computed on demand instead, at plot time, by
+    ensure_smoothed_curve().
+
+    For Domingo itself, returns its own full feature list unchanged (trivial
+    identity -- Domingo's own panel already IS "Domingo's genes"); callers
+    should treat that as "no restriction needed" for Domingo, not as
+    something to actually pass through compute_smoothed_curves(features=...)
+    (equivalent, but wastefully re-derives the full list from a CSV read).
+
+    Returns [] (not an error) if Domingo has no completed fit_trans run for
+    `cis_gene` at all (e.g. HHEX/IKZF1/RUNX1 -- Morris/Replogle cis genes
+    Domingo never fit) -- there's no Domingo panel to bound against, so
+    callers should precompute nothing by default and rely entirely on
+    ensure_smoothed_curve()'s on-demand path for that (dataset, cis_gene).
+    """
+    try:
+        domingo_summary, _ = load_gene_summary(DOMINGO, cis_gene)
+    except FileNotFoundError:
+        return []
+
+    if spec.name == DOMINGO.name:
+        return domingo_summary['feature'].dropna().tolist()
+
+    domingo_allsig = allsig_copy(domingo_summary, DOMINGO)
+    gene_ids = domingo_allsig['gene_id'].dropna().unique().tolist()
+
+    if spec.symbol_col == 'feature':
+        id_to_symbol = morris_id_to_symbol()
+        return sorted({id_to_symbol[g] for g in gene_ids if g in id_to_symbol})
+    return sorted(set(gene_ids))
+
+
+# ── On-demand smoothing (fallback for a gene missing from the precompute) ────
+
+_ON_DEMAND_MODEL_CACHE: Dict[Tuple[str, str], "bayesDREAM"] = {}
+
+
+def _get_on_demand_model(spec: DatasetSpec, cis_gene: str, device: Optional[str] = None) -> "bayesDREAM":
+    """Cached (per dataset, cis_gene) model reload backing on-the-fly
+    smoothing -- see ensure_smoothed_curve(). Loaded WITHOUT the trans-fit
+    posterior (load_model_for_plotting(..., load_trans=False)):
+    compute_smoothed_curves() never reads it (only x_true, alpha_y_prefit,
+    raw counts, sum_factors), and skipping it is what keeps a single
+    on-demand gene cheap even for Morris/Replogle -- no per-call reload of
+    their full ~10-20k-feature joint posterior (the actual cost that made
+    the FULL-panel precompute take hours, confirmed 2026-09-07). Cached
+    across calls in this process so plotting several missing genes in a row
+    for the same (dataset, cis_gene) only pays the reload once.
+    """
+    key = (spec.name, cis_gene)
+    if key not in _ON_DEMAND_MODEL_CACHE:
+        _ON_DEMAND_MODEL_CACHE[key] = load_model_for_plotting(spec, cis_gene, device=device, load_trans=False)
+    return _ON_DEMAND_MODEL_CACHE[key]
+
+
+def clear_on_demand_model_cache() -> None:
+    """Free every model held by _get_on_demand_model()'s cache -- these hold
+    raw counts (non-trivial for Morris/Replogle's full panel) for as long as
+    the process lives otherwise.
+    """
+    _ON_DEMAND_MODEL_CACHE.clear()
+
+
+def compute_smoothed_curve_on_demand(
+    spec: DatasetSpec, cis_gene: str, features: Sequence[str], *, device: Optional[str] = None,
+    sum_factor_col: Optional[str] = None,
+) -> Dict[str, object]:
+    """compute_smoothed_curves(), for just `features`, against a cached
+    trans-posterior-free model for (spec, cis_gene) reloaded on demand (see
+    _get_on_demand_model()) rather than requiring a live model be handed in.
+    Used by ensure_smoothed_curve() to backfill a gene missing from a
+    precomputed smoothed_xy_{modality}.npz.
+    """
+    model = _get_on_demand_model(spec, cis_gene, device=device)
+    sf_col = sum_factor_col or resolve_sum_factor_col(spec, model)
+    return compute_smoothed_curves(model, modality_name=spec.modality_name, sum_factor_col=sf_col,
+                                    features=list(features), verbose=False)
+
+
+def _merge_smoothed_curves_inplace(base: Dict[str, object], addition: Dict[str, object]) -> None:
+    """Append `addition`'s (compute_smoothed_curves() output) features into
+    `base` (a load_smoothed_curves()-shaped dict -- i.e. has 'feature_index')
+    IN PLACE. Silently skips any feature already present in `base`. Both must
+    share the same group_labels (guaranteed by ensure_smoothed_curve(): both
+    come from the same underlying model's meta/color_by).
+    """
+    if base['group_labels'] != addition['group_labels']:
+        raise ValueError(
+            f"group_labels mismatch merging smoothed curves: {base['group_labels']!r} vs "
+            f"{addition['group_labels']!r} -- on-demand compute must use the same color_by "
+            f"grouping as the original precompute."
+        )
+    new = [(i, f) for i, f in enumerate(addition['feature_names']) if f not in base['feature_index']]
+    if not new:
+        return
+    idxs = [i for i, _ in new]
+    names = [f for _, f in new]
+    base['x_log2'] = np.concatenate([base['x_log2'], addition['x_log2'][idxs]], axis=0)
+    base['y_log2'] = np.concatenate([base['y_log2'], addition['y_log2'][idxs]], axis=0)
+    start = len(base['feature_names'])
+    base['feature_names'] = base['feature_names'] + names
+    base['feature_index'].update({f: start + j for j, f in enumerate(names)})
+
+
+def ensure_smoothed_curve(
+    spec: DatasetSpec, cis_gene: str, smoothed: Dict[str, object], feature: str, *,
+    persist: bool = True, device: Optional[str] = None,
+) -> bool:
+    """If `feature` is already in `smoothed` (a load_smoothed_curves()/
+    compute_smoothed_curves() dict), no-op. Otherwise computes it on the fly
+    (compute_smoothed_curve_on_demand()) and merges it into `smoothed` IN
+    PLACE, so subsequent lookups against the same dict (e.g. row-0/row-1 of
+    the same panel) succeed without recomputing.
+
+    persist : bool
+        If True (default), also appends the newly-computed curve to the
+        on-disk smoothed_xy_{modality}.npz for (spec, cis_gene) -- so a
+        later notebook session (a fresh load_smoothed_curves() call) gets it
+        for free too, not just this one. Re-reads the file fresh from disk
+        before appending (not just `smoothed`, which may already hold other
+        in-memory-only curves from earlier persist=False calls) so this
+        never clobbers anything else already written there.
+
+    Returns True if `feature` is now available in `smoothed` (whether it
+    already was, or was just computed) -- False only if the on-demand
+    compute itself found nothing (e.g. `feature` isn't a real feature in
+    this dataset's own panel at all).
+    """
+    if feature in smoothed['feature_index']:
+        return True
+
+    print(f"[{spec.name}] {feature!r} not in the precomputed smoothed-curve artifact for "
+          f"cis gene {cis_gene!r} -- computing on demand...")
+    addition = compute_smoothed_curve_on_demand(spec, cis_gene, [feature], device=device)
+    if feature not in addition['feature_names']:
+        print(f"[{spec.name}] {feature!r} isn't a feature in this dataset's own panel -- skipping.")
+        return False
+
+    _merge_smoothed_curves_inplace(smoothed, addition)
+
+    if persist:
+        save_dir = spec.plotting_save_dir(cis_gene)
+        path = os.path.join(save_dir, f'smoothed_xy_{spec.modality_name}.npz')
+        on_disk = load_smoothed_curves(spec, cis_gene) if os.path.exists(path) else {
+            'feature_names': [], 'feature_index': {}, 'group_labels': addition['group_labels'],
+            'x_log2': np.zeros((0, len(addition['group_labels']), addition['x_log2'].shape[2]), dtype=np.float32),
+            'y_log2': np.zeros((0, len(addition['group_labels']), addition['y_log2'].shape[2]), dtype=np.float32),
+        }
+        if feature not in on_disk['feature_index']:
+            _merge_smoothed_curves_inplace(on_disk, addition)
+            save_smoothed_curves(save_dir, on_disk, modality_name=spec.modality_name)
+            print(f"[{spec.name}] appended {feature!r} to {path}")
+
+    return True
+
+
 def plot_gene_lightweight(
     ax: plt.Axes, feature: str, row: Optional[pd.Series], smoothed: Dict[str, object], spec: DatasetSpec,
-    *, fdr_threshold: float = 0.05, show_hill_function: bool = True,
+    *, cis_gene: Optional[str] = None, fdr_threshold: float = 0.05, show_hill_function: bool = True,
     hill_color: Optional[str] = None, hill_label: Optional[str] = None,
+    allow_on_demand: bool = True, device: Optional[str] = None,
 ) -> bool:
     """Model-free equivalent of _plot_into()/model.plot_xy_data() for one
     (dataset, feature): draws one smoothed trend line per color_by group
@@ -476,6 +688,14 @@ def plot_gene_lightweight(
     compute_smoothed_curves()'s docstring for why that's the right offset
     source here.
 
+    If `feature` isn't in `smoothed` (e.g. it fell outside the Domingo-
+    bounded precompute -- see domingo_shared_features()), and `cis_gene` is
+    given and `allow_on_demand` is True (both default-on for
+    make_panel_lightweight()'s calls), computes it on the fly via
+    ensure_smoothed_curve() and mutates `smoothed` in place so later calls
+    against the same dict find it already there. Pass allow_on_demand=False
+    (or leave `cis_gene` unset) to only ever draw what's already precomputed.
+
     Returns False if nothing was drawn (row missing/lacks x_ntc,y_ntc, or no
     smoothed data for this feature).
     """
@@ -488,6 +708,8 @@ def plot_gene_lightweight(
     x_off, y_off = np.log2(x_ntc), np.log2(y_ntc)
 
     drew_any = False
+    if feature not in smoothed['feature_index'] and allow_on_demand and cis_gene is not None:
+        ensure_smoothed_curve(spec, cis_gene, smoothed, feature, device=device)
     fi = smoothed['feature_index'].get(feature)
     if fi is not None:
         for gi, glabel in enumerate(smoothed['group_labels']):
@@ -776,7 +998,7 @@ def make_panel_lightweight(
     # on-disk fdr_alpha/fdr_beta -- see docstring above).
     for j in range(n):
         plot_gene_lightweight(axes[0][j], native[j], real_rows[j], smoothed_list[j], specs[j],
-                               fdr_threshold=fdr_threshold, hill_color=specs[j].color,
+                               cis_gene=cis_gene, fdr_threshold=fdr_threshold, hill_color=specs[j].color,
                                hill_label=specs[j].name)
         axes[0][j].set_title(specs[j].name)
 
@@ -787,7 +1009,7 @@ def make_panel_lightweight(
     for j in range(n):
         ax = axes[1][j]
         plot_gene_lightweight(ax, native[j], allsig_rows[j], smoothed_list[j], specs[j],
-                               fdr_threshold=fdr_threshold, hill_color=specs[j].color,
+                               cis_gene=cis_gene, fdr_threshold=fdr_threshold, hill_color=specs[j].color,
                                hill_label=specs[j].name)
         overlaid_names = []
         for k in range(n):

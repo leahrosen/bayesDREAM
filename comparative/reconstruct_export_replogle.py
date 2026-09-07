@@ -61,7 +61,7 @@ from save_for_plotting import save_model_for_plotting  # noqa: E402
 from .datasets import REPLOGLE, REPLOGLE_GENE_TO_ID  # noqa: E402
 from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 from .dose_response_panels import (  # noqa: E402
-    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col,
+    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col, domingo_shared_features,
 )
 
 # ── Paths / constants, from 10_bayesDREAM_fit_trans_MYB.ipynb (see the
@@ -311,10 +311,21 @@ def reconstruct_and_export(
     # lean (point-estimate, [C, T]) here rather than the full posterior (see
     # reconstruct_model()'s comment on why) -- compute_smoothed_curves()
     # handles that shape directly, same code path either way.
+    #
+    # features: bounded to domingo_shared_features() -- Domingo's own
+    # trans-gene panel for this cis gene, translated to Replogle's Ensembl
+    # IDs -- rather than Replogle's full ~10-20k-feature transcriptome-wide
+    # panel (hours; see reconstruct_export.py's matching comment for the
+    # measured per-feature cost). [] (not None) for a cis gene Domingo never
+    # fit (e.g. HHEX/IKZF1/RUNX1) -- nothing gets precomputed there, every
+    # gene is computed on demand at plot time by
+    # dose_response_panels.ensure_smoothed_curve() instead.
+    features = domingo_shared_features(REPLOGLE, gene_symbol)
     sf_col = resolve_sum_factor_col(REPLOGLE, model)
     print(f"[Replogle/{gene_symbol}] precomputing smoothed dose-response curves "
-          f"(sum_factor_col={sf_col!r})...")
-    smoothed = compute_smoothed_curves(model, modality_name="gene", sum_factor_col=sf_col)
+          f"(sum_factor_col={sf_col!r}, bounded to {len(features)} Domingo-shared gene(s) -- "
+          f"other genes are computed on demand at plot time)...")
+    smoothed = compute_smoothed_curves(model, modality_name="gene", sum_factor_col=sf_col, features=features)
     smoothed_path = save_smoothed_curves(save_dir, smoothed, modality_name="gene")
     print(f"[Replogle/{gene_symbol}] wrote {smoothed_path}")
 

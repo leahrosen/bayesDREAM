@@ -57,7 +57,7 @@ from save_for_plotting import save_model_for_plotting  # noqa: E402
 from .datasets import DatasetSpec, DOMINGO, MORRIS  # noqa: E402
 from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 from .dose_response_panels import (  # noqa: E402
-    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col,
+    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col, domingo_shared_features,
 )
 
 _SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS}
@@ -266,10 +266,29 @@ def reconstruct_and_export(
     # the model or raw counts. sum_factor_col matches what
     # dose_response_panels.py itself would plot against (resolve_sum_factor_col),
     # so the precomputed trend is consistent with what the heavy path shows too.
+    #
+    # features: for Domingo itself, None (its own panel is already only
+    # ~89-91 genes -- no restriction needed). For Morris, bounded to
+    # domingo_shared_features() -- Domingo's own trans-gene panel translated
+    # to Morris's native symbols -- rather than Morris's full ~11045-feature
+    # transcriptome-wide panel: confirmed 2026-09-07 that the unrestricted
+    # loop takes ~2.1s/feature (_smooth_knn's per-feature cost), i.e. ~6.5h
+    # for the full panel, vs. seconds for ~90 genes. This is exactly the
+    # gene set compare_all_domingo_cis_genes()'s default automated loop ever
+    # plots for Morris anyway (see domingo_shared_features()'s docstring) --
+    # anything outside it is computed on demand at plot time instead, by
+    # dose_response_panels.ensure_smoothed_curve().
+    features = None if dataset_name == 'Domingo' else domingo_shared_features(spec, cis_gene)
     sf_col = resolve_sum_factor_col(spec, model)
-    print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
-          f"(sum_factor_col={sf_col!r})...")
-    smoothed = compute_smoothed_curves(model, modality_name=modality_name, sum_factor_col=sf_col)
+    if features is not None:
+        print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
+              f"(sum_factor_col={sf_col!r}, bounded to {len(features)} Domingo-shared gene(s) -- "
+              f"other genes are computed on demand at plot time)...")
+    else:
+        print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
+              f"(sum_factor_col={sf_col!r})...")
+    smoothed = compute_smoothed_curves(model, modality_name=modality_name, sum_factor_col=sf_col,
+                                        features=features)
     smoothed_path = save_smoothed_curves(save_dir, smoothed, modality_name=modality_name)
     print(f"[{dataset_name}/{cis_gene}] wrote {smoothed_path}")
 
