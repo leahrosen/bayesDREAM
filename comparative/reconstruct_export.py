@@ -57,7 +57,7 @@ from save_for_plotting import save_model_for_plotting  # noqa: E402
 from .datasets import DatasetSpec, DOMINGO, MORRIS  # noqa: E402
 from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 from .dose_response_panels import (  # noqa: E402
-    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col, domingo_shared_features,
+    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col, domingo_union_features,
 )
 
 _SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS}
@@ -269,21 +269,24 @@ def reconstruct_and_export(
     #
     # features: for Domingo itself, None (its own panel is already only
     # ~89-91 genes -- no restriction needed). For Morris, bounded to
-    # domingo_shared_features() -- Domingo's own trans-gene panel translated
+    # domingo_union_features() -- the UNION of Domingo's own trans-gene
+    # panels across ALL of its cis genes (GFI1B, NFE2, MYB, TET2), translated
     # to Morris's native symbols -- rather than Morris's full ~11045-feature
     # transcriptome-wide panel: confirmed 2026-09-07 that the unrestricted
     # loop takes ~2.1s/feature (_smooth_knn's per-feature cost), i.e. ~6.5h
-    # for the full panel, vs. seconds for ~90 genes. This is exactly the
-    # gene set compare_all_domingo_cis_genes()'s default automated loop ever
-    # plots for Morris anyway (see domingo_shared_features()'s docstring) --
-    # anything outside it is computed on demand at plot time instead, by
-    # dose_response_panels.ensure_smoothed_curve().
-    features = None if dataset_name == 'Domingo' else domingo_shared_features(spec, cis_gene)
+    # for the full panel, vs. seconds for ~90-ish genes. Deliberately NOT
+    # per-cis-gene (Domingo's panel for just THIS cis gene): that left
+    # nothing to bound against for a cis gene Domingo never fit at all
+    # (HHEX/IKZF1/RUNX1 -- Morris/Replogle-only), forcing every gene there
+    # onto the on-demand path (confirmed 2026-09-07, "bounded to 0
+    # Domingo-shared gene(s)" for Replogle/HHEX). The union still gives a
+    # meaningful bound there too -- see domingo_union_features()'s docstring.
+    features = None if dataset_name == 'Domingo' else domingo_union_features(spec)
     sf_col = resolve_sum_factor_col(spec, model)
     if features is not None:
         print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
-              f"(sum_factor_col={sf_col!r}, bounded to {len(features)} Domingo-shared gene(s) -- "
-              f"other genes are computed on demand at plot time)...")
+              f"(sum_factor_col={sf_col!r}, bounded to {len(features)} gene(s) in Domingo's "
+              f"cross-cis-gene union -- other genes are computed on demand at plot time)...")
     else:
         print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
               f"(sum_factor_col={sf_col!r})...")

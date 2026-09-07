@@ -309,11 +309,11 @@ def compute_smoothed_curves(
     HOURS (confirmed 2026-09-07: ~2.1s/feature on Morris, ~6.5h projected for
     all 11045). reconstruct_export.py/reconstruct_export_replogle.py's own
     backfill therefore does NOT default to the full panel for Morris/Replogle
-    -- see their `features=domingo_shared_features(...)` call, which bounds
-    this to the ~89-91 genes Domingo's own (much smaller) panel ever needs
-    for the automated cross-dataset comparison. Anything outside that gets
-    computed on demand instead, at PLOT time, by ensure_smoothed_curve() (a
-    handful of features, not the whole panel -- see its docstring).
+    -- see their `features=domingo_union_features(...)` call, which bounds
+    this to the union of Domingo's own (much smaller) trans-gene panels
+    across all its cis genes. Anything outside that gets computed on demand
+    instead, at PLOT time, by ensure_smoothed_curve() (a handful of
+    features, not the whole panel -- see its docstring).
 
     features : sequence of str, optional
         Restrict the loop to just these feature names (a KeyError-free
@@ -495,52 +495,69 @@ def load_gene_summary(spec: DatasetSpec, cis_gene: str) -> Tuple[pd.DataFrame, p
     return summary, allsig_copy(summary, spec)
 
 
-def domingo_shared_features(spec: DatasetSpec, cis_gene: str) -> List[str]:
-    """The trans genes in Domingo's OWN trans_feature_summary for `cis_gene`,
-    translated into `spec`'s native feature identifier (its own 'feature'
-    column convention -- gene symbol for Domingo/Morris, Ensembl ID for
-    Replogle, via the same morris_symbol_to_id()/morris_id_to_symbol() maps
-    allsig_copy() uses for cross-dataset matching).
+_DOMINGO_UNION_CACHE: Dict[str, List[str]] = {}
 
-    This is the exact gene set compare_all_domingo_cis_genes()'s default
-    (bounding_dataset=DOMINGO, genes=None) can ever need for `cis_gene`, no
-    matter which OTHER datasets end up sharing the panel -- Domingo always
-    participates there, and compare_datasets_lightweight() intersects
-    gene_id across every participating spec, so the true intersection is
-    always a subset of Domingo's own ~89-91-gene panel. reconstruct_export.py/
-    reconstruct_export_replogle.py use this to bound compute_smoothed_curves()'s
-    precompute for Morris/Replogle down from their full ~10-20k-feature
-    transcriptome-wide panel (hours) to just this shared subset (seconds) --
-    anything outside it is computed on demand instead, at plot time, by
-    ensure_smoothed_curve().
 
-    For Domingo itself, returns its own full feature list unchanged (trivial
-    identity -- Domingo's own panel already IS "Domingo's genes"); callers
-    should treat that as "no restriction needed" for Domingo, not as
-    something to actually pass through compute_smoothed_curves(features=...)
-    (equivalent, but wastefully re-derives the full list from a CSV read).
+def domingo_union_features(spec: DatasetSpec) -> List[str]:
+    """Union of every trans gene appearing in ANY of Domingo's own
+    trans_feature_summary panels -- one per DOMINGO.cis_genes (GFI1B, NFE2,
+    MYB, TET2) -- translated into `spec`'s native feature identifier (its
+    own 'feature' column convention -- gene symbol for Domingo/Morris,
+    Ensembl ID for Replogle, via the same morris_symbol_to_id()/
+    morris_id_to_symbol() maps allsig_copy() uses for cross-dataset
+    matching).
 
-    Returns [] (not an error) if Domingo has no completed fit_trans run for
-    `cis_gene` at all (e.g. HHEX/IKZF1/RUNX1 -- Morris/Replogle cis genes
-    Domingo never fit) -- there's no Domingo panel to bound against, so
-    callers should precompute nothing by default and rely entirely on
-    ensure_smoothed_curve()'s on-demand path for that (dataset, cis_gene).
+    A single, cis-gene-INDEPENDENT bound (unlike an earlier per-cis-gene
+    version of this function): reconstruct_export.py/
+    reconstruct_export_replogle.py use the SAME set here for every one of
+    `spec`'s cis genes, bounding compute_smoothed_curves()'s precompute for
+    Morris/Replogle down from their full ~10-20k-feature transcriptome-wide
+    panel (hours) to this much smaller union (seconds) -- anything outside
+    it is computed on demand instead, at plot time, by
+    ensure_smoothed_curve(). Domingo's own per-cis-gene panels overlap
+    heavily in practice (largely the same readout genes tested against
+    every cis gene), so the union stays small, not anywhere near the full
+    transcriptome.
+
+    Being cis-gene-independent is deliberate: a per-cis-gene bound (only the
+    Domingo panel for THIS cis gene) has nothing to bound against for a cis
+    gene Domingo never fit at all -- HHEX/IKZF1/RUNX1, Morris/Replogle-only
+    cis genes -- leaving their precompute empty and every gene on the
+    on-demand path. Using the union of ALL of Domingo's panels instead still
+    gives a meaningful, small bound even there.
+
+    For Domingo itself, returns the union of its own 4 panels directly (no
+    translation needed) -- included for completeness; reconstruct_export.py
+    doesn't actually restrict Domingo's own (already small) per-cis-gene
+    precompute with it.
+
+    Cached per `spec.name` (module-level `_DOMINGO_UNION_CACHE`) since it's
+    identical across every cis gene of that dataset -- reconstruct_and_export()
+    calls this once per cis gene, and re-reading Domingo's 4 summary CSVs
+    each time would be wasteful.
     """
-    try:
+    if spec.name in _DOMINGO_UNION_CACHE:
+        return _DOMINGO_UNION_CACHE[spec.name]
+
+    gene_ids: set = set()
+    for cis_gene in DOMINGO.cis_genes:
         domingo_summary, _ = load_gene_summary(DOMINGO, cis_gene)
-    except FileNotFoundError:
-        return []
+        if spec.name == DOMINGO.name:
+            gene_ids.update(domingo_summary['feature'].dropna())
+        else:
+            domingo_allsig = allsig_copy(domingo_summary, DOMINGO)
+            gene_ids.update(domingo_allsig['gene_id'].dropna())
 
     if spec.name == DOMINGO.name:
-        return domingo_summary['feature'].dropna().tolist()
-
-    domingo_allsig = allsig_copy(domingo_summary, DOMINGO)
-    gene_ids = domingo_allsig['gene_id'].dropna().unique().tolist()
-
-    if spec.symbol_col == 'feature':
+        result = sorted(gene_ids)
+    elif spec.symbol_col == 'feature':
         id_to_symbol = morris_id_to_symbol()
-        return sorted({id_to_symbol[g] for g in gene_ids if g in id_to_symbol})
-    return sorted(set(gene_ids))
+        result = sorted({id_to_symbol[g] for g in gene_ids if g in id_to_symbol})
+    else:
+        result = sorted(gene_ids)
+
+    _DOMINGO_UNION_CACHE[spec.name] = result
+    return result
 
 
 # ── On-demand smoothing (fallback for a gene missing from the precompute) ────
@@ -689,7 +706,7 @@ def plot_gene_lightweight(
     source here.
 
     If `feature` isn't in `smoothed` (e.g. it fell outside the Domingo-
-    bounded precompute -- see domingo_shared_features()), and `cis_gene` is
+    bounded precompute -- see domingo_union_features()), and `cis_gene` is
     given and `allow_on_demand` is True (both default-on for
     make_panel_lightweight()'s calls), computes it on the fly via
     ensure_smoothed_curve() and mutates `smoothed` in place so later calls
