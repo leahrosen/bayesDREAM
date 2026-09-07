@@ -38,15 +38,15 @@ Design notes
   each dataset's own NTC baseline) variants, not raw x_true units -- the
   two datasets' cis gene expression scales are not directly comparable.
 - load_trans_summary() (and everything built on it) defaults to
-  single_hill_only=True: only fit_type == 'single_hill' genes are kept
-  (additive_hill -- both components active -- and not_dependent are
-  dropped, along with polynomial-fit rows, which have no fit_type at all).
-  A Hill-B-only gene isn't dropped -- it's relabeled onto the SAME
-  'a'-suffixed columns a Hill-A-only gene uses (see
-  _swap_hill_ab_columns()), so every single-Hill gene compares via one
-  consistent column set regardless of which component was actually fit.
-  Pass single_hill_only=False to any of these functions for the old
-  unfiltered behavior.
+  single_hill_only=True: only fit_type in {'single_hill', 'not_dependent'}
+  genes are kept -- dropping additive_hill (both components active) and
+  polynomial-fit rows (no fit_type at all), but keeping not_dependent
+  genes (a real "no effect" call). A Hill-B-only gene isn't dropped -- it's
+  relabeled onto the SAME 'a'-suffixed columns a Hill-A-only gene uses (see
+  _swap_hill_ab_columns()), so every kept gene compares via one consistent
+  column set regardless of which component was actually fit. Pass
+  single_hill_only=False to any of these functions for the old unfiltered
+  behavior.
 """
 
 import os
@@ -228,16 +228,18 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
     not a trans feature and would otherwise show up as a spurious point.
 
     single_hill_only : bool
-        If True (default), keep only fit_type == 'single_hill' rows
-        (dropping 'additive_hill' -- both components active -- and
-        'not_dependent', plus polynomial-fit rows, which have no
-        fit_type). A Hill-B-only gene (which_active == 'b') is NOT
-        dropped -- it's relabeled onto the SAME 'a'-suffixed columns a
-        Hill-A-only gene uses (see _swap_hill_ab_columns()), so every
-        single-Hill gene compares via one consistent set of columns
-        (n_a, Vmax_a, EC50_a_log2fc, ...) regardless of which component
-        actually carried the fit. Pass False to keep every fit_type
-        unfiltered and unrelabeled (the old behavior).
+        If True (default), keep only fit_type in {'single_hill',
+        'not_dependent'} rows -- dropping 'additive_hill' (both components
+        active) and polynomial-fit rows (no fit_type at all), but keeping
+        'not_dependent' genes (a real, informative "no effect" call, unlike
+        additive_hill's more complex two-component shape that doesn't
+        reduce to a single Hill). A Hill-B-only gene (which_active == 'b')
+        is NOT dropped -- it's relabeled onto the SAME 'a'-suffixed columns
+        a Hill-A-only gene uses (see _swap_hill_ab_columns()), so every
+        kept gene compares via one consistent set of columns (n_a, Vmax_a,
+        EC50_a_log2fc, ...) regardless of which component actually carried
+        the fit. Pass False to keep every fit_type unfiltered and
+        unrelabeled (the old behavior).
 
     Ambiguous symbols (see below) aside, low_memory=False avoids pandas'
     chunked dtype inference spuriously flagging mixed-type columns on a
@@ -346,9 +348,10 @@ def load_trans_summary(spec: DatasetSpec, cis_gene: str, modality_name: Optional
         b_only = (df['fit_type'] == 'single_hill') & (df['which_active'] == 'b')
         n_relabeled = int(b_only.sum())
         _swap_hill_ab_columns(df, b_only)
-        df = df.loc[df['fit_type'] == 'single_hill'].copy()
-        print(f"[{spec.name}] single_hill_only: kept {len(df)}/{n_before} single-Hill genes "
-              f"({n_relabeled} were Hill-B-only, relabeled onto the 'a' columns).")
+        keep = df['fit_type'].isin(['single_hill', 'not_dependent'])
+        df = df.loc[keep].copy()
+        print(f"[{spec.name}] single_hill_only: kept {len(df)}/{n_before} single-Hill-or-not-dependent "
+              f"genes ({n_relabeled} were Hill-B-only, relabeled onto the 'a' columns).")
 
     df = _standardize_params(df)
 
