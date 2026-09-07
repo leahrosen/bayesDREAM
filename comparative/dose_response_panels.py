@@ -600,11 +600,18 @@ def compute_smoothed_curve_on_demand(
     _get_on_demand_model()) rather than requiring a live model be handed in.
     Used by ensure_smoothed_curve() to backfill a gene missing from a
     precomputed smoothed_xy_{modality}.npz.
+
+    Uses `spec.smoothing_window` -- the SAME k-NN window the original
+    precompute used (reconstruct_export.py/reconstruct_export_replogle.py
+    also read it from there) -- so an on-demand curve merged into an
+    existing `smoothed` dict via ensure_smoothed_curve() looks consistent
+    with its precomputed neighbors rather than using a different window by
+    accident.
     """
     model = _get_on_demand_model(spec, cis_gene, device=device)
     sf_col = sum_factor_col or resolve_sum_factor_col(spec, model)
     return compute_smoothed_curves(model, modality_name=spec.modality_name, sum_factor_col=sf_col,
-                                    features=list(features), verbose=False)
+                                    features=list(features), window=spec.smoothing_window, verbose=False)
 
 
 def _merge_smoothed_curves_inplace(base: Dict[str, object], addition: Dict[str, object]) -> None:
@@ -771,6 +778,7 @@ def _plot_into(model, goi, ax, spec: DatasetSpec, sum_factor_col: str,
         color_palette=spec.cell_line_palette,
         hill_color=spec.color,
         hill_label=spec.name,
+        window=spec.smoothing_window,
     )
     if fdr_df is not None:
         # fdr_df (as opposed to reference_df) only overrides which FDR values

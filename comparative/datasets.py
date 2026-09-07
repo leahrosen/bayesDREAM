@@ -146,6 +146,16 @@ class DatasetSpec:
         are Ensembl IDs, so passing the bare symbol straight through raises
         "cis_gene 'GFI1B' not found in counts.index" against an
         ENSG00000... index.
+    smoothing_window : int
+        k-NN window size (number of cells) for the dose-response trend line
+        -- passed as `window` to both compute_smoothed_curves() (the
+        lightweight precompute, and its on-demand fallback
+        ensure_smoothed_curve()) and model.plot_xy_data() (the heavy path,
+        via _plot_into()), so both stay in sync for a given dataset rather
+        than silently drifting apart. Default 100, matching
+        compute_smoothed_curves()'s own default. Lower for a dataset with
+        fewer cells per gene (e.g. Morris: 30) where a 100-cell window
+        oversmooths relative to the local cell density.
     """
     name: str
     color: str
@@ -159,6 +169,7 @@ class DatasetSpec:
     init_sum_factor_col: str = 'sum_factor'
     plot_sum_factor_col: Optional[str] = None
     force_single_cell_line: Optional[str] = None
+    smoothing_window: int = 100
 
     def trans_summary_path(self, cis_gene: str, modality_name: Optional[str] = None) -> str:
         modality_name = modality_name or self.modality_name
@@ -346,6 +357,10 @@ MORRIS = DatasetSpec(
     init_sum_factor_col='sum_factor',
     plot_sum_factor_col='sum_factor_adj',
     force_single_cell_line='CRISPRi',
+    # Fewer cells per gene than Domingo/Replogle -- the default 100-cell k-NN
+    # window oversmooths the dose-response trend relative to Morris's local
+    # cell density. Requested 2026-09-07.
+    smoothing_window=30,
 )
 
 REPLOGLE = DatasetSpec(

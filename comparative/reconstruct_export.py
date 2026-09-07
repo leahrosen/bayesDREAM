@@ -285,13 +285,14 @@ def reconstruct_and_export(
     sf_col = resolve_sum_factor_col(spec, model)
     if features is not None:
         print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
-              f"(sum_factor_col={sf_col!r}, bounded to {len(features)} gene(s) in Domingo's "
-              f"cross-cis-gene union -- other genes are computed on demand at plot time)...")
+              f"(sum_factor_col={sf_col!r}, window={spec.smoothing_window}, bounded to "
+              f"{len(features)} gene(s) in Domingo's cross-cis-gene union -- other genes are "
+              f"computed on demand at plot time)...")
     else:
         print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
-              f"(sum_factor_col={sf_col!r})...")
+              f"(sum_factor_col={sf_col!r}, window={spec.smoothing_window})...")
     smoothed = compute_smoothed_curves(model, modality_name=modality_name, sum_factor_col=sf_col,
-                                        features=features)
+                                        features=features, window=spec.smoothing_window)
     smoothed_path = save_smoothed_curves(save_dir, smoothed, modality_name=modality_name)
     print(f"[{dataset_name}/{cis_gene}] wrote {smoothed_path}")
 

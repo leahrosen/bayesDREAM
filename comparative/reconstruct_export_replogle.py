@@ -325,9 +325,11 @@ def reconstruct_and_export(
     features = domingo_union_features(REPLOGLE)
     sf_col = resolve_sum_factor_col(REPLOGLE, model)
     print(f"[Replogle/{gene_symbol}] precomputing smoothed dose-response curves "
-          f"(sum_factor_col={sf_col!r}, bounded to {len(features)} gene(s) in Domingo's "
-          f"cross-cis-gene union -- other genes are computed on demand at plot time)...")
-    smoothed = compute_smoothed_curves(model, modality_name="gene", sum_factor_col=sf_col, features=features)
+          f"(sum_factor_col={sf_col!r}, window={REPLOGLE.smoothing_window}, bounded to "
+          f"{len(features)} gene(s) in Domingo's cross-cis-gene union -- other genes are "
+          f"computed on demand at plot time)...")
+    smoothed = compute_smoothed_curves(model, modality_name="gene", sum_factor_col=sf_col,
+                                        features=features, window=REPLOGLE.smoothing_window)
     smoothed_path = save_smoothed_curves(save_dir, smoothed, modality_name="gene")
     print(f"[Replogle/{gene_symbol}] wrote {smoothed_path}")
 
