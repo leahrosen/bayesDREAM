@@ -123,7 +123,9 @@ class DatasetSpec:
         The sum_factor column dose_response_panels.py should plot against
         (passed to plot_xy_data's sum_factor_col). This is the *final*,
         most-adjusted column for this dataset's pipeline -- Domingo's own
-        refit_sumfactor() writes 'sum_factor_new'; Morris/Replogle stop at
+        refit_sumfactor() writes 'sum_factor_refit' (its fit_trans() is
+        actually run with sum_factor_col='sum_factor_refit', see
+        publication_runs/domingo/generate_slurm.py); Morris/Replogle stop at
         adjust_ntc_sum_factor() and use 'sum_factor_adj'. If left None,
         dose_response_panels.pick_sum_factor_col() falls back to probing
         the reloaded model for the best available column -- set this
@@ -320,7 +322,15 @@ DOMINGO = DatasetSpec(
     run_dir_fn=lambda g: os.path.join(DOMINGO_OUTDIR, f'domingo_20260806_{g}'),
     save_for_plotting_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Domingo_{g}_GEX'),
     init_sum_factor_col='sum_factor',
-    plot_sum_factor_col='sum_factor_new',
+    # Matches Domingo's real fit_trans() call, which is run with
+    # sum_factor_col='sum_factor_refit' (see
+    # publication_runs/domingo/generate_slurm.py) -- NOT 'sum_factor_new'
+    # (a stale reference to refit_sumfactor()'s default output-column name
+    # in an older version of the library; renamed to 'sum_factor_refit' in
+    # the current bayesDREAM/core.py, confirmed 2026-09-07 after
+    # reconstruct_and_export() raised ValueError: configured
+    # plot_sum_factor_col='sum_factor_new' not found on the reloaded model).
+    plot_sum_factor_col='sum_factor_refit',
 )
 
 MORRIS = DatasetSpec(

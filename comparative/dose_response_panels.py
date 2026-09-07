@@ -196,7 +196,7 @@ def pick_sum_factor_col(model: "bayesDREAM", preference: Sequence[str] = (
 
 def resolve_sum_factor_col(spec: DatasetSpec, model: "bayesDREAM") -> str:
     """DatasetSpec.plot_sum_factor_col if set (known-correct per dataset --
-    Domingo's own refit_sumfactor() writes 'sum_factor_new'; Morris/Replogle
+    Domingo's own refit_sumfactor() writes 'sum_factor_refit'; Morris/Replogle
     stop at adjust_ntc_sum_factor() and use 'sum_factor_adj'), else fall back
     to probing the reloaded model via pick_sum_factor_col().
     """
