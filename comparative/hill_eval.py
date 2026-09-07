@@ -89,6 +89,7 @@ def is_already_backfilled(output_dir: str, modality_name: str, save_dir: str,
         f'alpha_y_prefit_{modality_name}.pt',       # save_ntc_fit
         'posterior_samples_cis.pt',                  # save_cis_fit
         f'posterior_samples_trans_{modality_name}.pt',  # save_trans_fit
+        f'smoothed_xy_{modality_name}.npz',          # compute_smoothed_curves/save_smoothed_curves
     ]
     return all(os.path.exists(os.path.join(save_dir, f)) for f in required_files)
 

@@ -56,6 +56,9 @@ from save_for_plotting import save_model_for_plotting  # noqa: E402
 
 from .datasets import DatasetSpec, DOMINGO, MORRIS  # noqa: E402
 from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
+from .dose_response_panels import (  # noqa: E402
+    compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col,
+)
 
 _SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS}
 _DATASET_DIRNAME = {'Domingo': 'domingo', 'Morris': 'morris'}
@@ -253,6 +256,22 @@ def reconstruct_and_export(
 
     print(f"[{dataset_name}/{cis_gene}] exporting for plotting -> {save_dir}")
     save_model_for_plotting(model, save_dir=save_dir)
+
+    # Pre-computed smoothed dose-response curves (comparative/
+    # dose_response_panels.py's compute_smoothed_curves()) -- written here,
+    # while the full model (raw counts + alpha_y_prefit) is already
+    # resident, so dose_response_panels.py's lightweight, model-free path
+    # (compare_datasets_lightweight()/make_panel_lightweight()) can later
+    # plot ANY trans gene in this panel on demand without ever reloading
+    # the model or raw counts. sum_factor_col matches what
+    # dose_response_panels.py itself would plot against (resolve_sum_factor_col),
+    # so the precomputed trend is consistent with what the heavy path shows too.
+    sf_col = resolve_sum_factor_col(spec, model)
+    print(f"[{dataset_name}/{cis_gene}] precomputing smoothed dose-response curves "
+          f"(sum_factor_col={sf_col!r})...")
+    smoothed = compute_smoothed_curves(model, modality_name=modality_name, sum_factor_col=sf_col)
+    smoothed_path = save_smoothed_curves(save_dir, smoothed, modality_name=modality_name)
+    print(f"[{dataset_name}/{cis_gene}] wrote {smoothed_path}")
 
     del model, df
     gc.collect()

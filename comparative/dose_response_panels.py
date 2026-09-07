@@ -54,24 +54,42 @@ from .datasets import DatasetSpec, morris_symbol_to_id, morris_id_to_symbol
 # ── Loading ────────────────────────────────────────────────────────────────
 
 def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[str] = None,
-                              lean: bool = False) -> "bayesDREAM":
+                              lean: bool = True) -> "bayesDREAM":
     """Re-initialise a bayesDREAM model from files written by
     save_model_for_plotting() (save_for_plotting.py) and load the fitted
     NTC/cis/trans parameters.
 
     lean : bool
-        Passed straight through to load_ntc_fit()/load_cis_fit()/
-        load_trans_fit() -- collapses each posterior to point estimates
-        (median + `<key>_lower`/`<key>_upper`) instead of keeping the full
-        multi-sample tensors, cutting peak memory substantially for Morris/
-        Replogle's large transcriptome-wide panels (real prior OOM kill for
-        exactly this, on Replogle's shared NTC fit -- see
-        reconstruct_export_replogle.py's reconstruct_model() comment).
-        save_trans_summary()'s own extract_param() already degrades
-        gracefully on a lean (no-sample-axis) array -- point estimate used
-        for median/lower/upper alike, i.e. the fitted curve itself is
-        unaffected, but plot_xy_data's shaded uncertainty band around it
-        will render zero-width. Default False (unchanged behavior).
+        Passed through to load_ntc_fit()/load_cis_fit() -- collapses each
+        posterior to point estimates (median + `<key>_lower`/`<key>_upper`)
+        instead of keeping the full multi-sample tensors. Does NOT reach
+        load_trans_fit(): lean=True there is not implemented (bayesDREAM/
+        io/load.py raises NotImplementedError unconditionally -- nearly
+        every save_trans_summary() column depends on the FULL joint
+        per-draw posterior of alpha/beta/Vmax_a/Vmax_b/K_a/K_b/n_a/n_b/A,
+        not just their marginals, so collapsing them first would silently
+        produce wrong CIs/FDR). The trans-fit posterior is also the
+        dominant share of peak memory for Morris/Replogle's ~8-11k-feature
+        panels ([1000 samples, n_features] per raw parameter, ~10
+        parameters for additive_hill) -- lean alone does NOT fix that. This
+        function still loads the FULL trans-fit posterior for every trans
+        gene regardless of `lean`; for interactive "plot any gene on demand"
+        use at Morris/Replogle scale, use compare_datasets_lightweight()/
+        make_panel_lightweight() instead, which never loads a model or raw
+        counts at all (see their docstrings). This function stays the
+        heavier "give me a live model" path -- e.g. for the notebook's
+        "inspect a single panel inline" cell, or any use that genuinely
+        needs the live posterior. save_trans_summary()'s own extract_param()
+        (used for the NTC/cis point estimates `lean` DOES affect) degrades
+        gracefully on a lean array -- verified directly against
+        predict_trans_function()/_extract_param_mean()/_compute_hill_markers()
+        in xy_plots.py too (same `.mean(dim=0)`-then-squeeze idiom
+        throughout, and none of them draw a shaded band around the Hill
+        curve in this code path, so there's no visual degradation from THIS
+        part at all). Default True: real, repeated kernel-killing OOMs on
+        any Morris/Replogle comparison without it -- see
+        reconstruct_export_replogle.py's reconstruct_model() comment for an
+        identical prior incident on Replogle's shared NTC fit specifically.
     """
     save_dir = spec.plotting_save_dir(cis_gene)
 
@@ -133,7 +151,14 @@ def load_model_for_plotting(spec: DatasetSpec, cis_gene: str, device: Optional[s
 
     model.load_ntc_fit(input_dir=save_dir, lean=lean)
     model.load_cis_fit(input_dir=save_dir, lean=lean)
-    model.load_trans_fit(input_dir=save_dir, lean=lean)
+    # load_trans_fit(lean=True) is NOT implemented (bayesDREAM/io/load.py
+    # raises NotImplementedError unconditionally -- collapsing the joint
+    # per-draw posterior would silently break the Hill-curve/FDR/derivative
+    # evaluations save_trans_summary() computes downstream). `lean` here
+    # only ever collapses the NTC/cis posteriors -- see this function's own
+    # docstring, corrected 2026-09 after this line originally (wrongly)
+    # forwarded `lean` here too.
+    model.load_trans_fit(input_dir=save_dir, lean=False)
 
     sf_path = os.path.join(save_dir, 'sum_factors_plot.csv')
     if os.path.exists(sf_path):
@@ -216,6 +241,280 @@ def allsig_copy(summary: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     else:
         out['gene_id'] = out['feature']
     return out
+
+
+# ── Pre-computed smoothed curves (model-free plotting) ───────────────────────
+#
+# compare_datasets()/make_panel() need a full model (raw counts + trans-fit
+# posterior) per dataset -- too much memory to hold for Morris/Replogle's
+# transcriptome-wide panels if the notebook should stay usable to plot ANY
+# trans gene on demand, not just a pre-chosen subset. The functions below
+# instead precompute, ONCE per (dataset, cis_gene) at backfill time (when the
+# full model is already resident anyway -- see reconstruct_export.py/
+# reconstruct_export_replogle.py), a small per-gene "smoothed trend" array
+# (compute_smoothed_curves()) that gets saved alongside the existing
+# trans_feature_summary_{modality}.csv. At plot time, load_smoothed_curves()
+# + that CSV are the ONLY two things read -- no model, no raw counts, no
+# trans-fit posterior -- so every trans gene in the FULL panel can be plotted
+# interactively (make_panel_lightweight()/compare_datasets_lightweight()) at
+# a memory cost of a few tens of MB even for Morris/Replogle.
+
+def compute_smoothed_curves(
+    model, modality_name: str = 'gene', color_by: str = 'cell_line',
+    sum_factor_col: str = 'sum_factor', window: int = 100, n_points: int = 150,
+    verbose: bool = True,
+) -> Dict[str, object]:
+    """For every feature in `model`'s `modality_name` modality, compute the
+    SAME alpha_y-corrected, k-NN-smoothed (x_true, y_expr) trend that
+    model.plot_xy_data(show_correction='corrected') draws -- reusing that
+    exact machinery (bayesDREAM.plotting.xy_plots' private
+    _align_cells_to_modality/_knn_k/_smooth_knn, imported rather than
+    reimplemented, so this can never silently drift from what the live plot
+    would show), grouped by `color_by` (matching dose_response_panels.py's
+    own color_by='cell_line' convention).
+
+    Deliberately does NOT bake in the log2FC(x)/log2FC(y) NTC offset that
+    plot_xy_data(log2fc=True) applies -- returns absolute log2(x)/log2(y)
+    curves instead. plot_gene_lightweight() applies the offset later, at
+    plot time, from that gene's own trans_feature_summary row (x_ntc/y_ntc)
+    -- the SAME offset source _overlay_extra_curve() already uses for a
+    cross-dataset Hill-curve overlay, so a lightweight panel's smoothed
+    trend and its Hill curve are guaranteed to line up using one consistent
+    convention, even though this differs slightly from plot_xy_data's own
+    live mu_ntc-based offset (already true today: _overlay_extra_curve's
+    curves use row-based offsets while plot_xy_data's OWN curve+data use its
+    live offset -- an established, working precedent this reuses, not a new
+    inconsistency).
+
+    Meant to be called ONCE per (dataset, cis_gene), on the fully-loaded
+    model, right where reconstruct_export.py/reconstruct_export_replogle.py
+    already call save_model_for_plotting() -- see save_smoothed_curves().
+
+    Cost: dominated by _smooth_knn's per-feature Python loop over ~n_cells
+    windows -- for Morris/Replogle's ~10-20k-feature panels this is tens of
+    minutes, comparable to (or less than) the other backfill steps already
+    run there. A one-time cost, traded for the resulting artifact making
+    every later plot essentially free.
+
+    Returns {'feature_names': [F], 'group_labels': [G],
+    'x_log2': float32 [F, G, n_points], 'y_log2': float32 [F, G, n_points]},
+    NaN-padded past each (feature, group)'s actual smoothed-curve length (or
+    entirely, for a group with no valid cells for that feature -- e.g. an
+    all-zero-count gene in one cell_line).
+    """
+    from bayesDREAM.plotting.xy_plots import _align_cells_to_modality, _knn_k, _smooth_knn
+
+    modality = model.get_modality(modality_name)
+    if modality.alpha_y_prefit is None:
+        raise ValueError(
+            f"modality {modality_name!r} has no alpha_y_prefit -- fit_ntc()/load_ntc_fit() "
+            "must be loaded before precomputing smoothed curves."
+        )
+    if modality.sum_factors is None or sum_factor_col not in modality.sum_factors.columns:
+        raise ValueError(
+            f"sum_factor_col={sum_factor_col!r} not found in modality.sum_factors "
+            f"(available: {list(modality.sum_factors.columns) if modality.sum_factors is not None else '(none)'})."
+        )
+
+    x_true = model.x_true
+    if hasattr(x_true, 'cpu'):
+        x_true = x_true.cpu().numpy()
+    x_true = np.asarray(x_true)
+
+    alpha_y_full = modality.alpha_y_prefit
+    if hasattr(alpha_y_full, 'cpu'):
+        alpha_y_full = alpha_y_full.cpu().numpy()
+    alpha_y_full = np.asarray(alpha_y_full)  # [C, T] or [S, C, T]
+
+    feature_names = list(modality.feature_names)
+    n_features = len(feature_names)
+
+    # Group labels are fixed across every feature (same cell population,
+    # modulo per-feature NaN/zero filtering below) -- computed once here
+    # rather than per feature, so every feature shares the same [F, G, ...]
+    # slot layout (a feature missing a group just gets an all-NaN slot).
+    if color_by in model.meta.columns:
+        group_labels = sorted(model.meta[color_by].dropna().astype(str).unique())
+    else:
+        group_labels = ['All']
+    n_groups = len(group_labels)
+
+    x_arr = np.full((n_features, n_groups, n_points), np.nan, dtype=np.float32)
+    y_arr = np.full((n_features, n_groups, n_points), np.nan, dtype=np.float32)
+
+    iterator = range(n_features)
+    if verbose:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc=f'[{modality_name}] precomputing smoothed curves')
+        except ImportError:
+            print(f"[{modality_name}] precomputing smoothed curves for {n_features} features...")
+
+    for fi in iterator:
+        y_obs = modality.counts[fi, :] if modality.cells_axis == 1 else modality.counts[:, fi]
+        x_true_aligned, y_obs_aligned, meta_aligned = _align_cells_to_modality(model, modality, x_true, y_obs)
+        sum_factor = modality.sum_factors.loc[meta_aligned['cell'].values, sum_factor_col].values
+
+        y_expr = np.empty(len(meta_aligned))
+        if 'technical_group_code' in meta_aligned.columns:
+            tgc = meta_aligned['technical_group_code'].values
+            for gc in np.unique(tgc):
+                gc = int(gc)
+                a = (float(alpha_y_full[:, gc, fi].mean()) if alpha_y_full.ndim == 3
+                     else float(alpha_y_full[gc, fi]))
+                m = tgc == gc
+                y_expr[m] = y_obs_aligned[m] / (sum_factor[m] * a)
+        else:
+            y_expr = y_obs_aligned / sum_factor
+
+        cb_vals = (meta_aligned[color_by].astype(str).values if color_by in meta_aligned.columns
+                   else np.full(len(meta_aligned), 'All'))
+
+        for gi, glabel in enumerate(group_labels):
+            gmask = cb_vals == glabel
+            xg, yg = x_true_aligned[gmask], y_expr[gmask]
+            valid = (xg > 0) & np.isfinite(yg)
+            xg, yg = xg[valid], yg[valid]
+            if len(xg) == 0:
+                continue
+            k = _knn_k(len(xg), window)
+            x_smooth, y_smooth = _smooth_knn(xg, yg, k)
+            vs = y_smooth > 0
+            x_smooth, y_smooth = x_smooth[vs], y_smooth[vs]
+            if len(x_smooth) == 0:
+                continue
+            xl, yl = np.log2(x_smooth), np.log2(y_smooth)
+            if len(xl) > n_points:
+                # x_smooth is sorted (guaranteed by _smooth_knn) -- take
+                # evenly-spaced INDICES rather than interpolating, so the
+                # stored curve is a subset of real smoothed values, not a
+                # re-derived approximation of them.
+                idx = np.unique(np.linspace(0, len(xl) - 1, n_points).round().astype(int))
+                xl, yl = xl[idx], yl[idx]
+            x_arr[fi, gi, :len(xl)] = xl
+            y_arr[fi, gi, :len(yl)] = yl
+
+    return {
+        'feature_names': feature_names,
+        'group_labels': group_labels,
+        'x_log2': x_arr,
+        'y_log2': y_arr,
+    }
+
+
+def save_smoothed_curves(save_dir: str, smoothed: Dict[str, object], modality_name: str = 'gene') -> str:
+    """Save compute_smoothed_curves()'s output to
+    `save_dir`/smoothed_xy_{modality_name}.npz -- alongside
+    save_model_for_plotting()'s other exports, so load_smoothed_curves()
+    finds it via the same DatasetSpec.plotting_save_dir(cis_gene).
+    """
+    path = os.path.join(save_dir, f'smoothed_xy_{modality_name}.npz')
+    np.savez_compressed(
+        path,
+        feature_names=np.array(smoothed['feature_names']),
+        group_labels=np.array(smoothed['group_labels']),
+        x_log2=smoothed['x_log2'],
+        y_log2=smoothed['y_log2'],
+    )
+    return path
+
+
+def load_smoothed_curves(spec: DatasetSpec, cis_gene: str) -> Dict[str, object]:
+    """Load ONLY the precomputed smoothed-curve artifact (compute_smoothed_
+    curves()/save_smoothed_curves()) for (spec, cis_gene) -- no model, no
+    raw counts. Returns {'feature_names', 'feature_index' (name -> position,
+    for O(1) lookup), 'group_labels', 'x_log2', 'y_log2'}.
+    """
+    save_dir = spec.plotting_save_dir(cis_gene)
+    path = os.path.join(save_dir, f'smoothed_xy_{spec.modality_name}.npz')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"[{spec.name}] no precomputed smoothed-curve artifact at {path!r} for cis gene "
+            f"{cis_gene!r}. This is written by reconstruct_export(_replogle).py's "
+            f"reconstruct_and_export() alongside save_model_for_plotting() -- if this export "
+            f"predates that addition, re-run reconstruct_and_export(..., force=True) for this "
+            f"(dataset, cis_gene) to backfill it."
+        )
+    data = np.load(path)
+    feature_names = data['feature_names'].tolist()
+    return {
+        'feature_names': feature_names,
+        'feature_index': {f: i for i, f in enumerate(feature_names)},
+        'group_labels': data['group_labels'].tolist(),
+        'x_log2': data['x_log2'],
+        'y_log2': data['y_log2'],
+    }
+
+
+def load_gene_summary(spec: DatasetSpec, cis_gene: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load ONLY `spec`'s trans_feature_summary_{modality}.csv for `cis_gene`
+    -- the CSV every completed fit_trans run already writes, regardless of
+    whether save_model_for_plotting()/compute_smoothed_curves() have been
+    run. Returns (summary, summary_allsig) -- see allsig_copy().
+    """
+    summary = pd.read_csv(spec.trans_summary_path(cis_gene), low_memory=False)
+    return summary, allsig_copy(summary, spec)
+
+
+def plot_gene_lightweight(
+    ax: plt.Axes, feature: str, row: Optional[pd.Series], smoothed: Dict[str, object], spec: DatasetSpec,
+    *, fdr_threshold: float = 0.05, show_hill_function: bool = True,
+    hill_color: Optional[str] = None, hill_label: Optional[str] = None,
+) -> bool:
+    """Model-free equivalent of _plot_into()/model.plot_xy_data() for one
+    (dataset, feature): draws one smoothed trend line per color_by group
+    from `smoothed` (compute_smoothed_curves()/load_smoothed_curves()) plus
+    the fitted Hill curve from `row` (a trans_feature_summary row -- pass
+    the REAL row for genuine FDR gating, or an allsig_copy() row to
+    force-render regardless of significance, exactly as make_panel() does
+    for its row-0/row-1 respectively), via predict_hill_from_summary_row()
+    (the same function _overlay_extra_curve() already uses for cross-dataset
+    overlays).
+
+    Both the smoothed trend and the Hill curve are offset into log2FC(x)/
+    log2FC(y) space using `row`'s own x_ntc/y_ntc -- see
+    compute_smoothed_curves()'s docstring for why that's the right offset
+    source here.
+
+    Returns False if nothing was drawn (row missing/lacks x_ntc,y_ntc, or no
+    smoothed data for this feature).
+    """
+    if row is None:
+        return False
+    y_ntc = float(row.get('y_ntc', np.nan))
+    x_ntc = float(row.get('x_ntc', np.nan))
+    if not (np.isfinite(y_ntc) and y_ntc > 0 and np.isfinite(x_ntc) and x_ntc > 0):
+        return False
+    x_off, y_off = np.log2(x_ntc), np.log2(y_ntc)
+
+    drew_any = False
+    fi = smoothed['feature_index'].get(feature)
+    if fi is not None:
+        for gi, glabel in enumerate(smoothed['group_labels']):
+            xl, yl = smoothed['x_log2'][fi, gi], smoothed['y_log2'][fi, gi]
+            valid = np.isfinite(xl) & np.isfinite(yl)
+            if not valid.any():
+                continue
+            color = spec.cell_line_palette.get(glabel)
+            ax.plot(xl[valid] - x_off, yl[valid] - y_off, color=color, linewidth=2, label=glabel)
+            drew_any = True
+
+    if show_hill_function:
+        xlim = ax.get_xlim() if drew_any else (-6.0, 6.0)
+        x_abs = 2 ** (np.linspace(xlim[0], xlim[1], 2000) + x_off)
+        y_pred = predict_hill_from_summary_row(row, x_abs, fdr_threshold=fdr_threshold)
+        if y_pred is not None:
+            valid = y_pred > 0
+            if valid.any():
+                ax.plot(np.log2(x_abs[valid]) - x_off, np.log2(y_pred[valid]) - y_off,
+                        color=hill_color or spec.color, linewidth=2, label=hill_label or spec.name)
+                drew_any = True
+
+    ax.axhline(0, color='gray', linestyle=':', linewidth=0.6, alpha=0.5)
+    ax.axvline(0, color='gray', linestyle=':', linewidth=0.6, alpha=0.5)
+    ax.set_xlabel('log2FC(x_true)')
+    ax.set_ylabel('log2FC(y)')
+    return drew_any
 
 
 # ── Panel plotting ────────────────────────────────────────────────────────
@@ -420,6 +719,125 @@ def make_panel(
     return fig, unified_x
 
 
+def make_panel_lightweight(
+    goi: str,
+    specs: List[DatasetSpec], summaries: List[pd.DataFrame], summaries_allsig: List[pd.DataFrame],
+    smoothed_list: List[Dict[str, object]],
+    *, cis_gene: str, fdr_threshold: float = 0.05,
+    figsize_per: Tuple[float, float] = (3.6, 3.0), display_name: Optional[str] = None,
+) -> Tuple[plt.Figure, Tuple[float, float]]:
+    """Model-free equivalent of make_panel(): same 2xN row-0 (standalone,
+    real per-dataset FDR gating)/row-1 (own data force-rendered + every
+    other dataset's curve overlaid) layout and intent, but every trend/curve
+    is drawn from a precomputed smoothed array (compute_smoothed_curves()/
+    load_smoothed_curves()) + a trans_feature_summary row
+    (plot_gene_lightweight()) instead of a live model + plot_xy_data(). No
+    raw counts or trans-fit posterior are ever touched, so unlike
+    compare_datasets()/make_panel(), the caller can iterate this over a
+    dataset's ENTIRE trans panel -- see compare_datasets_lightweight().
+
+    `summaries` (real FDR values) drives row-0's standalone significance
+    gating -- these are the same fdr_alpha/fdr_beta columns
+    save_trans_summary() itself wrote to trans_feature_summary_{modality}.csv,
+    so this gates identically to make_panel()'s row-0 (which re-derives the
+    same values live from the model), just read from disk instead. Does NOT
+    support show_param_markers (row-0 EC50/inflection annotations) -- those
+    need the live posterior's per-sample derivative/root-finding, not
+    available from a summary row alone.
+
+    `goi`/`display_name` and the missing-gene KeyError behavior match
+    make_panel() exactly (see its docstring) -- `summaries_allsig` is what's
+    actually intersected/looked-up by gene_id.
+    """
+    n = len(specs)
+    assert n >= 2, "make_panel_lightweight needs at least 2 datasets to compare"
+
+    native = [_native_feature(summaries_allsig[j], goi) for j in range(n)]
+    missing_j = [j for j, f in enumerate(native) if f is None]
+    if missing_j:
+        raise KeyError(
+            f"gene_id {goi!r} not present in {[specs[j].name for j in missing_j]}'s trans "
+            f"summary. make_panel_lightweight() expects `goi` to already be a gene_id every "
+            f"dataset in `specs` shares -- compare_datasets_lightweight() only calls this "
+            f"after intersecting on gene_id."
+        )
+
+    def _real_row(j: int) -> Optional[pd.Series]:
+        match = summaries[j].loc[summaries[j]['feature'] == native[j]]
+        return match.iloc[0] if not match.empty else None
+
+    real_rows = [_real_row(j) for j in range(n)]
+    allsig_rows = [_lookup_row(summaries_allsig[j], goi) for j in range(n)]
+
+    fig, axes = plt.subplots(2, n, figsize=(figsize_per[0] * n, figsize_per[1] * 2),
+                              constrained_layout=True, squeeze=False)
+
+    # Row 0: standalone, real per-dataset FDR gating (from the row's own
+    # on-disk fdr_alpha/fdr_beta -- see docstring above).
+    for j in range(n):
+        plot_gene_lightweight(axes[0][j], native[j], real_rows[j], smoothed_list[j], specs[j],
+                               fdr_threshold=fdr_threshold, hill_color=specs[j].color,
+                               hill_label=specs[j].name)
+        axes[0][j].set_title(specs[j].name)
+
+    # Row 1: dataset j's own data + own curve (force-rendered via the allsig
+    # row, same "always show the shape" intent as make_panel()), plus every
+    # other dataset's curve overlaid on top via _overlay_extra_curve (already
+    # model-free -- it only ever reads a summary row).
+    for j in range(n):
+        ax = axes[1][j]
+        plot_gene_lightweight(ax, native[j], allsig_rows[j], smoothed_list[j], specs[j],
+                               fdr_threshold=fdr_threshold, hill_color=specs[j].color,
+                               hill_label=specs[j].name)
+        overlaid_names = []
+        for k in range(n):
+            if k == j:
+                continue
+            if allsig_rows[k] is not None and _overlay_extra_curve(ax, allsig_rows[k], specs[k],
+                                                                     fdr_threshold=fdr_threshold):
+                overlaid_names.append(specs[k].name)
+        title = specs[j].name if not overlaid_names else f"{specs[j].name} + {' + '.join(overlaid_names)}"
+        ax.set_title(title)
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        handles, labels = ax.get_legend_handles_labels()
+        seen, h2, l2 = set(), [], []
+        for h, l in zip(handles, labels):
+            if l not in seen:
+                seen.add(l)
+                h2.append(h)
+                l2.append(l)
+        if h2:
+            ax.legend(h2, l2, fontsize=7, frameon=False)
+
+    xlims = [axes[1][j].get_xlim() for j in range(n)]
+    ylims = [axes[1][j].get_ylim() for j in range(n)]
+    unified_x = (min(x[0] for x in xlims), max(x[1] for x in xlims))
+    unified_y = (min(y[0] for y in ylims), max(y[1] for y in ylims))
+    for ax in axes.ravel():
+        ax.set_xlim(unified_x)
+        ax.set_ylim(unified_y)
+
+    fig.suptitle(f'{cis_gene} → {display_name or goi}', fontsize=11, fontweight='bold')
+
+    seen, handles, labels = set(), [], []
+    for ax in axes.ravel():
+        leg = ax.get_legend()
+        if leg is None:
+            continue
+        for h, t in zip(leg.legend_handles, [t.get_text() for t in leg.get_texts()]):
+            if t not in seen:
+                seen.add(t)
+                handles.append(h)
+                labels.append(t)
+        leg.remove()
+    if handles:
+        fig.legend(handles, labels, bbox_to_anchor=(1.01, 0.5), loc='center left',
+                   frameon=False, fontsize=8)
+
+    return fig, unified_x
+
+
 # ── Cis-side guide-density panel ─────────────────────────────────────────────
 
 def _get_x_ntc_log2(model) -> float:
@@ -590,12 +1008,26 @@ def compare_datasets(
     specs: List[DatasetSpec], cis_gene: str,
     *, out_dir: str = './dose_response_plots', genes: Optional[List[str]] = None,
     show_param_markers: bool = True, device: Optional[str] = None,
-    panel_figsize_per: Tuple[float, float] = (3.6, 3.0), lean: bool = False,
+    panel_figsize_per: Tuple[float, float] = (3.6, 3.0), lean: bool = True,
 ) -> List[str]:
-    """Full pipeline for N (>=2) datasets: load all N models for `cis_gene`,
-    summarise each, find trans genes present in *every* dataset's summary
-    (or use `genes` if given), and write one 2xN panel PNG per gene plus one
-    guide-density panel to `out_dir`. Panel width auto-scales with N.
+    """Full pipeline for N (>=2) datasets: load all N *live models* for
+    `cis_gene`, summarise each, find trans genes present in *every*
+    dataset's summary (or use `genes` if given), and write one 2xN panel PNG
+    per gene plus one guide-density panel to `out_dir`. Panel width
+    auto-scales with N.
+
+    This is the heavy, full-model path -- every trans gene's full posterior
+    for every dataset in `specs` is loaded, which for Morris/Replogle's
+    transcriptome-wide panels is large even with `lean=True` (see
+    load_model_for_plotting()'s docstring: lean never touches the trans-fit
+    posterior). For interactively plotting genes across a dataset's FULL
+    panel on demand, use compare_datasets_lightweight() instead, which loads
+    only each dataset's trans_feature_summary CSV + a small precomputed
+    smoothed-curve artifact -- no model, no raw counts, no trans-fit
+    posterior at all. This function stays useful for genuinely needing the
+    live posterior (e.g. show_param_markers below, which needs per-sample
+    root-finding not available from a summary row alone), or for a short
+    hand-picked `genes` list where the model-reload cost is bounded anyway.
 
     Genes are matched across datasets by Ensembl gene_id, not raw 'feature'
     -- Domingo/Morris's own 'feature' column already is the gene symbol,
@@ -615,8 +1047,8 @@ def compare_datasets(
 
     lean : bool
         Passed through to load_model_for_plotting() for every dataset --
-        see its docstring for the memory/uncertainty-band tradeoff. Default
-        False (unchanged behavior).
+        see its docstring for what this does and doesn't cover (NTC/cis
+        only, not trans).
 
     Returns the list of trans genes actually plotted (display symbols, not
     gene_ids).
@@ -692,6 +1124,73 @@ def compare_datasets(
     return plotted
 
 
+def compare_datasets_lightweight(
+    specs: List[DatasetSpec], cis_gene: str,
+    *, out_dir: str = './dose_response_plots', genes: Optional[List[str]] = None,
+    fdr_threshold: float = 0.05, panel_figsize_per: Tuple[float, float] = (3.6, 3.0),
+) -> List[str]:
+    """Model-free equivalent of compare_datasets(): for each dataset in
+    `specs`, loads ONLY its trans_feature_summary CSV (load_gene_summary(),
+    already required for every completed fit_trans run) and its precomputed
+    smoothed-curve artifact (load_smoothed_curves(), written by
+    reconstruct_export.py/reconstruct_export_replogle.py's backfill) --
+    never a full model, raw counts, or trans-fit posterior. Both are cheap
+    (tens of MB) even for Morris/Replogle's full ~10-20k-gene panel, so
+    unlike compare_datasets() this scales to plotting the ENTIRE shared
+    trans-gene set (or any `genes` subset) on demand -- the intended default
+    for interactive use in the notebook.
+
+    Same 2xN panel semantics as compare_datasets()/make_panel() (see
+    make_panel_lightweight()'s docstring for the one real difference: row-0
+    gating reads on-disk FDR values instead of live per-sample posteriors,
+    and show_param_markers isn't available). Unlike compare_datasets(), does
+    NOT write a guide-density panel -- that needs per-cell x_true/guide data,
+    which this path never loads.
+
+    Raises FileNotFoundError up front (via load_smoothed_curves()) if any
+    dataset in `specs` hasn't had its smoothed-curve artifact computed yet.
+    """
+    assert len(specs) >= 2, "compare_datasets_lightweight needs at least 2 datasets"
+    names = [s.name for s in specs]
+    tag = _tag(specs)
+
+    print(f"[{' vs '.join(names)}] {cis_gene}: loading trans summaries + smoothed curves...")
+    summary_pairs = [load_gene_summary(spec, cis_gene) for spec in specs]
+    summaries = [p[0] for p in summary_pairs]
+    summaries_allsig = [p[1] for p in summary_pairs]
+    smoothed_list = [load_smoothed_curves(spec, cis_gene) for spec in specs]
+
+    if genes is None:
+        gene_sets = [set(s['gene_id'].dropna()) for s in summaries_allsig]
+        gene_ids = sorted(set.intersection(*gene_sets))
+    else:
+        sym_to_id = morris_symbol_to_id()
+        gene_ids = sorted({sym_to_id.get(g, g) for g in genes})
+    id_to_symbol = morris_id_to_symbol()
+    print(f"{' vs '.join(names)} ({cis_gene}): {len(gene_ids)} trans genes to plot")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    plotted = []
+    for i, gid in enumerate(gene_ids, 1):
+        display = id_to_symbol.get(gid, gid)
+        print(f"  [{i}/{len(gene_ids)}] {display}", end='', flush=True)
+        fig, _ = make_panel_lightweight(
+            gid, specs, summaries, summaries_allsig, smoothed_list,
+            cis_gene=cis_gene, fdr_threshold=fdr_threshold, figsize_per=panel_figsize_per,
+            display_name=display,
+        )
+        fig.savefig(os.path.join(out_dir, f'{cis_gene}_{tag}_{display}_panel.png'),
+                    dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        plotted.append(display)
+        print("  done")
+
+    print(f"\nDone. {len(plotted)} panels written to {out_dir}/ (no guide-density panel -- "
+          f"lightweight path never loads per-cell data).")
+    return plotted
+
+
 def compare_pair(
     spec_a: DatasetSpec, spec_b: DatasetSpec, cis_gene: str, **kwargs,
 ) -> List[str]:
@@ -701,15 +1200,29 @@ def compare_pair(
 
 def compare_all_domingo_cis_genes(
     *, out_dir: str = './dose_response_plots', datasets: Optional[List[DatasetSpec]] = None,
-    bounding_dataset: Optional[DatasetSpec] = None, require_all_exports: bool = True, **kwargs,
+    bounding_dataset: Optional[DatasetSpec] = None, require_all_exports: bool = True,
+    lightweight: bool = False, **kwargs,
 ) -> Dict[str, List[str]]:
-    """Automate compare_datasets() across every cis gene, using whichever
-    subset of `datasets` (default: [DOMINGO, MORRIS, REPLOGLE]) structurally
-    has a completed fit_trans run for that gene (per each DatasetSpec.cis_genes)
+    """Automate compare_datasets() (or compare_datasets_lightweight(), see
+    `lightweight`) across every cis gene, using whichever subset of
+    `datasets` (default: [DOMINGO, MORRIS, REPLOGLE]) structurally has a
+    completed fit_trans run for that gene (per each DatasetSpec.cis_genes)
     -- so GFI1B/NFE2 (all 3 fit) get a 2x3 panel, while TET2/MYB (Morris
     never fit these; see publication_runs/morris/config.yaml's primary_genes)
     are Domingo-vs-Replogle from the start. That drop is expected/structural,
     not an error.
+
+    lightweight : bool
+        If True, calls compare_datasets_lightweight() instead of
+        compare_datasets() for each gene -- no model/raw counts/trans-fit
+        posterior loaded, so this scales to plotting every trans gene in
+        every participating dataset's full panel, not just a hand-picked
+        subset (see that function's docstring). require_all_exports still
+        gates on save_model_for_plotting()'s export existing (that's where
+        the precomputed smoothed-curve artifact + trans_feature_summary CSV
+        live) -- it does not separately check for the smoothed-curve file;
+        compare_datasets_lightweight() raises its own clear error if that's
+        missing for a dataset whose model export otherwise exists.
 
     require_all_exports : bool
         If True (default), raise immediately if a dataset that DOES list a
@@ -721,15 +1234,14 @@ def compare_all_domingo_cis_genes(
         adoption before every gene has been exported).
 
     The cis gene list iterated is `bounding_dataset.cis_genes` (default: the
-    first dataset in `datasets`, i.e. Domingo) -- the dataset with the
-    smallest/most tractable trans gene panel, since this is a full-model-reload
-    per (dataset, gene) operation (see module docstring).
+    first dataset in `datasets`, i.e. Domingo).
 
     Writes into `out_dir/<cis_gene>/`. Returns {cis_gene: [genes plotted]}.
     """
     from .datasets import DOMINGO, MORRIS, REPLOGLE
     datasets = datasets or [DOMINGO, MORRIS, REPLOGLE]
     bounding_dataset = bounding_dataset or datasets[0]
+    compare_fn = compare_datasets_lightweight if lightweight else compare_datasets
 
     results = {}
     for cis_gene in bounding_dataset.cis_genes:
@@ -756,7 +1268,7 @@ def compare_all_domingo_cis_genes(
                 continue
 
         print(f"=== {cis_gene}: {[s.name for s in participating]} ===")
-        results[cis_gene] = compare_datasets(
+        results[cis_gene] = compare_fn(
             participating, cis_gene, out_dir=os.path.join(out_dir, cis_gene), **kwargs,
         )
     return results
