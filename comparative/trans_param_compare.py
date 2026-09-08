@@ -1086,3 +1086,126 @@ def compare_all_cis_genes_grid(
             for fig in figs.values():
                 plt.close(fig)
     return results
+
+
+# ── EC50 vs Hill coefficient, with an x_true coverage panel underneath ───────
+
+def _load_x_true_coverage(spec: DatasetSpec, cis_gene: str, x_ntc: float) -> pd.DataFrame:
+    """Per-cell log2FC(x_true) (relative to `x_ntc`, matching EC50_a_log2fc's
+    own baseline -- see bayesDREAM/io/summary.py's compute_log2fc_params(),
+    which centers EC50_a_log2fc on the exact same x_ntc value) plus a
+    'group' label in {'NTC', 'CRISPRi', 'CRISPRa'}.
+
+    Reads directly from save_model_for_plotting()'s lightweight per-cell
+    export (meta_plot.csv + x_true.pt) -- no full model reload, so this
+    stays cheap even for Morris/Replogle's transcriptome-wide runs.
+    """
+    import torch
+
+    save_dir = spec.plotting_save_dir(cis_gene)
+    meta = pd.read_csv(os.path.join(save_dir, 'meta_plot.csv'))
+
+    x_true_path = os.path.join(save_dir, 'x_true.pt')
+    if not os.path.exists(x_true_path):
+        raise FileNotFoundError(
+            f"[{spec.name}/{cis_gene}] no x_true.pt at {x_true_path!r} -- has "
+            "save_model_for_plotting() been run for this gene yet?"
+        )
+    x_true = torch.load(x_true_path, map_location='cpu')
+    x_true = np.asarray(x_true.cpu() if hasattr(x_true, 'cpu') else x_true).reshape(-1)
+    if len(x_true) != len(meta):
+        raise ValueError(
+            f"[{spec.name}/{cis_gene}] x_true.pt has {len(x_true)} entries but "
+            f"meta_plot.csv has {len(meta)} rows -- both are supposed to be saved "
+            "from the same model, in the same cell order."
+        )
+
+    meta = meta.assign(x_true=x_true)
+    meta = meta.loc[meta['x_true'] > 0].copy()
+    meta['log2fc_x'] = np.log2(meta['x_true']) - np.log2(max(float(x_ntc), 1e-10))
+
+    is_ntc = meta['target'].astype(str).str.lower() == 'ntc'
+    # force_single_cell_line datasets (Morris/Replogle: CRISPRi-only) may have
+    # a missing/inconsistent raw 'cell_line' column -- same override
+    # dose_response_panels.load_model_for_plotting() applies after reload.
+    if spec.force_single_cell_line:
+        cell_line = pd.Series(spec.force_single_cell_line, index=meta.index)
+    else:
+        cell_line = meta.get('cell_line', pd.Series('CRISPRi', index=meta.index)).astype(str)
+    meta['group'] = np.where(is_ntc, 'NTC', cell_line)
+
+    return meta[['log2fc_x', 'group']]
+
+
+def plot_ec50_hill_with_coverage(
+    spec: DatasetSpec, cis_gene: str, df: Optional[pd.DataFrame] = None,
+    *, ec50_col: str = 'EC50_a_log2fc', hill_col: str = 'n_a_median',
+    figsize: Tuple[float, float] = (6, 6.5), height_ratios: Tuple[float, float] = (3, 1),
+) -> plt.Figure:
+    """EC50 (log2FC) vs Hill-coefficient scatter for `cis_gene` in `spec`
+    (single Hill vs. not-dependent genes, as in the notebook's original
+    per-dataset plots), with an x_true 'coverage' density panel underneath
+    sharing the x-axis -- so it's visible at a glance which EC50 values fall
+    inside vs. outside the actually-observed cis-gene expression range.
+
+    Coverage is split into NTC / CRISPRi / CRISPRa using the standard
+    grey / steelblue / tomato scheme (see bayesDREAM/plotting/colors.py),
+    read from save_model_for_plotting()'s lightweight per-cell export --
+    no full model reload (see _load_x_true_coverage()).
+
+    df : precomputed load_trans_summary(spec, cis_gene) result, to reuse one
+    already loaded by the caller. Loaded fresh (single_hill_only=True
+    default) if not given.
+    """
+    if df is None:
+        df = load_trans_summary(spec, cis_gene)
+    if 'x_ntc' not in df.columns:
+        raise KeyError(
+            f"[{spec.name}/{cis_gene}] no 'x_ntc' column in trans_feature_summary -- "
+            "re-run save_trans_summary() with the cis modality's NTC fit available."
+        )
+    x_ntc = float(df['x_ntc'].iloc[0])
+
+    coverage = _load_x_true_coverage(spec, cis_gene, x_ntc)
+
+    ec50_vals = df[ec50_col]
+    finite_ec50 = ec50_vals[np.isfinite(ec50_vals)]
+    finite_cov = coverage['log2fc_x'][np.isfinite(coverage['log2fc_x'])]
+    lo = min(finite_ec50.min(), finite_cov.min())
+    hi = max(finite_ec50.max(), finite_cov.max())
+    pad = 0.05 * (hi - lo) if hi > lo else 1.0
+    xlim = (lo - pad, hi + pad)
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=figsize, sharex=True,
+        gridspec_kw={'height_ratios': height_ratios, 'hspace': 0.08},
+    )
+
+    dep = df['is_dependent']
+    ax_top.scatter(df.loc[dep, ec50_col], df.loc[dep, hill_col], label='single Hill', s=5)
+    ax_top.scatter(df.loc[~dep, ec50_col], df.loc[~dep, hill_col], label='not dependent', s=3, c='grey')
+    ax_top.set_ylabel('Hill coefficient')
+    ax_top.axvline(0, linestyle='dashed', c='black', alpha=0.4)
+    ax_top.axhline(0, linestyle='dashed', c='black', alpha=0.4)
+    ax_top.set_title(f'{spec.name}, {cis_gene}')
+    ax_top.legend()
+    ax_top.tick_params(labelbottom=False)
+
+    x_grid = np.linspace(xlim[0], xlim[1], 500)
+    for group, color in (('NTC', '#999999'), ('CRISPRi', 'steelblue'), ('CRISPRa', 'tomato')):
+        vals = coverage.loc[coverage['group'] == group, 'log2fc_x'].values
+        vals = vals[np.isfinite(vals)]
+        if len(vals) < 2:
+            continue
+        density = scipy_stats.gaussian_kde(vals, bw_method='scott')(x_grid)
+        ax_bot.fill_between(x_grid, 0, density, color=color, alpha=0.25)
+        ax_bot.plot(x_grid, density, color=color, linewidth=1.2, label=group)
+
+    ax_bot.set_xlim(xlim)
+    ax_bot.axvline(0, linestyle='dashed', c='black', alpha=0.4)
+    ax_bot.set_xlabel('EC50 / cis-gene expression (log2FC vs NTC)')
+    ax_bot.set_ylabel('Density')
+    ax_bot.legend(frameon=False, fontsize=8)
+
+    fig.tight_layout()
+    return fig
