@@ -1350,12 +1350,25 @@ def compare_datasets(
         summaries.append(model.save_trans_summary(compute_lfc_ci=False, compute_derivative_roots=False))
     summaries_allsig = [allsig_copy(s, spec) for s, spec in zip(summaries, specs)]
 
+    gene_sets = [set(s['gene_id'].dropna()) for s in summaries_allsig]
+    shared = set.intersection(*gene_sets)
     if genes is None:
-        gene_sets = [set(s['gene_id'].dropna()) for s in summaries_allsig]
-        gene_ids = sorted(set.intersection(*gene_sets))
+        gene_ids = sorted(shared)
     else:
+        # Still intersect against `shared`, not just translate -- an
+        # explicit `genes` list (e.g. domingo_union_features(DOMINGO), not
+        # guaranteed to be a subset of any other dataset's own trans panel)
+        # can legitimately name a gene Morris/Replogle never fit at all.
+        # make_panel()/make_panel_lightweight() both assume presence in
+        # every participating dataset is already guaranteed (see their own
+        # KeyError otherwise) -- confirmed 2026-09-08.
         sym_to_id = morris_symbol_to_id()
-        gene_ids = sorted({sym_to_id.get(g, g) for g in genes})
+        requested = {sym_to_id.get(g, g) for g in genes}
+        gene_ids = sorted(requested & shared)
+        n_missing = len(requested) - len(gene_ids)
+        if n_missing:
+            print(f"[{' vs '.join(names)}] {n_missing}/{len(requested)} requested gene(s) not present "
+                  f"in every participating dataset's trans summary for {cis_gene!r} -- skipped (not an error).")
     id_to_symbol = morris_id_to_symbol()
     print(f"\n{' vs '.join(names)} ({cis_gene}): {len(gene_ids)} trans genes to plot")
 
@@ -1427,12 +1440,21 @@ def compare_datasets_lightweight(
     summaries_allsig = [p[1] for p in summary_pairs]
     smoothed_list = [load_smoothed_curves(spec, cis_gene) for spec in specs]
 
+    gene_sets = [set(s['gene_id'].dropna()) for s in summaries_allsig]
+    shared = set.intersection(*gene_sets)
     if genes is None:
-        gene_sets = [set(s['gene_id'].dropna()) for s in summaries_allsig]
-        gene_ids = sorted(set.intersection(*gene_sets))
+        gene_ids = sorted(shared)
     else:
+        # Still intersect against `shared`, not just translate -- see the
+        # matching comment in compare_datasets() for why an explicit `genes`
+        # list can't just be trusted to already be present everywhere.
         sym_to_id = morris_symbol_to_id()
-        gene_ids = sorted({sym_to_id.get(g, g) for g in genes})
+        requested = {sym_to_id.get(g, g) for g in genes}
+        gene_ids = sorted(requested & shared)
+        n_missing = len(requested) - len(gene_ids)
+        if n_missing:
+            print(f"[{' vs '.join(names)}] {n_missing}/{len(requested)} requested gene(s) not present "
+                  f"in every participating dataset's trans summary for {cis_gene!r} -- skipped (not an error).")
     id_to_symbol = morris_id_to_symbol()
     print(f"{' vs '.join(names)} ({cis_gene}): {len(gene_ids)} trans genes to plot")
 
