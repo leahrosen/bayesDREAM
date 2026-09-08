@@ -278,6 +278,18 @@ def _load_morris_id_symbol_maps() -> Dict[str, Dict[str, str]]:
     gene_id (left unmappable) rather than picking one arbitrarily -- callers
     should treat a missing symbol as "can't be matched across datasets", not
     an error.
+
+    symbol_to_id is then extended with GENE_SYMBOL_SYNONYMS (e.g. Domingo's
+    'CFAP210' -> Morris's newer 'CCDC173') so a dataset using the OLD symbol
+    still resolves to the same Ensembl ID Morris's own meta reports it under
+    -- without this, dose_response_panels.py's cross-dataset gene_id matching
+    (morris_symbol_to_id() is its only symbol->id lookup) silently drops any
+    synonym-affected gene from a genes=None intersection, or raises a KeyError
+    once an explicit gene list carries the old symbol through unmapped
+    (confirmed 2026-09-08, compare_all_domingo_cis_genes(genes=domingo_union_
+    features(DOMINGO)) on 'CFAP210'). trans_param_compare.py's own
+    load_trans_summary() already does the equivalent canonicalization
+    separately; this is the same fix for this module's independent lookup.
     """
     global _morris_id_symbol_cache
     if _morris_id_symbol_cache is None:
@@ -286,6 +298,9 @@ def _load_morris_id_symbol_maps() -> Dict[str, Dict[str, str]]:
         symbol_counts = fm['gene_name'].value_counts()
         ambiguous = set(symbol_counts[symbol_counts > 1].index)
         symbol_to_id = {sym: gid for gid, sym in id_to_symbol.items() if sym not in ambiguous}
+        for old, new in GENE_SYMBOL_SYNONYMS.items():
+            if new in symbol_to_id and old not in symbol_to_id:
+                symbol_to_id[old] = symbol_to_id[new]
         _morris_id_symbol_cache = {'id_to_symbol': id_to_symbol, 'symbol_to_id': symbol_to_id}
     return _morris_id_symbol_cache
 
