@@ -280,6 +280,19 @@ def reconstruct_model(gene_symbol: str, *, device: Optional[str] = None):
     # Loads the EXISTING saved posterior -- does not fit anything.
     model.load_trans_fit(modalities=["gene"], subset_features=True)
 
+    # Mirrors reconstruct_export.py's (Domingo/Morris) same injection --
+    # without it, this model's meta has no 'cell_line' column (Replogle is
+    # single-cell-line), so compute_smoothed_curves()'s default
+    # color_by='cell_line' falls back to group_labels=['All'] here while
+    # dose_response_panels.py's load_model_for_plotting() (used for the
+    # on-demand reload of the SAME model at plot time) injects this same
+    # REPLOGLE.force_single_cell_line column, producing group_labels=
+    # ['CRISPRi'] instead -- a mismatch that trips _merge_smoothed_curves_
+    # inplace's consistency check when a gene outside the precompute's
+    # feature bound needs an on-demand smoothed curve (confirmed 2026-09-08).
+    if REPLOGLE.force_single_cell_line and 'cell_line' not in model.meta.columns:
+        model.meta['cell_line'] = REPLOGLE.force_single_cell_line
+
     return model, label, output_dir
 
 

@@ -273,7 +273,7 @@ def allsig_copy(summary: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
 # a memory cost of a few tens of MB even for Morris/Replogle.
 
 def compute_smoothed_curves(
-    model, modality_name: str = 'gene', color_by: str = 'cell_line',
+    model, modality_name: str = 'gene', color_by: Optional[str] = 'cell_line',
     sum_factor_col: str = 'sum_factor', window: int = 100, n_points: int = 150,
     verbose: bool = True, features: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
@@ -371,7 +371,7 @@ def compute_smoothed_curves(
     # modulo per-feature NaN/zero filtering below) -- computed once here
     # rather than per feature, so every feature shares the same [F, G, ...]
     # slot layout (a feature missing a group just gets an all-NaN slot).
-    if color_by in model.meta.columns:
+    if color_by is not None and color_by in model.meta.columns:
         group_labels = sorted(model.meta[color_by].dropna().astype(str).unique())
     else:
         group_labels = ['All']
@@ -406,7 +406,8 @@ def compute_smoothed_curves(
         else:
             y_expr = y_obs_aligned / sum_factor
 
-        cb_vals = (meta_aligned[color_by].astype(str).values if color_by in meta_aligned.columns
+        cb_vals = (meta_aligned[color_by].astype(str).values
+                   if color_by is not None and color_by in meta_aligned.columns
                    else np.full(len(meta_aligned), 'All'))
 
         for gi, glabel in enumerate(group_labels):
@@ -593,7 +594,7 @@ def clear_on_demand_model_cache() -> None:
 
 def compute_smoothed_curve_on_demand(
     spec: DatasetSpec, cis_gene: str, features: Sequence[str], *, device: Optional[str] = None,
-    sum_factor_col: Optional[str] = None,
+    sum_factor_col: Optional[str] = None, color_by: Optional[str] = 'cell_line',
 ) -> Dict[str, object]:
     """compute_smoothed_curves(), for just `features`, against a cached
     trans-posterior-free model for (spec, cis_gene) reloaded on demand (see
@@ -607,11 +608,25 @@ def compute_smoothed_curve_on_demand(
     existing `smoothed` dict via ensure_smoothed_curve() looks consistent
     with its precomputed neighbors rather than using a different window by
     accident.
+
+    color_by : passed straight through to compute_smoothed_curves(). Default
+    'cell_line' matches the original precompute's own default -- but
+    ensure_smoothed_curve() overrides this to None (forcing group_labels=
+    ['All']) when the base dict it's merging into was itself computed with
+    no cell_line grouping. That mismatch is real for Replogle: load_model_
+    for_plotting() (which _get_on_demand_model() uses) injects a synthetic
+    model.meta['cell_line'] column from spec.force_single_cell_line, but
+    reconstruct_export_replogle.py's own reconstruct_model() (used for the
+    original precompute) does not -- so an on-demand curve computed with the
+    default 'cell_line' would get group_labels=['CRISPRi'] while the
+    precomputed base has ['All'], tripping _merge_smoothed_curves_inplace's
+    consistency check.
     """
     model = _get_on_demand_model(spec, cis_gene, device=device)
     sf_col = sum_factor_col or resolve_sum_factor_col(spec, model)
     return compute_smoothed_curves(model, modality_name=spec.modality_name, sum_factor_col=sf_col,
-                                    features=list(features), window=spec.smoothing_window, verbose=False)
+                                    features=list(features), window=spec.smoothing_window, verbose=False,
+                                    color_by=color_by)
 
 
 def _merge_smoothed_curves_inplace(base: Dict[str, object], addition: Dict[str, object]) -> None:
@@ -668,7 +683,12 @@ def ensure_smoothed_curve(
 
     print(f"[{spec.name}] {feature!r} not in the precomputed smoothed-curve artifact for "
           f"cis gene {cis_gene!r} -- computing on demand...")
-    addition = compute_smoothed_curve_on_demand(spec, cis_gene, [feature], device=device)
+    # Match whatever grouping the base dict was actually precomputed with --
+    # see compute_smoothed_curve_on_demand()'s `color_by` docstring for why
+    # this can't just always be 'cell_line' (Replogle's on-demand-reloaded
+    # model has a synthetic cell_line column its precompute model never had).
+    color_by = None if smoothed['group_labels'] == ['All'] else 'cell_line'
+    addition = compute_smoothed_curve_on_demand(spec, cis_gene, [feature], device=device, color_by=color_by)
     if feature not in addition['feature_names']:
         print(f"[{spec.name}] {feature!r} isn't a feature in this dataset's own panel -- skipping.")
         return False
