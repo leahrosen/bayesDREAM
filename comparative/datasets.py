@@ -372,10 +372,6 @@ MORRIS = DatasetSpec(
     init_sum_factor_col='sum_factor',
     plot_sum_factor_col='sum_factor_adj',
     force_single_cell_line='CRISPRi',
-    # Fewer cells per gene than Domingo/Replogle -- the default 100-cell k-NN
-    # window oversmooths the dose-response trend relative to Morris's local
-    # cell density. Requested 2026-09-07.
-    smoothing_window=30,
 )
 
 REPLOGLE = DatasetSpec(
@@ -400,6 +396,11 @@ REPLOGLE = DatasetSpec(
     init_sum_factor_col='sum_factor',
     plot_sum_factor_col='sum_factor_adj',
     force_single_cell_line='CRISPRi',
+    # Fewer cells per gene than Domingo/Morris -- the default 100-cell k-NN
+    # window oversmooths the dose-response trend relative to Replogle's local
+    # cell density. Requested 2026-09-07 (misapplied to Morris instead of
+    # Replogle at the time; corrected 2026-09-08).
+    smoothing_window=30,
 )
 
 ALL_DATASETS = {d.name: d for d in (DOMINGO, MORRIS, REPLOGLE)}
