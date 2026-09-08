@@ -1503,12 +1503,27 @@ def compare_all_domingo_cis_genes(
     The cis gene list iterated is `bounding_dataset.cis_genes` (default: the
     first dataset in `datasets`, i.e. Domingo).
 
+    `kwargs['genes']` (forwarded to `compare_fn`) defaults to
+    domingo_union_features(DOMINGO) -- Domingo's own ~91-ish trans-gene union
+    across ALL of its cis genes -- rather than leaving it unset. Both
+    compare_datasets() and compare_datasets_lightweight() treat an unset/None
+    `genes` as "intersect every trans gene across whichever datasets happen
+    to participate for this cis gene", which is harmless for a Domingo cis
+    gene (Domingo's own small panel already bounds the intersection) but
+    silently balloons to Morris/Replogle's full ~8-11k-gene transcriptome-
+    wide panel for a Morris/Replogle-only cis gene (HHEX/IKZF1/RUNX1, where
+    Domingo never participates in the intersection at all) -- confirmed
+    2026-09-08 (7990 trans genes plotted for HHEX instead of the intended
+    ~91). Pass genes=None explicitly to opt back into the full-intersection
+    behavior for a specific call.
+
     Writes into `out_dir/<cis_gene>/`. Returns {cis_gene: [genes plotted]}.
     """
     from .datasets import DOMINGO, MORRIS, REPLOGLE
     datasets = datasets or [DOMINGO, MORRIS, REPLOGLE]
     bounding_dataset = bounding_dataset or datasets[0]
     compare_fn = compare_datasets_lightweight if lightweight else compare_datasets
+    kwargs.setdefault('genes', domingo_union_features(DOMINGO))
 
     results = {}
     for cis_gene in bounding_dataset.cis_genes:
