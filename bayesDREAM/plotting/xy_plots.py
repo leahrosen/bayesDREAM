@@ -571,15 +571,24 @@ def _multinomial_correct_binned_probs(
 # Posterior Extraction Utilities
 # ============================================================================
 
-def _extract_param_mean(param_samples, feature_idx: int):
-    """Extract the posterior-mean value for one feature from a parameter tensor."""
-    if hasattr(param_samples, 'mean'):
-        param_mean = param_samples.mean(dim=0)
+def _extract_param_median(param_samples, feature_idx: int):
+    """
+    Extract the posterior-median value for one feature from a parameter tensor.
+
+    Matches the median point-estimate convention used at fit time (see
+    `fitting/ntc.py`/`fitting/cis.py`, which store `.median(dim=0).values`).
+    Works unchanged on lean-loaded posteriors: `io.load._reduce_posterior_samples`
+    already collapses the sample axis to `quantile(0.5, keepdim=True)`, so
+    taking the median again over that singleton axis is a no-op that returns
+    the same value.
+    """
+    if isinstance(param_samples, torch.Tensor):
+        param_median = torch.quantile(param_samples.float(), 0.5, dim=0)
     else:
-        param_mean = param_samples.mean(axis=0)
-    if param_mean.ndim > 1:
-        param_mean = param_mean.squeeze(0)
-    val = param_mean[feature_idx]
+        param_median = np.median(np.asarray(param_samples), axis=0)
+    if param_median.ndim > 1:
+        param_median = param_median.squeeze(0)
+    val = param_median[feature_idx]
     return val.item() if hasattr(val, 'item') else val
 
 
@@ -1071,17 +1080,14 @@ def predict_trans_derivatives(
     if feature_list is None:
         return None, None, None
 
-    # Get dimensions
-    if hasattr(A_samples, 'mean'):
-        A_mean = A_samples.mean(dim=0)
-        if A_mean.ndim > 1:
-            A_mean = A_mean.squeeze(0)
-        n_genes_posterior = A_mean.shape[0]
-    else:
-        A_mean = A_samples.mean(axis=0)
-        if A_mean.ndim > 1:
-            A_mean = A_mean.squeeze(0)
-        n_genes_posterior = A_mean.shape[0]
+    # Get dimensions — only the post-reduction shape matters here (sanity check
+    # against feature_list), so read it directly instead of materializing a
+    # mean/median reduction over A_samples (cheaper, and shape-only means this
+    # works identically on lean-loaded (1-sample) or full posteriors).
+    A_shape = tuple(A_samples.shape[1:])   # drop sample axis (dim 0)
+    if len(A_shape) > 1 and A_shape[0] == 1:
+        A_shape = A_shape[1:]              # drop size-1 cis-gene axis, mirrors squeeze(0)
+    n_genes_posterior = A_shape[0]
 
     if n_genes_posterior != len(feature_list):
         return None, None, None
@@ -1095,14 +1101,14 @@ def predict_trans_derivatives(
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL =====
         try:
-            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
-            beta = _extract_param_mean(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
-            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
-            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
-            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+            alpha = _extract_param_median(posterior['alpha'], feature_idx)
+            beta = _extract_param_median(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_median(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_median(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_median(posterior['K_a'], feature_idx)
+            K_b = _extract_param_median(posterior['K_b'], feature_idx)
+            n_a = _extract_param_median(posterior['n_a'], feature_idx)
+            n_b = _extract_param_median(posterior['n_b'], feature_idx)
 
             a_null, b_null = _resolve_hill_null_flags(
                 feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
@@ -1135,14 +1141,14 @@ def predict_trans_derivatives(
     elif 'upper_limit' in posterior and 'Vmax_a' in posterior and 'Vmax_b' in posterior:
         # ===== ADDITIVE HILL (binomial/multinomial) =====
         try:
-            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
-            beta = _extract_param_mean(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
-            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
-            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
-            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+            alpha = _extract_param_median(posterior['alpha'], feature_idx)
+            beta = _extract_param_median(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_median(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_median(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_median(posterior['K_a'], feature_idx)
+            K_b = _extract_param_median(posterior['K_b'], feature_idx)
+            n_a = _extract_param_median(posterior['n_a'], feature_idx)
+            n_b = _extract_param_median(posterior['n_b'], feature_idx)
 
             a_null, b_null = _resolve_hill_null_flags(
                 feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
@@ -1175,10 +1181,10 @@ def predict_trans_derivatives(
     elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
-            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
-            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
-            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            alpha = _extract_param_median(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param_median(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param_median(posterior['K_a'], feature_idx)
+            n_a = _extract_param_median(posterior['n_a'], feature_idx)
 
             # First derivative
             first_deriv = alpha * Hill_first_derivative(x_range, Vmax=Vmax_a, K=K_a, n=n_a)
@@ -1269,9 +1275,9 @@ def predict_trans_log2fc(
         return None, None, None, None, None
 
     if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = cis_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        x_ntc = np.mean(cis_mu_ntc, axis=0).squeeze()
+        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
 
     # Handle case where x_ntc is a scalar or 1-element array
     if np.ndim(x_ntc) == 0:
@@ -1294,9 +1300,9 @@ def predict_trans_log2fc(
         return None, None, None, None, None
 
     if hasattr(trans_mu_ntc, 'mean'):
-        y_ntc_all = trans_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        y_ntc_all = torch.quantile(trans_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
+        y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
     # trans_mod.feature_names is the single source of truth (resolved +
@@ -1387,9 +1393,9 @@ def predict_trans_log2fc_samples(
         return None, None
 
     if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = cis_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        x_ntc = np.mean(cis_mu_ntc, axis=0).squeeze()
+        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
 
     if np.ndim(x_ntc) == 0:
         x_ntc = float(x_ntc)
@@ -1411,9 +1417,9 @@ def predict_trans_log2fc_samples(
         return None, None
 
     if hasattr(trans_mu_ntc, 'mean'):
-        y_ntc_all = trans_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        y_ntc_all = torch.quantile(trans_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
+        y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
     # trans_mod.feature_names is the single source of truth (resolved +
@@ -1495,9 +1501,9 @@ def predict_trans_delta_p(
         return None, None, None, None, None
 
     if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = cis_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        x_ntc = np.mean(cis_mu_ntc, axis=0).squeeze()
+        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
 
     # Handle case where x_ntc is a scalar or 1-element array
     if np.ndim(x_ntc) == 0:
@@ -1520,9 +1526,9 @@ def predict_trans_delta_p(
         return None, None, None, None, None
 
     if hasattr(trans_mu_ntc, 'mean'):
-        y_ntc_all = trans_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        y_ntc_all = torch.quantile(trans_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
+        y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
     # trans_mod.feature_names is the single source of truth (resolved +
@@ -1626,9 +1632,9 @@ def predict_trans_delta_p_samples(
         return None, None
 
     if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = cis_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        x_ntc = np.mean(cis_mu_ntc, axis=0).squeeze()
+        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
 
     if np.ndim(x_ntc) == 0:
         x_ntc = float(x_ntc)
@@ -1650,9 +1656,9 @@ def predict_trans_delta_p_samples(
         return None, None
 
     if hasattr(trans_mu_ntc, 'mean'):
-        y_ntc_all = trans_mu_ntc.mean(dim=0).squeeze().cpu().numpy()
+        y_ntc_all = torch.quantile(trans_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
     else:
-        y_ntc_all = np.mean(trans_mu_ntc, axis=0).squeeze()
+        y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
     # trans_mod.feature_names is the single source of truth (resolved +
@@ -1878,7 +1884,7 @@ def plot_trans_functions(
         if hasattr(model, 'x_true') and model.x_true is not None:
             x_true_np = model.x_true.cpu().numpy() if hasattr(model.x_true, 'cpu') else np.array(model.x_true)
             if x_true_np.ndim > 1:
-                x_true_np = x_true_np.mean(axis=0)  # Average over posterior samples
+                x_true_np = np.median(x_true_np, axis=0)  # collapse legacy multi-sample x_true to a point estimate
             x_min = max(x_true_np.min(), 1e-6)  # Avoid log(0)
             x_max = x_true_np.max()
             # Evenly spaced points in log2 space for smooth curve on log-log plot
@@ -2386,24 +2392,16 @@ def predict_trans_function(
 
     A_samples = posterior['A']
 
-    # Get posterior dimensions
+    # Get posterior dimensions — only the post-reduction shape matters here, so
+    # read it directly instead of materializing a mean/median reduction (cheaper,
+    # and works identically on lean-loaded (1-sample) or full posteriors).
     # For primary modality: A_samples is (S, T) where S=samples, T=trans_genes
-    #   After mean(dim=0): (T,)
     # For non-primary modality: A_samples is (S, C, T) where C=cis_genes, T=trans_features
-    #   After mean(dim=0): (C, T)
     # We want the LAST dimension (T) in both cases
-    if hasattr(A_samples, 'mean'):
-        A_mean = A_samples.mean(dim=0)
-        # Squeeze out cis gene dimension if present (should be size 1 for non-primary modalities)
-        if A_mean.ndim > 1:
-            A_mean = A_mean.squeeze(0)
-        n_genes_posterior = A_mean.shape[0]
-    else:
-        A_mean = A_samples.mean(axis=0)
-        # Squeeze out cis gene dimension if present
-        if A_mean.ndim > 1:
-            A_mean = A_mean.squeeze(0)
-        n_genes_posterior = A_mean.shape[0]
+    A_shape = tuple(A_samples.shape[1:])   # drop sample axis (dim 0)
+    if len(A_shape) > 1 and A_shape[0] == 1:
+        A_shape = A_shape[1:]              # drop size-1 cis-gene axis, mirrors squeeze(0)
+    n_genes_posterior = A_shape[0]
 
     # Get feature list from modality — always the ground truth.
     # modality.feature_names is the single source of truth (resolved + deduped
@@ -2444,14 +2442,14 @@ def predict_trans_function(
         # ===== ADDITIVE HILL (negbinom/normal/studentt) =====
         try:
             # Extract parameters using helper function
-            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
-            beta = _extract_param_mean(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
-            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
-            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
-            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+            alpha = _extract_param_median(posterior['alpha'], feature_idx)
+            beta = _extract_param_median(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_median(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_median(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_median(posterior['K_a'], feature_idx)
+            K_b = _extract_param_median(posterior['K_b'], feature_idx)
+            n_a = _extract_param_median(posterior['n_a'], feature_idx)
+            n_b = _extract_param_median(posterior['n_b'], feature_idx)
 
             a_null, b_null = _resolve_hill_null_flags(
                 feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
@@ -2482,14 +2480,14 @@ def predict_trans_function(
         # ===== ADDITIVE HILL (binomial/multinomial with upper_limit and Vmax_a/b) =====
         try:
             # Extract parameters using helper function
-            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
-            beta = _extract_param_mean(posterior['beta'], feature_idx)
-            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
-            Vmax_b = _extract_param_mean(posterior['Vmax_b'], feature_idx)
-            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
-            K_b = _extract_param_mean(posterior['K_b'], feature_idx)
-            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
-            n_b = _extract_param_mean(posterior['n_b'], feature_idx)
+            alpha = _extract_param_median(posterior['alpha'], feature_idx)
+            beta = _extract_param_median(posterior['beta'], feature_idx)
+            Vmax_a = _extract_param_median(posterior['Vmax_a'], feature_idx)
+            Vmax_b = _extract_param_median(posterior['Vmax_b'], feature_idx)
+            K_a = _extract_param_median(posterior['K_a'], feature_idx)
+            K_b = _extract_param_median(posterior['K_b'], feature_idx)
+            n_a = _extract_param_median(posterior['n_a'], feature_idx)
+            n_b = _extract_param_median(posterior['n_b'], feature_idx)
 
             a_null, b_null = _resolve_hill_null_flags(
                 feature, feature_idx, posterior, fdr_df=fdr_df, fdr_threshold=fdr_threshold
@@ -2516,10 +2514,10 @@ def predict_trans_function(
     elif 'Vmax_a' in posterior:
         # ===== SINGLE HILL =====
         try:
-            alpha = _extract_param_mean(posterior['alpha'], feature_idx)
-            Vmax_a = _extract_param_mean(posterior['Vmax_a'], feature_idx)
-            K_a = _extract_param_mean(posterior['K_a'], feature_idx)
-            n_a = _extract_param_mean(posterior['n_a'], feature_idx)
+            alpha = _extract_param_median(posterior['alpha'], feature_idx)
+            Vmax_a = _extract_param_median(posterior['Vmax_a'], feature_idx)
+            K_a = _extract_param_median(posterior['K_a'], feature_idx)
+            n_a = _extract_param_median(posterior['n_a'], feature_idx)
 
             # Compute Hill function: y = A + alpha * Hill(x, Vmax=Vmax_a, K=K_a, n=n_a)
             Hill_a = Hill_based_positive(x_range, Vmax=Vmax_a, A=0, K=K_a, n=n_a)
@@ -2537,20 +2535,23 @@ def predict_trans_function(
             # theta shape for primary: (samples, features, n_params)
             # theta shape for non-primary: (samples, cis_genes, features, n_params)
 
-            # Average over samples and squeeze cis gene dimension if present
+            # Median over samples and squeeze cis gene dimension if present.
+            # torch.quantile(.., 0.5, dim=0) / np.median(.., axis=0) match the
+            # median point-estimate convention elsewhere, and are a no-op on a
+            # lean-loaded (1-sample) posterior — same value comes out either way.
             if hasattr(theta_samples, 'mean'):
-                theta_mean = theta_samples.mean(dim=0)
+                theta_median = torch.quantile(theta_samples.float(), 0.5, dim=0)
                 # Squeeze out cis gene dimension if present
-                if theta_mean.ndim > 2:  # (cis_genes, features, n_params)
-                    theta_mean = theta_mean.squeeze(0)  # (features, n_params)
-                theta_mean = theta_mean[feature_idx, :]  # (n_params,)
-                theta_np = theta_mean.cpu().numpy() if hasattr(theta_mean, 'cpu') else np.array(theta_mean)
+                if theta_median.ndim > 2:  # (cis_genes, features, n_params)
+                    theta_median = theta_median.squeeze(0)  # (features, n_params)
+                theta_median = theta_median[feature_idx, :]  # (n_params,)
+                theta_np = theta_median.cpu().numpy() if hasattr(theta_median, 'cpu') else np.array(theta_median)
             else:
-                theta_mean = theta_samples.mean(axis=0)
-                if theta_mean.ndim > 2:
-                    theta_mean = theta_mean.squeeze(0)
-                theta_mean = theta_mean[feature_idx, :]
-                theta_np = np.array(theta_mean)
+                theta_median = np.median(theta_samples, axis=0)
+                if theta_median.ndim > 2:
+                    theta_median = theta_median.squeeze(0)
+                theta_median = theta_median[feature_idx, :]
+                theta_np = np.array(theta_median)
 
             # Polynomial: y = coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + ...
             # First coefficient is baseline (like A)
@@ -3087,7 +3088,9 @@ def _compute_posterior_fdr(posterior, activity_epsilon: float = 0.01):
             ratio = alpha_s * vmax_s / np.maximum(A_s, 1e-12)
             return (ratio > activity_epsilon).mean(axis=0)
         if alpha_s is not None:
-            m = alpha_s.mean(axis=0) if alpha_s.ndim >= 2 else alpha_s
+            # Fallback point estimate of alpha (not a P(active) draw-count, so
+            # use the median convention, not a mean); a no-op on a lean (1-sample) array.
+            m = np.median(alpha_s, axis=0) if alpha_s.ndim >= 2 else alpha_s
             return np.clip(np.asarray(m, dtype=float), 0.0, 1.0)
         return None
 
@@ -3237,7 +3240,7 @@ def _build_hill_markers_from_params(
     Parameters
     ----------
     A, alpha, Vmax_a, K_a, n_a : float
-        Posterior/summary mean values for component A parameters.
+        Posterior/summary median values for component A parameters.
     beta, Vmax_b, K_b, n_b : float or None
         Component B parameters (additive_hill only).
     a_null, b_null : bool
@@ -3465,19 +3468,19 @@ def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0
     if not all(k in params for k in required):
         return []
 
-    def pmean(key):
-        return float(params[key].mean()) if key in params else None
+    def pmedian(key):
+        return float(np.median(params[key])) if key in params else None
 
-    A      = pmean('A');     alpha = pmean('alpha');  Vmax_a = pmean('Vmax_a')
-    K_a    = pmean('K_a');   n_a   = pmean('n_a')
+    A      = pmedian('A');     alpha = pmedian('alpha');  Vmax_a = pmedian('Vmax_a')
+    K_a    = pmedian('K_a');   n_a   = pmedian('n_a')
 
     is_additive = ('Vmax_b' in posterior and 'Vmax_b' in params and
                    'n_b' in params and 'beta' in params and 'K_b' in params)
 
     beta = Vmax_b = K_b = n_b = None
     if is_additive:
-        beta   = pmean('beta');  Vmax_b = pmean('Vmax_b')
-        K_b    = pmean('K_b');   n_b    = pmean('n_b')
+        beta   = pmedian('beta');  Vmax_b = pmedian('Vmax_b')
+        K_b    = pmedian('K_b');   n_b    = pmedian('n_b')
 
         # Null classification: same criterion used everywhere else (predict_trans_function,
         # predict_trans_derivatives, save_trans_summary) so the curve, its derivatives,
@@ -3600,11 +3603,12 @@ def _compute_global_log2fc_offsets(
         mu_ntc = np.asarray(mu_ntc, dtype=float)
         # Collapse any unexpected leading dims beyond (samples, features)
         while mu_ntc.ndim > 2:
-            mu_ntc = mu_ntc.mean(axis=0)
-        # Average over posterior samples → [T], then pick this feature
-        mu_ntc_mean = mu_ntc.mean(axis=0)   # [T]
-        if feature_idx < len(mu_ntc_mean):
-            y_ntc_val = float(mu_ntc_mean[feature_idx])
+            mu_ntc = np.median(mu_ntc, axis=0)
+        # Median over posterior samples → [T], then pick this feature.
+        # np.median is a no-op on a lean-loaded (1-sample) posterior.
+        mu_ntc_median = np.median(mu_ntc, axis=0)   # [T]
+        if feature_idx < len(mu_ntc_median):
+            y_ntc_val = float(mu_ntc_median[feature_idx])
             if np.isfinite(y_ntc_val) and y_ntc_val > 0:
                 y_offset = np.log2(y_ntc_val)
 
@@ -3832,10 +3836,11 @@ def plot_negbinom_xy(
                     _mu_ntc = _mu_ntc.cpu().numpy()
                 _mu_ntc = np.asarray(_mu_ntc, dtype=float)
                 while _mu_ntc.ndim > 2:
-                    _mu_ntc = _mu_ntc.mean(axis=0)
-                _mu_ntc_mean = _mu_ntc.mean(axis=0)   # [T]
-                if _feature_idx < len(_mu_ntc_mean):
-                    _val = float(_mu_ntc_mean[_feature_idx])
+                    _mu_ntc = np.median(_mu_ntc, axis=0)
+                # np.median is a no-op on a lean-loaded (1-sample) posterior.
+                _mu_ntc_median = np.median(_mu_ntc, axis=0)   # [T]
+                if _feature_idx < len(_mu_ntc_median):
+                    _val = float(_mu_ntc_median[_feature_idx])
                     if np.isfinite(_val) and _val > 0:
                         _y_offset_from_technical = np.log2(_val)
             if _y_offset_from_technical is not None:
@@ -3962,7 +3967,13 @@ def plot_negbinom_xy(
                 for gc in df['technical_group_code'].unique():
                     gc = int(gc)
                     if alpha_y_full.ndim == 3:
-                        a = _to_scalar(alpha_y_full[:, gc, feature_idx].mean())
+                        # Legacy [S, C, T] format (pre point-estimate-at-fit-time):
+                        # median matches the current point-estimate convention.
+                        _slice = alpha_y_full[:, gc, feature_idx]
+                        if hasattr(_slice, 'cpu'):
+                            a = _to_scalar(torch.quantile(_slice.float(), 0.5))
+                        else:
+                            a = _to_scalar(np.median(np.asarray(_slice)))
                     else:
                         a = _to_scalar(alpha_y_full[gc, feature_idx])
                     mask = df['technical_group_code'].values == gc
@@ -4082,8 +4093,8 @@ def plot_negbinom_xy(
                         for _kname in ('K_a', 'K_b'):
                             if _kname in _posterior_ep:
                                 _ks = _posterior_ep[_kname]
-                                _km = (_ks.mean(dim=0) if hasattr(_ks, 'mean')
-                                       else np.mean(_ks, axis=0))
+                                _km = (torch.quantile(_ks.float(), 0.5, dim=0) if hasattr(_ks, 'mean')
+                                       else np.median(_ks, axis=0))
                                 if hasattr(_km, 'detach'):
                                     _km = _km.detach().cpu().numpy()
                                 _km = np.asarray(_km).ravel()
@@ -4495,7 +4506,13 @@ def plot_binomial_xy(
                 # 3. Apply correction on logit scale
                 alpha_y_add = modality.alpha_y_prefit_add
                 if alpha_y_add.ndim == 3:
-                    correction = _to_scalar(alpha_y_add[:, group_code, feature_idx].mean())
+                    # Legacy [S, C, T] format: median matches the current
+                    # point-estimate convention (no-op on a 1-sample lean array).
+                    _slice = alpha_y_add[:, group_code, feature_idx]
+                    if hasattr(_slice, 'cpu'):
+                        correction = _to_scalar(torch.quantile(_slice.float(), 0.5))
+                    else:
+                        correction = _to_scalar(np.median(np.asarray(_slice)))
                 else:
                     correction = _to_scalar(alpha_y_add[group_code, feature_idx])
                 logit_corrected = logit_p - correction
@@ -5037,7 +5054,13 @@ def plot_normal_xy(
                 if hasattr(modality, 'alpha_y_prefit_add'):
                     alpha_y_add = modality.alpha_y_prefit_add
                     if alpha_y_add.ndim == 3:
-                        correction = _to_scalar(alpha_y_add[:, group_code, feature_idx].mean())
+                        # Legacy [S, C, T] format: median matches the current
+                        # point-estimate convention (no-op on a 1-sample lean array).
+                        _slice = alpha_y_add[:, group_code, feature_idx]
+                        if hasattr(_slice, 'cpu'):
+                            correction = _to_scalar(torch.quantile(_slice.float(), 0.5))
+                        else:
+                            correction = _to_scalar(np.median(np.asarray(_slice)))
                     else:
                         correction = _to_scalar(alpha_y_add[group_code, feature_idx])
                     y_plot = y_plot - correction
@@ -5906,9 +5929,11 @@ def plot_xy_data(
             )
             show_correction = 'uncorrected'
 
-    # Get x_true
+    # Get x_true. The ndim==2 branch only fires for a legacy multi-sample x_true
+    # (or a (1, N)-reshaped 1D input, where median is a no-op); use median to
+    # match the current point-estimate convention.
     x2d = _to_2d(model.x_true)
-    x_true = x2d.mean(axis=0) if x2d.ndim == 2 else x2d.ravel()
+    x_true = np.median(x2d, axis=0) if x2d.ndim == 2 else x2d.ravel()
 
     # Reorder if needed
     if src_barcodes is not None:

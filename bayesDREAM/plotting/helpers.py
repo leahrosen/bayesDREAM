@@ -205,15 +205,15 @@ def _xtrue_posterior_stats(model, log2=False):
     ``None`` if no x_true posterior is available.
 
     Full (non-lean) posterior: computed directly from the raw ``[S, N_cells]``
-    samples — ``point`` is the posterior mean, ``std`` the sample std,
-    ``lower``/``upper`` the 2.5%/97.5% percentiles.
+    samples — ``point`` is the posterior MEDIAN (matching the median
+    point-estimate convention used everywhere else, e.g. alpha_x_prefit/
+    alpha_y_prefit/x_true at fit time), ``std`` the sample std, ``lower``/
+    ``upper`` the 2.5%/97.5% percentiles.
 
     Lean-loaded posterior (see ``bayesDREAM.io.load._reduce_posterior_samples``):
     only a point estimate + CI survive, so:
-      - ``point`` is the stored per-cell posterior MEDIAN (not mean) — the
-        median/mean substitution already used throughout lean-mode summary
-        export (matches how alpha_x_prefit/alpha_y_prefit use the median as
-        their point estimate at fit time).
+      - ``point`` is the stored per-cell posterior median — same convention
+        as the full-posterior branch above, just already reduced at load time.
       - ``lower``/``upper`` are the precomputed 2.5%/97.5% quantiles — exact,
         not approximated (quantiles commute with the monotonic log2
         transform, so log2(lower)/log2(upper) are still exact quantiles of
@@ -250,7 +250,7 @@ def _xtrue_posterior_stats(model, log2=False):
     post = to_np(psc['x_true'])  # [S, N]
     if log2:
         post = _log2_safe(post)
-    point = np.nanmean(post, axis=0)
+    point = np.nanmedian(post, axis=0)
     std = np.nanstd(post, axis=0)
     lower = np.nanpercentile(post, 2.5, axis=0)
     upper = np.nanpercentile(post, 97.5, axis=0)

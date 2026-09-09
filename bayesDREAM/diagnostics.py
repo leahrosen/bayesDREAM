@@ -1714,9 +1714,16 @@ class DiagnosticsMixin:
             groups_subset = None
             C = 1
 
-        # ---- Posterior mean parameters (all features, then subsetted) -------
+        # ---- Posterior median parameters (all features, then subsetted) -----
         def _pm(key):
-            """Return posterior mean of key as a float32 CPU tensor or None."""
+            """
+            Return posterior median of key as a float32 CPU tensor or None.
+
+            Matches the median point-estimate convention used elsewhere
+            (fitting/ntc.py, fitting/cis.py). torch.quantile(.., 0.5, dim=0)
+            is a no-op on a lean-loaded (1-sample) posterior, so this works
+            unchanged whether `posterior` holds full or lean-reduced samples.
+            """
             if key not in posterior:
                 return None
             v = posterior[key]
@@ -1726,9 +1733,9 @@ class DiagnosticsMixin:
                 v = torch.tensor(np.asarray(v, dtype=np.float32))
             if v.dim() == 0:
                 return v
-            # Average over sample dimension (dim 0) if present
+            # Collapse sample dimension (dim 0) if present
             # Heuristic: if first dim >> second, it's the sample dim
-            return v.mean(dim=0) if v.dim() > 1 else v
+            return torch.quantile(v, 0.5, dim=0) if v.dim() > 1 else v
 
         A         = _pm("A")          # [T] or [T, K] for multinomial
         alpha_pm  = _pm("alpha")      # [T] or [T, K] for multinomial

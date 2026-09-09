@@ -457,7 +457,7 @@ class CisFitter:
         x_obs_factored = x_obs_tensor / sum_factor_tensor
         
         if self.model.alpha_x_prefit is not None:
-            # alpha_x_prefit is always a [C] point estimate (mean already taken at fit_ntc time)
+            # alpha_x_prefit is always a [C] point estimate (median already taken at fit_ntc time)
             alpha_x_full = self.model.alpha_x_prefit.flatten()
             # Select the correct alpha_x for each observation (expand for broadcasting)
             alpha_x_used = alpha_x_full[groups_tensor]  # groups_tensor indexes into (C,)
@@ -474,7 +474,11 @@ class CisFitter:
                 "fit_ntc() estimates o_x for the cis gene from NTC cells, which is required "
                 "to set a data-driven overdispersion prior instead of the generic Gamma(9,3)."
             )
-        o_x_ntc = float(cis_modality.posterior_samples_ntc['o_x'].mean().item())
+        # Median matches the point-estimate convention used everywhere else in the
+        # pipeline (alpha_x_prefit/alpha_y_prefit/x_true all use median at fit
+        # time); also a no-op on a lean-loaded (1-sample) posterior_samples_ntc.
+        o_x_ntc = float(torch.quantile(
+            cis_modality.posterior_samples_ntc['o_x'].float().flatten(), 0.5).item())
         print(f"[INFO] fit_cis: using technical o_x = {o_x_ntc:.4f} (phi = {1/o_x_ntc**2:.2f})")
 
         # Compute guide-level means and MADs.

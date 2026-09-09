@@ -1003,8 +1003,10 @@ class bayesDREAM(
                 )
             else:
                 mu_ntc = ps['mu_ntc']
-                mu_ntc_mean = mu_ntc.mean(dim=0) if mu_ntc.dim() > 1 else mu_ntc
-                mu_ntc_np = mu_ntc_mean.detach().cpu().numpy().flatten()
+                # Median matches the point-estimate convention elsewhere; a no-op
+                # on a lean-loaded (1-sample) posterior_samples_ntc.
+                mu_ntc_median = torch.quantile(mu_ntc.float(), 0.5, dim=0) if mu_ntc.dim() > 1 else mu_ntc
+                mu_ntc_np = mu_ntc_median.detach().cpu().numpy().flatten()
                 if mu_ntc_np.shape[0] != n_features:
                     warnings.warn(
                         f"exclude_trans_genes: mu_ntc has {mu_ntc_np.shape[0]} entries but "
@@ -1141,9 +1143,11 @@ class bayesDREAM(
             )
 
         def _to_numpy(t):
+            # Median matches the point-estimate convention elsewhere; a no-op
+            # on a lean-loaded (1-sample) posterior_samples_ntc.
             if isinstance(t, _torch.Tensor):
-                return t.mean(dim=0).detach().cpu().numpy().flatten()
-            return np.asarray(t).mean(axis=0).flatten()
+                return _torch.quantile(t.float(), 0.5, dim=0).detach().cpu().numpy().flatten()
+            return np.median(np.asarray(t), axis=0).flatten()
 
         # Trans genes — NaN where features were excluded from fitting (zero NTC counts, etc.)
         log2_trans = np.log2(_to_numpy(ps_primary['mu_ntc']))
@@ -1293,9 +1297,11 @@ class bayesDREAM(
                 "Run fit_ntc() first."
             )
 
-        # Extract posterior means — tensors may be [S, T] or [S, C, T]
-        mu_ntc_raw = ps['mu_ntc'].mean(dim=0).detach().numpy()
-        o_y_raw    = ps['o_y'].mean(dim=0).detach().numpy()
+        # Extract posterior medians — tensors may be [S, T] or [S, C, T].
+        # torch.quantile(.., 0.5, dim=0) is a no-op on a lean-loaded (1-sample)
+        # posterior_samples_ntc, so this works unchanged on lean or full data.
+        mu_ntc_raw = torch.quantile(ps['mu_ntc'].float(), 0.5, dim=0).detach().numpy()
+        o_y_raw    = torch.quantile(ps['o_y'].float(), 0.5, dim=0).detach().numpy()
 
         # Flatten multi-group tensors to 1D (take first group = NTC reference)
         mu_ntc = mu_ntc_raw.reshape(-1) if mu_ntc_raw.ndim == 1 else mu_ntc_raw[0]
@@ -1317,8 +1323,8 @@ class bayesDREAM(
         if 'cis' in self.modalities:
             cis_ps = self.modalities['cis'].posterior_samples_ntc
             if cis_ps is not None and 'mu_ntc' in cis_ps and 'o_x' in cis_ps:
-                cis_mu = float(cis_ps['mu_ntc'].mean().item())
-                cis_ox = float(cis_ps['o_x'].mean().item())
+                cis_mu = float(torch.quantile(cis_ps['mu_ntc'].float().flatten(), 0.5).item())
+                cis_ox = float(torch.quantile(cis_ps['o_x'].float().flatten(), 0.5).item())
                 ax.scatter(
                     np.log2(max(cis_mu, 1e-8)),
                     np.log2(max(cis_ox, 1e-8)),

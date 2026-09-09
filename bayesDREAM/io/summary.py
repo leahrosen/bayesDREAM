@@ -2498,16 +2498,16 @@ class ModelSummarizer:
                     if param.ndim > 2:
                         param = param.mean(axis=tuple(range(2, param.ndim)))
 
-                mean_val = np.median(param, axis=0)
+                median_val = np.median(param, axis=0)
                 lower_val = np.quantile(param, 0.025, axis=0)
                 upper_val = np.quantile(param, 0.975, axis=0)
             else:
                 # Point estimate: [n_features]
-                mean_val = param
+                median_val = param
                 lower_val = param
                 upper_val = param
 
-            return mean_val, lower_val, upper_val
+            return median_val, lower_val, upper_val
 
         def extract_param_full(name):
             """Extract full posterior samples for per-sample computations."""
@@ -2528,7 +2528,7 @@ class ModelSummarizer:
         def extract_param_abs(name):
             """
             Posterior summaries for abs(parameter). This is needed for inflection because it depends on |n|.
-            Returns mean, lower(2.5%), upper(97.5%) of |param|.
+            Returns median, lower(2.5%), upper(97.5%) of |param|.
             """
             param = posterior[name]
             if isinstance(param, torch.Tensor):
@@ -2546,13 +2546,13 @@ class ModelSummarizer:
             param_abs = np.abs(param)
 
             if param_abs.ndim >= 2:
-                mean_val = np.median(param_abs, axis=0)
+                median_val = np.median(param_abs, axis=0)
                 lower_val = np.quantile(param_abs, 0.025, axis=0)
                 upper_val = np.quantile(param_abs, 0.975, axis=0)
             else:
-                mean_val = lower_val = upper_val = param_abs
+                median_val = lower_val = upper_val = param_abs
 
-            return mean_val, lower_val, upper_val
+            return median_val, lower_val, upper_val
 
         # Component A (first Hill function)
         Vmax_a_median, Vmax_a_lower, Vmax_a_upper = extract_param('Vmax_a')
@@ -3673,12 +3673,12 @@ class ModelSummarizer:
                 param = param.mean(axis=tuple(range(2, param.ndim)))
 
             if param.ndim == 2:  # [S, T]
-                mean = np.median(param, axis=0)
+                median = np.median(param, axis=0)
                 lo = np.quantile(param, 0.025, axis=0)
                 hi = np.quantile(param, 0.975, axis=0)
             else:                # [T] point
-                mean = lo = hi = param
-            return mean, lo, hi
+                median = lo = hi = param
+            return median, lo, hi
 
         def extract_param_full(name):
             param = posterior[name]
@@ -3701,12 +3701,12 @@ class ModelSummarizer:
 
             param_abs = np.abs(param)
             if param_abs.ndim == 2:
-                mean = np.median(param_abs, axis=0)
+                median = np.median(param_abs, axis=0)
                 lo = np.quantile(param_abs, 0.025, axis=0)
                 hi = np.quantile(param_abs, 0.975, axis=0)
             else:
-                mean = lo = hi = param_abs
-            return mean, lo, hi
+                median = lo = hi = param_abs
+            return median, lo, hi
 
         def _broadcast(arr):
             arr = np.atleast_1d(arr)

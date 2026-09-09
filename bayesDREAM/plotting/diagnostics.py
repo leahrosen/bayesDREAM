@@ -632,12 +632,15 @@ def plot_x_true_residuals_vs_sumfactor(
     if not hasattr(model, "posterior_samples_cis") or model.posterior_samples_cis is None:
         raise RuntimeError("fit_cis() must be called before this plot.")
 
-    # --- posterior-mean guide-level quantities ---
-    x_eff_g_mean = model.posterior_samples_cis["x_eff_g"].mean(dim=0)     # [G]
-    sigma_eff_mean = model.posterior_samples_cis["sigma_eff"].mean(dim=0)  # [G]
+    # --- posterior-median guide-level quantities ---
+    # torch.quantile(.., 0.5, dim=0) matches the median point-estimate
+    # convention used elsewhere, and is a no-op on a lean-loaded (1-sample)
+    # posterior_samples_cis (already reduced via quantile(0.5, keepdim=True)).
+    x_eff_g_median = torch.quantile(model.posterior_samples_cis["x_eff_g"].float(), 0.5, dim=0)     # [G]
+    sigma_eff_median = torch.quantile(model.posterior_samples_cis["sigma_eff"].float(), 0.5, dim=0)  # [G]
 
-    log2_x_eff_g_np = torch.log2(x_eff_g_mean.clamp(min=1e-12)).cpu().numpy()
-    sigma_eff_np = sigma_eff_mean.cpu().numpy()
+    log2_x_eff_g_np = torch.log2(x_eff_g_median.clamp(min=1e-12)).cpu().numpy()
+    sigma_eff_np = sigma_eff_median.cpu().numpy()
 
     # --- cell-level arrays (positionally aligned with model.meta rows) ---
     meta = model.meta

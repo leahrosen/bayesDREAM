@@ -89,11 +89,11 @@ model.load_ntc_fit()
 # Or specify custom directory
 model.load_ntc_fit(input_dir='./my_results/technical/')
 
-# Use posterior samples (default)
-model.load_ntc_fit(use_posterior=True)
+# Load full posterior samples (default)
+model.load_ntc_fit()
 
-# Or use point estimates (posterior mean)
-model.load_ntc_fit(use_posterior=False)
+# Or collapse to lean point estimates (median + 2.5%/97.5% CI sibling keys)
+model.load_ntc_fit(lean=True)
 
 # Load specific modalities only
 model.load_ntc_fit(modalities=['gene', 'atac'])
@@ -105,14 +105,20 @@ model.load_ntc_fit(modalities=['atac'])  # Skips model-level (primary is 'gene')
 
 **Parameters**:
 - `input_dir`: Directory containing saved files (default: `self.output_dir`)
-- `use_posterior`: If `True`, loads full posterior samples. If `False`, uses posterior mean as point estimate
+- `lean`: If `True`, collapses each modality's `posterior_samples_ntc` to point estimates
+  (median, plus `<key>_lower`/`<key>_upper` 2.5%/97.5% sibling keys) instead of keeping
+  the full multi-sample tensors. Safe for summary export and pipeline continuation; not
+  safe for most of `bayesDREAM.plotting`, which reads raw per-draw samples for
+  uncertainty bands. Default `False` (full load).
 - `modalities`: List of modality names to load (default: all available modalities)
 
 **What Happens**:
-- Sets `self.alpha_x_prefit` and `self.alpha_x_type`
-- Sets `self.alpha_y_prefit` and `self.alpha_y_type`
-- Loads `self.posterior_samples_ntc`
-- Loads per-modality `alpha_y_prefit` for each modality
+- Sets `self.alpha_x_prefit` (a `[C]` point estimate — the posterior median, taken at
+  fit time regardless of `lean`)
+- Sets each modality's `alpha_y_prefit`/`alpha_y_prefit_mult`/`alpha_y_prefit_add`
+  (also point estimates taken at fit time)
+- Loads `self.posterior_samples_ntc` per modality (full multi-sample, or lean-reduced
+  if `lean=True`)
 
 ### 3. Save Cis Fit
 
@@ -144,13 +150,14 @@ model.load_ntc_fit()
 # Load cis fit
 model.load_cis_fit()
 
-# Or with point estimates
-model.load_cis_fit(use_posterior=False)
+# Or with lean point estimates (median + CI sibling keys, smaller footprint)
+model.load_cis_fit(lean=True)
 ```
 
 **What Happens**:
-- Sets `self.x_true` and `self.x_true_type`
-- Loads `self.posterior_samples_cis`
+- Sets `self.x_true` and `self.log2_x_true` (`[N_cells]` point estimates — the
+  posterior median, taken at fit time regardless of `lean`)
+- Loads `self.posterior_samples_cis` (full multi-sample, or lean-reduced if `lean=True`)
 
 ### 5. Save Trans Fit
 
@@ -354,29 +361,38 @@ model3.fit_trans(modality_name='atac', sum_factor_col='sum_factor_adj')
 model3.save_trans_fit(modalities=['atac'])  # Model-level skipped automatically (primary is 'gene')
 ```
 
-## Posterior Samples vs Point Estimates
+## Posterior Samples vs Lean Point Estimates
 
-By default, `load_*_fit()` methods load full posterior samples. You can optionally use point estimates (posterior means) for:
-- **Faster loading**: Smaller memory footprint
-- **Compatibility**: Some downstream tools may expect point estimates
-- **Speed**: Faster computation in subsequent stages
+`alpha_x_prefit`/`alpha_y_prefit`/`x_true`/`log2_x_true` are always point estimates
+(the posterior **median**, taken once at fit time) — there is no `use_posterior`
+switch for those; they are never stored as full multi-sample tensors.
 
-### Using Point Estimates
+What `lean` controls is the accompanying `posterior_samples_ntc`/`posterior_samples_cis`
+dict, which by default keeps the full multi-sample draws (needed for uncertainty bands
+in `bayesDREAM.plotting`, FDR computation, etc.). Passing `lean=True` to `load_*_fit()`
+collapses those to a point estimate (median) plus `<key>_lower`/`<key>_upper`
+(2.5%/97.5%) sibling keys, discarding the raw per-draw samples, for:
+- **Faster loading / smaller memory footprint**: the dominant cost at scale
+  (e.g. 1000 posterior draws × every technical group × every feature)
+- **Pipeline continuation**: `save_ntc_summary`/`save_cis_summary`/`add_cis_gene`/
+  `fit_cis`/`refit_sumfactor` only ever read point estimates from these dicts anyway
+
+### Using Lean Loading
 
 ```python
-# Load as point estimates
-model.load_ntc_fit(use_posterior=False)  # alpha_x_type='point', alpha_y_type='point'
-model.load_cis_fit(use_posterior=False)        # x_true_type='point'
+# Collapse posterior_samples_ntc / posterior_samples_cis to point estimates
+model.load_ntc_fit(lean=True)
+model.load_cis_fit(lean=True)
 ```
 
 ### When to Use Each
 
 | Scenario | Recommendation |
 |----------|---------------|
-| Full Bayesian uncertainty propagation | `use_posterior=True` (default) |
-| Quick exploratory analysis | `use_posterior=False` |
-| Memory constrained environment | `use_posterior=False` |
-| Final publication-quality results | `use_posterior=True` |
+| Full Bayesian uncertainty propagation, plotting posterior draws | `lean=False` (default) |
+| Summary export / pipeline continuation only | `lean=True` |
+| Memory constrained environment | `lean=True` |
+| Final publication-quality results (plots need real CIs) | `lean=False` |
 
 ## Modality-Specific Parameters
 
@@ -469,7 +485,7 @@ If per-modality files aren't loaded:
 ### Memory Issues
 
 If loading large posteriors causes memory issues:
-- Use `use_posterior=False` to load point estimates
+- Use `lean=True` to collapse `posterior_samples_ntc`/`posterior_samples_cis` to point estimates
 - Consider loading only necessary components manually
 
 ## Migration from Old run_pipeline Scripts
@@ -493,13 +509,14 @@ The new methods:
 - ✅ Handle cis gene extraction automatically
 - ✅ Support per-modality parameters
 - ✅ Provide consistent interface
-- ✅ Include proper type tracking ('posterior' vs 'point')
+- ✅ Always store point estimates (posterior median) for alpha_x/alpha_y/x_true;
+  `lean=True` additionally collapses the accompanying posterior-sample dicts
 
 ## Summary
 
 - Use `save_*_fit()` after each pipeline stage
 - Use `load_*_fit()` before the next stage
-- Set `use_posterior=False` for faster loading with point estimates
+- Set `lean=True` for faster loading with smaller posterior-sample dicts
 - Per-modality parameters are saved/loaded automatically
 - Default `output_dir` is used unless specified
 

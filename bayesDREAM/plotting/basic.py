@@ -29,7 +29,7 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
                      single_guide_cells_only=False, facet_ntc=False,
                      ax=None, show=True):
     """
-    Scatter of per-cell x_true posterior mean vs std, one point per cell.
+    Scatter of per-cell x_true posterior median vs std, one point per cell.
 
     Uses ``model.posterior_samples_cis['x_true']`` (shape ``[S, N_cells]``) when
     available so that x and y reflect genuine posterior uncertainty per cell.
@@ -75,31 +75,31 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
-    x_mean, x_std, _, _ = _xtrue_posterior_stats(model, log2=log2)
+    x_median, x_std, _, _ = _xtrue_posterior_stats(model, log2=log2)
     _lean_x_true = getattr(model, 'is_cis_lean', False)
-    if x_mean is not None:
-        x_mean = x_mean[cell_mask]
+    if x_median is not None:
+        x_median = x_median[cell_mask]
         x_std = x_std[cell_mask]
     else:
         x_vals = to_np(model.x_true)[cell_mask]
         if log2:
             x_vals = _log2_safe(x_vals)
-        x_mean = x_vals
+        x_median = x_vals
         x_std  = np.zeros_like(x_vals)
 
     guide_labels = guide_labels[cell_mask]
 
     if log2fc:
         ntc_mask = _guide_ntc_mask(guide_labels, model)
-        ntc_mean = float(np.nanmean(x_mean[ntc_mask])) if ntc_mask.any() else 0.0
-        x_mean = x_mean - ntc_mean
+        ntc_mean = float(np.nanmean(x_median[ntc_mask])) if ntc_mask.any() else 0.0
+        x_median = x_median - ntc_mean
         xlabel = 'log2FC x_true (vs NTC)'
     else:
-        xlabel = f'mean x_true{" (log2)" if log2 else ""}'
+        xlabel = f'median x_true{" (log2)" if log2 else ""}'
 
     suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
     if _lean_x_true:
-        suffix += ' [lean: mean→median, std≈CI/1.96]'
+        suffix += ' [lean: std≈CI/1.96]'
 
     def _draw(ax_, gl, xm, xs, title_):
         for guide in sorted(np.unique(gl), key=_guide_sort_key):
@@ -126,9 +126,9 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
     if facet_ntc:
         ntc = _guide_ntc_mask(guide_labels, model)
         fig, (ax_ntc, ax_tgt) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-        _draw(ax_ntc, guide_labels[ntc],  x_mean[ntc],  x_std[ntc],
+        _draw(ax_ntc, guide_labels[ntc],  x_median[ntc],  x_std[ntc],
               f'{cis_gene}: NTC{suffix}')
-        _draw(ax_tgt, guide_labels[~ntc], x_mean[~ntc], x_std[~ntc],
+        _draw(ax_tgt, guide_labels[~ntc], x_median[~ntc], x_std[~ntc],
               f'{cis_gene}: targeting{suffix}')
         plt.tight_layout()
         if show:
@@ -137,8 +137,8 @@ def scatter_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
-    _draw(ax, guide_labels, x_mean, x_std,
-          f'{cis_gene}: mean vs std of x_true{suffix}')
+    _draw(ax, guide_labels, x_median, x_std,
+          f'{cis_gene}: median vs std of x_true{suffix}')
     plt.tight_layout()
     if show:
         plt.show()
@@ -150,7 +150,7 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
                           color_scheme=None, single_guide_cells_only=False,
                           facet_ntc=False, ax=None, show=True):
     """
-    Scatter of per-cell x_true posterior mean vs 95 % CI width, one point per cell.
+    Scatter of per-cell x_true posterior median vs 95 % CI width, one point per cell.
 
     Uses ``model.posterior_samples_cis['x_true']`` when available so that the CI
     reflects genuine posterior uncertainty.  Falls back to ``model.x_true`` (CI = 0).
@@ -196,20 +196,20 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
     guide_labels, cell_mask = resolve_guide_labels(model, single_guide_cells_only)
 
     # Under lean loading, q_lo/q_hi come from the precomputed x_true_lower/upper
-    # sibling keys (exact — quantiles commute with the monotonic log2 transform);
-    # x_mean is the stored per-cell median rather than the true mean (see
-    # _xtrue_posterior_stats docstring). CI-width y-values are unaffected either way.
-    x_mean, _, q_lo, q_hi = _xtrue_posterior_stats(model, log2=log2)
-    _lean_x_true = getattr(model, 'is_cis_lean', False)
-    if x_mean is not None:
-        x_mean = x_mean[cell_mask]
+    # sibling keys (exact — quantiles commute with the monotonic log2 transform).
+    # x_median is the per-cell posterior median in both lean and full-posterior
+    # modes (see _xtrue_posterior_stats docstring). CI-width y-values are
+    # unaffected either way.
+    x_median, _, q_lo, q_hi = _xtrue_posterior_stats(model, log2=log2)
+    if x_median is not None:
+        x_median = x_median[cell_mask]
         q_lo = q_lo[cell_mask]
         q_hi = q_hi[cell_mask]
     else:
         x_vals = to_np(model.x_true)[cell_mask]
         if log2:
             x_vals = _log2_safe(x_vals)
-        x_mean = x_vals
+        x_median = x_vals
         q_lo = q_hi = x_vals
 
     y_val = (q_hi - q_lo) if full_width else 0.5 * (q_hi - q_lo)
@@ -217,15 +217,13 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     if log2fc:
         ntc_mask = _guide_ntc_mask(guide_labels, model)
-        ntc_mean = float(np.nanmean(x_mean[ntc_mask])) if ntc_mask.any() else 0.0
-        x_mean = x_mean - ntc_mean
+        ntc_mean = float(np.nanmean(x_median[ntc_mask])) if ntc_mask.any() else 0.0
+        x_median = x_median - ntc_mean
         xlabel = 'log2FC x_true (vs NTC)'
     else:
-        xlabel = f'mean x_true{" (log2)" if log2 else ""}'
+        xlabel = f'median x_true{" (log2)" if log2 else ""}'
 
     suffix = ' (log2FC)' if log2fc else (' (log2)' if log2 else '')
-    if _lean_x_true:
-        suffix += ' [lean: mean→median]'
     ylabel = '95% CI ' + ('width' if full_width else 'half-width') + f' x_true{" (log2)" if log2 else ""}'
 
     def _draw(ax_, gl, xm, yv, title_):
@@ -253,9 +251,9 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
     if facet_ntc:
         ntc = _guide_ntc_mask(guide_labels, model)
         fig, (ax_ntc, ax_tgt) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-        _draw(ax_ntc, guide_labels[ntc],  x_mean[ntc],  y_val[ntc],
+        _draw(ax_ntc, guide_labels[ntc],  x_median[ntc],  y_val[ntc],
               f'{cis_gene}: NTC{suffix}')
-        _draw(ax_tgt, guide_labels[~ntc], x_mean[~ntc], y_val[~ntc],
+        _draw(ax_tgt, guide_labels[~ntc], x_median[~ntc], y_val[~ntc],
               f'{cis_gene}: targeting{suffix}')
         plt.tight_layout()
         if show:
@@ -264,7 +262,7 @@ def scatter_ci95_by_guide(model, cis_gene=None, log2=False, log2fc=False,
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
-    _draw(ax, guide_labels, x_mean, y_val,
+    _draw(ax, guide_labels, x_median, y_val,
           f'{cis_gene}: mean vs 95% CI of x_true{suffix}')
     plt.tight_layout()
     if show:
@@ -696,7 +694,7 @@ def scatter_param_mean_vs_ci(
     figsize=(7, 5),
 ):
     """
-    Scatter plot of parameter mean vs 95% CI width, with optional color coding.
+    Scatter plot of parameter median vs 95% CI width, with optional color coding.
 
     This is useful for visualizing parameter uncertainty vs magnitude, with
     optional coloring by dependency masks, NaN fractions, or other metrics.
@@ -764,8 +762,11 @@ def scatter_param_mean_vs_ci(
     """
     param_samps = np.asarray(param_samps)
 
-    # Compute mean and CI width
-    param_mean = np.nanmean(param_samps, axis=0)
+    # Compute the median point estimate (matches the convention used
+    # elsewhere, e.g. alpha_x_prefit/alpha_y_prefit/x_true at fit time) and
+    # CI width. Despite the function's name (kept for backward compat),
+    # this has always plotted a point estimate + CI, not literally the mean.
+    param_median = np.nanmedian(param_samps, axis=0)
     param_lo = np.nanpercentile(param_samps, 2.5, axis=0)
     param_hi = np.nanpercentile(param_samps, 97.5, axis=0)
     param_ci_width = param_hi - param_lo
@@ -775,21 +776,21 @@ def scatter_param_mean_vs_ci(
 
     # Case 1: No subsetting - plot all points in one color
     if subset_mask is None:
-        ax.scatter(param_mean, param_ci_width, s=8, alpha=0.6, color='blue')
+        ax.scatter(param_median, param_ci_width, s=8, alpha=0.6, color='blue')
 
     # Case 2: Subsetting without color coding
     elif color_by is None:
         # Plot non-masked points in grey
         if not np.all(subset_mask):
             ax.scatter(
-                param_mean[~subset_mask],
+                param_median[~subset_mask],
                 param_ci_width[~subset_mask],
                 s=5, alpha=0.3, color='grey', label='not selected'
             )
 
         # Plot masked points in blue
         ax.scatter(
-            param_mean[subset_mask],
+            param_median[subset_mask],
             param_ci_width[subset_mask],
             s=5, alpha=0.2, color='blue', label='selected'
         )
@@ -804,13 +805,13 @@ def scatter_param_mean_vs_ci(
         # Plot non-masked points in grey
         if not np.all(subset_mask):
             ax.scatter(
-                param_mean[~subset_mask],
+                param_median[~subset_mask],
                 param_ci_width[~subset_mask],
                 s=5, alpha=0.3, color='grey'
             )
 
         # Plot masked points with color coding
-        valid_mask = subset_mask & np.isfinite(param_mean) & np.isfinite(param_ci_width)
+        valid_mask = subset_mask & np.isfinite(param_median) & np.isfinite(param_ci_width)
 
         if vmin is None:
             vmin = np.nanmin(color_by[valid_mask])
@@ -818,7 +819,7 @@ def scatter_param_mean_vs_ci(
             vmax = np.nanmax(color_by[valid_mask])
 
         sc = ax.scatter(
-            param_mean[valid_mask],
+            param_median[valid_mask],
             param_ci_width[valid_mask],
             c=color_by[valid_mask],
             cmap=cmap,
@@ -833,7 +834,7 @@ def scatter_param_mean_vs_ci(
         cbar.set_label(color_label)
 
     # Labels and formatting
-    xlabel = f'Mean {param_name}' + (' (log₂)' if log2 else '')
+    xlabel = f'Median {param_name}' + (' (log₂)' if log2 else '')
     ylabel = f'95% CI width of {param_name}' + (' (log₂)' if log2 else '')
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -1798,7 +1799,7 @@ def _cell_log2_response(model, response='x_true',
     ----------
     model : bayesDREAM
     response : {'x_true', 'x_obs'}
-        ``'x_true'`` uses the posterior mean ``model.log2_x_true``.
+        ``'x_true'`` uses the posterior median ``model.log2_x_true``.
         ``'x_obs'`` computes ``log2((x_obs + epsilon) / (alpha_x * sum_factor))``,
         mirroring the normalisation applied inside ``fit_cis``.
     sum_factor_col : str
@@ -1913,7 +1914,7 @@ def plot_additivity_scatter(model, response='x_obs',
 
         * ``'x_obs'`` – normalised raw counts:
           ``log2((x_obs + epsilon) / (alpha_x * sum_factor))``
-        * ``'x_true'`` – posterior mean ``model.log2_x_true``
+        * ``'x_true'`` – posterior median ``model.log2_x_true``
     sum_factor_col : str, default 'sum_factor'
         Sum-factor column to use when ``response='x_obs'``.
     epsilon : float, default 0.5
@@ -2019,7 +2020,7 @@ def plot_additivity_violin(model, response='x_obs',
 
         * ``'x_obs'`` – normalised raw counts:
           ``log2((x_obs + epsilon) / (alpha_x * sum_factor))``
-        * ``'x_true'`` – posterior mean ``model.log2_x_true``
+        * ``'x_true'`` – posterior median ``model.log2_x_true``
     sum_factor_col : str, default 'sum_factor'
         Sum-factor column to use when ``response='x_obs'``.
     epsilon : float, default 0.5
