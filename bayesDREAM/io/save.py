@@ -4,6 +4,7 @@ Save methods for bayesDREAM fitted parameters.
 
 import os
 import torch
+import pandas as pd
 
 from ..utils import is_lean_posterior
 from .load import _reduce_posterior_samples
@@ -104,6 +105,32 @@ class ModelSaver:
                 saved_summary.append('alpha_x')
                 if verbose:
                     print(f"[SAVE] alpha_x_prefit → {path}")
+
+            # Save technical_group_code -> covariate-value mapping. Without this,
+            # technical_group_code is just a positional index into alpha_x_prefit/
+            # alpha_y_prefit that is only meaningful for the exact dataframe
+            # set_technical_groups() was run on — pandas' groupby(...).ngroup()
+            # renumbers groups from the distinct covariate combinations *present*,
+            # so re-running set_technical_groups() on a different subset (e.g. a
+            # per-cis-gene subset with fewer batches than the full NTC panel) can
+            # silently reassign the same integer code to a different real batch.
+            # load_ntc_fit() uses this file to re-derive technical_group_code by
+            # looking up each cell's actual covariate values, instead of trusting
+            # whatever ngroup() happened to produce on the current dataframe.
+            tg_covariates = getattr(self.model, '_technical_group_covariates', None)
+            if tg_covariates is not None and 'technical_group_code' in self.model.meta.columns:
+                mapping_cols = list(tg_covariates) + ['technical_group_code']
+                mapping_df = (self.model.meta[mapping_cols]
+                              .drop_duplicates()
+                              .sort_values('technical_group_code')
+                              .reset_index(drop=True))
+                mapping_path = os.path.join(output_dir, 'technical_group_labels.csv')
+                mapping_df.to_csv(mapping_path, index=False)
+                saved_files['technical_group_labels'] = mapping_path
+                saved_summary.append('technical_group_labels')
+                if verbose:
+                    print(f"[SAVE] technical_group_labels ({len(mapping_df)} groups, "
+                          f"covariates={tg_covariates}) → {mapping_path}")
 
         # Save per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_save:

@@ -604,6 +604,7 @@ class NTCFitter:
         if not covariates:
             print("[INFO] No covariates specified - creating single technical group (C=1)")
             self.model.meta["technical_group_code"] = 0
+            self.model._technical_group_covariates = []
             return
 
         missing_cols = [c for c in covariates if c not in self.model.meta.columns]

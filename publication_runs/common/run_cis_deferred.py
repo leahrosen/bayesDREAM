@@ -114,8 +114,20 @@ def run_cis_deferred(cfg: dict) -> None:
                                           "cis_gene": cis_gene})
 
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
-    if ntc_cfg.get("set_technical_groups"):
-        model.set_technical_groups(ntc_cfg["set_technical_groups"])
+    # Same fixup fit_trans/run_compensation apply: a freshly-built model object
+    # may not have technical_group_code set even though alpha_x_prefit/x_true
+    # loaded fine. Guarded (not unconditional) because this subset's meta may
+    # already carry a technical_group_code column written by subset_per_gene.py
+    # from the FULL dataset's set_technical_groups() call -- recomputing it here
+    # via groupby(...).ngroup() on this per-gene subset (which can span far fewer
+    # batches than the full NTC panel) would renumber groups and desync
+    # technical_group_code from the alpha_x_prefit/alpha_y_prefit tensors
+    # load_ntc_fit() below loads (those were fit and saved under the full
+    # panel's numbering). See publication_runs/common/check_technical_groups.sh.
+    if "technical_group_code" not in model.meta.columns:
+        covariates = ntc_cfg.get("set_technical_groups")
+        if covariates:
+            model.set_technical_groups(covariates)
 
     # load_ntc_fit()/add_cis_gene() are cheap, deterministic setup (NOT the
     # expensive SVI step) -- they always run regardless of whether fit_cis

@@ -416,6 +416,59 @@ class ModelLoader:
         loaded = {}
         loaded_summary = []  # Track what was loaded for summary
 
+        # ── technical_group_code: re-derive from the saved mapping (authoritative) ──
+        # pandas' groupby(...).ngroup() (used by set_technical_groups()) numbers
+        # groups 0..k-1 from the distinct covariate combinations *present in
+        # whatever dataframe it's run on* — it is not a stable/global code. A
+        # technical_group_code column already sitting in self.model.meta (e.g.
+        # from a set_technical_groups() call made on a per-cis-gene subset with
+        # fewer batches than the full NTC panel) therefore cannot be trusted to
+        # line up with the numbering alpha_x_prefit/alpha_y_prefit were actually
+        # fit and saved under. When save_ntc_fit() wrote a technical_group_labels.csv
+        # (covariate values -> technical_group_code), it is the single source of
+        # truth here and overwrites whatever technical_group_code is already set,
+        # regardless of call order.
+        tg_labels_path = os.path.join(input_dir, 'technical_group_labels.csv')
+        if os.path.exists(tg_labels_path):
+            tg_mapping = pd.read_csv(tg_labels_path)
+            tg_cols = [c for c in tg_mapping.columns if c != 'technical_group_code']
+            if not tg_cols:
+                # Single technical group (no covariates) -- trivially group 0 for every cell.
+                self.model.meta['technical_group_code'] = 0
+                self.model._technical_group_covariates = []
+                if verbose:
+                    print(f"[LOAD] technical_group_code ← {tg_labels_path} (single group, no covariates)")
+            else:
+                missing_cols = [c for c in tg_cols if c not in self.model.meta.columns]
+                if missing_cols:
+                    raise ValueError(
+                        f"load_ntc_fit(): technical_group_labels.csv at {tg_labels_path} keys "
+                        f"technical groups by {tg_cols}, but meta is missing column(s) {missing_cols}. "
+                        f"Cannot re-derive technical_group_code."
+                    )
+                merge_left = self.model.meta[tg_cols].astype(str)
+                merge_right = tg_mapping.astype({c: str for c in tg_cols})
+                merged = merge_left.merge(merge_right, on=tg_cols, how='left')
+                unmatched = merged['technical_group_code'].isna()
+                if unmatched.any():
+                    unseen = self.model.meta.loc[unmatched.values, tg_cols].drop_duplicates()
+                    raise ValueError(
+                        f"load_ntc_fit(): {int(unmatched.sum())} cell(s) have covariate "
+                        f"combination(s) of {tg_cols} not present among the NTC fit's technical "
+                        f"groups (see {tg_labels_path}):\n{unseen.to_string(index=False)}\n"
+                        f"No alpha_x_prefit/alpha_y_prefit estimate exists for these batches — "
+                        f"either they were excluded from the NTC fit, or this model's covariate "
+                        f"columns don't match the ones the NTC fit used."
+                    )
+                self.model.meta['technical_group_code'] = merged['technical_group_code'].astype(int).values
+                self.model._technical_group_covariates = tg_cols
+                if verbose:
+                    print(f"[LOAD] technical_group_code ← {tg_labels_path} "
+                          f"({tg_mapping['technical_group_code'].nunique()} groups, covariates={tg_cols})")
+        elif verbose:
+            print(f"[LOAD] No technical_group_labels.csv found at {tg_labels_path} — "
+                  f"technical_group_code left as-is (fit predates this safeguard).")
+
         # Determine which modalities to load
         if modalities is None:
             modalities_to_load = list(self.model.modalities.keys())
