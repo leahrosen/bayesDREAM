@@ -240,9 +240,9 @@ def prepare_de_for_cg(model, de_df, cis_gene=None, color_scheme=None):
     dep_mask = dependency_mask_from_n(n_samps)  # [T] bool
     T        = n_median.shape[0]
 
-    # gene names aligned to posterior arrays — modality.feature_names is the
+    # gene names aligned to posterior arrays — modality.feature_ids is the
     # single source of truth (resolved + deduped in Modality.__init__).
-    gene_names = np.array(model.get_modality('gene').feature_names)
+    gene_names = np.array(model.get_modality('gene').feature_ids)
     if len(gene_names) != T:
         print(f"[{cis_gene}] WARNING: len(gene_names)={len(gene_names)} != T={T}. "
               "Trimming gene_names to first T entries.")

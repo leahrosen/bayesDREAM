@@ -194,7 +194,7 @@ print(meta.head())
 #   `cells_axis=1` is the default for a `pd.DataFrame` with cells as columns)
 # - `.feature_meta` — per-feature annotation `DataFrame` (from our
 #   `gene_meta` above, plus any columns bayesDREAM adds internally)
-# - `.feature_names` — canonical, order-matched list of feature identifiers
+# - `.feature_ids` — canonical, order-matched list of feature identifiers
 #   (aligned with the feature axis of `.counts` and the rows of
 #   `.feature_meta` — always use this instead of re-deriving names from
 #   `feature_meta` yourself)
@@ -311,7 +311,7 @@ def plot_ntc_log2_mu(model, gene_panel=None, highlight_genes=None,
     else:
         mu_ntc = np.asarray(mu_ntc).mean(axis=0).flatten()
 
-    feature_names = mod.feature_names
+    feature_names = mod.feature_ids
     log2_mu = np.log2(mu_ntc)
     name_to_log2 = dict(zip(feature_names, log2_mu))
 
@@ -333,7 +333,7 @@ def plot_ntc_log2_mu(model, gene_panel=None, highlight_genes=None,
     if highlight_genes:
         for i, g in enumerate(highlight_genes):
             if g not in name_to_log2:
-                print(f"[WARN] '{g}' not found in modality '{modality_name}' feature_names — skipping")
+                print(f"[WARN] '{g}' not found in modality '{modality_name}' feature_ids — skipping")
                 continue
             val = name_to_log2[g]
             ax.axvline(val, color=colors[i % len(colors)], lw=2, ls='--',

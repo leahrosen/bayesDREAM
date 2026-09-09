@@ -76,7 +76,7 @@ def permute_from_ntc(
     # ------------------------------------------------------------------ #
     # Resolve feature list                                                  #
     # ------------------------------------------------------------------ #
-    feature_names = modality.feature_names
+    feature_names = modality.feature_ids
     n_features = modality.dims['n_features']
 
     if features2permute is None or features2permute == 'All' or features2permute == ['All']:

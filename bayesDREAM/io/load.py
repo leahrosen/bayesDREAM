@@ -519,8 +519,8 @@ class ModelLoader:
             mod_loaded = []
 
             # Resolve current feature names for alignment
-            current_feature_names = (mod.feature_names
-                                     if mod.feature_names is not None
+            current_feature_names = (mod.feature_ids
+                                     if mod.feature_ids is not None
                                      else (list(mod.feature_meta.index)
                                            if mod.feature_meta is not None else None))
 
@@ -557,7 +557,7 @@ class ModelLoader:
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                     posterior_raw = loaded_data['posterior_samples']
                     n_features = loaded_data.get('n_features')
-                    saved_feature_names = loaded_data.get('feature_names')
+                    saved_feature_names = loaded_data.get('feature_ids', loaded_data.get('feature_names'))
                     n_features_saved = n_features
 
                     # Align posteriors to current modality's feature set. Works
@@ -1014,15 +1014,15 @@ class ModelLoader:
 
             posterior_raw = loaded_data['posterior_samples']
             n_features = loaded_data.get('n_features') or n_features_hint
-            saved_names = loaded_data.get('feature_names')
+            saved_names = loaded_data.get('feature_ids', loaded_data.get('feature_names'))
             mod_name_saved = loaded_data.get('modality_name')
             feat_mask = None
 
             # Align to current modality features if possible
             if mod_name_saved and mod_name_saved in self.model.modalities:
                 mod = self.model.modalities[mod_name_saved]
-                cur_names = (mod.feature_names
-                             if mod.feature_names is not None
+                cur_names = (mod.feature_ids
+                             if mod.feature_ids is not None
                              else (list(mod.feature_meta.index)
                                    if mod.feature_meta is not None else None))
                 if (cur_names is not None and saved_names is not None
@@ -1081,9 +1081,9 @@ class ModelLoader:
                                         mod.denominator = denom[mask_np, :]
                                     else:
                                         mod.denominator = denom[:, mask_np]
-                                # Subset feature_names
-                                if mod.feature_names is not None:
-                                    mod.feature_names = [mod.feature_names[i]
+                                # Subset feature_ids
+                                if mod.feature_ids is not None:
+                                    mod.feature_ids = [mod.feature_ids[i]
                                                          for i, m in enumerate(mask_np) if m]
                                 # Subset feature_meta
                                 if mod.feature_meta is not None:
@@ -1096,8 +1096,8 @@ class ModelLoader:
                                       f"subsetted to {n_kept} features present in saved trans fit "
                                       f"(dropped {n_missing}).")
                                 # Re-align posteriors with the subsetted modality (no NaNs now)
-                                new_cur_names = (mod.feature_names
-                                                 if mod.feature_names is not None
+                                new_cur_names = (mod.feature_ids
+                                                 if mod.feature_ids is not None
                                                  else [cur_names[i] for i, m in enumerate(mask_np) if m])
                                 posterior_raw, feat_mask = _align_posterior_features(
                                     loaded_data['posterior_samples'], saved_names, new_cur_names, n_features)

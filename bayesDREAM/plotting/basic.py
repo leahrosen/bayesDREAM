@@ -1316,7 +1316,7 @@ def plot_parameter_ci_panel(
 
     # Get feature names from modality — the single source of truth (resolved +
     # deduped in Modality.__init__), no need to re-derive it here.
-    feature_names = modality.feature_names
+    feature_names = modality.feature_ids
     if feature_names is None:
         feature_names = [str(i) for i in range(modality.dims['n_features'])]
 
@@ -1694,9 +1694,9 @@ def extract_posterior_dataframe(
             "Must run fit_trans() first."
         )
 
-    # Get gene names — modality.feature_names is the single source of truth
+    # Get gene names — modality.feature_ids is the single source of truth
     # (resolved + deduped in Modality.__init__), no need to re-derive it here.
-    gene_names = modality.feature_names
+    gene_names = modality.feature_ids
     if gene_names is None:
         gene_names = [str(i) for i in range(modality.dims['n_features'])]
 

@@ -386,8 +386,8 @@ def _resolve_features(feature_or_gene: str, modality) -> Tuple[List[int], List[s
     feature_idx = _get_feature_index(feature_or_gene, modality)
     if feature_idx is not None:
         # Found as a feature - get the actual feature name
-        if hasattr(modality, 'feature_names') and modality.feature_names is not None:
-            feature_name = modality.feature_names[feature_idx]
+        if hasattr(modality, 'feature_ids') and modality.feature_ids is not None:
+            feature_name = modality.feature_ids[feature_idx]
         else:
             feature_name = feature_or_gene
         return [feature_idx], [feature_name], False
@@ -413,10 +413,10 @@ def _resolve_features(feature_or_gene: str, modality) -> Tuple[List[int], List[s
             indices = mask.values.nonzero()[0].tolist()
 
             # Get feature names for matched indices.
-            # modality.feature_names is the single source of truth (resolved +
+            # modality.feature_ids is the single source of truth (resolved +
             # deduped in Modality.__init__), no need to re-derive it here.
-            if modality.feature_names is not None:
-                names = [modality.feature_names[i] for i in indices]
+            if modality.feature_ids is not None:
+                names = [modality.feature_ids[i] for i in indices]
             else:
                 names = [str(i) for i in indices]
 
@@ -462,9 +462,9 @@ def _get_feature_index(feature: str, modality) -> Optional[int]:
                 # Use argmax to get integer position, not index label
                 return mask.values.argmax()
 
-    # Check feature_names attribute
-    if hasattr(modality, 'feature_names'):
-        feature_names = modality.feature_names
+    # Check feature_ids attribute
+    if hasattr(modality, 'feature_ids'):
+        feature_names = modality.feature_ids
         if isinstance(feature_names, (list, np.ndarray)):
             feature_names_list = list(feature_names)
             if feature in feature_names_list:
@@ -1073,10 +1073,10 @@ def predict_trans_derivatives(
     A_samples = posterior['A']
 
     # Get feature list — always from the modality, never from model.trans_genes.
-    # modality.feature_names is the single source of truth (resolved + deduped
+    # modality.feature_ids is the single source of truth (resolved + deduped
     # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    feature_list = modality.feature_names
+    feature_list = modality.feature_ids
     if feature_list is None:
         return None, None, None
 
@@ -1305,9 +1305,9 @@ def predict_trans_log2fc(
         y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
-    # trans_mod.feature_names is the single source of truth (resolved +
+    # trans_mod.feature_ids is the single source of truth (resolved +
     # deduped in Modality.__init__), no need to re-derive it here.
-    feature_list = trans_mod.feature_names
+    feature_list = trans_mod.feature_ids
 
     if feature_list is None or feature not in feature_list:
         return None, None, None, None, None
@@ -1422,9 +1422,9 @@ def predict_trans_log2fc_samples(
         y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
-    # trans_mod.feature_names is the single source of truth (resolved +
+    # trans_mod.feature_ids is the single source of truth (resolved +
     # deduped in Modality.__init__), no need to re-derive it here.
-    feature_list = trans_mod.feature_names
+    feature_list = trans_mod.feature_ids
 
     if feature_list is None or feature not in feature_list:
         return None, None
@@ -1531,9 +1531,9 @@ def predict_trans_delta_p(
         y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find the feature index to get the right NTC
-    # trans_mod.feature_names is the single source of truth (resolved +
+    # trans_mod.feature_ids is the single source of truth (resolved +
     # deduped in Modality.__init__), no need to re-derive it here.
-    feature_list = trans_mod.feature_names
+    feature_list = trans_mod.feature_ids
 
     if feature_list is None or feature not in feature_list:
         return None, None, None, None, None
@@ -1661,9 +1661,9 @@ def predict_trans_delta_p_samples(
         y_ntc_all = np.median(trans_mu_ntc, axis=0).squeeze()
 
     # Find feature index
-    # trans_mod.feature_names is the single source of truth (resolved +
+    # trans_mod.feature_ids is the single source of truth (resolved +
     # deduped in Modality.__init__), no need to re-derive it here.
-    feature_list = trans_mod.feature_names
+    feature_list = trans_mod.feature_ids
 
     if feature_list is None or feature not in feature_list:
         return None, None
@@ -1855,7 +1855,7 @@ def plot_trans_functions(
     ...                            show_first_derivative=True)
 
     >>> # Plot all non-monotonic genes (genes where derivative changes sign)
-    >>> feature_names = model.get_modality(model.primary_modality).feature_names
+    >>> feature_names = model.get_modality(model.primary_modality).feature_ids
     >>> non_monotonic = [g for g in feature_names if is_non_monotonic(model, g)]
     >>> model.plot_trans_functions(non_monotonic, show_first_derivative=True)
     """
@@ -2404,10 +2404,10 @@ def predict_trans_function(
     n_genes_posterior = A_shape[0]
 
     # Get feature list from modality — always the ground truth.
-    # modality.feature_names is the single source of truth (resolved + deduped
+    # modality.feature_ids is the single source of truth (resolved + deduped
     # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    feature_list = modality.feature_names if modality.feature_names is not None else []
+    feature_list = modality.feature_ids if modality.feature_ids is not None else []
     if not feature_list and modality_name != model.primary_modality:
         if debug: print(f"[predict_trans_function] returning None: non-primary modality has no feature_names or feature_meta")
         return None
@@ -2725,10 +2725,10 @@ def predict_trans_function_samples(
         A_samples = np.array(A_samples)
 
     # Get feature list — always from the modality, never from model.trans_genes.
-    # modality.feature_names is the single source of truth (resolved + deduped
+    # modality.feature_ids is the single source of truth (resolved + deduped
     # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    feature_list = modality.feature_names
+    feature_list = modality.feature_ids
     if feature_list is None:
         return None
 
@@ -2909,10 +2909,10 @@ def predict_trans_derivatives_samples(
         A_samples = np.array(A_samples)
 
     # Get feature list — always from the modality, never from model.trans_genes.
-    # modality.feature_names is the single source of truth (resolved + deduped
+    # modality.feature_ids is the single source of truth (resolved + deduped
     # in Modality.__init__), no need to re-derive it here.
     modality = model.get_modality(modality_name)
-    feature_list = modality.feature_names
+    feature_list = modality.feature_ids
     if feature_list is None:
         return None, None, None, None
 
@@ -3444,17 +3444,17 @@ def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0
         if not hasattr(model, 'posterior_samples_trans') or model.posterior_samples_trans is None:
             return []
         posterior = model.posterior_samples_trans
-        # Use modality.feature_names — always matches the fitted posterior dimensions.
-        feature_list = list(modality.feature_names) if modality.feature_names is not None else []
+        # Use modality.feature_ids — always matches the fitted posterior dimensions.
+        feature_list = list(modality.feature_ids) if modality.feature_ids is not None else []
     else:
         if not hasattr(modality, 'posterior_samples_trans') or modality.posterior_samples_trans is None:
             return []
         posterior = modality.posterior_samples_trans
-        # modality.feature_names is the single source of truth (resolved + deduped
+        # modality.feature_ids is the single source of truth (resolved + deduped
         # in Modality.__init__), no need to re-derive it here.
-        if modality.feature_names is None:
+        if modality.feature_ids is None:
             return []
-        feature_list = list(modality.feature_names)
+        feature_list = list(modality.feature_ids)
 
     if feature not in feature_list:
         return []
@@ -4086,8 +4086,8 @@ def plot_negbinom_xy(
                                  if modality.name == model.primary_modality
                                  else getattr(modality, 'posterior_samples_trans', None))
                 if _posterior_ep is not None and 'K_a' in _posterior_ep:
-                    _fnames_ep = (list(modality.feature_names)
-                                  if modality.feature_names is not None else [])
+                    _fnames_ep = (list(modality.feature_ids)
+                                  if modality.feature_ids is not None else [])
                     if feature in _fnames_ep:
                         _fi_ep = _fnames_ep.index(feature)
                         for _kname in ('K_a', 'K_b'):

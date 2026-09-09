@@ -868,7 +868,7 @@ class DiagnosticsMixin:
             denom_arr = self._get_dense_array(modality.denominator)
 
         # ---- Feature names / indices -------------------------------------------
-        feature_names = modality.feature_names
+        feature_names = modality.feature_ids
         if feature_names is None:
             feature_names = list(range(counts_arr.shape[0]))
 
@@ -1193,7 +1193,7 @@ class DiagnosticsMixin:
             # normal / studentt: theta = sigma_y directly
             theta_arr = val
 
-        feature_names = modality.feature_names
+        feature_names = modality.feature_ids
         if feature_names is not None and len(theta_arr) == len(feature_names):
             return pd.Series(theta_arr, index=feature_names)
         return theta_arr  # positional fallback
@@ -1215,7 +1215,7 @@ class DiagnosticsMixin:
                     nu_y = np.asarray(nu_y)
                 while nu_y.ndim > 1:
                     nu_y = np.median(nu_y, axis=0)  # collapse to [T]
-                feature_names = modality.feature_names
+                feature_names = modality.feature_ids
                 if feature_names is not None and len(nu_y) == len(feature_names):
                     return pd.Series(nu_y, index=feature_names)
                 return nu_y
@@ -1582,7 +1582,7 @@ class DiagnosticsMixin:
         ----------
         genes : str or list of str
             Gene (feature) name(s) to compute the loss for.  This must be a
-            subset of ``modality.feature_names``.
+            subset of ``modality.feature_ids``.
         modality_name : str or None
             Modality to use (default: primary modality).
         cells : list of str or str or None
@@ -1645,7 +1645,7 @@ class DiagnosticsMixin:
         # ---- Resolve gene list ------------------------------------------------
         if isinstance(genes, str):
             genes = [genes]
-        feature_names = modality.feature_names or list(range(modality.counts.shape[0]))
+        feature_names = modality.feature_ids or list(range(modality.counts.shape[0]))
         gene_indices = []
         for g in genes:
             if g not in feature_names:

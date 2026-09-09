@@ -29,7 +29,7 @@ separately, but no caller in this pipeline currently requests it for
 recapitulation).
 
 CHECK BEFORE TRUSTING AT SCALE: simulate_from_trans_summary's returned
-DataFrame is reindexed here to match the modality's feature_names/cell_names
+DataFrame is reindexed here to match the modality's feature_ids/cell_names
 order defensively (its docstring doesn't guarantee row/column order matches
 the input trans_summary_df/meta exactly) -- but this reindexing has only
 been checked by reading the source, not run end-to-end. Sanity-check on one
@@ -258,11 +258,11 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
     sim_counts = simulated.drop(index=model.cis_gene, errors="ignore")
     sim_mod = sim_model.get_modality(modality_name)
     # Defensive reindex -- see module docstring's "CHECK BEFORE TRUSTING" note.
-    sim_counts = sim_counts.reindex(index=sim_mod.feature_names, columns=sim_mod.cell_names)
+    sim_counts = sim_counts.reindex(index=sim_mod.feature_ids, columns=sim_mod.cell_names)
     if sim_counts.isna().any().any():
         raise ValueError(
             "Reindexing simulate_from_trans_summary()'s output to the modality's "
-            "feature_names/cell_names produced NaNs -- the returned frame's row/"
+            "feature_ids/cell_names produced NaNs -- the returned frame's row/"
             "column labels don't fully match the modality. Inspect `simulated` "
             "directly before proceeding."
         )

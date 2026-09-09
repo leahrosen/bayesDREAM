@@ -12,7 +12,7 @@ import torch
 from typing import Literal, Optional, Union, Dict, Any
 from scipy import sparse
 
-from .utils import make_names_unique, resolve_feature_names, is_lean_posterior
+from .utils import resolve_feature_ids, is_lean_posterior
 
 
 class Modality:
@@ -44,11 +44,13 @@ class Modality:
         counts: Union[np.ndarray, pd.DataFrame],
         feature_meta: pd.DataFrame,
         distribution: Literal['negbinom', 'multinomial', 'binomial', 'normal', 'studentt'],
+        feature_name_col: Optional[str] = None,
         feature_names: Optional[list] = None,
         denominator: Optional[np.ndarray] = None,
         cells_axis: int = 1,  # 0 if cells are rows, 1 if cells are columns
         cell_names: Optional[list] = None,  # Explicit cell names (when counts is ndarray)
         min_count: int = 1,
+        is_gene_identity: bool = False,
         # Exon skipping specific parameters
         inc1: Optional[np.ndarray] = None,
         inc2: Optional[np.ndarray] = None,
@@ -65,15 +67,43 @@ class Modality:
         counts : np.ndarray or pd.DataFrame
             Count/measurement data
         feature_meta : pd.DataFrame
-            Feature metadata with index matching features in counts
+            Feature metadata. Required unless `counts` is a DataFrame with a
+            usable (non-integer) index along the feature axis — see
+            `feature_name_col`/`feature_names` below for the full priority
+            used to determine each feature's identity.
         distribution : str
             Distribution type
+        feature_name_col : str, optional
+            Column of `feature_meta` to use as the authoritative per-feature
+            identifier (`feature_id`). Mutually exclusive with `feature_names`
+            — passing both raises ValueError. Requires `feature_meta` to be
+            provided. Every value in this column must be a non-null string
+            and unique; violations raise ValueError.
+
+            This is the highest-priority identity source: when given, it
+            always wins over any index or column auto-detection (see
+            "Feature identity resolution" below).
+        feature_names : list of str, optional
+            Explicit feature_id list, one entry per feature (length must match
+            `counts`'s feature count). Mutually exclusive with
+            `feature_name_col`. Every value must be a non-null string and
+            unique; violations raise ValueError. Same top priority as
+            `feature_name_col`.
         denominator : np.ndarray, optional
             For binomial: denominator counts (e.g., total gene expression for SJ usage)
         cells_axis : int
             Which axis represents cells (0 or 1 for 2D data)
         cell_names : list, optional
             Explicit cell names/identifiers (used when counts is ndarray, not DataFrame)
+        is_gene_identity : bool, default=False
+            True only for modalities where each row IS one gene (the primary
+            'gene' modality and the 'cis' modality) — enables gene-specific
+            bonus identifier columns (`ens_id`/`gene_id`/`gene`/`gene_name`/
+            `gene_symbol`) in the column-cascade fallback (see below). Leave
+            False for modalities where genes are many-to-one with rows
+            (transcripts, splice junctions, ATAC peaks, custom modalities) —
+            those gene columns repeat once per feature belonging to the same
+            gene and are not valid per-feature identifiers there.
         inc1 : np.ndarray, optional
             For exon skipping: inclusion counts from first junction (d1->a2)
         inc2 : np.ndarray, optional
@@ -82,6 +112,34 @@ class Modality:
             For exon skipping: skipping counts (d1->a3)
         exon_aggregate_method : str, optional
             For exon skipping: how inc1 and inc2 were aggregated ('min' or 'mean')
+
+        Feature identity resolution
+        ----------------------------
+        Every feature gets a canonical string `feature_id`, which becomes
+        `self.feature_ids` (order-matched to `counts`), `feature_meta`'s
+        index, `feature_meta['feature_id']`, and — when `counts` is a
+        DataFrame — `counts`'s own index/columns along the feature axis.
+        Overwriting an existing, *different* string index/column anywhere in
+        this chain emits a `UserWarning`.
+
+        The identifier source is chosen by trying, in order, the first one
+        that is fully populated with unique strings (see
+        `bayesDREAM.utils.resolve_feature_ids` for the full algorithm and
+        exact column priority):
+
+        1. `feature_name_col` or `feature_names` (explicit; raises on
+           violation rather than silently falling through — these were
+           deliberately requested).
+        2. `counts`'s own non-integer index along the feature axis (raises on
+           violation, same reasoning as #1).
+        3. `feature_meta`'s own non-integer index (raises on violation).
+        4. A cascade of `feature_meta` columns (silently skipped, not raised,
+           if missing/invalid): `'feature_id' > 'feature' > [gene-identity
+           bonus: 'ens_id' > 'gene_id' > 'gene'] > 'feature_name' >
+           [gene-identity bonus: 'gene_name' > 'gene_symbol']`, then the first
+           remaining fully-valid string column of `feature_meta` in column
+           order.
+        5. If none of the above yields a usable source: raises ValueError.
         """
         if distribution not in self.VALID_DISTRIBUTIONS:
             raise ValueError(f"distribution must be one of {self.VALID_DISTRIBUTIONS}, got {distribution}")
@@ -89,64 +147,60 @@ class Modality:
         self.name = name
         self.distribution = distribution
         self.cells_axis = cells_axis
+        self.is_gene_identity = is_gene_identity
 
         # Handle different count input formats
         # Check if counts is sparse matrix
         self.is_sparse = sparse.issparse(counts)
+
+        # Compute n_features up front (mirrors _validate()) so an explicit
+        # feature_names list can be length-checked during identity resolution.
+        counts_ndim = counts.ndim if hasattr(counts, 'ndim') else len(counts.shape)
+        if distribution in ('negbinom', 'normal', 'binomial', 'studentt'):
+            if counts_ndim != 2:
+                raise ValueError(f"{distribution} modality requires 2D counts, got shape {counts.shape}")
+            n_features_for_resolution = counts.shape[1 - cells_axis]
+        elif distribution == 'multinomial':
+            if counts_ndim != 3:
+                raise ValueError(f"multinomial modality requires 3D counts (features, cells, categories), got shape {counts.shape}")
+            n_features_for_resolution = counts.shape[0]
+
+        # Single source of truth for feature identity — see docstring above
+        # and bayesDREAM.utils.resolve_feature_ids for the full algorithm.
+        # Stamps 'feature_id' onto feature_meta's index+column and (for
+        # DataFrame counts) onto counts' index/columns along the feature axis.
+        self.feature_ids, feature_meta, counts = resolve_feature_ids(
+            counts=counts,
+            feature_meta=feature_meta,
+            feature_name_col=feature_name_col,
+            feature_names=feature_names,
+            cells_axis=cells_axis,
+            n_features=n_features_for_resolution,
+            is_gene_identity=is_gene_identity,
+            context=f"Modality '{name}'",
+        )
 
         if isinstance(counts, pd.DataFrame):
             # DataFrame: store both values and DataFrame
             self.counts = counts.values
             self.count_df = counts
             self.is_sparse = False  # DataFrames are dense
-            # Feature names: use explicit parameter if provided, else from index/columns
             if cells_axis == 1:
-                self.feature_names = feature_names if feature_names is not None else counts.index.tolist()
                 self.cell_names = counts.columns.tolist()
             else:
-                self.feature_names = feature_names if feature_names is not None else counts.columns.tolist()
                 self.cell_names = counts.index.tolist()
         elif self.is_sparse:
             # Sparse matrix: keep sparse, don't densify!
             self.counts = counts
             self.count_df = None
-            self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
-            pass  # sparse matrix stored as-is
         else:
             # Dense array: convert to numpy array
             self.counts = np.asarray(counts)
             self.count_df = None
-            self.feature_names = feature_names if feature_names is not None else None
             self.cell_names = cell_names if cell_names is not None else None
 
-        # If no explicit feature_names and no DataFrame index/columns to derive
-        # from (raw ndarray/sparse counts, e.g. add_custom_modality), fall back
-        # to feature_meta — same priority order used everywhere else in the
-        # codebase, so downstream code can always rely on modality.feature_names
-        # instead of re-deriving its own guess from feature_meta.
-        if self.feature_names is None:
-            self.feature_names = resolve_feature_names(feature_meta, context=f"Modality '{name}'")
-
-        # Disambiguate duplicate feature names (e.g. Ensembl gene_name collisions
-        # from pseudogenes/readthrough transcripts, or a many-to-one fallback
-        # column like 'gene' repeating once per SJ belonging to that gene).
-        # Name-based lookups throughout the codebase (feature_names.index(),
-        # pd.Series indexed by feature_names, get_feature_subset(), plotting by
-        # gene name, etc.) all assume uniqueness.
-        if self.feature_names is not None:
-            deduped = make_names_unique(self.feature_names)
-            if deduped != self.feature_names:
-                n_dup = sum(1 for a, b in zip(deduped, self.feature_names) if a != b)
-                warnings.warn(
-                    f"Modality '{name}' had {n_dup} duplicate feature name(s); "
-                    "disambiguated by appending -1, -2, ... to repeats (scanpy-style). "
-                    "Original identifiers are still available in feature_meta.",
-                    UserWarning
-                )
-            self.feature_names = deduped
-
-        self.feature_meta = feature_meta.copy()
+        self.feature_meta = feature_meta
 
         # For multinomial: ensure the implicit Kth residual slot (position K_max-1) is
         # always a REAL category, not a padded zero.
@@ -232,13 +286,13 @@ class Modality:
                             f"[Modality '{name}'] All multinomial features were filtered out "
                             f"(≤1 real category or zero ratio variance). Check input data."
                         )
-                    self.feature_meta = self.feature_meta[keep].reset_index(drop=True)
+                    # Preserve feature_meta's feature_id index — do NOT reset_index here.
+                    self.feature_meta = self.feature_meta[keep]
                     self.feature_meta['n_categories'] = n_cats[keep]
                     self.counts = counts_arr
-                    if self.feature_names is not None:
-                        self.feature_names = [
-                            fn for fn, k in zip(self.feature_names, keep) if k
-                        ]
+                    self.feature_ids = [
+                        fid for fid, k in zip(self.feature_ids, keep) if k
+                    ]
 
         # Handle denominator (can also be sparse)
         if denominator is not None:
@@ -296,7 +350,7 @@ class Modality:
 
         Called at the end of __init__, so it also fires automatically after any cell
         subsetting (get_cell_subset returns a new Modality which calls __init__).
-        Modifies self in place; updates counts, feature_meta, feature_names, denominator,
+        Modifies self in place; updates counts, feature_meta, feature_ids, denominator,
         inc1/inc2/skip, and dims.
 
         Per-distribution logic
@@ -412,9 +466,9 @@ class Modality:
         # ------------------------------------------------------------------ #
         # 3. Update metadata and dims                                         #
         # ------------------------------------------------------------------ #
-        self.feature_meta = self.feature_meta.iloc[keep_idx].reset_index(drop=True)
-        if self.feature_names is not None:
-            self.feature_names = [self.feature_names[i] for i in keep_idx]
+        # Preserve feature_meta's feature_id index — do NOT reset_index here.
+        self.feature_meta = self.feature_meta.iloc[keep_idx]
+        self.feature_ids = [self.feature_ids[i] for i in keep_idx]
 
         self.dims = self._compute_dims()
 
@@ -434,10 +488,10 @@ class Modality:
                 raise ValueError(f"multinomial modality requires 3D counts (features, cells, categories), got shape {counts_shape}")
             n_features = counts_shape[0]
         
-        if self.feature_names is not None:
-            if len(self.feature_names) != n_features:
+        if self.feature_ids is not None:
+            if len(self.feature_ids) != n_features:
                 raise ValueError(
-                    f"feature_names has length {len(self.feature_names)} but counts has {n_features} features"
+                    f"feature_ids has length {len(self.feature_ids)} but counts has {n_features} features"
                 )
         
         # Validate feature_meta matches
@@ -510,9 +564,9 @@ class Modality:
         if isinstance(feature_indices, (list, np.ndarray)) and len(feature_indices) > 0:
             if isinstance(feature_indices[0], str):
                 # Convert names to indices
-                if self.feature_names is None:
-                    raise ValueError("Cannot subset by name: feature_names not available")
-                feature_indices = [self.feature_names.index(n) for n in feature_indices]
+                if self.feature_ids is None:
+                    raise ValueError("Cannot subset by name: feature_ids not available")
+                feature_indices = [self.feature_ids.index(n) for n in feature_indices]
 
         # Subset counts (maintain sparsity if counts is sparse)
         if self.distribution in ['negbinom', 'normal', 'binomial', 'studentt']:
@@ -537,12 +591,9 @@ class Modality:
             new_inc2 = None
             new_skip = None
 
-        # Subset metadata
+        # Subset metadata (preserves the feature_id index via .iloc)
         new_feature_meta = self.feature_meta.iloc[feature_indices].copy()
-        # NEW: subset feature_names if present
-        new_feature_names = None
-        if self.feature_names is not None:
-            new_feature_names = [self.feature_names[i] for i in feature_indices]
+        new_feature_ids = [self.feature_ids[i] for i in feature_indices]
         return Modality(
             name=self.name,
             counts=new_counts,
@@ -550,7 +601,8 @@ class Modality:
             distribution=self.distribution,
             denominator=new_denom,
             cells_axis=self.cells_axis,
-            feature_names=new_feature_names,
+            feature_names=new_feature_ids,
+            is_gene_identity=self.is_gene_identity,
             cell_names=self.cell_names,
             min_count=self.min_count,
             inc1=new_inc1,
@@ -613,7 +665,8 @@ class Modality:
             distribution=self.distribution,
             denominator=new_denom,
             cells_axis=self.cells_axis,
-            feature_names=self.feature_names,  # Preserve feature names during cell subsetting
+            feature_names=self.feature_ids,  # Preserve feature identity during cell subsetting
+            is_gene_identity=self.is_gene_identity,
             cell_names=new_cell_names,
             min_count=self.min_count,
             inc1=new_inc1,
@@ -723,7 +776,9 @@ class Modality:
             self.inc1 = inc1_unfilt[valid_events, :]
             self.inc2 = inc2_unfilt[valid_events, :]
             self.skip = skip_unfilt[valid_events, :]
-            self.feature_meta = meta_unfilt.iloc[valid_events].reset_index(drop=True)
+            # Preserve feature_meta's feature_id index — do NOT reset_index here.
+            self.feature_meta = meta_unfilt.iloc[valid_events]
+            self.feature_ids = self.feature_meta.index.tolist()
 
             # Recompute inclusion and total
             if method == 'min':

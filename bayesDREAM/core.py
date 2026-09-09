@@ -649,7 +649,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 
         # zero-count genes removed here from self.counts; Modality.__init__ reports its own filtering
         # Feature names for trans modelling are read directly from the primary modality
-        # (via model.get_modality(primary_modality).feature_names) so no separate trans_genes attribute.
+        # (via model.get_modality(primary_modality).feature_ids) so no separate trans_genes attribute.
         
         # Ensure same order of meta and counts
         # Use _cell_names for sparse/dense array compatibility

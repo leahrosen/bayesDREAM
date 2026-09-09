@@ -12,7 +12,7 @@ def _make_exon_skip_data(n_events=5, n_cells=10, seed=42):
     inc2 = np.random.poisson(12, (n_events, n_cells)).astype(float)
     skip = np.random.poisson(8, (n_events, n_cells)).astype(float)
     feature_meta = pd.DataFrame({
-        'trip_id': range(n_events),
+        'trip_id': [f'event_{i}' for i in range(n_events)],
         'chrom': ['chr1'] * n_events,
         'strand': ['+'] * n_events,
     })

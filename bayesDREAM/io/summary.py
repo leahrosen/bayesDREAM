@@ -1068,9 +1068,9 @@ class ModelSummarizer:
                 alpha_y = alpha_y.mean(axis=0)
             # alpha_y is now [C, T]
 
-        # Get feature names - prefer modality.feature_names (what users see)
-        if modality.feature_names is not None:
-            feature_names = modality.feature_names
+        # Get feature names - prefer modality.feature_ids (what users see)
+        if modality.feature_ids is not None:
+            feature_names = modality.feature_ids
         else:
             feature_names = modality.feature_meta.index.tolist()
 
@@ -1081,7 +1081,7 @@ class ModelSummarizer:
                 f"Resolved feature names for modality '{modality_name}' are not unique "
                 f"({len(_dupes)} duplicated value(s), e.g. {_dupes[:5]}). "
                 "feature_meta.index must be unique per feature, or set "
-                "modality.feature_names explicitly."
+                "modality.feature_ids explicitly."
             )
 
         n_features = len(feature_names)
@@ -1677,7 +1677,7 @@ class ModelSummarizer:
                 raise ValueError(f"Trans fit not found for modality '{modality_name}'. Run fit_trans(modality_name='{modality_name}') first.")
             posterior = modality.posterior_samples_trans
 
-        # Get feature names - prefer modality.feature_names (what users see and use)
+        # Get feature names - prefer modality.feature_ids (what users see and use)
         feature_meta = modality.feature_meta
 
         # Extract per-feature actual category count for multinomial masking.
@@ -1687,14 +1687,14 @@ class ModelSummarizer:
         if modality.distribution == 'multinomial' and feature_meta is not None and len(feature_meta) > 0:
             if 'n_categories' in feature_meta.columns:
                 n_cats_per_feature = feature_meta['n_categories'].values.astype(int)
-        # modality.feature_names is populated by Modality.__init__ for every
+        # modality.feature_ids is populated by Modality.__init__ for every
         # construction path (explicit, DataFrame index/columns, or resolved
-        # from feature_meta via resolve_feature_names()) and deduped there —
+        # from feature_meta via resolve_feature_ids()) and deduped there —
         # this is the single source of truth, no need to re-derive it here.
-        if modality.feature_names is not None:
-            feature_names = modality.feature_names
+        if modality.feature_ids is not None:
+            feature_names = modality.feature_ids
         else:
-            # No feature_names or feature_meta at all
+            # No feature_ids or feature_meta at all
             feature_names = list(range(modality.counts.shape[0]))
 
         # feature_names must be unique: it becomes the 'feature' column, which
@@ -1710,7 +1710,7 @@ class ModelSummarizer:
                 f"({len(_dupes)} duplicated value(s), e.g. {_dupes[:5]}). "
                 "This usually means feature_meta lacks a proper per-feature identifier "
                 "column (e.g. 'feature_id') and fell back to a many-to-one column "
-                "like 'gene'. Set modality.feature_names explicitly or add a unique "
+                "like 'gene'. Set modality.feature_ids explicitly or add a unique "
                 "'feature_id' column to feature_meta."
             )
 
@@ -1818,7 +1818,7 @@ class ModelSummarizer:
         # Guard: y_ntc must match n_features.  A common cause of mismatch is that
         # posterior_samples_ntc['mu_ntc'] was not subsetted when the modality was
         # subsetted to fewer features (e.g. a random 100-gene subset).  When the
-        # modality has feature_names we try to align by name; otherwise we fall back
+        # modality has feature_ids we try to align by name; otherwise we fall back
         # to discarding y_ntc so the rest of the summary still completes.
         if _y_ntc is not None and np.asarray(_y_ntc).shape[0] != n_features:
             _y_ntc_arr = np.asarray(_y_ntc)
@@ -1827,8 +1827,9 @@ class ModelSummarizer:
             ntc_feat_names = None
             if (hasattr(modality, 'posterior_samples_ntc')
                     and isinstance(modality.posterior_samples_ntc, dict)):
-                ntc_feat_names = modality.posterior_samples_ntc.get('feature_names')
-            cur_feat_names = getattr(modality, 'feature_names', None)
+                ntc_feat_names = modality.posterior_samples_ntc.get(
+                    'feature_ids', modality.posterior_samples_ntc.get('feature_names'))
+            cur_feat_names = getattr(modality, 'feature_ids', None)
             if ntc_feat_names is not None and cur_feat_names is not None:
                 ntc_idx_map = {n: i for i, n in enumerate(ntc_feat_names)}
                 subset_idx = [ntc_idx_map.get(n, -1) for n in cur_feat_names]
@@ -2042,7 +2043,7 @@ class ModelSummarizer:
 
         # Attach feature_meta columns from modality.
         #
-        # This is a positional attach, not a key-based merge: feature_names (and
+        # This is a positional attach, not a key-based merge: feature_ids (and
         # therefore every row of `data`/`df`) was built directly from feature_meta's
         # own rows/index above, in the same order, and optionally truncated to the
         # first `max_features` rows. So feature_meta's rows are guaranteed row-aligned

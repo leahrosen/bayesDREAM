@@ -39,7 +39,7 @@ def _make_model():
 
 
 def _trans_feature_names(model):
-    return model.get_modality(model.primary_modality).feature_names
+    return model.get_modality(model.primary_modality).feature_ids
 
 
 def test_exclude_by_name():
@@ -80,7 +80,7 @@ def test_exclude_by_min_log2_mu_ntc():
     model = _make_model()
     mod = model.get_modality(model.primary_modality)
     n_features = mod.dims['n_features']
-    names = mod.feature_names
+    names = mod.feature_ids
 
     # Fake an NTC posterior: GENE2 and GENE5 are very lowly expressed.
     mu_ntc_vals = np.full(n_features, 10.0)
@@ -95,7 +95,7 @@ def test_exclude_by_min_log2_mu_ntc():
 
     model.exclude_trans_genes(min_log2_mu_ntc=-4)
     mod = model.get_modality(model.primary_modality)
-    remaining_names = mod.feature_names
+    remaining_names = mod.feature_ids
     for g in low_expr:
         assert g not in remaining_names
     assert mod.dims['n_features'] == n_features - len(low_expr)
@@ -121,7 +121,7 @@ def test_exclude_combined_criteria():
     model = _make_model()
     mod = model.get_modality(model.primary_modality)
     n_features = mod.dims['n_features']
-    names = mod.feature_names
+    names = mod.feature_ids
     mu_ntc_vals = np.full(n_features, 10.0)
     idx_gene4 = names.index('GENE4')
     mu_ntc_vals[idx_gene4] = 2 ** -8
@@ -135,7 +135,7 @@ def test_exclude_combined_criteria():
         min_log2_mu_ntc=-4,
     )
     mod = model.get_modality(model.primary_modality)
-    remaining = set(mod.feature_names)
+    remaining = set(mod.feature_ids)
     assert 'GENE1' not in remaining
     assert 'GENE4' not in remaining
     assert 'GENE2' not in remaining  # non-protein-coding

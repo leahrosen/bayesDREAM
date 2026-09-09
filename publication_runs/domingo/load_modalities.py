@@ -207,7 +207,7 @@ def load_binomial_modality(
     elif denominator_mode == "gene_expression":
         gene_mod = model.get_modality(model.primary_modality)
         gene_counts = _to_dense(gene_mod.counts)
-        gene_names = list(gene_mod.feature_names)
+        gene_names = list(gene_mod.feature_ids)
         cell_index = {c: i for i, c in enumerate(gene_mod.cell_names)}
 
         # add_cis_gene() extracts the cis gene out of the primary modality into
@@ -273,12 +273,12 @@ def load_multinomial_modality(
         name=modality_name, counts=counts_3d, feature_meta=feature_meta.reset_index(drop=True),
         distribution="multinomial", cell_names=model_cells, overwrite=overwrite,
     )
-    # bayesDREAM/utils.py's resolve_feature_names should already pick
+    # bayesDREAM/utils.py's resolve_feature_ids should already pick
     # 'feature_id' automatically when present; set it explicitly too, matching
     # the reference notebook code (defensive, not redundant if that ever
     # changes upstream).
     if "feature_id" in feature_meta.columns:
-        model.get_modality(modality_name).feature_names = list(feature_meta["feature_id"].values)
+        model.get_modality(modality_name).feature_ids = list(feature_meta["feature_id"].values)
     print(f"Added '{modality_name}': {counts_3d.shape[0]} features")
     return modality_name
 
@@ -326,7 +326,7 @@ def attach_modality_precomputed(model, spec: Dict, precomputed_dir: str) -> str:
             distribution="multinomial", cell_names=cell_names,
         )
         if "feature_id" in feature_meta.columns:
-            model.get_modality(modality_name).feature_names = list(feature_meta["feature_id"].values)
+            model.get_modality(modality_name).feature_ids = list(feature_meta["feature_id"].values)
     else:
         counts = _to_dense(scipy.sparse.load_npz(os.path.join(precomputed_dir, "counts.npz")))
         denom_path = os.path.join(precomputed_dir, "denominator.npz")

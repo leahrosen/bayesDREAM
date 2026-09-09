@@ -343,7 +343,7 @@ if isinstance(mu_ntc_all, torch.Tensor):
     mu_ntc_all = mu_ntc_all.mean(dim=0).detach().cpu().numpy().flatten()
 else:
     mu_ntc_all = np.asarray(mu_ntc_all).mean(axis=0).flatten()
-log2_mu_by_gene = dict(zip(gene_mod.feature_names, np.log2(mu_ntc_all)))
+log2_mu_by_gene = dict(zip(gene_mod.feature_ids, np.log2(mu_ntc_all)))
 
 candidate_table = pd.DataFrame({
     "gene": CANDIDATE_GENES,

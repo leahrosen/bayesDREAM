@@ -130,9 +130,9 @@ class ModelPlottingMixin:
         require_full_posterior(posterior, "plot_technical_fit")
 
         # Get feature names - will be adjusted based on alpha_y source later.
-        # modality.feature_names is the single source of truth (resolved +
+        # modality.feature_ids is the single source of truth (resolved +
         # deduped in Modality.__init__), no need to re-derive it here.
-        modality_feature_names = modality.feature_names
+        modality_feature_names = modality.feature_ids
         if modality_feature_names is None:
             modality_feature_names = modality.feature_meta.index.tolist()
 
@@ -508,9 +508,9 @@ class ModelPlottingMixin:
             distribution=modality.distribution
         )
 
-        # modality.feature_names is the single source of truth (resolved +
+        # modality.feature_ids is the single source of truth (resolved +
         # deduped in Modality.__init__), no need to re-derive it here.
-        feature_names = modality.feature_names
+        feature_names = modality.feature_ids
         if feature_names is None:
             feature_names = modality.feature_meta.index.tolist()
 

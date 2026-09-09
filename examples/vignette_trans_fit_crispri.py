@@ -335,7 +335,7 @@ if isinstance(mu_ntc_all, torch.Tensor):
     mu_ntc_all = mu_ntc_all.mean(dim=0).detach().cpu().numpy().flatten()
 else:
     mu_ntc_all = np.asarray(mu_ntc_all).mean(axis=0).flatten()
-log2_mu_by_gene = dict(zip(gene_mod.feature_names, np.log2(mu_ntc_all)))
+log2_mu_by_gene = dict(zip(gene_mod.feature_ids, np.log2(mu_ntc_all)))
 
 trans_candidates = background_genes + responsive_genes
 kept_trans_genes = {g for g in trans_candidates if log2_mu_by_gene.get(g, -np.inf) >= MIN_LOG2_MU_NTC_TRANS}
@@ -607,7 +607,7 @@ def hill_value_at_log2fc_per_guide(model, modality_name: str, y_ntc: np.ndarray)
         )
 
     log2_x_ntc = np.log2(max(_get_x_ntc(model), 1e-12))
-    feature_names = model.get_modality(modality_name).feature_names
+    feature_names = model.get_modality(modality_name).feature_ids
 
     targeting_mask = model.meta["target"].values != "ntc"
     guides = sorted(model.meta.loc[targeting_mask, "guide"].unique())
