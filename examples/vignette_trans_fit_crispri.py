@@ -18,10 +18,12 @@
 #   run_trans.py` + `sbatch_blocks.py` infrastructure.
 # - `function_type='single_hill'` throughout (no `additive_hill` warmup
 #   phase — see below).
-# - Manual runs, with `save_trans_summary()` **plus a hand-added column**
+# - Manual runs, with `save_trans_summary()` **plus hand-added columns**
 #   (median + 95% CI of the fitted Hill curve at `x_log2FC = -1`, i.e. 50%
-#   cis knockdown), for the 7 named genes: `GFI1B`, `NFE2`, `MYB`, `TET2`,
-#   `IKZF1`, `HHEX`, `RUNX1`.
+#   cis knockdown, in both raw y and y log2FC vs. NTC -- once masked to
+#   `is_dependent` genes only, once (`_allgenes` suffix) for every trans
+#   gene regardless of dependence), for the 7 named genes: `GFI1B`, `NFE2`,
+#   `MYB`, `TET2`, `IKZF1`, `HHEX`, `RUNX1`.
 # - Example plots for those 7 genes: `plot_xy_data`, proportion
 #   positive/negative/not-dependent (vs. `y_ntc` and `full_log2FC`),
 #   EC50 (log2FC) vs. Hill coefficient `n`, and observed vs. full log2FC
@@ -37,6 +39,7 @@ import time
 import subprocess
 import textwrap
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -406,11 +409,13 @@ for gene in CANDIDATE_GENES:
 # Sequence: init (deferred) -> `set_technical_groups()` ->
 # `load_ntc_fit(mask_features=True)` -> `add_cis_gene()` -> `load_cis_fit()`
 # (reads the `x_true`/`posterior_samples_cis` saved above — **not** re-fitting
-# cis) -> `adjust_ntc_sum_factor()` + `refit_sumfactor()` (neither survives a
-# save/load round trip, so both are recomputed fresh here, in that order —
-# same as `publication_runs/common/config_utils.py`'s
-# `apply_sum_factor_adjustments` docstring explains) -> defensive
-# `exclude_trans_genes()` pass -> `fit_trans(function_type='single_hill')`.
+# cis) -> `adjust_ntc_sum_factor()` (doesn't survive a save/load round trip,
+# so it's recomputed fresh here — same as
+# `publication_runs/common/config_utils.py`'s `apply_sum_factor_adjustments`
+# docstring explains) -> defensive `exclude_trans_genes()` pass ->
+# `fit_trans(function_type='single_hill')` on `sum_factor_adj` directly
+# (skipping `refit_sumfactor()`, which would otherwise re-estimate sum
+# factors from the posterior cis expression on top of the NTC adjustment).
 #
 # **Why `single_hill` has no warm-up phase to account for**: `fit_trans()`'s
 # `warmup` curriculum (a cheaper single-Hill phase before the real fit) only
@@ -449,7 +454,6 @@ def build_trans_model(gene: str, niters: int, function_type: str = "single_hill"
     # point estimates are ever read from it downstream.
     model.load_cis_fit(input_dir=os.path.join(OUTDIR, f"vignette_{gene}"))
     model.adjust_ntc_sum_factor(covariates=["batch"])
-    model.refit_sumfactor(covariates=["batch"])
     model.exclude_trans_genes(min_log2_mu_ntc=MIN_LOG2_MU_NTC_TRANS)
     return model, label
 
@@ -457,12 +461,55 @@ def build_trans_model(gene: str, niters: int, function_type: str = "single_hill"
 HILL_LOG2FC_TARGETS = [-1.0]  # x log2FC value(s) to evaluate the fitted Hill curve at
 
 
-def hill_value_at_log2fc(model, modality_name: str, x_log2fc: float, is_dependent: np.ndarray):
+def _get_x_ntc(model):
+    """The cis gene's NTC reference expression (linear space), shared by
+    every function below that needs to convert a raw x_true/log2_x_true
+    value into an x_log2FC. Prefers the cis modality's own fit_ntc-derived
+    mu_ntc (requires add_cis_gene() to have extracted it from the shared
+    panel -- see the markdown note above build_trans_model()); falls back to
+    the median *fitted* x_true among this model's own NTC cells if that
+    extraction never happened (e.g. cis_gene was set eagerly instead) --
+    less precise (a point estimate from the cis fit itself, not the
+    technical fit's own o_x-aware estimate) but keeps callers usable either
+    way.
+    """
+    cis_mod = model.get_modality("cis")
+    ps_ntc = cis_mod.posterior_samples_ntc
+    if ps_ntc is not None and "mu_ntc" in ps_ntc:
+        mu_ntc_cis = ps_ntc["mu_ntc"]
+        return float(mu_ntc_cis.mean().item() if isinstance(mu_ntc_cis, torch.Tensor) else np.mean(mu_ntc_cis))
+    x_true = model.x_true
+    x_true = x_true.detach().cpu().numpy() if isinstance(x_true, torch.Tensor) else np.asarray(x_true)
+    ntc_mask = (model.meta["target"].values == "ntc")
+    return float(np.median(x_true[ntc_mask]))
+
+
+def hill_value_at_log2fc(model, modality_name: str, x_log2fc: float,
+                          is_dependent: Optional[np.ndarray], y_ntc: np.ndarray):
     """Median + 95% CI of the fitted single-Hill y at a given cis-gene log2FC
-    (e.g. -1.0 = 50% knock-down vs. NTC), for is_dependent genes only (NaN
-    otherwise). Uses the exact same formula as fit_trans()'s own single_hill
-    model (bayesDREAM/utils.py's Hill_based_positive_logK) and
-    io/summary.py's _hill_value: y = A + alpha * Vmax_a * x^n / (K_a^n + x^n).
+    (e.g. -1.0 = 50% knock-down vs. NTC). Uses the exact same formula as
+    fit_trans()'s own single_hill model (bayesDREAM/utils.py's
+    Hill_based_positive_logK) and io/summary.py's _hill_value:
+    y = A + alpha * Vmax_a * x^n / (K_a^n + x^n).
+
+    Also returns the same value as a trans-gene log2FC, log2(y) - log2(y_ntc)
+    -- same reference and definition as save_trans_summary()'s own
+    full_log2fc/observed_log2fc (io/summary.py's g(u) = log2(y(x)) -
+    log2(y_ntc), y_ntc = the trans gene's fit_ntc-derived NTC mean). Pass in
+    `y_ntc` as e.g. `df["y_ntc"].values` from the same save_trans_summary()
+    call so both use an identical reference.
+
+    is_dependent : array of bool, or None
+        If given, values for genes where ``is_dependent`` is False are
+        replaced with NaN (the fitted curve is still there under the hood,
+        but the fit isn't judged trustworthy for that gene by the FDR gate,
+        so masking it out is the usual choice for a headline column).
+        Pass ``None`` to skip masking and get every trans gene's value,
+        dependent or not -- e.g. to sanity-check borderline/non-dependent
+        genes or compare against known true positives that missed the FDR
+        cutoff at this vignette's reduced `niters` (see
+        ``hill_value_at_log2fc_all_genes`` below, a thin wrapper for exactly
+        that).
     """
     mod = model.get_modality(modality_name)
     ps = mod.posterior_samples_trans
@@ -482,23 +529,7 @@ def hill_value_at_log2fc(model, modality_name: str, x_log2fc: float, is_dependen
     n = full("n_a")
     alpha = full("alpha", default=np.ones_like(A))
 
-    # x_ntc: prefer the cis modality's own fit_ntc-derived mu_ntc (requires
-    # add_cis_gene() to have extracted it from the shared panel -- see the
-    # markdown note above `build_trans_model()`). Falls back to the median
-    # *fitted* x_true among this model's own NTC cells if that extraction
-    # never happened (e.g. cis_gene was set eagerly instead) -- less precise
-    # (a point estimate from the cis fit itself, not the technical fit's own
-    # o_x-aware estimate) but keeps this function usable either way.
-    cis_mod = model.get_modality("cis")
-    ps_ntc = cis_mod.posterior_samples_ntc
-    if ps_ntc is not None and "mu_ntc" in ps_ntc:
-        mu_ntc_cis = ps_ntc["mu_ntc"]
-        x_ntc = float(mu_ntc_cis.mean().item() if isinstance(mu_ntc_cis, torch.Tensor) else np.mean(mu_ntc_cis))
-    else:
-        x_true = model.x_true
-        x_true = x_true.detach().cpu().numpy() if isinstance(x_true, torch.Tensor) else np.asarray(x_true)
-        ntc_mask = (model.meta["target"].values == "ntc")
-        x_ntc = float(np.median(x_true[ntc_mask]))
+    x_ntc = _get_x_ntc(model)
     x_target = x_ntc * (2.0 ** x_log2fc)
 
     eps = 1e-12
@@ -511,15 +542,100 @@ def hill_value_at_log2fc(model, modality_name: str, x_log2fc: float, is_dependen
     y_lower = np.quantile(y_samples, 0.025, axis=0)
     y_upper = np.quantile(y_samples, 0.975, axis=0)
 
-    y_median = np.where(is_dependent, y_median, np.nan)
-    y_lower = np.where(is_dependent, y_lower, np.nan)
-    y_upper = np.where(is_dependent, y_upper, np.nan)
-    return y_median, y_lower, y_upper
+    # log2FC(y) = log2(y) - log2(y_ntc), per-sample before collapsing to
+    # median/CI (not log2 of the already-collapsed y_median/lower/upper --
+    # those don't commute, and per-sample matches how full_log2fc/
+    # observed_log2fc are computed in io/summary.py).
+    y_ntc = np.asarray(y_ntc, dtype=float)
+    log2fc_samples = np.log2(np.clip(y_samples, eps, None)) - np.log2(np.clip(y_ntc, eps, None))
+    y_log2fc_median = np.median(log2fc_samples, axis=0)
+    y_log2fc_lower = np.quantile(log2fc_samples, 0.025, axis=0)
+    y_log2fc_upper = np.quantile(log2fc_samples, 0.975, axis=0)
+
+    if is_dependent is not None:
+        y_median = np.where(is_dependent, y_median, np.nan)
+        y_lower = np.where(is_dependent, y_lower, np.nan)
+        y_upper = np.where(is_dependent, y_upper, np.nan)
+        y_log2fc_median = np.where(is_dependent, y_log2fc_median, np.nan)
+        y_log2fc_lower = np.where(is_dependent, y_log2fc_lower, np.nan)
+        y_log2fc_upper = np.where(is_dependent, y_log2fc_upper, np.nan)
+
+    return y_median, y_lower, y_upper, y_log2fc_median, y_log2fc_lower, y_log2fc_upper
+
+
+def hill_value_at_log2fc_all_genes(model, modality_name: str, x_log2fc: float, y_ntc: np.ndarray):
+    """Same as ``hill_value_at_log2fc`` (median + 95% CI at a given cis-gene
+    log2FC, in both raw count and log2FC space) but for every trans gene --
+    dependent or not. The fitted single-Hill curve exists for every gene
+    regardless of whether it passes the ``is_dependent`` FDR gate; this is
+    just that value without the dependent-only mask, useful for sanity
+    checks on non-dependent/borderline genes or comparisons against genes
+    with known true signal that missed the cutoff at reduced ``niters``.
+    """
+    return hill_value_at_log2fc(model, modality_name, x_log2fc, None, y_ntc)
+
+
+def hill_value_at_log2fc_per_guide(model, modality_name: str, y_ntc: np.ndarray) -> pd.DataFrame:
+    """``hill_value_at_log2fc_all_genes()`` (median + 95% CI, raw count and
+    log2FC space, every trans gene -- dependent or not), evaluated once per
+    *targeting* guide (``target != 'ntc'``), each at that guide's own mean
+    ``log2_x_true`` across its cells -- not a single hypothetical knockdown
+    level like ``HILL_LOG2FC_TARGETS``, but each guide's actual average
+    perturbation strength. Lets you see what the fitted curve predicts each
+    guide's cells landed on, rather than only a fixed x_log2FC.
+
+    Requires ``model.log2_x_true`` (set by ``fit_cis()``/``load_cis_fit()``)
+    and a ``'guide'``/``'target'`` column on ``model.meta``, row-aligned to
+    ``log2_x_true`` (true after ``add_cis_gene()``, which is always the case
+    for models built by ``build_trans_model()`` above).
+
+    Returns
+    -------
+    pd.DataFrame, one row per (guide, trans gene), columns:
+        ``guide``, ``feature``, ``guide_mean_log2_x_true``, ``guide_x_log2fc``,
+        ``y_median``, ``y_lower``, ``y_upper``,
+        ``y_log2fc_median``, ``y_log2fc_lower``, ``y_log2fc_upper``.
+    """
+    if not hasattr(model, "log2_x_true") or model.log2_x_true is None:
+        raise ValueError("model.log2_x_true not set -- run fit_cis() or load_cis_fit() first.")
+    log2_x_true = model.log2_x_true
+    log2_x_true = log2_x_true.detach().cpu().numpy() if isinstance(log2_x_true, torch.Tensor) else np.asarray(log2_x_true)
+    if len(log2_x_true) != len(model.meta):
+        raise ValueError(
+            f"log2_x_true length ({len(log2_x_true)}) != model.meta length "
+            f"({len(model.meta)}); cannot align by row position."
+        )
+
+    log2_x_ntc = np.log2(max(_get_x_ntc(model), 1e-12))
+    feature_names = model.get_modality(modality_name).feature_names
+
+    targeting_mask = model.meta["target"].values != "ntc"
+    guides = sorted(model.meta.loc[targeting_mask, "guide"].unique())
+
+    rows = []
+    for guide in guides:
+        guide_mask = targeting_mask & (model.meta["guide"].values == guide)
+        guide_mean_log2_x_true = float(np.mean(log2_x_true[guide_mask]))
+        guide_x_log2fc = guide_mean_log2_x_true - log2_x_ntc
+
+        med, lo, hi, lfc_med, lfc_lo, lfc_hi = hill_value_at_log2fc_all_genes(
+            model, modality_name, guide_x_log2fc, y_ntc
+        )
+        rows.append(pd.DataFrame({
+            "guide": guide,
+            "feature": feature_names,
+            "guide_mean_log2_x_true": guide_mean_log2_x_true,
+            "guide_x_log2fc": guide_x_log2fc,
+            "y_median": med, "y_lower": lo, "y_upper": hi,
+            "y_log2fc_median": lfc_med, "y_log2fc_lower": lfc_lo, "y_log2fc_upper": lfc_hi,
+        }))
+
+    return pd.concat(rows, ignore_index=True)
 
 
 def fit_and_summarise_trans(gene: str, niters: int, function_type: str = "single_hill"):
     model, label = build_trans_model(gene, niters=niters, function_type=function_type)
-    model.fit_trans(sum_factor_col="sum_factor_refit", function_type=function_type,
+    model.fit_trans(sum_factor_col="sum_factor_adj", function_type=function_type,
                      tolerance=0, niters=niters)
     model.save_trans_fit()
 
@@ -527,12 +643,32 @@ def fit_and_summarise_trans(gene: str, niters: int, function_type: str = "single
     df = model.save_trans_summary(output_dir=out_dir, modality_name="gene")
 
     is_dep = df["is_dependent"].fillna(False).astype(bool).values
+    y_ntc = df["y_ntc"].values
     for x_log2fc in HILL_LOG2FC_TARGETS:
-        med, lo, hi = hill_value_at_log2fc(model, "gene", x_log2fc, is_dep)
         tag = f"x_log2fc{x_log2fc:+.0f}".replace("+", "p").replace("-", "m")
+
+        # Dependent-gene-only columns (NaN elsewhere) -- the headline columns.
+        med, lo, hi, lfc_med, lfc_lo, lfc_hi = hill_value_at_log2fc(
+            model, "gene", x_log2fc, is_dep, y_ntc
+        )
         df[f"y_at_{tag}_median"] = med
         df[f"y_at_{tag}_lower"] = lo
         df[f"y_at_{tag}_upper"] = hi
+        df[f"y_at_{tag}_log2fc_median"] = lfc_med
+        df[f"y_at_{tag}_log2fc_lower"] = lfc_lo
+        df[f"y_at_{tag}_log2fc_upper"] = lfc_hi
+
+        # Same values for every trans gene, dependent or not -- for
+        # sanity-checking non-dependent/borderline calls.
+        med_a, lo_a, hi_a, lfc_med_a, lfc_lo_a, lfc_hi_a = hill_value_at_log2fc_all_genes(
+            model, "gene", x_log2fc, y_ntc
+        )
+        df[f"y_at_{tag}_median_allgenes"] = med_a
+        df[f"y_at_{tag}_lower_allgenes"] = lo_a
+        df[f"y_at_{tag}_upper_allgenes"] = hi_a
+        df[f"y_at_{tag}_log2fc_median_allgenes"] = lfc_med_a
+        df[f"y_at_{tag}_log2fc_lower_allgenes"] = lfc_lo_a
+        df[f"y_at_{tag}_log2fc_upper_allgenes"] = lfc_hi_a
 
     csv_path = os.path.join(out_dir, "trans_feature_summary_gene.csv")
     df.to_csv(csv_path, index=False)
@@ -601,11 +737,10 @@ _profile_worker_src = textwrap.dedent(f"""
     model.add_cis_gene(gene)
     model.load_cis_fit(input_dir={OUTDIR!r} + f"/vignette_{{gene}}", lean=True)
     model.adjust_ntc_sum_factor(covariates=["batch"])
-    model.refit_sumfactor(covariates=["batch"])
     model.exclude_trans_genes(min_log2_mu_ntc={MIN_LOG2_MU_NTC_TRANS})
 
     t0 = time.perf_counter()
-    model.fit_trans(sum_factor_col="sum_factor_refit", function_type="single_hill",
+    model.fit_trans(sum_factor_col="sum_factor_adj", function_type="single_hill",
                      tolerance=0, niters=niters)
     elapsed = time.perf_counter() - t0
 
@@ -696,7 +831,6 @@ for gene in CANDIDATE_GENES:
         "ntc": {"set_technical_groups": ["batch"]},
         "sum_factor": {
             "adjust_ntc_sum_factor": {"enabled": True, "args": {"covariates": ["batch"]}},
-            "refit_sumfactor": {"enabled": True, "args": {"covariates": ["batch"]}},
         },
         "exclude_trans_genes": {"enabled": True, "args": {"min_log2_mu_ntc": MIN_LOG2_MU_NTC_TRANS}},
         "trans": {
@@ -708,7 +842,7 @@ for gene in CANDIDATE_GENES:
             "load_ntc": {"args": {"input_dir": NTC_SHARED_DIR, "mask_features": True, "lean": True}},
             "load_cis": {"enabled": True, "args": {"lean": True}},  # default input_dir=output_dir/label -- same label as cis stage
             "fit": {
-                "sum_factor_col": "sum_factor_refit",
+                "sum_factor_col": "sum_factor_adj",
                 "function_type": "single_hill",
                 "tolerance": 0,
                 "niters": NITERS_PRODUCTION,
@@ -782,6 +916,26 @@ for gene in NAMED_GENES:
     model, df = fit_and_summarise_trans(gene, niters=NITERS_TRANS)
     trans_models[gene] = model
     trans_summaries[gene] = df
+
+# %% [markdown]
+# ## `hill_value_at_log2fc_per_guide`: fitted curve at each guide's actual mean perturbation
+#
+# `HILL_LOG2FC_TARGETS`/`hill_value_at_log2fc` evaluate the fitted Hill curve
+# at one fixed, hypothetical `x_log2FC` (-1, i.e. 50% knockdown) — the same
+# value for every guide and every cis gene. `hill_value_at_log2fc_per_guide`
+# instead evaluates it once per **targeting guide**, at that guide's own
+# mean `log2_x_true` across its cells — the perturbation level the guide
+# actually produced, which differs guide to guide (see `guide_mean_log2fc`
+# in the simulation above, sampled per-guide with its own noise term). Every
+# trans gene is included, dependent or not (same as `_allgenes` above).
+
+# %%
+per_guide_gfi1b = hill_value_at_log2fc_per_guide(
+    trans_models["GFI1B"], "gene", trans_summaries["GFI1B"]["y_ntc"].values
+)
+print(f"{len(per_guide_gfi1b)} rows = "
+      f"{per_guide_gfi1b['guide'].nunique()} guides x {per_guide_gfi1b['feature'].nunique()} trans genes")
+per_guide_gfi1b.head(10)
 
 # %% [markdown]
 # ## `plot_xy_data`: raw x-y relationship + fitted Hill curve
