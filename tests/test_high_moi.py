@@ -318,3 +318,120 @@ def test_add_cis_gene_unknown_gene_raises(high_moi_deferred_model):
     model.fit_ntc(sum_factor_col='sum_factor', niters=200, nsamples=50)
     with pytest.raises(ValueError, match='not found'):
         model.add_cis_gene('NOT_A_REAL_GENE')
+
+
+# ----------------------------------------------------------------------
+# High MOI guide_covariates tests: each guide's guide_assignment column
+# split by an observed covariate (here 'lane'), the high-MOI analogue of
+# single-guide mode's guide_used split. guide_A/guide_B (target GFI1B,
+# cells 0:30) and ntc_1 (target ntc, cells 80:100) each get their cells
+# split roughly in half across 'L1'/'L2'.
+# ----------------------------------------------------------------------
+def _make_high_moi_covariate_data(n_cells=100, n_genes=50, n_guides=6, seed=42):
+    meta, counts, guide_assignment, guide_meta, n_guides = _make_high_moi_data(
+        n_cells, n_genes, n_guides, seed
+    )
+    lane = np.array(['L1'] * n_cells)
+    lane[15:30] = 'L2'  # half of guide_A/guide_B's cells (0:30) -> L2
+    lane[80:90] = 'L2'  # half of ntc_1's cells (80:100) -> L2
+    meta = meta.copy()
+    meta['lane'] = lane
+    return meta, counts, guide_assignment, guide_meta, n_guides
+
+
+@pytest.fixture(scope='module')
+def high_moi_covariate_model():
+    pytest.importorskip('torch')
+    pytest.importorskip('pyro')
+    from bayesDREAM import bayesDREAM
+
+    meta, counts, guide_assignment, guide_meta, _ = _make_high_moi_covariate_data()
+    model = bayesDREAM(
+        meta=meta,
+        counts=counts,
+        guide_assignment=guide_assignment,
+        guide_meta=guide_meta,
+        cis_gene='GFI1B',
+        guide_covariates=['lane'],
+        guide_covariates_ntc=['lane'],
+        output_dir='./test_output',
+        label='test_high_moi_covariate',
+        device='cpu',
+    )
+    return model
+
+
+def test_covariate_expansion_column_count(high_moi_covariate_model):
+    # 3 base guides (guide_A, guide_B, ntc_1) x 2 observed lanes each = 6 columns
+    model = high_moi_covariate_model
+    assert model.guide_assignment.shape[1] == 6
+    assert len(model.guide_meta) == 6
+
+
+def test_covariate_expansion_preserves_original_guide_names(high_moi_covariate_model):
+    model = high_moi_covariate_model
+    assert sorted(model.guide_meta['guide'].tolist()) == [
+        'guide_A', 'guide_A', 'guide_B', 'guide_B', 'ntc_1', 'ntc_1'
+    ]
+
+
+def test_covariate_expansion_key_values(high_moi_covariate_model):
+    model = high_moi_covariate_model
+    assert set(model.guide_meta['guide_covariate_key']) == {'L1', 'L2'}
+
+
+def test_covariate_expansion_column_sums_match_original(high_moi_covariate_model):
+    # Splitting a guide's column by covariate must not gain/lose any cells.
+    model = high_moi_covariate_model
+    ga = model.guide_assignment
+    gm = model.guide_meta
+    for guide_name, expected_total in [('guide_A', 30), ('guide_B', 30), ('ntc_1', 20)]:
+        cols = gm.index[gm['guide'] == guide_name]
+        assert ga[:, cols].sum() == expected_total
+
+
+def test_covariate_expansion_guide_targets_dict_still_resolves(high_moi_covariate_model):
+    # add_cis_gene()/NTC-mask logic looks up guide_targets_dict by guide_meta['guide'];
+    # duplicated names post-expansion must still resolve correctly.
+    model = high_moi_covariate_model
+    for _, row in model.guide_meta.iterrows():
+        targets = model.guide_targets_dict.get(row['guide'], [])
+        assert targets, f"guide '{row['guide']}' has no resolvable targets after expansion"
+
+
+def test_covariate_expansion_noop_when_covariates_empty(high_moi_model):
+    # Regression: default (no guide_covariates) behavior is untouched.
+    model = high_moi_model['model']
+    assert model.guide_assignment.shape[1] == 3
+    assert 'guide_covariate_key' not in model.guide_meta.columns
+
+
+def test_covariate_expansion_matches_across_deferred_and_eager_cis_gene():
+    # Expansion runs at __init__ regardless of whether cis_gene is known yet;
+    # add_cis_gene()'s guide pruning (keyed by original guide name) should end
+    # up with the same expanded guide panel as the eager cis_gene=... path.
+    pytest.importorskip('torch')
+    pytest.importorskip('pyro')
+    from bayesDREAM import bayesDREAM
+
+    meta, counts, guide_assignment, guide_meta, _ = _make_high_moi_covariate_data()
+    deferred_model = bayesDREAM(
+        meta=meta,
+        counts=counts,
+        guide_assignment=guide_assignment,
+        guide_meta=guide_meta,
+        guide_covariates=['lane'],
+        guide_covariates_ntc=['lane'],
+        output_dir='./test_output',
+        label='test_high_moi_covariate_deferred',
+        device='cpu',
+    )
+    deferred_model.set_technical_groups(['cell_line'])
+    deferred_model.fit_ntc(sum_factor_col='sum_factor', niters=200, nsamples=50)
+    deferred_model.add_cis_gene('GFI1B')
+
+    assert deferred_model.guide_assignment.shape[1] == 6
+    assert sorted(deferred_model.guide_meta['guide'].tolist()) == [
+        'guide_A', 'guide_A', 'guide_B', 'guide_B', 'ntc_1', 'ntc_1'
+    ]
+    assert set(deferred_model.guide_meta['guide_covariate_key']) == {'L1', 'L2'}

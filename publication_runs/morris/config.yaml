@@ -58,8 +58,16 @@ model_defaults:
   # to 'lane' everywhere here for internal consistency (matches every OTHER
   # sum-factor-related call in the reference scripts) -- confirm/override if
   # 'experiment' (or both) is actually what you want.
-  guide_covariates: [lane]
-  guide_covariates_ntc: [lane]
+  #
+  # guide_covariates/guide_covariates_ntc are intentionally [] here (2026-09-09):
+  # they were previously silently ignored in high-MOI mode (a bug -- config
+  # claimed a per-guide 'lane' split that never happened); bayesDREAM/core.py
+  # now supports them in high-MOI mode too (splits each guide's
+  # guide_assignment column by observed covariate value), but Morris has no
+  # need for it -- 'lane' batch structure is already accounted for via
+  # set_technical_groups above and sum_factor.covariates below.
+  guide_covariates: []
+  guide_covariates_ntc: []
   min_count: 10
 
 # Guides to drop everywhere, regardless of cis gene (e.g. a known-bad

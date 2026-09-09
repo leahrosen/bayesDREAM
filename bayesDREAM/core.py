@@ -96,9 +96,14 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             fit_ntc(), to specify it. label must be provided explicitly when cis_gene
             is omitted.
         guide_covariates : list of str
-            List of columns used to construct guide_used for non-NTC guides (single-guide mode only).
+            Columns to split non-NTC guides' effects by. Single-guide mode: columns used
+            to construct guide_used (guide + covariate values -> one guide_code per
+            combination). High-MOI mode: columns used to split each non-NTC guide's
+            guide_assignment column into one column per distinct combination observed
+            among cells carrying that guide (see _expand_guide_assignment_by_covariates).
         guide_covariates_ntc : list of str or None
-            List of columns used to construct guide_used for NTC guides (single-guide mode only).
+            Same as guide_covariates, but for NTC guides (used instead of guide_covariates
+            when a guide's target is an NTC variant).
         output_dir : str
             Where to save results
         label : str
@@ -671,6 +676,12 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             # correctly reference the 100-row guide_assignment, not the 50-row subset.
             cell_indices = [_ga_original_cell_names.index(cell) for cell in self.meta['cell']]
             self.guide_assignment = self.guide_assignment[cell_indices, :]
+
+            # guide_covariates/guide_covariates_ntc: high-MOI analogue of single-guide's
+            # guide_used split above. self.meta is already row-aligned with
+            # self.guide_assignment at this point (both in self.meta['cell'] order).
+            self._expand_guide_assignment_by_covariates(guide_covariates, guide_covariates_ntc)
+
             self.guide_assignment_tensor = torch.tensor(
                 self.guide_assignment,
                 dtype=torch.float32,
@@ -712,6 +723,90 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         # After all init logic above has consumed self.counts, drop it to save RAM.
         self.counts = None
         self.is_sparse_counts = None  # no longer meaningful without the matrix
+
+    def _expand_guide_assignment_by_covariates(self, guide_covariates, guide_covariates_ntc):
+        """
+        High-MOI analogue of single-guide mode's ``guide_used`` column (see the
+        ``if not self.is_high_moi`` branch just above this method's call site).
+
+        Splits each guide's column in ``self.guide_assignment``/``self.guide_meta``
+        into one column per distinct combination of covariate values observed
+        among the cells carrying that guide, so the same physical guide can have
+        an independent ``x_eff_g`` effect per covariate level (e.g. per lane).
+        NTC-classified guides (any target in the NTC variants) are split by
+        ``guide_covariates_ntc``; all other guides (cis-targeting, or
+        not-yet-classified 'other' when cis_gene is still deferred) are split by
+        ``guide_covariates``. No-op if both lists are empty (preserves prior
+        behavior exactly — this is the default).
+
+        ``_model_x`` needs no changes for this: it already treats each
+        ``guide_assignment`` column as an independent latent effect and sums
+        per-cell via matmul, so this is purely a data-prep step. Requires
+        ``self.meta`` to already be row-aligned (by position) with
+        ``self.guide_assignment`` when called.
+
+        ``guide_meta['guide']`` is preserved unchanged (original guide name,
+        possibly now duplicated across the guide's split columns) so that
+        ``self.guide_targets_dict`` lookups elsewhere (NTC-mask computation,
+        ``add_cis_gene()``'s guide pruning, etc.) keep working without any
+        changes — they iterate ``guide_meta`` rows and look up
+        ``guide_targets_dict.get(row['guide'], [])``, which tolerates duplicate
+        keys since it's never used as a name -> single-row mapping. Downstream
+        per-guide plots/summaries that key off ``guide_meta['guide']`` will show
+        one row per (guide, covariate) column rather than one row per guide —
+        the correct behavior here, since each column now has its own effect.
+        """
+        if not guide_covariates and not guide_covariates_ntc:
+            return
+
+        ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+
+        def _is_ntc_guide(guide_name):
+            targets = self.guide_targets_dict.get(guide_name, [])
+            return any(t in ntc_variants for t in targets)
+
+        def _covariate_key(cols):
+            if not cols:
+                return None
+            return self.meta[cols].astype(str).agg('|'.join, axis=1).values
+
+        key_ntc = _covariate_key(guide_covariates_ntc)
+        key_non_ntc = _covariate_key(guide_covariates)
+
+        n_guides_before = self.guide_assignment.shape[1]
+        new_columns = []
+        new_meta_rows = []
+        for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
+            guide_name = guide_row['guide']
+            is_ntc = _is_ntc_guide(guide_name)
+            key_arr = key_ntc if is_ntc else key_non_ntc
+            col = self.guide_assignment[:, pos_idx]
+            cell_mask = col.astype(bool)
+
+            if key_arr is None or not cell_mask.any():
+                new_columns.append(col)
+                row = guide_row.copy()
+                row['guide_covariate_key'] = ''
+                new_meta_rows.append(row)
+                continue
+
+            for key in sorted(set(key_arr[cell_mask])):
+                new_col = np.zeros_like(col)
+                new_col[cell_mask & (key_arr == key)] = 1
+                new_columns.append(new_col)
+                row = guide_row.copy()
+                row['guide_covariate_key'] = key
+                new_meta_rows.append(row)
+
+        self.guide_assignment = np.stack(new_columns, axis=1)
+        self.guide_meta = pd.DataFrame(new_meta_rows).reset_index(drop=True)
+        self.guide_meta['guide_code'] = range(len(self.guide_meta))
+
+        n_guides_after = len(new_columns)
+        if n_guides_after != n_guides_before:
+            print(f"[INFO] High MOI: expanded {n_guides_before} guides to {n_guides_after} "
+                  f"(guide, covariate)-columns (guide_covariates={guide_covariates}, "
+                  f"guide_covariates_ntc={guide_covariates_ntc})")
 
     def set_alpha_x(
         self,

@@ -40,11 +40,17 @@ availability, the known `fit_cis()` high-MOI dtype bug).
    `stats_csv`) and `global_exclude_guides` if any (distinct from the
    per-cis-gene SNP exclusion table, which is computed automatically -- see
    below).
-3. Confirm `guide_covariates`/`sum_factor.batch_col`/`sum_factor.covariates`
-   (defaulted to `[lane]` everywhere — the reference scripts were
-   inconsistent between `lane` and `experiment` on the `set_technical_groups`
-   call specifically; `lane` was picked for internal consistency with every
-   OTHER sum-factor-related call, confirm/override).
+3. Confirm `sum_factor.batch_col`/`sum_factor.covariates` (defaulted to
+   `[lane]` everywhere — the reference scripts were inconsistent between
+   `lane` and `experiment` on the `set_technical_groups` call specifically;
+   `lane` was picked for internal consistency with every OTHER
+   sum-factor-related call, confirm/override). `guide_covariates`/
+   `guide_covariates_ntc` are `[]` and should stay that way: high-MOI mode
+   does support them now (splits each guide's `guide_assignment` column by
+   covariate -- see `docs/OUTSTANDING_TASKS.md`'s guide_covariates entry),
+   but Morris has no need for a guide-level covariate split -- `lane` is
+   already fully accounted for via `set_technical_groups`/
+   `sum_factor.covariates` above.
 4. Run `python generate_slurm.py`, inspect `slurm/`, then on Dardel:
    `bash slurm/submit_all.sh`.
 
