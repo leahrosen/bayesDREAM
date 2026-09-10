@@ -19,6 +19,60 @@ morris/preprocess.py, domingo/preprocess.py), analogous to how those
 scripts already turn raw exports into the base meta.csv/gene_counts.npz/
 gene_meta.csv used here as input.
 
+Optional ``batch_match_ntc`` step (top-level config key, disabled by
+default): restricts the NTC cells kept after ``add_cis_gene()`` to only
+those from a technical batch where THIS gene was actually targeted --
+
+    is_tgt = model.meta['target'] != 'ntc'
+    keys = set(model.meta.loc[is_tgt, batch_col])
+    keep = is_tgt | model.meta[batch_col].isin(keys)
+
+i.e. every cis-gene-targeting cell is kept regardless of batch; only the
+NTC pool is restricted. Ported from Replogle's own ad hoc
+`load_gene_model_inputs()` (see publication_runs/replogle/STRATEGY.md §2) --
+useful whenever a dataset pools cells from many technical batches/
+experiments but any single gene's guides only appear in a handful of them,
+so comparing that gene's cells against NTCs from batches that never
+contained the gene's guides would mix in batch-to-batch variation beyond
+what `sum_factor`/`alpha_y` correct for::
+
+    batch_match_ntc:
+      enabled: true
+      batch_col: batch   # column in model.meta; default 'batch'
+
+Optional ``select_ntc_guides`` step (top-level config key, disabled by
+default): restricts the NTC cells kept after ``add_cis_gene()`` to only
+those carrying one of an explicit, curated list of NTC guides --
+
+    is_tgt = model.meta['target'] != 'ntc'
+    keep = is_tgt | model.meta['guide'].isin(guides)
+
+Composes with ``batch_match_ntc`` above (both, if enabled, are ANDed
+together for the NTC portion -- cis-gene-targeting cells are always kept
+regardless of either)::
+
+    select_ntc_guides:
+      enabled: true
+      guides: ["non-targeting_01407|non-targeting_03530", ...]   # exact model.meta['guide'] values
+
+Ported from Replogle's own pipeline: its pre-built `NTC_subset/` input
+(read by an earlier version of `replogle/preprocess.py`) turned out to
+already be restricted to a curated NTC guide list this way -- see
+`publication_runs/replogle/STRATEGY.md` §10. `replogle/preprocess.py` now
+reads the FULL (unrestricted) NTC population instead, so this flag is what
+reproduces that curation explicitly, at the per-gene subsetting stage,
+rather than baking it silently into an upstream input file.
+
+Both flags are applied AFTER `add_cis_gene()` (so `model.meta['target']`
+is already reduced to {cis_gene, 'ntc'}) but BEFORE the per-mode writing
+loop below -- computed once, reused for both `full`/`cis_only` (identical
+cell set either way; only the feature panel differs between modes).
+Deliberately computed before `compute_scran` runs (kept default off for
+both Domingo/Morris anyway, see below) rather than after, so a
+hypothetical future per-subset scran call still sees the SAME cell
+population `add_cis_gene()` produced, matching this script's pre-existing
+behavior when neither flag is set.
+
 --modes (comma-separated, e.g. "full,cis_only") -- one subdirectory of
 --outdir written per requested mode, from a SINGLE model construction
 (add_cis_gene() already separates 'cis' from the trans panel; both pieces
@@ -105,7 +159,10 @@ from scipy import sparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from config_utils import build_model_from_config, load_bayesdream_yaml, apply_sum_factor_adjustments  # noqa: E402
+from config_utils import (  # noqa: E402
+    build_model_from_config, load_bayesdream_yaml, apply_sum_factor_adjustments,
+    is_enabled, normalize_stage_args,
+)
 
 VALID_MODES = ("full", "cis_only")
 
@@ -132,6 +189,47 @@ def subset_per_gene(cfg: dict, outdir: str, modes) -> None:
         model.set_technical_groups(ntc_cfg["set_technical_groups"])
 
     model.add_cis_gene(cis_gene)
+
+    # Both restrictions apply only to the NTC portion of model.meta (every
+    # cis-gene-targeting cell is always kept); when both are enabled they
+    # combine via AND, matching the ACTUAL original Replogle pipeline's
+    # composition (NTC_subset's curated guide list, then batch-matched on
+    # top of that -- see STRATEGY.md §10).
+    cell_mask = None
+
+    def _and_into(new_mask, label):
+        nonlocal cell_mask
+        cell_mask = new_mask if cell_mask is None else (cell_mask & new_mask)
+        n_dropped = int((~new_mask).sum())
+        print(f"[subset_per_gene] {cis_gene}: {label} drops {n_dropped} NTC cell(s) "
+              f"({int(new_mask.sum())}/{len(new_mask)} cells kept by this step alone)")
+
+    bm_cfg = cfg.get("batch_match_ntc") or {}
+    if is_enabled(bm_cfg, default=False):
+        batch_args = normalize_stage_args(bm_cfg)
+        batch_col = batch_args.get("batch_col", "batch")
+        if batch_col not in model.meta.columns:
+            raise ValueError(f"batch_match_ntc: batch_col {batch_col!r} not found in model.meta columns.")
+        is_tgt = model.meta["target"] != "ntc"
+        keys = set(model.meta.loc[is_tgt, batch_col])
+        batch_mask = (is_tgt | model.meta[batch_col].isin(keys)).to_numpy()
+        _and_into(batch_mask, f"batch_match_ntc (batch_col={batch_col!r})")
+
+    sg_cfg = cfg.get("select_ntc_guides") or {}
+    if is_enabled(sg_cfg, default=False):
+        sg_args = normalize_stage_args(sg_cfg)
+        guides = sg_args.get("guides")
+        if not guides:
+            raise ValueError("select_ntc_guides: 'guides' (non-empty list) is required.")
+        if "guide" not in model.meta.columns:
+            raise ValueError("select_ntc_guides: model.meta has no 'guide' column.")
+        is_tgt = model.meta["target"] != "ntc"
+        guide_mask = (is_tgt | model.meta["guide"].isin(guides)).to_numpy()
+        _and_into(guide_mask, f"select_ntc_guides ({len(guides)} guide(s))")
+
+    if cell_mask is not None:
+        print(f"[subset_per_gene] {cis_gene}: combined NTC restriction keeps "
+              f"{int(cell_mask.sum())}/{len(cell_mask)} cells total")
 
     # scran (compute_scran) needs the FULL gene panel to mean anything --
     # pooling-based normalisation across many genes -- so it must run HERE,
@@ -171,16 +269,20 @@ def subset_per_gene(cfg: dict, outdir: str, modes) -> None:
             counts = cis_counts_sp
             feature_meta = cis_mod.feature_meta[id_cols].reset_index(drop=True)
 
-        model.meta.to_csv(os.path.join(mode_outdir, "meta.csv"), index=False)
-        sparse.save_npz(os.path.join(mode_outdir, "gene_counts.npz"), counts)
+        meta_out = model.meta if cell_mask is None else model.meta.loc[cell_mask].reset_index(drop=True)
+        counts_out = counts if cell_mask is None else counts[:, cell_mask]
+
+        meta_out.to_csv(os.path.join(mode_outdir, "meta.csv"), index=False)
+        sparse.save_npz(os.path.join(mode_outdir, "gene_counts.npz"), counts_out)
         feature_meta.to_csv(os.path.join(mode_outdir, "gene_meta.csv"), index=False)
 
         if model.is_high_moi:
-            np.save(os.path.join(mode_outdir, "guide_assignment.npy"), model.guide_assignment)
+            guide_assignment_out = model.guide_assignment if cell_mask is None else model.guide_assignment[cell_mask]
+            np.save(os.path.join(mode_outdir, "guide_assignment.npy"), guide_assignment_out)
             model.guide_meta.to_csv(os.path.join(mode_outdir, "guide_meta.csv"), index=False)
 
-        print(f"[subset_per_gene] {cis_gene} (mode={mode}): {len(model.meta)} cells x "
-              f"{counts.shape[0]} genes -> {mode_outdir}")
+        print(f"[subset_per_gene] {cis_gene} (mode={mode}): {len(meta_out)} cells x "
+              f"{counts_out.shape[0]} genes -> {mode_outdir}")
 
 
 def main() -> None:

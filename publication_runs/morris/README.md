@@ -316,3 +316,37 @@ on ALL 5 primary genes' `01b_subset_<gene>.sh` jobs; each gene's
 job; `04_trans_packed.sh` depends on ALL 5 primary genes' `02_cis_<gene>.sh`
 jobs (`--dependency=afterok:$CIS_GFI1B:$CIS_NFE2:...`); `05`/`06` each
 depend on just `$TRANS_PACKED` (one dependency instead of one per gene).
+
+## Feature identity (`model_defaults.feature_name_col`, 2026-09-10)
+
+**This one is a real, required fix, not defense-in-depth** (contrast
+Domingo's own "Feature identity" section). bayesDREAM commit `24bc2f5`
+("Unify feature identity resolution") changed how a modality picks its
+per-feature identity when no explicit override is given: the
+`resolve_feature_ids` column-priority cascade now ranks `gene_id`/`ens_id`
+ABOVE `gene_name`/`gene_symbol` (previously `gene_name` ranked above
+`gene`, and `gene_id` wasn't even a candidate column). Morris's primary
+counts are a sparse `.npz` with no row labels (`config_utils._read_counts`
+dispatches straight to `sparse.load_npz`), so identity resolution has
+always had to fall through to `gene_meta.csv`'s column cascade -- meaning
+this reordering, left unaddressed, would have silently switched Morris's
+primary AND `'cis'` modality identity from `gene_name` ("GFI1B") to
+Ensembl `gene_id` ("ENSG00000165702") for every stage. That would have
+changed `trans_feature_summary_gene.csv`'s `'feature'` column (and every
+other gene-name-keyed output) transcriptome-wide, and broken this
+pipeline's own gene-name-keyed config (`cis_genes`/`primary_genes`,
+`per_gene_exclude_guides`'s SNP-exclusion matching) if anything here read
+`modality.feature_ids` directly rather than going through `add_cis_gene()`
+(which locates by name regardless, via `locate_feature`'s permissive
+search -- so `add_cis_gene('GFI1B')` itself was never at risk, only what
+the resulting modality is THEN labelled).
+
+Fixed by setting `model_defaults.feature_name_col: gene_name` explicitly,
+threaded through `base_cfg["model"]` in `generate_slurm.py` so every stage
+agrees. `add_cis_gene()` needs no corresponding change: because
+`resolve_feature_ids` also stamps the resolved identity onto
+`feature_meta`'s own index (not just a column), any later `feature_meta`
+slice -- including the deferred workflow's own `'cis'`-modality
+construction -- inherits the SAME `gene_name` value via that index rather
+than independently re-resolving from columns, so no per-call-site pinning
+is needed beyond the one `feature_name_col` set at construction.

@@ -196,6 +196,9 @@ def main() -> None:
             "modality_name": model_defaults["modality_name"],
             "guide_covariates": model_defaults["guide_covariates"],
             "guide_covariates_ntc": model_defaults["guide_covariates_ntc"],
+            # Defense-in-depth (see config.yaml's feature_name_col comment) --
+            # gene_counts.csv's own index already IS gene_name.
+            "feature_name_col": model_defaults["feature_name_col"],
             "output_dir": output_dir,
             "device": "cpu",
         },

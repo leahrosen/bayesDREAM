@@ -69,6 +69,22 @@ model_defaults:
   guide_covariates: []
   guide_covariates_ntc: []
   min_count: 10
+  # feature_name_col: pins the primary/'cis' gene modality's identity to
+  # gene_name (symbol), explicitly (2026-09-10, see bayesDREAM commit
+  # 24bc2f5, "Unify feature identity resolution"). Morris's primary counts
+  # are a sparse .npz with no row labels, so identity resolution falls
+  # through to feature_meta's column-priority cascade -- that cascade now
+  # ranks 'gene_id' ABOVE 'gene_name' (previously the reverse, and 'gene_id'
+  # wasn't even a candidate column before this commit), so WITHOUT this
+  # override every Morris output (trans_feature_summary_gene.csv's 'feature'
+  # column, exclude_trans_genes(genes=[...]), the 'cis' modality's own
+  # feature_ids, etc.) would have silently switched from gene symbols
+  # ("GFI1B") to Ensembl IDs ("ENSG00000165702") -- a real behavior change,
+  # not just a naming detail, since every downstream/comparative/ tool and
+  # this pipeline's own gene-name-keyed config (cis_genes, primary_genes,
+  # per_gene_exclude_guides) assumes gene_name identity. See
+  # publication_runs/morris/README.md's "Feature identity" section.
+  feature_name_col: gene_name
 
 # Guides to drop everywhere, regardless of cis gene (e.g. a known-bad
 # guide/batch) -- distinct from the per-cis-gene SNP exclusion table below.

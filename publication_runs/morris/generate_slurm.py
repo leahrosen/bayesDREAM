@@ -261,6 +261,11 @@ def main() -> None:
             "guide_covariates": model_defaults["guide_covariates"],
             "guide_covariates_ntc": model_defaults["guide_covariates_ntc"],
             "min_count": model_defaults["min_count"],
+            # Pins primary/'cis' gene identity to gene_name -- see
+            # config.yaml's feature_name_col comment (bayesDREAM's new
+            # column-priority cascade would otherwise resolve Morris's
+            # sparse-.npz-backed modalities to Ensembl gene_id instead).
+            "feature_name_col": model_defaults["feature_name_col"],
             "output_dir": output_dir,
         },
         "ntc": {"set_technical_groups": ntc_shared_cfg["set_technical_groups"]},

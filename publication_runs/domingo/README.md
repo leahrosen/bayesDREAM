@@ -320,3 +320,32 @@ Every trans-derived stage (trans/permutation/recapitulation) drops genes
 with `log2(mu_ntc) < -4` before fitting, via bayesDREAM's own
 `model.exclude_trans_genes(min_log2_mu_ntc=...)` (config.yaml's
 `trans.exclude_trans_genes`).
+
+## Feature identity (`model_defaults.feature_name_col`, 2026-09-10)
+
+bayesDREAM commit `24bc2f5` ("Unify feature identity resolution") changed
+how a modality picks its per-feature identity when no explicit override is
+given: `resolve_feature_ids`'s column-priority cascade now ranks
+`gene_id`/`ens_id` ABOVE `gene_name`/`gene_symbol` (previously `gene_name`
+ranked above `gene`, and `gene_id` wasn't even a candidate column at all).
+Domingo's `gene_counts.csv` carries its own string index that IS
+`gene_name` already (`preprocess.py`: `to_csv(..., index_label="gene")`),
+and resolve_feature_ids' step 2 (a DataFrame's own non-integer index) wins
+before that column cascade ever runs -- plus the SAME commit fixed a latent
+bug where the `'cis'` modality could independently re-derive a DIFFERENT
+identifier than the primary modality when this happens (see the commit
+message) by pinning `'cis'` to the exact string the primary modality
+resolved. So **Domingo's actual identity resolution is unaffected** by the
+column-priority reordering -- both `gene_counts.csv`'s own index and the
+`'cis'` modality still consistently resolve to `gene_name`, matching every
+existing output (`trans_feature_summary_gene.csv`'s `'feature'` column,
+`cis_genes: [GFI1B, ...]`, `exclude_cells`/`exclude_trans_genes`, etc.).
+
+`model_defaults.feature_name_col: gene_name` is set anyway, as of this
+writing, purely as defense-in-depth/self-documentation -- it makes the
+convention explicit rather than depending on `gene_counts.csv` always
+carrying a valid `gene_name` index (see `bayesDREAM(feature_name_col=...)`'s
+docstring). Threaded through `base_cfg["model"]` in `generate_slurm.py`, so
+it applies to every stage (including the splicing/transcript/multinomial
+modalities, harmlessly -- `feature_name_col` only affects `is_gene_identity`
+modalities: the primary `'gene'` modality and `'cis'`).

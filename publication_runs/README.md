@@ -44,6 +44,7 @@ publication_runs/
 │
 ├── domingo/                         # dataset: 4 cis genes, primary + splicing/velocity modalities
 ├── morris/                          # dataset: high-MOI, 5 primary + padj-derived cis-only sweep
+├── replogle/                        # dataset: low-MOI, 7 cis genes, 3 fit_cis variants each (batch-matched/all-NTC x independent_mu_sigma)
 ├── template_dataset/                # copy this to start a new dataset
 ├── README.md                         # this file
 └── VERIFICATION.md                   # checklist: how to verify/test/run a dataset's pipeline

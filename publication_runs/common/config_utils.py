@@ -48,12 +48,21 @@ from bayesDREAM.cli import (
 
 # Superset of bayesDREAM.cli._build_model's allowed_model_keys (as of this
 # writing) -- adds 'exclude_guides' and 'min_count', both accepted by
-# bayesDREAM.__init__ but not forwarded by the CLI's own allow-list.
+# bayesDREAM.__init__ but not forwarded by the CLI's own allow-list. Also
+# adds 'feature_name_col'/'feature_names' (bayesDREAM commit 24bc2f5, "Unify
+# feature identity resolution") -- pin the primary/cis-gene modality's
+# feature_id explicitly rather than relying on resolve_feature_ids' column-
+# priority cascade, which reordered 'gene_id' ABOVE 'gene_name' relative to
+# the old fallback logic (see publication_runs/morris/README.md and
+# publication_runs/domingo/README.md's "Feature identity" sections for what
+# this means for a dataset with a sparse/`.npz` primary counts matrix, where
+# the cascade — not an explicit override — decides identity).
 _EXTENDED_MODEL_KEYS = {
     "modality_name", "cis_gene", "cis_feature", "guide_covariates", "guide_covariates_ntc",
     "sum_factor_col", "output_dir", "label", "device", "random_seed", "cores",
     "exclude_targets", "require_ntc",
     "exclude_guides", "min_count",
+    "feature_name_col", "feature_names",
 }
 
 

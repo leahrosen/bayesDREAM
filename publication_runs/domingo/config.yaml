@@ -56,6 +56,18 @@ model_defaults:
   modality_name: gene
   guide_covariates: [cell_line]
   guide_covariates_ntc: [cell_line]
+  # feature_name_col: pins the primary/'cis' gene modality's identity to
+  # gene_name (symbol) explicitly (2026-09-10, see bayesDREAM commit 24bc2f5,
+  # "Unify feature identity resolution"). NOT strictly required for Domingo
+  # the way it is for Morris -- gene_counts.csv's own index IS gene_name
+  # already (preprocess.py: `to_csv(..., index_label="gene")`), and
+  # resolve_feature_ids's step 2 (a DataFrame's own non-integer index) wins
+  # before the column-priority cascade that changed gene_id/gene_name's
+  # relative order ever runs, and the cis-modality-extraction fix in the same
+  # commit pins the 'cis' modality to that exact string too. Set anyway as
+  # defense-in-depth/self-documentation, matching Morris. See
+  # publication_runs/domingo/README.md's "Feature identity" section.
+  feature_name_col: gene_name
 
 cis_genes: [GFI1B, MYB, NFE2, TET2]
 
