@@ -456,3 +456,39 @@ fixture (20 genes, 75 cells, one named `ENSG00000165702`/`GFI1B`) through
 `full/` and `cis_only/` output `gene_meta.csv` files came out gene_id-indexed
 with the real symbol preserved in `gene_name` -- confirming both the
 `feature_name_col` pin and the `feature_meta` fix work together correctly.
+
+## 12. Small `batch` values break scran's `quickCluster` (2026-09-10)
+
+A real Dardel run of `preprocess.py` hit `RRuntimeError: ... fewer cells
+than the minimum cluster size` inside `quickCluster(sce, block=batch)`.
+The traceback's `1 remote errors, element index: 27` means exactly ONE
+`batch` value in the combined [full NTC + 7 genes] population has fewer
+cells than `quickCluster`'s own default `min.size=100` -- the "499
+unevaluated" alongside it is `BiocParallel`'s cascade from that one worker
+dying, not 499 separate failures.
+
+Considered dropping `batch` from scran's blocking entirely (i.e.
+`clusters=NULL`) vs. pooling just the too-small batch(es). Chose pooling:
+dropping blocking would change the normalization for every one of the
+~300 batches to fix a problem specific to one of them, for no reason (the
+other batches all cluster fine on their own).
+
+**Fix**: `_bin_small_batches()` in `preprocess.py` -- any `batch` value
+with fewer than `--min-block-size` cells (default 100, matching
+`quickCluster`'s own default) gets merged into one
+`'_pooled_small_batches'` bucket, used ONLY as scran's blocking variable
+(a separate temp column/frame, never written to `meta.csv` or used
+anywhere else in the pipeline -- `set_technical_groups`,
+`adjust_ntc_sum_factor`, `bm`'s `batch_match_ntc` all still see the real,
+unmodified `batch` column). If pooling ALL rare batches together still
+doesn't reach `min_size` (i.e. scran's minimum genuinely can't be
+satisfied), raises with the offending batch/counts rather than silently
+proceeding.
+
+Verified via two synthetic fixtures: (a) one 5-cell rare batch with
+nothing to pool it with -- correctly raises
+`"pooling ALL of them together still only totals 5 cells (< 100)"`; (b)
+three small batches (40+40+30=110 cells) that pool to a valid size --
+correctly succeeds, scran called with `{'b1': 152, '_pooled_small_batches':
+110}`, and the real `batch` column in the written `meta.csv` came back
+with all four original distinct values, unmutated.

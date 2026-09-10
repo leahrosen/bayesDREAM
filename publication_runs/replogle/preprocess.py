@@ -152,6 +152,53 @@ def _read_parquet(path: str) -> pd.DataFrame:
     return pd.read_parquet(path, engine='fastparquet')
 
 
+def _bin_small_batches(meta: pd.DataFrame, batch_col: str, min_size: int) -> pd.Series:
+    """Return a NEW Series (not written into `meta`) merging every value of
+    `meta[batch_col]` with fewer than `min_size` rows into one pooled
+    `'_pooled_small_batches'` bucket, for use ONLY as scran's `quickCluster`
+    blocking variable.
+
+    `quickCluster(sce, block=batch)` clusters cells SEPARATELY within each
+    block, and raises ("fewer cells than the minimum cluster size") if any
+    single block has fewer cells than its own `min.size` (scran's default:
+    100) -- confirmed on Replogle's real combined [full NTC + 7 genes]
+    population, 2026-09-10 (`BiocParallel errors ... 1 remote errors,
+    element index: 27` -- exactly ONE batch value too small; the "499
+    unevaluated" alongside it is BiocParallel's cascade from that one
+    worker dying, not 499 separate failures).
+
+    Deliberately does NOT touch the real `batch` column anywhere else in
+    this pipeline (`set_technical_groups`, `adjust_ntc_sum_factor`, `bm`'s
+    `batch_match_ntc`) -- this pooling exists ONLY to make scran's
+    clustering step succeed; every other stage still sees genuine,
+    unmodified batch identity. If the pooled bucket ITSELF is still below
+    `min_size` (i.e. there's no way to satisfy scran's own minimum by
+    pooling every rare batch together), raises rather than silently
+    proceeding -- that would need actual investigation, not automatic
+    handling.
+    """
+    counts = meta[batch_col].value_counts()
+    small = counts[counts < min_size].index
+    if len(small) == 0:
+        return meta[batch_col]
+
+    pooled_label = "_pooled_small_batches"
+    binned = meta[batch_col].astype(str).where(~meta[batch_col].isin(small), pooled_label)
+
+    pooled_size = int((binned == pooled_label).sum())
+    if pooled_size < min_size:
+        raise ValueError(
+            f"_bin_small_batches: {len(small)} batch value(s) in {batch_col!r} have fewer than "
+            f"{min_size} cells each ({dict(counts[counts < min_size])}), and pooling ALL of them "
+            f"together still only totals {pooled_size} cells (< {min_size}) -- scran's quickCluster "
+            f"would still fail on this bucket. Needs manual investigation, not automatic binning."
+        )
+    print(f"[preprocess] _bin_small_batches: pooled {len(small)} batch value(s) with < {min_size} "
+          f"cells each ({dict(counts[counts < min_size])}) into '{pooled_label}' ({pooled_size} cells) "
+          f"for scran's blocking variable only -- the real {batch_col!r} column is unchanged.")
+    return binned
+
+
 def _read_full_ntc(indir: str):
     """Read the FULL NTC population from <indir>/NTC/ -- same files
     tmp/06_bayesDREAM_fit_ntc_combined.ipynb reads, including its own two
@@ -173,7 +220,8 @@ def _read_full_ntc(indir: str):
     return cell_meta, gene_meta, counts_sp
 
 
-def preprocess(indir: str, outdir: str, cis_genes, batch_col: str = "batch", seed: int = 42) -> None:
+def preprocess(indir: str, outdir: str, cis_genes, batch_col: str = "batch", seed: int = 42,
+               min_block_size: int = 100) -> None:
     os.makedirs(outdir, exist_ok=True)
 
     missing_genes = [g for g in cis_genes if g not in REPLOGLE_GENE_TO_ID]
@@ -250,10 +298,20 @@ def preprocess(indir: str, outdir: str, cis_genes, batch_col: str = "batch", see
     gene_meta_out = gm_indexed.loc[canonical_gene_order, ["gene_name"]].reset_index()
 
     # ---- sum_factor: quickCluster blocked by batch_col, computed ONCE on this combined population ----
+    # Rare batch values (fewer cells than scran's own quickCluster min.size,
+    # default 100) are pooled into one bucket for THIS blocking variable
+    # only -- see _bin_small_batches' docstring. A separate column/temp
+    # frame is used so the real `batch_col` in combined_meta (used
+    # everywhere else downstream) is never touched.
+    scran_block_col = f"_{batch_col}_scran_block"
+    scran_meta = combined_meta.copy()
+    scran_meta[scran_block_col] = _bin_small_batches(combined_meta, batch_col, min_size=min_block_size)
+
     print(f"[preprocess] computing scran sum factors on the combined [full NTC + {len(cis_genes)} cis genes] "
-          f"population ({len(combined_meta)} cells, batch_col={batch_col!r})...")
+          f"population ({len(combined_meta)} cells, batch_col={batch_col!r}, "
+          f"min_block_size={min_block_size})...")
     combined_meta["sum_factor"] = _compute_scran_sizefactors(
-        combined_counts, combined_meta, batch_col=batch_col, seed=seed)
+        combined_counts, scran_meta, batch_col=scran_block_col, seed=seed)
 
     # ---- write combined output ----
     combined_meta.to_csv(os.path.join(outdir, "meta.csv"), index=False)
@@ -290,9 +348,16 @@ def main() -> None:
                          help="Blocking column for scran's quickCluster (default: 'batch', matching "
                               "adjust_ntc_sum_factor(covariates=['batch']) in the existing notebooks).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--min-block-size", type=int, default=100,
+                         help="Any batch_col value with fewer cells than this is pooled into one "
+                              "bucket for scran's quickCluster blocking variable ONLY (default: 100, "
+                              "matching quickCluster's own min.size default) -- the real batch_col "
+                              "column used everywhere else downstream is never touched. See "
+                              "_bin_small_batches' docstring.")
     args = parser.parse_args()
     cis_genes = [g.strip() for g in args.cis_genes.split(",") if g.strip()]
-    preprocess(args.indir, args.outdir, cis_genes, batch_col=args.batch_col, seed=args.seed)
+    preprocess(args.indir, args.outdir, cis_genes, batch_col=args.batch_col, seed=args.seed,
+               min_block_size=args.min_block_size)
 
 
 if __name__ == "__main__":

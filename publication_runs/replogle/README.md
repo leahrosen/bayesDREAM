@@ -114,6 +114,15 @@ for `common/slurm/list_job_status.py`.
    own curated-guide-list restriction (`config.yaml`'s
    `bm_selected_ntc_guides`).
 
+   **Small `batch` values**: any `batch` value with fewer than
+   `--min-block-size` cells (default 100, matching `quickCluster`'s own
+   `min.size`) is pooled into one bucket for scran's blocking variable
+   only (real `batch` column elsewhere is untouched) -- needed on a real
+   run, where one batch was too small and `quickCluster` raised `fewer
+   cells than the minimum cluster size`. See `STRATEGY.md` §12. Requires
+   `fastparquet` (not the default `pyarrow`, which has a confirmed bug
+   against these exact files) -- install into `bayesdream_cpu` if missing.
+
    ```bash
    python preprocess.py \
      --indir /cfs/klemming/projects/snic/lappalainen_lab1/users/lisetts/Replogle_data/pr_data/for_bayesDREAM/K562_combined \
