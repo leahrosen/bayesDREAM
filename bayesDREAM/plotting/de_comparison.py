@@ -10,28 +10,7 @@ from matplotlib.lines import Line2D
 
 from .helpers import to_np
 from .colors import lighten, darken, ColorScheme
-
-
-def dependency_mask_from_n(n_samps, ci=95.0):
-    """
-    Dependency mask based on n: 95% CI excludes 0.
-
-    Parameters
-    ----------
-    n_samps : array-like, shape (n_samples, n_features)
-        Posterior samples of n parameter
-    ci : float
-        Confidence interval percentage
-
-    Returns
-    -------
-    mask : np.ndarray, shape (n_features,)
-        Boolean mask: True if CI excludes 0
-    """
-    lo_q = (100 - ci) / 2.0
-    hi_q = 100 - lo_q
-    lo, hi = np.percentile(n_samps, [lo_q, hi_q], axis=0)
-    return (lo > 0) | (hi < 0)
+from .utils import dependency_mask_from_n
 
 
 def compute_log2fc_metrics(A_samps, alpha_samps, Vmax_samps, K_samps, n_samps,
@@ -45,8 +24,9 @@ def compute_log2fc_metrics(A_samps, alpha_samps, Vmax_samps, K_samps, n_samps,
     ----------
     A_samps, alpha_samps, Vmax_samps, K_samps, n_samps : array-like, shape (n_samples, n_features)
         Posterior samples for each parameter
-    x_true_samps : array-like, shape (n_samples, n_cells)
-        Posterior samples of x_true for this cis gene
+    x_true_samps : array-like, shape (n_samples, n_cells) or (n_cells,)
+        Posterior samples of x_true for this cis gene, or (current architecture,
+        see model.x_true) an already-reduced per-cell point estimate.
     eps : float
         Small constant for numerical stability
 
@@ -59,7 +39,9 @@ def compute_log2fc_metrics(A_samps, alpha_samps, Vmax_samps, K_samps, n_samps,
     log2fc_obs : np.ndarray, shape (n_samples, n_features)
         Observed-range log2FC: y(x_max_obs) vs y(x_min_obs), directional in x
     x_min_obs, x_max_obs : float
-        Observed min/max of mean x_true across cells
+        Observed min/max of per-cell x_true point estimate (median over
+        samples if x_true_samps is multi-sample; passed through unchanged if
+        already a per-cell point estimate — see model.x_true)
     """
     # ensure arrays
     A_samps     = np.asarray(A_samps)
@@ -68,11 +50,15 @@ def compute_log2fc_metrics(A_samps, alpha_samps, Vmax_samps, K_samps, n_samps,
     K_samps     = np.asarray(K_samps)
     n_samps     = np.asarray(n_samps)
 
-    # --- observed x range from mean x_true across samples per cell ---
-    X = np.asarray(x_true_samps)              # [S, N_cells]
-    x_means_per_cell = X.mean(axis=0)         # [N_cells]
-    x_min_obs = float(x_means_per_cell.min())
-    x_max_obs = float(x_means_per_cell.max())
+    # --- observed x range from per-cell x_true point estimate ---
+    X = np.asarray(x_true_samps)
+    # model.x_true is always 1D (a per-cell point estimate) in the current
+    # architecture; a 2D [S, N_cells] array only occurs for legacy raw
+    # multi-sample input, in which case median matches the point-estimate
+    # convention used elsewhere.
+    x_point_per_cell = np.median(X, axis=0) if X.ndim > 1 else X   # [N_cells]
+    x_min_obs = float(x_point_per_cell.min())
+    x_max_obs = float(x_point_per_cell.max())
 
     A     = A_samps
     alpha = alpha_samps
@@ -126,13 +112,14 @@ def compute_log2fc_obs_for_cells(
     ----------
     A_samps, alpha_samps, Vmax_samps, K_samps, n_samps : array-like, shape (n_samples, n_features)
         Posterior samples
-    x_true_samps : array-like, shape (n_samples, n_cells)
-        Cis x_true samples
+    x_true_samps : array-like, shape (n_samples, n_cells) or (n_cells,)
+        Cis x_true samples, or (current architecture, see model.x_true) an
+        already-reduced per-cell point estimate.
     cell_mask : array-like, shape (n_cells,)
         Boolean mask selecting cells to use for x_min/x_max
     guide_labels : array-like, shape (n_cells,), optional
-        Guide IDs. If provided, first average x_true per guide, then take min/max
-        across guide means
+        Guide IDs. If provided, first aggregate x_true per guide, then take min/max
+        across guides
     eps : float
         Numerical stability constant
 
@@ -150,23 +137,27 @@ def compute_log2fc_obs_for_cells(
     n_samps     = np.asarray(n_samps)
     X           = np.asarray(x_true_samps)
 
-    # subset cells
-    X_sub = X[:, cell_mask]  # [S, N_sub]
-
-    # per-cell means over posterior samples
-    x_means_per_cell = X_sub.mean(axis=0)  # [N_sub]
+    # model.x_true is always 1D (a per-cell point estimate) in the current
+    # architecture; a 2D [S, N_cells] array only occurs for legacy raw
+    # multi-sample input, in which case median matches the point-estimate
+    # convention used elsewhere.
+    if X.ndim > 1:
+        X_sub = X[:, cell_mask]                        # [S, N_sub]
+        x_point_per_cell = np.median(X_sub, axis=0)    # [N_sub]
+    else:
+        x_point_per_cell = X[cell_mask]                # [N_sub]
 
     if guide_labels is not None:
         # aggregate by guide first
         guide_labels_sub = np.asarray(guide_labels)[cell_mask]
         unique_guides = np.unique(guide_labels_sub)
-        guide_means = []
+        guide_medians = []
         for g in unique_guides:
             mask_g = guide_labels_sub == g
-            guide_means.append(x_means_per_cell[mask_g].mean())
-        x_vals_for_minmax = np.array(guide_means)
+            guide_medians.append(np.median(x_point_per_cell[mask_g]))
+        x_vals_for_minmax = np.array(guide_medians)
     else:
-        x_vals_for_minmax = x_means_per_cell
+        x_vals_for_minmax = x_point_per_cell
 
     x_min_obs = float(x_vals_for_minmax.min())
     x_max_obs = float(x_vals_for_minmax.max())
@@ -217,7 +208,7 @@ def prepare_de_for_cg(model, de_df, cis_gene=None, color_scheme=None):
     -------
     tuple or None
         (A_samps, alpha_samps, Vmax_samps, K_samps, n_samps, x_true_samps,
-         meta, de_cg (with idx, logFC, FDR, gene, n_mean, dependent, ext_sig),
+         meta, de_cg (with idx, logFC, FDR, gene, n_median, dependent, ext_sig),
          base_target_color, base_ntc_color)
         Returns None if posterior_samples_trans not found in model.
     """
@@ -245,12 +236,13 @@ def prepare_de_for_cg(model, de_df, cis_gene=None, color_scheme=None):
     x_true_samps = to_np(model.x_true)
     meta = model.meta
 
-    n_mean   = n_samps.mean(axis=0)             # [T]
+    n_median = np.median(n_samps, axis=0)       # [T] — median point estimate
     dep_mask = dependency_mask_from_n(n_samps)  # [T] bool
-    T        = n_mean.shape[0]
+    T        = n_median.shape[0]
 
-    # gene names aligned to posterior arrays
-    gene_names = np.array(model.get_modality('gene').feature_meta['gene'])
+    # gene names aligned to posterior arrays — modality.feature_ids is the
+    # single source of truth (resolved + deduped in Modality.__init__).
+    gene_names = np.array(model.get_modality('gene').feature_ids)
     if len(gene_names) != T:
         print(f"[{cis_gene}] WARNING: len(gene_names)={len(gene_names)} != T={T}. "
               "Trimming gene_names to first T entries.")
@@ -264,7 +256,7 @@ def prepare_de_for_cg(model, de_df, cis_gene=None, color_scheme=None):
     de_cg = de_cg.dropna(subset=['idx'])
     de_cg['idx'] = de_cg['idx'].astype(int)
 
-    de_cg['n_mean']     = n_mean[de_cg['idx'].values]
+    de_cg['n_median']   = n_median[de_cg['idx'].values]
     de_cg['dependent']  = dep_mask[de_cg['idx'].values]
     de_cg['ext_sig']    = de_cg['FDR'] < 0.05
 
@@ -478,8 +470,8 @@ def plot_edger_vs_bayes_full_range(cis_genes, model, de_df, fc_thresh=0.5,
         log2fc_full, _, _, _ = compute_log2fc_metrics(
             A_samps, alpha_samps, Vmax_samps, K_samps, n_samps, x_true_samps
         )
-        log2fc_full_mean = log2fc_full.mean(axis=0)  # [T]
-        de_cg['log2fc_full'] = log2fc_full_mean[de_cg['idx'].values]
+        log2fc_full_median = np.median(log2fc_full, axis=0)  # [T]
+        de_cg['log2fc_full'] = log2fc_full_median[de_cg['idx'].values]
 
         guides_in_model = set(meta['guide'].astype(str).unique())
 
@@ -569,9 +561,9 @@ def plot_edger_vs_bayes_observed_range(cis_genes, model, de_df, fc_thresh=0.5,
                 cell_mask=cell_mask,
                 guide_labels=guide_labels_all if aggregate_by_guide else None,
             )
-            log2fc_obs_mean_guide = log2fc_obs_guide.mean(axis=0)
+            log2fc_obs_median_guide = np.median(log2fc_obs_guide, axis=0)
             de_cg.loc[df_g.index, 'log2fc_obs_guide'] = \
-                log2fc_obs_mean_guide[df_g['idx'].values]
+                log2fc_obs_median_guide[df_g['idx'].values]
 
             df_g = de_cg.loc[df_g.index].copy()
 

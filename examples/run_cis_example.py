@@ -70,7 +70,7 @@ if __name__ == "__main__":
 
     # Load technical fit
     print(f"\nLoading technical fit...")
-    model.load_technical_fit()
+    model.load_ntc_fit()
 
     # Fit cis
     print(f"\nRunning fit_cis...")

@@ -138,27 +138,27 @@ def _build_model(cfg: Dict[str, Any]) -> bayesDREAM:
     )
 
 
-def _run_fit_technical(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
-    tech_cfg = cfg.get("technical") or {}
+def _run_fit_ntc(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
+    tech_cfg = cfg.get("ntc") or cfg.get("technical") or {}
 
     if tech_cfg.get("set_technical_groups"):
         model.set_technical_groups(tech_cfg["set_technical_groups"])
 
     fit_args = _normalize_stage_args(tech_cfg.get("fit"))
-    model.fit_technical(**fit_args)
+    model.fit_ntc(**fit_args)
 
     if _is_enabled(tech_cfg.get("save"), default=True):
         save_args = _normalize_stage_args(tech_cfg.get("save"))
-        model.save_technical_fit(**save_args)
+        model.save_ntc_fit(**save_args)
 
 
 def _run_fit_cis(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
     cis_cfg = cfg.get("cis") or {}
-    tech_cfg = cfg.get("technical") or {}
+    tech_cfg = cfg.get("ntc") or cfg.get("technical") or {}
 
-    if _is_enabled(cis_cfg.get("load_technical"), default=True):
-        load_args = _normalize_stage_args(cis_cfg.get("load_technical"))
-        model.load_technical_fit(**load_args)
+    if _is_enabled(cis_cfg.get("load_ntc", cis_cfg.get("load_technical")), default=True):
+        load_args = _normalize_stage_args(cis_cfg.get("load_ntc") or cis_cfg.get("load_technical"))
+        model.load_ntc_fit(**load_args)
 
     # Stepwise mode may start from a fresh model object where technical_group_code
     # was not persisted in metadata. Recreate it before fit_cis when possible.
@@ -185,9 +185,9 @@ def _run_fit_cis(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
 def _run_fit_trans(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
     trans_cfg = cfg.get("trans") or {}
 
-    if _is_enabled(trans_cfg.get("load_technical"), default=True):
-        load_tech_args = _normalize_stage_args(trans_cfg.get("load_technical"))
-        model.load_technical_fit(**load_tech_args)
+    if _is_enabled(trans_cfg.get("load_ntc", trans_cfg.get("load_technical")), default=True):
+        load_tech_args = _normalize_stage_args(trans_cfg.get("load_ntc") or trans_cfg.get("load_technical"))
+        model.load_ntc_fit(**load_tech_args)
 
     if _is_enabled(trans_cfg.get("load_cis"), default=True):
         load_cis_args = _normalize_stage_args(trans_cfg.get("load_cis"))
@@ -204,9 +204,9 @@ def _run_fit_trans(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
 def _run_report(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
     report_cfg = cfg.get("report") or {}
 
-    if _is_enabled(report_cfg.get("load_technical"), default=False):
-        load_args = _normalize_stage_args(report_cfg.get("load_technical"))
-        model.load_technical_fit(**load_args)
+    if _is_enabled(report_cfg.get("load_ntc", report_cfg.get("load_technical")), default=False):
+        load_args = _normalize_stage_args(report_cfg.get("load_ntc") or report_cfg.get("load_technical"))
+        model.load_ntc_fit(**load_args)
 
     if _is_enabled(report_cfg.get("load_cis"), default=False):
         load_args = _normalize_stage_args(report_cfg.get("load_cis"))
@@ -216,9 +216,9 @@ def _run_report(model: bayesDREAM, cfg: Dict[str, Any]) -> None:
         load_args = _normalize_stage_args(report_cfg.get("load_trans"))
         model.load_trans_fit(**load_args)
 
-    if _is_enabled(report_cfg.get("technical"), default=True):
-        args = _normalize_stage_args(report_cfg.get("technical"))
-        model.save_technical_summary(**args)
+    if _is_enabled(report_cfg.get("ntc", report_cfg.get("technical")), default=True):
+        args = _normalize_stage_args(report_cfg.get("ntc") or report_cfg.get("technical"))
+        model.save_ntc_summary(**args)
 
     if _is_enabled(report_cfg.get("cis"), default=True):
         args = _normalize_stage_args(report_cfg.get("cis"))
@@ -242,19 +242,19 @@ def run_pipeline(
     model = _build_model(cfg)
 
     run_cfg = cfg.get("run") or {}
-    pipeline_steps = run_cfg.get("steps", ["technical", "cis", "trans", "report"])
+    pipeline_steps = run_cfg.get("steps", ["ntc", "cis", "trans", "report"])
     if steps:
         pipeline_steps = [s.strip() for s in steps.split(",") if s.strip()]
 
-    valid_steps = {"technical", "cis", "trans", "report"}
+    valid_steps = {"ntc", "technical", "cis", "trans", "report"}
     unknown = [s for s in pipeline_steps if s not in valid_steps]
     if unknown:
         raise typer.BadParameter(f"Unknown run steps: {unknown}. Valid: {sorted(valid_steps)}")
 
     for step in pipeline_steps:
         typer.echo(f"[bayesdream] running step: {step}")
-        if step == "technical":
-            _run_fit_technical(model, cfg)
+        if step in ("ntc", "technical"):
+            _run_fit_ntc(model, cfg)
         elif step == "cis":
             _run_fit_cis(model, cfg)
         elif step == "trans":
@@ -263,14 +263,14 @@ def run_pipeline(
             _run_report(model, cfg)
 
 
-@app.command("fit-technical")
-def fit_technical(
+@app.command("fit-ntc")
+def fit_ntc(
     config: Path = typer.Option(..., "--config", "-c", help="Path to YAML config file."),
 ) -> None:
-    """Run technical fit stage."""
+    """Run NTC fit stage (overdispersion estimation and batch effect correction)."""
     cfg = _load_yaml(config)
     model = _build_model(cfg)
-    _run_fit_technical(model, cfg)
+    _run_fit_ntc(model, cfg)
 
 
 @app.command("fit-cis")

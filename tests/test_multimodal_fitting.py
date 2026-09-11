@@ -2,7 +2,7 @@
 
 Tests:
 1. Backward compatibility: bayesDREAM works exactly like bayesDREAM for gene expression
-2. fit_modality_technical() delegates correctly to fit_technical()
+2. fit_modality_technical() delegates correctly to fit_ntc()
 3. fit_modality_trans() delegates correctly to fit_trans()
 4. Distribution registry is properly loaded
 """
@@ -64,7 +64,7 @@ def test_model_creation(multimodal_model):
 
 def test_core_fitting_methods_exist(multimodal_model):
     model = multimodal_model['model']
-    for method in ('fit_technical', 'fit_cis', 'fit_trans', 'set_technical_groups'):
+    for method in ('fit_ntc', 'fit_cis', 'fit_trans', 'set_technical_groups'):
         assert hasattr(model, method), f"Missing method: {method}"
 
 

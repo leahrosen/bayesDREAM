@@ -20,6 +20,7 @@ pyro-ppl>=1.9.0
 # Visualization
 matplotlib>=3.10.0
 seaborn>=0.13.0
+adjustText>=1.0.0  # Non-overlapping label placement for volcano plots
 
 # Data I/O
 h5py>=3.14.0

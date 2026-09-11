@@ -24,7 +24,9 @@ class TranscriptModalityMixin:
         counts_name: str = 'transcript_counts',
         usage_name: str = 'transcript_usage',
         cell_names: Optional[List[str]] = None,
-        overwrite: bool = False
+        overwrite: bool = False,
+        feature_name_col: Optional[str] = None,
+        feature_names: Optional[list] = None,
     ):
         """
         Add transcript-level data as counts and/or isoform usage.
@@ -50,7 +52,44 @@ class TranscriptModalityMixin:
             Should match number of cells (axis 1 for 2D data).
         overwrite : bool, default=False
             Whether to overwrite existing modalities with the same name(s)
+        feature_name_col : str, optional
+            Column of `transcript_meta` to use as the authoritative per-feature
+            identifier (`feature_id`) for the **'counts' (transcript-level)
+            modality only** — the 'usage' (isoform-usage) modality's rows are
+            genes, not transcripts, so this override does not apply there (its
+            per-gene identity is always auto-resolved from `transcript_meta`'s
+            gene column). Mutually exclusive with `feature_names` — passing
+            both raises ValueError. Every value in this column must be a
+            non-null string and unique among the transcripts actually kept
+            (after missing/zero-variance filtering); violations raise
+            ValueError. See `Modality.__init__`'s "Feature identity
+            resolution" docstring section for the full priority used when
+            neither this nor `feature_names` is given.
+        feature_names : list of str, optional
+            Explicit feature_id list for the 'counts' modality, one entry per
+            row of `transcript_meta` (same order), i.e. before any
+            missing/zero-variance transcript filtering — the surviving
+            entries are looked up by `transcript_id` and passed through.
+            Mutually exclusive with `feature_name_col`. Does not apply to the
+            'usage' modality (see `feature_name_col` above).
         """
+        if feature_name_col is not None and feature_names is not None:
+            raise ValueError("Provide either feature_name_col or feature_names, not both.")
+        if feature_names is not None and len(feature_names) != len(transcript_meta):
+            raise ValueError(
+                f"feature_names has length {len(feature_names)} but transcript_meta has "
+                f"{len(transcript_meta)} rows. It must be one entry per row of transcript_meta "
+                f"(before missing/zero-variance filtering); surviving entries are looked up by "
+                f"transcript_id."
+            )
+        # Map transcript_id -> explicit feature_id, looked up after filtering below (the
+        # 'counts' modality's row set can shrink via missing-transcript/zero-variance
+        # filtering, so a plain positional slice of feature_names would misalign).
+        tx_id_to_feature_name = (
+            dict(zip(transcript_meta['transcript_id'], feature_names))
+            if feature_names is not None else None
+        )
+
         # Validate required columns
         if 'transcript_id' not in transcript_meta.columns:
             raise ValueError("transcript_meta must have 'transcript_id' column")
@@ -178,13 +217,26 @@ class TranscriptModalityMixin:
                 if len(transcript_counts_ordered) == 0:
                     warnings.warn(f"No transcripts left after filtering zero-variance transcripts. Skipping '{counts_name}' modality.")
                 else:
+                    counts_feature_names = (
+                        [tx_id_to_feature_name[tx] for tx in tx_meta_subset['transcript_id']]
+                        if tx_id_to_feature_name is not None else None
+                    )
                     modality = Modality(
                         name=counts_name,
                         counts=transcript_counts_ordered,
-                        feature_meta=tx_meta_subset.reset_index(drop=True),
+                        # NOTE: deliberately NOT .reset_index(drop=True) — if tx_meta_subset
+                        # carries a genuine string index (e.g. transcript IDs set as index by
+                        # the caller), it should survive into Modality.__init__'s feature
+                        # identity resolution (resolve_feature_ids) rather than being
+                        # discarded. Nothing downstream here relies on a reset positional
+                        # index — tx_meta_subset is only used to build/filter this Modality.
+                        feature_meta=tx_meta_subset,
                         distribution='negbinom',
                         cells_axis=1,
-                        cell_names=extracted_cell_names
+                        cell_names=extracted_cell_names,
+                        feature_name_col=feature_name_col,
+                        feature_names=counts_feature_names,
+                        is_gene_identity=False,
                     )
                     self.add_modality(counts_name, modality, overwrite=overwrite)
 
@@ -254,6 +306,10 @@ class TranscriptModalityMixin:
                         feature_meta=gene_meta_df,
                         distribution='multinomial',
                         cells_axis=1,
-                        cell_names=extracted_cell_names
+                        cell_names=extracted_cell_names,
+                        # Unlike the 'counts' modality (rows = transcripts, many-to-one with
+                        # genes), each row here IS one gene (isoform usage grouped by gene),
+                        # so the gene-specific bonus identifier columns are valid here.
+                        is_gene_identity=True,
                     )
                     self.add_modality(usage_name, modality, overwrite=overwrite)

@@ -11,18 +11,16 @@ from scipy import stats
 
 
 def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
-                              min_denominator=None, use_data_driven_priors=True, save_path=None):
+                              min_denominator=None, save_path=None):
     """
     Plot prior vs posterior distributions for additive Hill parameters.
 
     For binomial distributions, priors are:
-    - A: Beta(1, (1-A_mean)/A_mean) - pushes toward 0 (if data-driven)
-    - Vmax_a, Vmax_b: Beta(Vmax_mean * 10, (1-Vmax_mean) * 10) - independent (if data-driven)
+    - A: Beta(1, (1-A_mean)/A_mean) - pushes toward 0 (data-driven)
+    - Vmax_a, Vmax_b: Beta(Vmax_mean * 10, (1-Vmax_mean) * 10) - independent (data-driven)
     - K_a, K_b: LogNormal(log_mu, log_sigma) where mean = K_max, std = K_max/(2*sqrt(2))
 
-    If use_data_driven_priors=False, uses uniform Beta(1,1) for A and Vmax.
-
-    IMPORTANT: min_denominator and use_data_driven_priors should match what was used in fit_trans!
+    IMPORTANT: min_denominator should match what was used in fit_trans!
 
     Parameters
     ----------
@@ -35,8 +33,6 @@ def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
     min_denominator : int, optional
         Minimum denominator for filtering observations (should match fit_trans)
         If None, tries to infer from fitting parameters
-    use_data_driven_priors : bool
-        Whether data-driven priors were used (default: True)
     save_path : str, optional
         Path to save figure
 
@@ -207,7 +203,6 @@ def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
         print(f"  Amean (5th percentile): {Amean_est:.4f}")
         print(f"  Upper quantile (95th percentile): {upper_quantile:.4f}")
         print(f"  Vmax_mean (range = 95th - 5th): {Vmax_mean_est:.4f}")
-        print(f"  use_data_driven_priors: {use_data_driven_priors}")
     else:
         Amean_est = 0.1
         Vmax_mean_est = 0.5
@@ -246,21 +241,16 @@ def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
     ax = axes[0, 0]
     ax.hist(A_post, bins=50, density=True, alpha=0.7, label='Posterior', color='steelblue')
 
-    # Prior for A depends on use_data_driven_priors
     x = np.linspace(0.001, 0.999, 1000)
-    if use_data_driven_priors and Amean_est > 0 and Amean_est < 1:
-        # Data-driven: Beta(alpha=1, beta=(1-Amean)/Amean)
+    if Amean_est > 0 and Amean_est < 1:
         beta_A = (1 - Amean_est) / Amean_est
         alpha_A = 1.0
         prior_A = stats.beta.pdf(x, alpha_A, beta_A)
         ax.plot(x, prior_A, 'r-', linewidth=2, label=f'Prior Beta({alpha_A:.1f}, {beta_A:.2f})')
         ax.axvline(Amean_est, color='red', linestyle='--', linewidth=2, label='Prior mean')
     else:
-        # Uniform: Beta(1, 1)
-        alpha_A = 1.0
-        beta_A = 1.0
-        prior_A = stats.beta.pdf(x, alpha_A, beta_A)
-        ax.plot(x, prior_A, 'r-', linewidth=2, label=f'Prior Beta({alpha_A:.1f}, {beta_A:.1f}) [Uniform]')
+        prior_A = stats.beta.pdf(x, 1.0, 1.0)
+        ax.plot(x, prior_A, 'r-', linewidth=2, label='Prior Beta(1.0, 1.0) [fallback]')
 
     ax.axvline(A_post.mean(), color='steelblue', linestyle='--', linewidth=2, label='Posterior mean')
     ax.set_xlabel('A (baseline)')
@@ -275,10 +265,7 @@ def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
     ax = axes[0, 1]
     ax.hist(Vmax_a_post, bins=50, density=True, alpha=0.7, label='Posterior', color='darkgreen')
 
-    # Prior for Vmax_a depends on use_data_driven_priors
-    x = np.linspace(0.001, 0.999, 1000)
-    if use_data_driven_priors and Vmax_mean_est > 0 and Vmax_mean_est < 1:
-        # Data-driven: Beta(Vmax_mean * 10, (1 - Vmax_mean) * 10)
+    if Vmax_mean_est > 0 and Vmax_mean_est < 1:
         concentration = 10.0
         alpha_Vmax = Vmax_mean_est * concentration
         beta_Vmax = (1 - Vmax_mean_est) * concentration
@@ -286,11 +273,10 @@ def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
         ax.plot(x, prior_Vmax, 'r-', linewidth=2, label=f'Prior Beta({alpha_Vmax:.1f}, {beta_Vmax:.1f})')
         ax.axvline(Vmax_mean_est, color='red', linestyle='--', linewidth=2, label='Prior mean')
     else:
-        # Uniform: Beta(1, 1)
         alpha_Vmax = 1.0
         beta_Vmax = 1.0
         prior_Vmax = stats.beta.pdf(x, alpha_Vmax, beta_Vmax)
-        ax.plot(x, prior_Vmax, 'r-', linewidth=2, label=f'Prior Beta({alpha_Vmax:.1f}, {beta_Vmax:.1f}) [Uniform]')
+        ax.plot(x, prior_Vmax, 'r-', linewidth=2, label='Prior Beta(1.0, 1.0) [fallback]')
 
     ax.axvline(Vmax_a_post.mean(), color='darkgreen', linestyle='--', linewidth=2, label='Posterior mean')
     ax.set_xlabel('Vmax_a')
@@ -314,15 +300,13 @@ def plot_additive_hill_priors(model, sj_id, modality_name='splicing_sj',
         ax.hist(Vmax_b_post, bins=50, density=True, alpha=0.7, label='Posterior', color='purple')
 
         # Prior for Vmax_b: same as Vmax_a
-        if use_data_driven_priors and Vmax_mean_est > 0 and Vmax_mean_est < 1:
-            # Data-driven
+        if Vmax_mean_est > 0 and Vmax_mean_est < 1:
             prior_Vmax = stats.beta.pdf(x, alpha_Vmax, beta_Vmax)
             ax.plot(x, prior_Vmax, 'r-', linewidth=2, label=f'Prior Beta({alpha_Vmax:.1f}, {beta_Vmax:.1f})')
             ax.axvline(Vmax_mean_est, color='red', linestyle='--', linewidth=2, label='Prior mean')
         else:
-            # Uniform
             prior_Vmax = stats.beta.pdf(x, 1.0, 1.0)
-            ax.plot(x, prior_Vmax, 'r-', linewidth=2, label=f'Prior Beta(1.0, 1.0) [Uniform]')
+            ax.plot(x, prior_Vmax, 'r-', linewidth=2, label='Prior Beta(1.0, 1.0) [fallback]')
 
         ax.axvline(Vmax_b_post.mean(), color='purple', linestyle='--', linewidth=2, label='Posterior mean')
         ax.set_xlabel('Vmax_b')

@@ -36,10 +36,10 @@ class SlurmJobGenerator:
     """
     Generate SLURM job submission scripts for bayesDREAM pipeline on Berzelius.
 
-    Berzelius resource specs:
-    - Fat nodes (-C fat): 128GB RAM + 10GB VRAM per GPU
-    - Thin nodes (-C thin): 64GB RAM + 5GB VRAM per GPU
-    - CPU partition: 7.76GB RAM per core
+    Berzelius resource specs (Ampere/A100 nodes only):
+    - Fat nodes (-C fat): A100 80GB VRAM per GPU, 256GB RAM per GPU (2TB per 8-GPU node)
+    - Thin nodes (-C thin): A100 40GB VRAM per GPU, 128GB RAM per GPU (1TB per 8-GPU node)
+    - CPU partition (berzelius-cpu): 7.76GB RAM per core
     """
 
     def __init__(
@@ -62,6 +62,7 @@ class SlurmJobGenerator:
         bayesdream_path: str = '/proj/berzelius-aiics-real/users/x_learo/bayesDREAM',
         data_path: Optional[str] = None,
         nsamples: int = 1000,
+        force_iaf: bool = False,
     ):
         """
         Initialize SLURM job generator.
@@ -107,6 +108,14 @@ class SlurmJobGenerator:
             loaded from memory (not implemented - user must save data first)
         nsamples : int
             Number of posterior samples
+        force_iaf : bool
+            fit_ntc's guide defaults to AutoNormal (mean-field) — robust across
+            dataset sizes and sparsity levels. Set True to request AutoIAFNormal
+            instead (matches fit_ntc's own force_iaf parameter, and is threaded into
+            the generated fit_technical script). Only recommended for small,
+            deeply-sequenced datasets with no near-zero-count NTC features — IAF's
+            single shared network across all features means one sparse feature's
+            exploding gradient can corrupt every other feature's fit in one step.
         """
         self.meta = meta
         self.counts = counts
@@ -124,6 +133,7 @@ class SlurmJobGenerator:
         self.bayesdream_path = bayesdream_path
         self.data_path = data_path
         self.nsamples = nsamples
+        self.force_iaf = force_iaf
 
         # Auto-detect dataset characteristics
         self.n_features = counts.shape[0]
@@ -133,7 +143,7 @@ class SlurmJobGenerator:
             if sparse.issparse(counts):
                 self.sparsity = 1.0 - (counts.nnz / (counts.shape[0] * counts.shape[1]))
             else:
-                self.sparsity = (counts == 0).sum() / counts.size
+                self.sparsity = float(np.asarray(counts == 0).sum()) / counts.size
         else:
             self.sparsity = sparsity
 
@@ -183,6 +193,17 @@ class SlurmJobGenerator:
         dict
             Memory estimates for each step with resource recommendations.
         """
+        # docs/ is a sibling of bayesDREAM/ at the repo root, not an installed package --
+        # only importable as `docs.memory_calculator` when the repo root is on sys.path.
+        # That's true when a script is run with the repo root as cwd (or PYTHONPATH set
+        # to it), but NOT when a script is invoked by its full path from elsewhere (e.g.
+        # `$PYTHON_ENV $EXAMPLES/generate_slurm.py ...`), which puts the script's own
+        # directory on sys.path[0] instead. Resolve relative to this file so the import
+        # works regardless of how/from-where the caller was invoked.
+        import sys
+        _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
         from docs.memory_calculator import estimate_memory
 
         # Estimate for fit_technical
@@ -199,17 +220,23 @@ class SlurmJobGenerator:
             verbose=False
         )
 
-        # Determine if AutoIAFNormal can be used (< 20GB VRAM threshold)
+        # fit_ntc defaults to AutoNormal (mean-field) regardless of dataset size —
+        # see bayesDREAM/fitting/ntc.py's fit_ntc docstring. AutoIAFNormal is opt-in
+        # via force_iaf=True (matches fit_ntc's own parameter, threaded into the
+        # generated fit_technical script below). This estimator used to auto-select
+        # IAF whenever it fit an (essentially always crossed at realistic gene
+        # counts) 20GB VRAM budget, which silently assumed IAF's 50k-iteration
+        # profile almost universally — that no longer reflects fit_ntc's real
+        # default, so the choice here now mirrors self.force_iaf directly.
         n_latent = (self.n_groups - 1 + 2) * self.n_features
         iaf_vram_gb = (n_latent ** 2 * 4 * 3 * 1.5) / 1e9
-        self.use_autonormal = (iaf_vram_gb >= 20.0)
+        self.use_autonormal = not self.force_iaf
 
         if self.use_autonormal:
-            print(f"\n[INFO] AutoIAFNormal would require {iaf_vram_gb:.1f} GB VRAM")
-            print(f"[INFO] Will use AutoNormal (mean-field) with niters=100,000")
+            print(f"\n[INFO] Using AutoNormal (mean-field, default) with niters=100,000")
+            print(f"[INFO] (AutoIAFNormal would need ~{iaf_vram_gb:.1f} GB VRAM — pass force_iaf=True to use it)")
         else:
-            print(f"\n[INFO] AutoIAFNormal estimated at {iaf_vram_gb:.1f} GB VRAM")
-            print(f"[INFO] Will use AutoIAFNormal with niters=50,000")
+            print(f"\n[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_vram_gb:.1f} GB VRAM) with niters=50,000")
 
         # Add resource recommendations
         results['resources'] = self._recommend_resources(results)
@@ -233,8 +260,8 @@ class SlurmJobGenerator:
         resources = {}
 
         # fit_technical (same conditions as fit_trans)
-        tech_ram = memory['fit_technical_ram_gb']
-        tech_vram = memory['fit_technical_vram_gb']
+        tech_ram = memory['fit_ntc_ram_gb']
+        tech_vram = memory['fit_ntc_vram_gb']
 
         if self.partition_preference != 'auto':
             # User override
@@ -249,81 +276,89 @@ class SlurmJobGenerator:
                     'rationale': 'User requested CPU'
                 }
             elif self.partition_preference == 'fat':
+                _tech_gpus = max(1, int(np.ceil(tech_vram / 80)))
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
-                    'gpus': max(1, int(np.ceil(tech_vram / 10))),
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'gpus': _tech_gpus,
+                    # NSC recommends CPU cores proportional to GPUs on a shared node:
+                    # 128 cores / 8 GPUs per node = 16 cores per GPU.
+                    'cpus': 16 * _tech_gpus,
+                    # NSC proportional default (safe headroom over the estimate, which
+                    # the tier-selection thresholds already guarantee doesn't exceed
+                    # this): fat nodes have 256GB RAM per GPU.
+                    'mem_gb': 256 * _tech_gpus,
                     'vram_gb': tech_vram,
                     'rationale': 'User requested fat nodes'
                 }
             else:  # thin
+                _tech_gpus = max(1, int(np.ceil(tech_vram / 40)))
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'thin',
-                    'gpus': max(1, int(np.ceil(tech_vram / 5))),
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'gpus': _tech_gpus,
+                    'cpus': 16 * _tech_gpus,
+                    # thin nodes have 128GB RAM per GPU (~7995MB per core x 16 cores/GPU)
+                    'mem_gb': 128 * _tech_gpus,
                     'vram_gb': tech_vram,
                     'rationale': 'User requested thin nodes'
                 }
         else:
             # Auto-select (same logic as fit_trans)
-            if tech_vram <= 5 and tech_ram <= 64:
+            if tech_vram <= 40 and tech_ram <= 128:
                 # Single thin GPU
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'thin',
                     'gpus': 1,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 16,  # NSC: 128 cores / 8 GPUs per node = 16 cores/GPU
+                    'mem_gb': 128,  # thin: 128GB RAM per GPU, safe default over the estimate
                     'vram_gb': tech_vram,
-                    'rationale': 'Fits on 1 thin GPU (5GB VRAM, 64GB RAM)'
+                    'rationale': 'Fits on 1 thin GPU (40GB VRAM, 128GB RAM)'
                 }
-            elif tech_vram <= 10 and tech_ram <= 128:
+            elif tech_vram <= 80 and tech_ram <= 256:
                 # Single fat GPU
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 1,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 16,
+                    'mem_gb': 256,  # fat: 256GB RAM per GPU
                     'vram_gb': tech_vram,
-                    'rationale': 'Fits on 1 fat GPU (10GB VRAM, 128GB RAM)'
+                    'rationale': 'Fits on 1 fat GPU (80GB VRAM, 256GB RAM)'
                 }
-            elif tech_vram <= 20 and tech_ram <= 256:
+            elif tech_vram <= 160 and tech_ram <= 512:
                 # 2 fat GPUs
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 2,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 32,
+                    'mem_gb': 512,
                     'vram_gb': tech_vram,
-                    'rationale': 'Requires 2 fat GPUs (20GB VRAM, 256GB RAM)'
+                    'rationale': 'Requires 2 fat GPUs (160GB VRAM, 512GB RAM)'
                 }
-            elif tech_vram <= 40 and tech_ram <= 512:
+            elif tech_vram <= 320 and tech_ram <= 1024:
                 # 4 fat GPUs
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 4,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 64,
+                    'mem_gb': 1024,
                     'vram_gb': tech_vram,
-                    'rationale': 'Requires 4 fat GPUs (40GB VRAM, 512GB RAM)'
+                    'rationale': 'Requires 4 fat GPUs (320GB VRAM, 1024GB RAM)'
                 }
-            elif tech_vram <= 80 and tech_ram <= 1024:
+            elif tech_vram <= 640 and tech_ram <= 2048:
                 # 8 fat GPUs (full node)
                 resources['fit_technical'] = {
                     'partition': 'berzelius',
                     'constraint': 'fat',
                     'gpus': 8,
-                    'cpus': 1,
-                    'mem_gb': tech_ram,
+                    'cpus': 128,
+                    'mem_gb': 2048,
                     'vram_gb': tech_vram,
-                    'rationale': 'Requires 8 fat GPUs (80GB VRAM, 1024GB RAM) - full node'
+                    'rationale': 'Requires 8 fat GPUs (640GB VRAM, 2048GB RAM) - full node'
                 }
             else:
                 # Too large for GPU, use CPU
@@ -355,60 +390,60 @@ class SlurmJobGenerator:
         trans_ram = memory['fit_trans_ram_gb']
         trans_vram = memory['fit_trans_vram_gb']
 
-        if trans_vram <= 5 and trans_ram <= 64:
+        if trans_vram <= 40 and trans_ram <= 128:
             # Single thin GPU
             resources['fit_trans'] = {
                 'partition': 'berzelius',
                 'constraint': 'thin',
                 'gpus': 1,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 16,  # NSC: 128 cores / 8 GPUs per node = 16 cores/GPU
+                'mem_gb': 128,  # thin: 128GB RAM per GPU, safe default over the estimate
                 'vram_gb': trans_vram,
-                'rationale': 'Fits on 1 thin GPU (5GB VRAM, 64GB RAM)'
+                'rationale': 'Fits on 1 thin GPU (40GB VRAM, 128GB RAM)'
             }
-        elif trans_vram <= 10 and trans_ram <= 128:
+        elif trans_vram <= 80 and trans_ram <= 256:
             # Single fat GPU
             resources['fit_trans'] = {
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 1,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 16,
+                'mem_gb': 256,  # fat: 256GB RAM per GPU
                 'vram_gb': trans_vram,
-                'rationale': 'Fits on 1 fat GPU (10GB VRAM, 128GB RAM)'
+                'rationale': 'Fits on 1 fat GPU (80GB VRAM, 256GB RAM)'
             }
-        elif trans_vram <= 20 and trans_ram <= 256:
+        elif trans_vram <= 160 and trans_ram <= 512:
             # 2 fat GPUs
             resources['fit_trans'] = {
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 2,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 32,
+                'mem_gb': 512,
                 'vram_gb': trans_vram,
-                'rationale': 'Requires 2 fat GPUs (20GB VRAM, 256GB RAM)'
+                'rationale': 'Requires 2 fat GPUs (160GB VRAM, 512GB RAM)'
             }
-        elif trans_vram <= 40 and trans_ram <= 512:
+        elif trans_vram <= 320 and trans_ram <= 1024:
             # 4 fat GPUs
             resources['fit_trans'] = {
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 4,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 64,
+                'mem_gb': 1024,
                 'vram_gb': trans_vram,
-                'rationale': 'Requires 4 fat GPUs (40GB VRAM, 512GB RAM)'
+                'rationale': 'Requires 4 fat GPUs (320GB VRAM, 1024GB RAM)'
             }
-        elif trans_vram <= 80 and trans_ram <= 1024:
+        elif trans_vram <= 640 and trans_ram <= 2048:
             # 8 fat GPUs (full node)
             resources['fit_trans'] = {
                 'partition': 'berzelius',
                 'constraint': 'fat',
                 'gpus': 8,
-                'cpus': 1,
-                'mem_gb': trans_ram,
+                'cpus': 128,
+                'mem_gb': 2048,
                 'vram_gb': trans_vram,
-                'rationale': 'Requires 8 fat GPUs (80GB VRAM, 1024GB RAM) - full node'
+                'rationale': 'Requires 8 fat GPUs (640GB VRAM, 2048GB RAM) - full node'
             }
         else:
             # Too large for GPU, use CPU
@@ -525,8 +560,8 @@ class SlurmJobGenerator:
     def _print_resource_summary(self, memory: Dict, times: Dict, resources: Dict):
         """Print summary of resource allocation."""
         print(f"Memory Requirements:")
-        print(f"  fit_technical: {memory['fit_technical_ram_gb']:.1f} GB RAM, "
-              f"{memory['fit_technical_vram_gb']:.1f} GB VRAM")
+        print(f"  fit_technical: {memory['fit_ntc_ram_gb']:.1f} GB RAM, "
+              f"{memory['fit_ntc_vram_gb']:.1f} GB VRAM")
         print(f"  fit_cis:       {memory['fit_cis_ram_gb']:.1f} GB RAM, "
               f"{memory['fit_cis_vram_gb']:.1f} GB VRAM")
         print(f"  fit_trans:     {memory['fit_trans_ram_gb']:.1f} GB RAM, "
@@ -644,15 +679,16 @@ model = bayesDREAM(
 # Set technical groups
 model.set_technical_groups(['cell_line'])  # Adjust as needed
 
-# Run fit_technical
-print("Running fit_technical...")
-model.fit_technical(
+# Run fit_ntc
+print("Running fit_ntc...")
+model.fit_ntc(
     niters={niters},
     use_all_cells={use_all_cells_flag},
-    nsamples={self.nsamples}
+    nsamples={self.nsamples},
+    force_iaf={self.force_iaf}
 )
 
-print("fit_technical completed successfully")
+print("fit_ntc completed successfully")
 PYEOF
 
 echo "Job completed: $SLURM_JOB_ID"
@@ -906,7 +942,7 @@ Generated: {pd.Timestamp.now()}
 
 | Step | RAM | VRAM |
 |------|-----|------|
-| fit_technical | {memory['fit_technical_ram_gb']:.1f} GB | {memory['fit_technical_vram_gb']:.1f} GB |
+| fit_technical | {memory['fit_ntc_ram_gb']:.1f} GB | {memory['fit_ntc_vram_gb']:.1f} GB |
 | fit_cis | {memory['fit_cis_ram_gb']:.1f} GB | {memory['fit_cis_vram_gb']:.1f} GB |
 | fit_trans | {memory['fit_trans_ram_gb']:.1f} GB | {memory['fit_trans_vram_gb']:.1f} GB |
 
@@ -957,14 +993,15 @@ model = bayesDREAM(
 )
 
 model.set_technical_groups(['cell_line'])
-model.fit_technical(
+model.fit_ntc(
     niters={niters},
     use_all_cells={str(self.use_all_cells_technical)},
-    nsamples={self.nsamples}
+    nsamples={self.nsamples},
+    force_iaf={self.force_iaf}
 )
 ```
 
-**Output**: `alpha_y_prefit.pt`, `posterior_samples_technical.pt`
+**Output**: `alpha_y_prefit.pt`, `posterior_samples_ntc.pt`
 
 ### fit_cis
 
@@ -1017,14 +1054,14 @@ model.fit_trans(
 
 Each script produces logs in `logs/` with stdout and stderr:
 
-**fit_technical** (`logs/tech_*.out`):
+**fit_ntc** (`logs/tech_*.out`):
 ```
 Processing cis gene: GFI1B
 Loading data...
 Initializing bayesDREAM for cis_gene: GFI1B
-Running fit_technical...
+Running fit_ntc...
 [Pyro iteration output with ELBO values]
-fit_technical completed successfully
+fit_ntc completed successfully
 Job completed: 123456
 ```
 

@@ -317,7 +317,37 @@ These tasks represent significant architectural changes and are not planned for 
 
 ## Known Issues
 
-### None currently
+### ~~guide_covariates not implemented for high-MOI mode~~ (fixed 2026-09-09)
+
+**Status**: Implemented (`core.py`'s `_expand_guide_assignment_by_covariates`, called from `__init__`)
+
+**Description**: `guide_covariates`/`guide_covariates_ntc` previously only built the
+single-guide-mode `guide_used` column (guide name + covariate values -> per-covariate-group
+guide effect). High-MOI mode has no per-cell single-guide identity (`guide_assignment` is a
+multi-hot matrix), so these params were accepted but silently ignored there — a config could
+claim to model a covariate split that wasn't actually happening. Discovered via
+`publication_runs/morris` (high-MOI, `guide_covariates: [lane]` in config, which did nothing;
+fixed to `[]` there — lane is already handled via `set_technical_groups`/`sum_factor.covariates`,
+and this dataset has no other reason to want a guide covariate).
+
+**Implementation**: `_expand_guide_assignment_by_covariates()` splits each guide's column in
+`guide_assignment`/`guide_meta` into one column per distinct combination of covariate values
+observed among the cells carrying that guide (NTC-classified guides split by
+`guide_covariates_ntc`, all others by `guide_covariates`) — the high-MOI analogue of
+single-guide's `guide_used`. `_model_x` needed no changes — it already treats each
+`guide_assignment` column as an independent latent effect summed per-cell via matmul, so this
+is purely a data-prep step, called once at the end of `__init__` (works for both eager
+`cis_gene=...` and deferred `add_cis_gene()` workflows without any changes to the latter —
+`guide_meta['guide']` keeps the original, possibly-duplicated guide name, so
+`guide_targets_dict` lookups elsewhere keep working unchanged). No-op when both covariate
+lists are empty (the default), so existing pipelines are unaffected. Tests:
+`tests/test_high_moi.py`'s `test_covariate_expansion_*` group.
+
+**Known follow-on (not fixed)**: per-guide plots/summaries that key off
+`guide_meta['guide']` (e.g. `plotting/basic.py`'s guide bar plots) will show one row per
+(guide, covariate) column rather than one row per guide when covariates are used — correct
+information, but cosmetically unlabeled (no dedicated column render distinguishing the split
+in those specific plots yet; `guide_meta['guide_covariate_key']` has the value).
 
 If you discover issues, please document them here with:
 - Description of the issue

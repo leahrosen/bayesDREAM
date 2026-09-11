@@ -23,7 +23,9 @@ class ATACModalityMixin:
         name: str = 'atac',
         cis_region: Optional[str] = None,
         cell_names: Optional[List[str]] = None,
-        overwrite: bool = False
+        overwrite: bool = False,
+        feature_name_col: Optional[str] = None,
+        feature_names: Optional[list] = None,
     ):
         """
         Add ATAC-seq modality with genomic region annotations.
@@ -62,6 +64,23 @@ class ATACModalityMixin:
             Should match number of cells (axis 1 for 2D data).
         overwrite : bool, default=False
             Whether to overwrite existing modality with the same name
+        feature_name_col : str, optional
+            Column of `region_meta` to use as the authoritative per-region
+            identifier (`feature_id`) instead of the default `region_id`
+            index. Mutually exclusive with `feature_names` — passing both
+            raises ValueError. Every value in this column must be a non-null
+            string and unique among the regions actually kept (after
+            zero-std filtering); violations raise ValueError. Applied
+            consistently to both this modality and the 'cis' modality (when
+            `cis_region` triggers its creation). See `Modality.__init__`'s
+            "Feature identity resolution" docstring section for the full
+            priority used when neither this nor `feature_names` is given.
+        feature_names : list of str, optional
+            Explicit feature_id list, one entry per row of `region_meta`
+            (same order), i.e. before zero-std filtering — sliced down to
+            the regions actually kept. Mutually exclusive with
+            `feature_name_col`. Applied consistently to both this modality
+            and the 'cis' modality (when `cis_region` triggers its creation).
 
         Examples
         --------
@@ -75,9 +94,25 @@ class ATACModalityMixin:
         >>> # Now 'cis' modality exists from ATAC region
         >>>
         >>> # Fit using either approach
-        >>> model.fit_technical()
+        >>> model.fit_ntc()
         >>> model.fit_cis()
         """
+        if feature_name_col is not None and feature_names is not None:
+            raise ValueError("Provide either feature_name_col or feature_names, not both.")
+        if feature_names is not None and len(feature_names) != len(region_meta):
+            raise ValueError(
+                f"feature_names has length {len(feature_names)} but region_meta has "
+                f"{len(region_meta)} rows. It must be one entry per row of region_meta "
+                f"(before zero-std filtering)."
+            )
+        # Keyed by region_id (before region_id becomes the index below) so the explicit
+        # override survives both this modality's zero-std filtering and the separate
+        # 'cis' extraction below, which slices the pre-Modality region_meta independently.
+        region_id_to_feature_name = (
+            dict(zip(region_meta['region_id'], feature_names))
+            if feature_names is not None else None
+        )
+
         # Validate required columns
         required_cols = ['region_id', 'region_type', 'chrom', 'start', 'end', 'gene']
         missing_cols = set(required_cols) - set(region_meta.columns)
@@ -167,6 +202,13 @@ class ATACModalityMixin:
         else:
             counts_final = counts_array
 
+        # An explicit full-panel feature_names list (keyed by region_id) is looked up for
+        # the regions actually kept after zero-std filtering.
+        atac_feature_names = (
+            [region_id_to_feature_name[rid] for rid in region_meta.index]
+            if region_id_to_feature_name is not None else None
+        )
+
         # Create modality
         modality = Modality(
             name=name,
@@ -174,7 +216,10 @@ class ATACModalityMixin:
             feature_meta=region_meta,
             distribution='negbinom',  # ATAC uses negbinom like gene expression
             cells_axis=1,
-            cell_names=extracted_cell_names
+            cell_names=extracted_cell_names,
+            feature_name_col=feature_name_col,
+            feature_names=atac_feature_names,
+            is_gene_identity=False,
         )
 
         self.add_modality(name, modality, overwrite=overwrite)
@@ -201,13 +246,21 @@ class ATACModalityMixin:
 
             cis_region_meta = region_meta.loc[[cis_region]].copy()
 
+            cis_feature_name_single = (
+                [region_id_to_feature_name[cis_region]]
+                if region_id_to_feature_name is not None else None
+            )
+
             cis_modality = Modality(
                 name='cis',
                 counts=cis_counts_df,
                 feature_meta=cis_region_meta,
                 distribution='negbinom',
                 cells_axis=1,
-                cell_names=extracted_cell_names
+                cell_names=extracted_cell_names,
+                feature_name_col=feature_name_col,
+                feature_names=cis_feature_name_single,
+                is_gene_identity=False,
             )
             self.add_modality('cis', cis_modality, overwrite=False)
             print(f"[INFO] Created 'cis' modality with ATAC region '{cis_region}'")

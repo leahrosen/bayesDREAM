@@ -44,6 +44,7 @@ setup(
         'pyro-ppl>=1.9.0',
         'matplotlib>=3.7',
         'seaborn>=0.12',
+        'adjustText>=1.0.0',  # Non-overlapping label placement for volcano plots
         'h5py>=3.8.0',
         'typer>=0.12.0',
         'pyyaml>=6.0.0',

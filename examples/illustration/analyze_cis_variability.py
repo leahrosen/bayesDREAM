@@ -116,7 +116,7 @@ for seed_i in range(N_SEEDS):
             device="cpu", random_seed=seed,
         )
         model.set_technical_groups(["cell_line"])
-        model.fit_technical(
+        model.fit_ntc(
             modality_name="gene", sum_factor_col="sum_factor",
             niters=3000, nsamples=100, tolerance=1e-4,
         )

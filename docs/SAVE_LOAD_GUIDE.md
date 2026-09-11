@@ -3,7 +3,7 @@
 ## Overview
 
 bayesDREAM provides methods to save and load fitted parameters at each stage of the pipeline:
-1. **Technical fit** (`fit_technical`) → `save_technical_fit()` / `load_technical_fit()`
+1. **Technical fit** (`fit_ntc`) → `save_ntc_fit()` / `load_ntc_fit()`
 2. **Cis fit** (`fit_cis`) → `save_cis_fit()` / `load_cis_fit()`
 3. **Trans fit** (`fit_trans`) → `save_trans_fit()` / `load_trans_fit()`
 
@@ -18,7 +18,7 @@ This allows you to:
 
 | Method | Saves | File(s) Created | Modality Control |
 |--------|-------|-----------------|------------------|
-| `save_technical_fit()` | Technical parameters | `alpha_x_prefit.pt`, `alpha_y_prefit.pt`, `posterior_samples_technical.pt`, `alpha_y_prefit_{modality}.pt` | `modalities=` |
+| `save_ntc_fit()` | Technical parameters | `alpha_x_prefit.pt`, `alpha_y_prefit.pt`, `posterior_samples_ntc.pt`, `alpha_y_prefit_{modality}.pt` | `modalities=` |
 | `save_cis_fit()` | Cis parameters | `x_true.pt`, `posterior_samples_cis.pt` | N/A (cis is model-level) |
 | `save_trans_fit()` | Trans parameters | `posterior_samples_trans.pt`, `posterior_samples_trans_{modality}.pt` | `modalities=` |
 
@@ -26,7 +26,7 @@ This allows you to:
 
 | Method | Loads | Required Files | Modality Control |
 |--------|-------|----------------|------------------|
-| `load_technical_fit()` | Technical parameters | `alpha_x_prefit.pt`, `alpha_y_prefit.pt`, etc. | `modalities=` |
+| `load_ntc_fit()` | Technical parameters | `alpha_x_prefit.pt`, `alpha_y_prefit.pt`, etc. | `modalities=` |
 | `load_cis_fit()` | Cis parameters | `x_true.pt`, `posterior_samples_cis.pt` | N/A (cis is model-level) |
 | `load_trans_fit()` | Trans parameters | `posterior_samples_trans.pt`, etc. | `modalities=` |
 
@@ -34,25 +34,25 @@ This allows you to:
 
 ### 1. Save Technical Fit
 
-After running `fit_technical()`:
+After running `fit_ntc()`:
 
 ```python
 model = bayesDREAM(...)
 model.set_technical_groups(['cell_line'])
-model.fit_technical(modality_name='gene', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='gene', sum_factor_col='sum_factor')
 
 # Save all modalities to default output_dir
-model.save_technical_fit()
+model.save_ntc_fit()
 
 # Or specify custom directory
-model.save_technical_fit(output_dir='./my_results/technical/')
+model.save_ntc_fit(output_dir='./my_results/technical/')
 
 # Save specific modalities only
-model.save_technical_fit(modalities=['gene', 'atac'])
+model.save_ntc_fit(modalities=['gene', 'atac'])
 
 # Note: Model-level parameters are automatically saved when primary modality is included
 # If you save only non-primary modalities, model-level params are skipped automatically
-model.save_technical_fit(modalities=['atac'])  # Skips model-level (primary is 'gene')
+model.save_ntc_fit(modalities=['atac'])  # Skips model-level (primary is 'gene')
 ```
 
 **What Gets Saved**:
@@ -60,7 +60,7 @@ model.save_technical_fit(modalities=['atac'])  # Skips model-level (primary is '
 Model-level (automatically saved when primary modality is included):
 - `alpha_x_prefit.pt`: Overdispersion for cis gene (if exists)
 - `alpha_y_prefit.pt`: Overdispersion for trans genes (primary modality, backward compat)
-- `posterior_samples_technical.pt`: Full posterior samples (primary modality)
+- `posterior_samples_ntc.pt`: Full posterior samples (primary modality)
 
 Per-modality (for each modality in `modalities` list):
 - `alpha_y_prefit_{modality}.pt`: Per-modality overdispersion
@@ -70,7 +70,7 @@ Per-modality (for each modality in `modalities` list):
 output_dir/
 ├── alpha_x_prefit.pt
 ├── alpha_y_prefit.pt
-├── posterior_samples_technical.pt
+├── posterior_samples_ntc.pt
 ├── alpha_y_prefit_gene.pt
 ├── alpha_y_prefit_splicing_donor.pt
 └── ...
@@ -84,35 +84,41 @@ Before running `fit_cis()`:
 model = bayesDREAM(...)
 
 # Load all modalities from default output_dir
-model.load_technical_fit()
+model.load_ntc_fit()
 
 # Or specify custom directory
-model.load_technical_fit(input_dir='./my_results/technical/')
+model.load_ntc_fit(input_dir='./my_results/technical/')
 
-# Use posterior samples (default)
-model.load_technical_fit(use_posterior=True)
+# Load full posterior samples (default)
+model.load_ntc_fit()
 
-# Or use point estimates (posterior mean)
-model.load_technical_fit(use_posterior=False)
+# Or collapse to lean point estimates (median + 2.5%/97.5% CI sibling keys)
+model.load_ntc_fit(lean=True)
 
 # Load specific modalities only
-model.load_technical_fit(modalities=['gene', 'atac'])
+model.load_ntc_fit(modalities=['gene', 'atac'])
 
 # Note: Model-level parameters are automatically loaded when primary modality is included
 # If you load only non-primary modalities, model-level params are skipped automatically
-model.load_technical_fit(modalities=['atac'])  # Skips model-level (primary is 'gene')
+model.load_ntc_fit(modalities=['atac'])  # Skips model-level (primary is 'gene')
 ```
 
 **Parameters**:
 - `input_dir`: Directory containing saved files (default: `self.output_dir`)
-- `use_posterior`: If `True`, loads full posterior samples. If `False`, uses posterior mean as point estimate
+- `lean`: If `True`, collapses each modality's `posterior_samples_ntc` to point estimates
+  (median, plus `<key>_lower`/`<key>_upper` 2.5%/97.5% sibling keys) instead of keeping
+  the full multi-sample tensors. Safe for summary export and pipeline continuation; not
+  safe for most of `bayesDREAM.plotting`, which reads raw per-draw samples for
+  uncertainty bands. Default `False` (full load).
 - `modalities`: List of modality names to load (default: all available modalities)
 
 **What Happens**:
-- Sets `self.alpha_x_prefit` and `self.alpha_x_type`
-- Sets `self.alpha_y_prefit` and `self.alpha_y_type`
-- Loads `self.posterior_samples_technical`
-- Loads per-modality `alpha_y_prefit` for each modality
+- Sets `self.alpha_x_prefit` (a `[C]` point estimate — the posterior median, taken at
+  fit time regardless of `lean`)
+- Sets each modality's `alpha_y_prefit`/`alpha_y_prefit_mult`/`alpha_y_prefit_add`
+  (also point estimates taken at fit time)
+- Loads `self.posterior_samples_ntc` per modality (full multi-sample, or lean-reduced
+  if `lean=True`)
 
 ### 3. Save Cis Fit
 
@@ -139,18 +145,19 @@ Before running `fit_trans()`:
 model = bayesDREAM(...)
 
 # Load technical fit first (required for alpha_y)
-model.load_technical_fit()
+model.load_ntc_fit()
 
 # Load cis fit
 model.load_cis_fit()
 
-# Or with point estimates
-model.load_cis_fit(use_posterior=False)
+# Or with lean point estimates (median + CI sibling keys, smaller footprint)
+model.load_cis_fit(lean=True)
 ```
 
 **What Happens**:
-- Sets `self.x_true` and `self.x_true_type`
-- Loads `self.posterior_samples_cis`
+- Sets `self.x_true` and `self.log2_x_true` (`[N_cells]` point estimates — the
+  posterior median, taken at fit time regardless of `lean`)
+- Loads `self.posterior_samples_cis` (full multi-sample, or lean-reduced if `lean=True`)
 
 ### 5. Save Trans Fit
 
@@ -185,7 +192,7 @@ For downstream analysis:
 model = bayesDREAM(...)
 
 # Load all previous fits
-model.load_technical_fit()
+model.load_ntc_fit()
 model.load_cis_fit()
 model.load_trans_fit()
 
@@ -223,8 +230,8 @@ model = bayesDREAM(
 
 # Stage 1: Technical
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
-model.save_technical_fit()
+model.fit_ntc(sum_factor_col='sum_factor')
+model.save_ntc_fit()
 
 # Stage 2: Cis
 model.fit_cis(sum_factor_col='sum_factor')
@@ -247,8 +254,8 @@ counts = pd.read_csv('counts.csv', index_col=0)
 
 model = bayesDREAM(meta=meta, counts=counts, cis_gene='GFI1B', output_dir='./results/')
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
-model.save_technical_fit()
+model.fit_ntc(sum_factor_col='sum_factor')
+model.save_ntc_fit()
 ```
 
 **Script 2: `run_cis.py`**
@@ -262,7 +269,7 @@ counts = pd.read_csv('counts.csv', index_col=0)
 model = bayesDREAM(meta=meta, counts=counts, cis_gene='GFI1B', output_dir='./results/')
 
 # Load previous fit
-model.load_technical_fit()
+model.load_ntc_fit()
 
 # Continue with cis
 model.fit_cis(sum_factor_col='sum_factor')
@@ -280,7 +287,7 @@ counts = pd.read_csv('counts.csv', index_col=0)
 model = bayesDREAM(meta=meta, counts=counts, cis_gene='GFI1B', output_dir='./results/')
 
 # Load previous fits
-model.load_technical_fit()
+model.load_ntc_fit()
 model.load_cis_fit()
 
 # Continue with trans
@@ -296,14 +303,14 @@ model = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_covari
 model.add_atac_modality(atac_counts, region_meta)
 
 model.set_technical_groups(['cell_line'])
-model.fit_technical(modality_name='gene', sum_factor_col='sum_factor')
-model.save_technical_fit()  # Saves alpha_x_prefit, alpha_y_prefit, alpha_y_prefit_atac
+model.fit_ntc(modality_name='gene', sum_factor_col='sum_factor')
+model.save_ntc_fit()  # Saves alpha_x_prefit, alpha_y_prefit, alpha_y_prefit_atac
 
 # Stage 2: Load and fit cis
 model2 = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_covariates=['cell_line'])
 model2.add_atac_modality(atac_counts, region_meta)
 
-model2.load_technical_fit()  # Loads all technical parameters including per-modality
+model2.load_ntc_fit()  # Loads all technical parameters including per-modality
 model2.fit_cis(sum_factor_col='sum_factor')
 model2.save_cis_fit()
 
@@ -311,7 +318,7 @@ model2.save_cis_fit()
 model3 = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B', guide_covariates=['cell_line'])
 model3.add_atac_modality(atac_counts, region_meta)
 
-model3.load_technical_fit()
+model3.load_ntc_fit()
 model3.load_cis_fit()
 model3.fit_trans(modality_name='atac', sum_factor_col='sum_factor_adj', function_type='additive_hill')
 model3.save_trans_fit()  # Saves posterior_samples_trans_atac.pt
@@ -326,19 +333,19 @@ model.add_atac_modality(atac_counts, region_meta)
 model.add_splicing_modality(sj_counts, sj_meta, splicing_types=['donor'])
 
 model.set_technical_groups(['cell_line'])
-model.fit_technical(modality_name='gene', sum_factor_col='sum_factor')
-model.fit_technical(modality_name='atac', sum_factor_col='sum_factor')
-model.fit_technical(modality_name='splicing_donor', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='gene', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='atac', sum_factor_col='sum_factor')
+model.fit_ntc(modality_name='splicing_donor', sum_factor_col='sum_factor')
 
 # Save only specific modalities
-model.save_technical_fit(modalities=['gene', 'atac'])  # Skip splicing_donor
+model.save_ntc_fit(modalities=['gene', 'atac'])  # Skip splicing_donor
 
 # In a new session, load only what you need
 model2 = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B')
 model2.add_atac_modality(atac_counts, region_meta)
 # Note: No need to add splicing_donor if we're not loading it
 
-model2.load_technical_fit(modalities=['gene'])  # Load only gene
+model2.load_ntc_fit(modalities=['gene'])  # Load only gene
 model2.fit_cis(sum_factor_col='sum_factor')
 model2.save_cis_fit()
 
@@ -346,7 +353,7 @@ model2.save_cis_fit()
 model3 = bayesDREAM(meta=meta, counts=gene_counts, cis_gene='GFI1B')
 model3.add_atac_modality(atac_counts, region_meta)
 
-model3.load_technical_fit(modalities=['gene', 'atac'])  # Load both
+model3.load_ntc_fit(modalities=['gene', 'atac'])  # Load both
 model3.load_cis_fit()
 
 # Fit trans on ATAC, save only ATAC trans results
@@ -354,29 +361,38 @@ model3.fit_trans(modality_name='atac', sum_factor_col='sum_factor_adj')
 model3.save_trans_fit(modalities=['atac'])  # Model-level skipped automatically (primary is 'gene')
 ```
 
-## Posterior Samples vs Point Estimates
+## Posterior Samples vs Lean Point Estimates
 
-By default, `load_*_fit()` methods load full posterior samples. You can optionally use point estimates (posterior means) for:
-- **Faster loading**: Smaller memory footprint
-- **Compatibility**: Some downstream tools may expect point estimates
-- **Speed**: Faster computation in subsequent stages
+`alpha_x_prefit`/`alpha_y_prefit`/`x_true`/`log2_x_true` are always point estimates
+(the posterior **median**, taken once at fit time) — there is no `use_posterior`
+switch for those; they are never stored as full multi-sample tensors.
 
-### Using Point Estimates
+What `lean` controls is the accompanying `posterior_samples_ntc`/`posterior_samples_cis`
+dict, which by default keeps the full multi-sample draws (needed for uncertainty bands
+in `bayesDREAM.plotting`, FDR computation, etc.). Passing `lean=True` to `load_*_fit()`
+collapses those to a point estimate (median) plus `<key>_lower`/`<key>_upper`
+(2.5%/97.5%) sibling keys, discarding the raw per-draw samples, for:
+- **Faster loading / smaller memory footprint**: the dominant cost at scale
+  (e.g. 1000 posterior draws × every technical group × every feature)
+- **Pipeline continuation**: `save_ntc_summary`/`save_cis_summary`/`add_cis_gene`/
+  `fit_cis`/`refit_sumfactor` only ever read point estimates from these dicts anyway
+
+### Using Lean Loading
 
 ```python
-# Load as point estimates
-model.load_technical_fit(use_posterior=False)  # alpha_x_type='point', alpha_y_type='point'
-model.load_cis_fit(use_posterior=False)        # x_true_type='point'
+# Collapse posterior_samples_ntc / posterior_samples_cis to point estimates
+model.load_ntc_fit(lean=True)
+model.load_cis_fit(lean=True)
 ```
 
 ### When to Use Each
 
 | Scenario | Recommendation |
 |----------|---------------|
-| Full Bayesian uncertainty propagation | `use_posterior=True` (default) |
-| Quick exploratory analysis | `use_posterior=False` |
-| Memory constrained environment | `use_posterior=False` |
-| Final publication-quality results | `use_posterior=True` |
+| Full Bayesian uncertainty propagation, plotting posterior draws | `lean=False` (default) |
+| Summary export / pipeline continuation only | `lean=True` |
+| Memory constrained environment | `lean=True` |
+| Final publication-quality results (plots need real CIs) | `lean=False` |
 
 ## Modality-Specific Parameters
 
@@ -385,36 +401,36 @@ model.load_cis_fit(use_posterior=False)        # x_true_type='point'
 **Use Case 1: Save Storage Space**
 ```python
 # If you only need gene expression results, don't save ATAC
-model.save_technical_fit(modalities=['gene'])
+model.save_ntc_fit(modalities=['gene'])
 model.save_trans_fit(modalities=['gene'])
 ```
 
 **Use Case 2: Selective Loading for Speed**
 ```python
 # Load only what you need for this analysis
-model.load_technical_fit(modalities=['gene'])  # Skip loading large ATAC arrays
+model.load_ntc_fit(modalities=['gene'])  # Skip loading large ATAC arrays
 ```
 
 **Use Case 3: Incremental Fitting**
 ```python
 # Fit and save modalities one at a time
-model.fit_technical(modality_name='gene', ...)
-model.save_technical_fit(modalities=['gene'])  # Includes model-level (primary)
+model.fit_ntc(modality_name='gene', ...)
+model.save_ntc_fit(modalities=['gene'])  # Includes model-level (primary)
 
-model.fit_technical(modality_name='atac', ...)
-model.save_technical_fit(modalities=['atac'])  # Skips model-level (not primary)
+model.fit_ntc(modality_name='atac', ...)
+model.save_ntc_fit(modalities=['atac'])  # Skips model-level (not primary)
 ```
 
 **Use Case 4: Different Compute Resources**
 ```python
 # Fit heavy modalities on HPC, lighter ones locally
 # On HPC:
-model.fit_technical(modality_name='atac', ...)
-model.save_technical_fit(modalities=['atac'])  # Skips model-level automatically
+model.fit_ntc(modality_name='atac', ...)
+model.save_ntc_fit(modalities=['atac'])  # Skips model-level automatically
 
 # On local machine:
-model.load_technical_fit(modalities=['gene'])  # From previous run
-model.load_technical_fit(modalities=['atac'])  # From HPC
+model.load_ntc_fit(modalities=['gene'])  # From previous run
+model.load_ntc_fit(modalities=['atac'])  # From HPC
 ```
 
 ### Automatic Model-Level Behavior
@@ -427,9 +443,9 @@ model.load_technical_fit(modalities=['atac'])  # From HPC
 **Example**:
 ```python
 # Primary modality is 'gene'
-model.save_technical_fit(modalities=['gene'])  # Saves model-level params
-model.save_technical_fit(modalities=['atac'])  # Skips model-level params
-model.save_technical_fit(modalities=['gene', 'atac'])  # Saves model-level params
+model.save_ntc_fit(modalities=['gene'])  # Saves model-level params
+model.save_ntc_fit(modalities=['atac'])  # Skips model-level params
+model.save_ntc_fit(modalities=['gene', 'atac'])  # Saves model-level params
 ```
 
 ## Advanced: Manual Save/Load
@@ -469,7 +485,7 @@ If per-modality files aren't loaded:
 ### Memory Issues
 
 If loading large posteriors causes memory issues:
-- Use `use_posterior=False` to load point estimates
+- Use `lean=True` to collapse `posterior_samples_ntc`/`posterior_samples_cis` to point estimates
 - Consider loading only necessary components manually
 
 ## Migration from Old run_pipeline Scripts
@@ -485,21 +501,22 @@ model.set_alpha_x(alpha_y[:,:,model.counts.index.values == model.cis_gene].mean(
 
 **New way**:
 ```python
-model.save_technical_fit()
-model.load_technical_fit()  # Automatically handles alpha_x and alpha_y extraction
+model.save_ntc_fit()
+model.load_ntc_fit()  # Automatically handles alpha_x and alpha_y extraction
 ```
 
 The new methods:
 - ✅ Handle cis gene extraction automatically
 - ✅ Support per-modality parameters
 - ✅ Provide consistent interface
-- ✅ Include proper type tracking ('posterior' vs 'point')
+- ✅ Always store point estimates (posterior median) for alpha_x/alpha_y/x_true;
+  `lean=True` additionally collapses the accompanying posterior-sample dicts
 
 ## Summary
 
 - Use `save_*_fit()` after each pipeline stage
 - Use `load_*_fit()` before the next stage
-- Set `use_posterior=False` for faster loading with point estimates
+- Set `lean=True` for faster loading with smaller posterior-sample dicts
 - Per-modality parameters are saved/loaded automatically
 - Default `output_dir` is used unless specified
 
