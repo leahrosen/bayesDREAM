@@ -492,3 +492,76 @@ three small batches (40+40+30=110 cells) that pool to a valid size --
 correctly succeeds, scran called with `{'b1': 152, '_pooled_small_batches':
 110}`, and the real `batch` column in the written `meta.csv` came back
 with all four original distinct values, unmutated.
+
+## 13. NTC/target `batch` format mismatch -- a real, foundational bug (2026-09-11)
+
+A real `01b_subset_GFI1B_bm.sh` run produced a subset with **0 cells total**
+-- not just "NTC restricted to 0," the entire model (NTC + GFI1B) collapsed
+to exactly 85,711 cells, i.e. GFI1B's own cells vanished too, BEFORE
+`batch_match_ntc`/`select_ntc_guides` even ran. Root cause traced through a
+live debugging session with the user (who correctly rejected my first two
+guesses -- dropping `batch` from the technical grouping, and assuming NTC
+genuinely lacks per-batch representation -- both wrong):
+
+**The bug**: `NTC/cell_meta.csv`'s `batch` column is a bare, PER-EXPERIMENT
+integer (`1`, `42`, ...) -- confirmed dtype `int64`, confirmed reused
+independently across `experiment` values (`batch=1` exists in both
+`essential` and `gwps`). `cell_meta_full.parquet` (the source for the 7
+cis genes' own cells) formats the SAME real batches as
+`f"{experiment}-{batch}"` strings (`"essential-1"`, `"gwps-42"`) --
+confirmed by cross-referencing the exact same cell ID
+(`essential:AAGTCGTCAAGCCCAC-1`) in both files: `NTC/cell_meta.csv` shows
+`batch=1, experiment='essential'`; `cell_meta_full.parquet` shows
+`batch='essential-1'` for that identical cell. `preprocess.py` concatenates
+NTC rows (from `NTC/cell_meta.csv`) with the 7 genes' rows (sliced from
+`cell_meta_full.parquet`) -- so before this fix, `combined_meta['batch']`
+mixed two incompatible string representations of the SAME real batches,
+meaning NTC and target-gene cells could never match on `batch`, no matter
+how abundant NTC's true per-batch representation actually is (confirmed:
+75,050 NTC cells in the `gwps` experiment alone, ~275/batch on average --
+the user's original claim, which was correct).
+
+**Consequences of leaving it unfixed** (both real, both observed):
+1. `set_technical_groups()`'s built-in safeguard ("cells in technical
+   groups with no NTC representation are dropped") saw zero NTC
+   representation for every one of the 7 genes' own (mis-formatted)
+   batches and dropped all 1095 non-NTC cells across all 7 genes during
+   `subset_per_gene.py`'s own model construction.
+2. `bm`'s `batch_match_ntc` restriction independently found zero NTC cells
+   in any batch matching a gene's own cells, for the same reason --
+   confirmed in the same run: "batch_match_ntc ... drops 85711 NTC cell(s)
+   (0/85711 cells kept by this step alone)".
+3. Not yet observed but certain: `ntc_shared`'s ALREADY-COMPLETED GPU fit
+   was itself built from `meta_ntc.csv`, so its own `alpha_x_prefit`/
+   `alpha_y_prefit`/`technical_group_labels.csv` are keyed by the WRONG
+   (bare-int) batch identity throughout -- every one of the 7 genes' cells
+   would have hit `load_ntc_fit()`'s "covariate combination never seen
+   during the NTC fit" raise (the *other* recent bayesDREAM fix, §10) had
+   the pipeline gotten that far for any gene.
+
+**Fix**: `_fix_ntc_batch_format()` in `preprocess.py`, applied inside
+`_read_full_ntc()` right after loading `NTC/cell_meta.csv` (so both the
+combined `meta.csv` and the NTC-only `meta_ntc.csv` inherit it): reformat
+`batch` to `f"{experiment}-{batch}"`, matching `cell_meta_full.parquet`'s
+own convention exactly. Also incidentally fixes a second, subtler bug this
+uncovered: bare batch numbers being reused across experiments meant
+anything grouping by `batch` alone (not crossed with `experiment`) --
+`sum_factor.covariates: [batch]`, `bm`'s `batch_match_ntc` -- would have
+silently conflated two unrelated real batches that happened to share a
+number. The reformatted value is globally unique across experiments, so
+this stops being a risk even without `experiment` alongside it.
+
+Verified via a synthetic fixture reproducing the exact bug shape (NTC with
+bare-int `batch` + `experiment` reused across two experiments incl. a
+genuine `batch=1`-in-both-experiments collision; a target gene with
+already-`"gwps-N"`-prefixed batches): confirmed zero overlap before the
+fix's logic would apply, and confirmed `{'gwps-1', 'gwps-2'}` correctly
+overlapping between NTC and the target gene's cells after it.
+
+**Action required, not optional**: `ntc_shared`'s completed fit and the
+already-attempted `01b_subset_GFI1B_bm.sh` output are both built from the
+pre-fix data and must be regenerated -- rerun `preprocess.py`, then redo
+`01_ntc_shared.sh` from scratch, then regenerate every gene's subset
+output. No `generate_slurm.py`/`config.yaml` changes needed -- this was
+purely a `preprocess.py` data-construction bug, not a pipeline-structure
+one.

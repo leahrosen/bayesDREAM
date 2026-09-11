@@ -199,11 +199,49 @@ def _bin_small_batches(meta: pd.DataFrame, batch_col: str, min_size: int) -> pd.
     return binned
 
 
+def _fix_ntc_batch_format(cell_meta: pd.DataFrame) -> pd.DataFrame:
+    """Reformat NTC/cell_meta.csv's `batch` column from a bare, PER-EXPERIMENT
+    integer (e.g. 1, 42 -- reused independently across experiments) to the
+    same `f"{experiment}-{batch}"` string convention `cell_meta_full.parquet`
+    uses for every cell, NTC and target-gene alike (confirmed 2026-09-11:
+    cell_meta_full's own 2500 NTC rows -- essential-experiment only, it has
+    none from gwps -- show batch='essential-1' for the exact same cell
+    NTC/cell_meta.csv records as batch=1, experiment='essential'; GFI1B's
+    own cells show batch='gwps-42' etc., same pattern).
+
+    Without this, NTC/cell_meta.csv's bare int batch values can never match
+    any of the 7 cis genes' own (already-prefixed) batch values, even
+    though the real experimental design has abundant NTC representation in
+    EVERY batch (confirmed: 75,050 NTC cells in the `gwps` experiment alone,
+    ~275 cells per batch on average) -- `set_technical_groups()`'s own
+    "cells in technical groups with no NTC representation are dropped"
+    safeguard then silently drops EVERY target-gene cell (all 1095 of them
+    across the 7 genes, in the real run that surfaced this), and
+    `batch_match_ntc`'s restriction independently zeroes out the entire NTC
+    pool for the same reason. See STRATEGY.md's dedicated section for the
+    full investigation.
+
+    Also fixes a related, less visible bug: bare batch numbers are reused
+    independently PER experiment (e.g. `batch=1` exists in both `essential`
+    and `gwps`), so anything grouping by `batch` alone (not crossed with
+    `experiment`) would have silently conflated two unrelated real batches.
+    The reformatted value is globally unique across experiments, so this
+    stops being a risk even where `batch` is used without `experiment`
+    alongside it (e.g. `sum_factor.covariates`, `bm_selected_ntc_guides`'
+    batch_match_ntc).
+    """
+    cell_meta = cell_meta.copy()
+    cell_meta["batch"] = cell_meta["experiment"].astype(str) + "-" + cell_meta["batch"].astype(str)
+    return cell_meta
+
+
 def _read_full_ntc(indir: str):
     """Read the FULL NTC population from <indir>/NTC/ -- same files
     tmp/06_bayesDREAM_fit_ntc_combined.ipynb reads, including its own two
     alignment assertions. Returns (cell_meta, gene_meta, counts_sp) with
     counts_sp's rows in gene_meta's order and columns in cell_meta's order.
+    `cell_meta['batch']` is reformatted per `_fix_ntc_batch_format` before
+    being returned -- see that function's docstring.
     """
     ntc_dir = os.path.join(indir, "NTC")
     cell_meta = pd.read_csv(os.path.join(ntc_dir, "cell_meta.csv"))
@@ -216,6 +254,8 @@ def _read_full_ntc(indir: str):
         raise ValueError("NTC/gene_meta.csv and NTC/gene_counts_genes.npy are not row-aligned.")
     if not (cell_meta["cell"].to_numpy() == counts_cells).all():
         raise ValueError("NTC/cell_meta.csv and NTC/gene_counts_cells.npy are not column-aligned.")
+
+    cell_meta = _fix_ntc_batch_format(cell_meta)
 
     return cell_meta, gene_meta, counts_sp
 

@@ -123,6 +123,19 @@ for `common/slurm/list_job_status.py`.
    `fastparquet` (not the default `pyarrow`, which has a confirmed bug
    against these exact files) -- install into `bayesdream_cpu` if missing.
 
+   **`batch` format fix (2026-09-11, `STRATEGY.md` §13)**: `NTC/cell_meta.csv`'s
+   `batch` was a bare per-experiment integer, while `cell_meta_full.parquet`
+   (the 7 genes' own source) formats the same real batches as
+   `f"{experiment}-{batch}"` -- meaning NTC and target-gene cells could
+   never match on `batch` at all, even though NTC is genuinely abundant in
+   every real batch. `preprocess.py` now reformats `NTC/cell_meta.csv`'s
+   `batch` to match before combining. **If you already ran `preprocess.py`
+   and/or `01_ntc_shared.sh` before this fix, both are built from the wrong
+   batch identity and must be redone from scratch** -- rerun
+   `preprocess.py`, then resubmit `01_ntc_shared.sh`, then regenerate every
+   gene's `01b_subset_*.sh` output (the already-produced 0-cell GFI1B `bm`
+   subset is stale).
+
    ```bash
    python preprocess.py \
      --indir /cfs/klemming/projects/snic/lappalainen_lab1/users/lisetts/Replogle_data/pr_data/for_bayesDREAM/K562_combined \
