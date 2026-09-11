@@ -188,10 +188,43 @@ unrestricted coverage).
 | stage | data variant | partition | time | cores | status |
 |---|---|---|---|---|---|
 | `ntc_shared` | (all NTC) | GPU (1 gpu) | 24h | 8 | fixed -- GPU jobs don't need profiling (see below) |
-| `subset` (both variants) | full combined panel + `add_cis_gene()` | CPU | 4h | 10 | **placeholder -- see profiling below** |
-| `cis` (all 3 variants) | `cis_only` (1 gene) + transient full-panel ntc load | CPU | 24h | 4 | **placeholder -- see profiling below** |
-| `trans` (`bm_indmu`/`bm_noindmu`) | `full`, batch-matched | CPU | 24h | 8 | **placeholder -- see profiling below** |
+| `subset` (both variants) | full combined panel + `add_cis_gene()` | `main` (full node) | 4h | 128 (placeholder) | **measured 102GB -- see "Full-node CPU stages" below** |
+| `cis` (all 3 variants) | `cis_only` (1 gene) + transient full-panel ntc load | `main` (full node) | 24h | 128 (placeholder) | **inferred from subset's measurement -- see below** |
+| `trans` (`bm_indmu`/`bm_noindmu`) | `full`, batch-matched | CPU (`shared`) | 24h | 8 | **placeholder -- see profiling below** |
 | `trans` (`all_indmu`) | `full`, all NTC | GPU (1 gpu) | 24h | 8 | fixed, not profiled (see rationale below) |
+
+## Full-node CPU stages (`subset`/`cis`, `cluster.partition_main`)
+
+Per-instruction (2026-09-11): any CPU stage whose real profiled peak memory
+exceeds ~50% of a node gets a full `main`-partition node instead of a
+fractional `--cpus-per-task` request on `shared` (which bills memory
+strictly at 888MB/core -- a 100GB+ job would need a ~115-core request
+there anyway, most of a node either way, just accounted per-core instead
+of as one exclusive allocation).
+
+**`subset` -- real measurement**, `common/profile_memory.py --stage cis
+--ntc-shared-dir <ntc_shared output>` against a `bm`-variant
+`*_subset_input.yaml` config (this reproduces `subset_per_gene.py`'s own
+two most expensive steps exactly -- see `config.yaml`'s comment):
+model construction on the full 86,806-cell combined panel (47.5s, 26GB),
+then `load_ntc_fit()`+`add_cis_gene()` -- the dominant cost -- jumping to
+**102,026 MB peak**.
+
+**`cis` -- inferred, not yet directly measured**: the real `cis` stage pays
+the identical `load_ntc_fit()+add_cis_gene()` call against the same
+`ntc_shared` posterior; its own construction starts from the already-tiny
+`cis_only/` file rather than the full panel, so its real peak is likely
+somewhat below `subset`'s 102GB, but almost certainly still over half a
+node. Re-profile once a real `01b_subset_<gene>_bm.sh` has actually run
+(needed for `data.meta` in the `_cis.yaml` config to exist) and correct
+`cis.use_full_node`/`config.yaml`'s comment if it comes in low enough to
+fit on `shared` instead.
+
+**`cluster.main_node_cores: 128` is a PLACEHOLDER** -- not independently
+confirmed. Run `sinfo -p main -o "%c %m"` and correct it (and
+`cluster.partition_main`/`main_node_sbatch_lines` if `main` isn't
+literally the right partition name) before submitting either stage for
+real.
 
 **`ntc_shared` (and `trans`'s `all_indmu` GPU job) don't need memory
 profiling.** Dardel's `888MB/core` rule (`publication_runs/README.md`'s

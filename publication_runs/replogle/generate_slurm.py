@@ -105,6 +105,24 @@ def main() -> None:
     partition_cpu = cluster.get("partition_cpu", "shared")
     partition_gpu = cluster.get("partition_gpu", "gpu")
     gpu_single_sbatch_lines = cluster.get("gpu_single_sbatch_lines", ["#SBATCH --gpus=1"])
+    partition_main = cluster.get("partition_main", "main")
+    main_node_cores = cluster.get("main_node_cores")
+    main_node_sbatch_lines = cluster.get("main_node_sbatch_lines", ["#SBATCH -N 1"])
+
+    def _cpu_placement(stage_cfg: dict):
+        """(partition, cpus, extra_sbatch_lines) for a CPU stage --
+        `cluster.partition_main`/`main_node_cores` (a full node) if
+        `stage_cfg['use_full_node']` is set (see config.yaml's per-stage
+        comments for the profiled evidence behind each one), else a
+        fractional `partition_cpu` request using `stage_cfg['resources']['cores']`."""
+        if stage_cfg.get("use_full_node"):
+            if not main_node_cores:
+                raise ValueError(
+                    "cluster.main_node_cores must be set (confirm via `sinfo -p main -o "
+                    "\"%c %m\"`) -- at least one stage has use_full_node: true."
+                )
+            return partition_main, main_node_cores, main_node_sbatch_lines
+        return partition_cpu, stage_cfg["resources"]["cores"], []
 
     label_prefix = cfg["label_prefix"]
     model_defaults = cfg["model_defaults"]
@@ -249,11 +267,12 @@ def main() -> None:
             f'--config "{subset_input_cfg_path}" --outdir "{subset_dir_for(gene, data_variant)}" '
             f'--modes full,cis_only'
         )
+        subset_partition, subset_cpus, subset_extra_lines = _cpu_placement(subset_cfg)
         step = SbatchStep(
             job_name=f"replogle_subset_{gene}_{data_variant}", account=account, log_dir=str(logs_dir),
             time_hours=subset_cfg["resources"].get("time_hours", TIME_HOURS_DEFAULT),
-            cpus=subset_cfg["resources"]["cores"],
-            partition=partition_cpu, repo_dir=repo_dir, commands=[cmd],
+            cpus=subset_cpus, partition=subset_partition, extra_sbatch_lines=subset_extra_lines,
+            repo_dir=repo_dir, commands=[cmd],
         )
         filename = f"01b_subset_{gene}_{data_variant}.sh"
         scripts.append((filename, step.render()))
@@ -300,11 +319,12 @@ def main() -> None:
             cis_cfg_path = configs_dir / f"{label}_cis.yaml"
             write_yaml(cis_cfg_path, cis_bd_cfg)
 
+            cis_partition, cis_cpus, cis_extra_lines = _cpu_placement(cis_cfg)
             cis_step = SbatchStep(
                 job_name=f"replogle_cis_{gene}_{variant_name}", account=account, log_dir=str(logs_dir),
                 time_hours=cis_cfg["resources"].get("time_hours", TIME_HOURS_DEFAULT),
-                cpus=cis_cfg["resources"]["cores"],
-                partition=partition_cpu, repo_dir=repo_dir,
+                cpus=cis_cpus, partition=cis_partition, extra_sbatch_lines=cis_extra_lines,
+                repo_dir=repo_dir,
                 commands=[bd_cmd("cis_deferred", cis_cfg_path, python_env)],
             )
             cis_filename = f"02_cis_{gene}_{variant_name}.sh"
