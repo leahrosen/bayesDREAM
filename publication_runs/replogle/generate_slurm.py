@@ -218,7 +218,20 @@ def main() -> None:
 
     def write_subset_step(gene: str, gene_id: str, data_variant: str) -> str:
         subset_label = f"{label_prefix}_{gene}_{data_variant}_subset_input"
-        overrides = {"model": {"label": subset_label}, "cis_gene": gene_id}
+        # subset_per_gene.py itself never reads a 'cis:' block (it never
+        # calls fit_cis()) -- this 'cis' key exists ONLY so this SAME
+        # rendered file can also be used to profile the subset step via
+        # `profile_memory.py --config <this file> --stage cis
+        # --ntc-shared-dir ...` (see replogle/README.md's "Resources"
+        # section), which does call a tiny fit_cis(niters=10) as part of
+        # that stage. Mirrors the real cis stage's own force= setting
+        # (config.yaml's cis.fit.force) so a low-NTC-expression gene like
+        # GFI1B doesn't fail this profiling call any differently than it
+        # would fail (or not) the real job.
+        overrides = {
+            "model": {"label": subset_label}, "cis_gene": gene_id,
+            "cis": {"fit": {"force": cis_cfg.get("fit", {}).get("force", False)}},
+        }
         if data_variant == "bm":
             # "bm" replicates the ORIGINAL ad hoc pipeline's actual NTC
             # subsetting -- a curated guide list (what NTC_subset/ silently

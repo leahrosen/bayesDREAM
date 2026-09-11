@@ -181,7 +181,15 @@ cis:
   # niters=100_000 matches fit_cis()'s own library default; tolerance/other
   # hyperparameters NOT confirmed against the (missing) reference fit_cis
   # notebook -- see STRATEGY.md §1's "fit_cis notebook is missing" note.
-  fit: {tolerance: 0}
+  # force: true -- fit_cis() refuses by default when the cis gene's own NTC
+  # expression is low (log2(mu_ntc) < -1, "overdispersion estimated from
+  # near-zero counts may be unreliable"). Confirmed 2026-09-11: GFI1B hits
+  # this (log2 = -1.65) -- expected for a lowly-expressed TF, not a data
+  # bug (see docs/FALSE_POSITIVES_GFI1B_DIAGNOSIS.md's o_x/low-expression
+  # discussion for this exact gene in a different dataset). Without `force`,
+  # every one of GFI1B's (and potentially other TFs among the 7's) cis jobs
+  # would fail immediately on submission, not just profile_memory.py.
+  fit: {tolerance: 0, force: true}
 
 trans:
   # `resources:` applies ONLY to the "bm" (batch-matched, i.e. subsetted)
