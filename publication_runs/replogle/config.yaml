@@ -51,15 +51,18 @@ cluster:
   # Full-node CPU partition -- used (per user instruction, 2026-09-11) for
   # any CPU stage whose real profiled peak memory exceeds ~50% of a node,
   # instead of a fractional --cpus-per-task request on `shared` (which
-  # bills memory strictly at 888MB/core -- a 100GB+ job would need an
-  # ~115-core request there, most of a node anyway, just accounted
-  # per-core instead of as one exclusive allocation). main_node_cores is a
-  # PLACEHOLDER -- confirm via `sinfo -p main -o "%c %m"` and correct
-  # before submitting; used as --cpus-per-task for any stage below with
-  # use_full_node: true (the whole node's memory comes with the
-  # allocation, not requested separately).
+  # bills memory strictly at 888MB/core). Confirmed via
+  # `sinfo -p main -o "%c %m"` (2026-09-11): 256 cores, ~237174 MB per node
+  # -- i.e. "50% of a node" = 128 cores / ~118,587 MB. Used as
+  # --cpus-per-task for any stage below with use_full_node: true (the
+  # whole node's memory comes with the allocation, not requested
+  # separately). As of this writing NO stage actually sets
+  # use_full_node: true -- subset/cis's real/inferred peaks both come in
+  # under this 50% line once measured against the REAL node spec (see
+  # their own comments) -- kept here as ready-to-use infrastructure for
+  # any future stage (e.g. trans, once profiled) that does cross it.
   partition_main: main
-  main_node_cores: 128
+  main_node_cores: 256
 
 model_defaults:
   modality_name: gene
@@ -142,15 +145,19 @@ sum_factor:
 # cis_variants below then map each of the 3 requested fit_cis configurations
 # onto one of these two data variants.
 subset:
-  # use_full_node: true -- REAL profiled peak, 2026-09-11 (GFI1B, bm
-  # variant): 102026 MB (construction on the full 86806-cell combined
-  # panel: 47.5s/26GB; load_ntc_fit+add_cis_gene, the dominant cost: 111.1s,
-  # jumps to 102GB). Well over half of any reasonably-sized node -- routed
-  # to cluster.partition_main/main_node_cores instead of a ~115-core
-  # fractional request on `shared`. time_hours kept generous since this is
-  # now a whole-node allocation, not a per-core-billed one.
-  use_full_node: true
-  resources: {time_hours: 4}   # cores come from cluster.main_node_cores when use_full_node
+  # REAL profiled peak, 2026-09-11 (GFI1B, bm variant): 102026 MB
+  # (construction on the full 86806-cell combined panel: 47.5s/26GB;
+  # load_ntc_fit+add_cis_gene, the dominant cost: 111.1s, jumps to 102GB
+  # total = ~114.9 cores at 888MB/core). Against the REAL main-node spec
+  # (256 cores / ~237174 MB, confirmed via `sinfo -p main -o "%c %m"`),
+  # that's ~44.9% of cores / ~43.0% of memory -- UNDER the 50% line, so
+  # stays on `shared` rather than moving to a full main-partition node.
+  # cores: 125 -- measured 114.9 rounded up with a ~9% safety margin
+  # (peak memory is shape-, not iteration-count-determined per
+  # profile_memory.py's own docstring, so the real niters=100_000 subset
+  # construction should match this closely), while staying comfortably
+  # under the 128-core/50% threshold.
+  resources: {cores: 125, time_hours: 4}
 
 # Curated NTC guide list for the "bm" data variant's select_ntc_guides step
 # -- given directly by the user (2026-09-09), reproducing what the original
@@ -197,17 +204,19 @@ cis_variants:
 # the whole point of profiling this path, see profile_memory.py's own
 # module docstring's "Two shapes of config" section).
 cis:
-  # use_full_node: true -- INFERRED, not yet directly measured (2026-09-11):
-  # the real cis stage pays the SAME load_ntc_fit()+add_cis_gene() cost that
-  # dominated subset's measured 102GB peak (it's the identical call against
-  # the identical ntc_shared posterior); its own construction step starts
-  # from the already-tiny cis_only/ file rather than the full combined
-  # panel, so real peak is likely somewhat LESS than subset's 102GB, but
-  # still almost certainly over half a node. Re-profile once
-  # 01b_subset_GFI1B_bm.sh has actually run (needed for this config's
-  # data.meta to exist) and correct if it comes in low enough for `shared`.
-  use_full_node: true
-  resources: {time_hours: 24}   # cores come from cluster.main_node_cores when use_full_node
+  # INFERRED, not yet directly measured (2026-09-11): the real cis stage
+  # pays the SAME load_ntc_fit()+add_cis_gene() cost that dominated
+  # subset's measured 102GB peak (it's the identical call against the
+  # identical ntc_shared posterior); its own construction step starts from
+  # the already-tiny cis_only/ file rather than the full combined panel, so
+  # real peak is likely somewhat LESS than subset's 102GB. Even taking
+  # subset's own 102GB/~115-core figure as a (conservative) upper bound,
+  # that's only ~44.9%/43.0% of the real 256-core/~237174MB main node --
+  # under the 50% line, so stays on `shared`, not a full main-partition
+  # node. cores: 125, same value/margin as subset pending real profiling
+  # (needs 01b_subset_GFI1B_bm.sh to have actually run first -- see
+  # instructions below) -- lower this once you have the real number.
+  resources: {cores: 125, time_hours: 24}
   # niters=100_000 matches fit_cis()'s own library default; tolerance/other
   # hyperparameters NOT confirmed against the (missing) reference fit_cis
   # notebook -- see STRATEGY.md §1's "fit_cis notebook is missing" note.
