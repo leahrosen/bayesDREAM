@@ -201,37 +201,42 @@ cis_variants:
 # fit_cis loads ONLY the cis gene's own single-feature counts for the
 # actual SVI fit (`cis_only/` subset, one row) -- it does NOT touch the
 # trans gene panel. But `common/run_cis_deferred.py`'s add_cis_gene() setup
-# step (load_ntc_fit(ntc_shared_dir, mask_features=True) then
-# add_cis_gene()) TRANSIENTLY loads the shared ntc_shared fit's FULL
+# step (load_ntc_fit(ntc_shared_dir, mask_features=True, lean=True) then
+# add_cis_gene()) transiently loads the shared ntc_shared fit's FULL
 # ~8195-feature posterior from disk in order to extract just this gene's
-# own alpha before discarding the rest -- so real peak memory for this
-# stage is likely dominated by that transient full-panel load, not by the
-# tiny 1-gene fit itself. `cores:` below is measured via, per cis_variant
-# (all 3 share the same shape/cost since they all read a `cis_only/`
-# subset and the SAME ntc_shared fit; only independent_mu_sigma differs, a
-# tiny flag, not a shape change):
+# own alpha before discarding the rest.
+#
+# `bm_indmu`/`bm_noindmu` share one `resources:` value (identical
+# `cis_only/` data -- 165 cells -- only `independent_mu_sigma`, a Pyro-model
+# flag, differs); `all_indmu` gets its own `all_resources:` -- its
+# `cis_only/` file has EVERY NTC cell (85,753 rows vs. 165), and despite
+# being only 1 feature wide, that genuinely costs more, not the same as
+# initially guessed (see STRATEGY.md §14 for why the "just 1 feature wide,
+# should be identical" prediction was wrong by ~9x, not just imprecise --
+# checked before trusting it, per the subset lesson above). Re-profile
+# either with:
 #   python common/profile_memory.py \
 #     --config slurm/configs/<label_prefix>_<gene>_<cis_variant>_cis.yaml \
 #     --stage cis --niters 10
-# (needs a REAL, already-completed ntc_shared run on disk first -- that's
-# the whole point of profiling this path, see profile_memory.py's own
-# module docstring's "Two shapes of config" section). Unlike subset's
-# figure (see subset: above), this profiling command DOES accurately mirror
-# the real run_cis_deferred.py job -- both do the exact same
-# load_ntc_fit()+add_cis_gene()+fit_cis() sequence, just with different
-# niters -- so it's a trustworthy proxy, not a methodology error.
+# (needs a REAL, already-completed ntc_shared run on disk first). Unlike
+# subset's figure (see subset: above), this profiling command DOES
+# accurately mirror the real run_cis_deferred.py job -- both do the exact
+# same load_ntc_fit()+add_cis_gene()+fit_cis() sequence, just with
+# different niters -- so it's a trustworthy proxy, not a methodology error.
 cis:
-  # REAL measured peak (GFI1B, bm_indmu, 2026-09-13): 49,621 MB = ~55.9
-  # cores at 888MB/core. This was measured BEFORE run_cis_deferred.py's
-  # lean=True fix (2026-09-13, see that script's own comment) -- lean
-  # collapses posterior_samples_ntc to point estimates before
-  # add_cis_gene() extracts one gene's alpha, and add_cis_gene()/fit_cis()
-  # only ever read point estimates from it anyway, so the real (post-fix)
-  # peak should be meaningfully LOWER than 49,621 MB.
-  # cores: 60 -- the PRE-lean measurement + a small margin, kept as a safe
-  # upper bound until re-profiled with the same command above (now that
-  # lean=True is in effect) -- lower this once you have the post-fix number.
-  resources: {cores: 60, time_hours: 24}
+  # REAL measured peak, POST lean=True (GFI1B, bm_indmu, 2026-09-13): 610 MB
+  # (~0.7 cores at 888MB/core) -- down from 49,621 MB pre-lean (~70-90x).
+  # cores: 4 -- generous margin over the ~0.7-core measurement (niters=10
+  # here vs. the real 100,000; peak memory is shape-, not
+  # iteration-count-determined, but this is cheap enough that a wide margin
+  # costs nothing).
+  resources: {cores: 4, time_hours: 24}
+  # REAL measured peak, POST lean=True (GFI1B, all_indmu, 2026-09-13): 5,489
+  # MB (~6.2 cores) -- the ALL-NTC cis_only construction (85,753 rows) does
+  # cost meaningfully more than bm's 165-row one, confirming this needed
+  # its own measurement rather than assuming equivalence.
+  # cores: 10 -- ~6.2 measured + margin.
+  all_resources: {cores: 10, time_hours: 24}
   # niters=100_000 matches fit_cis()'s own library default; tolerance/other
   # hyperparameters NOT confirmed against the (missing) reference fit_cis
   # notebook -- see STRATEGY.md §1's "fit_cis notebook is missing" note.

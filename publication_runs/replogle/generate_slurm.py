@@ -319,10 +319,16 @@ def main() -> None:
             cis_cfg_path = configs_dir / f"{label}_cis.yaml"
             write_yaml(cis_cfg_path, cis_bd_cfg)
 
-            cis_partition, cis_cpus, cis_extra_lines = _cpu_placement(cis_cfg)
+            # cis's two data variants cost meaningfully different amounts
+            # (all_indmu's cis_only/ has every NTC cell, not just bm's
+            # restricted ~165 -- see config.yaml's cis: comment) -- select
+            # the matching resources block before deciding placement.
+            cis_resources = cis_cfg["resources"] if data_variant == "bm" else cis_cfg["all_resources"]
+            cis_partition, cis_cpus, cis_extra_lines = _cpu_placement(
+                {"resources": cis_resources, "use_full_node": cis_cfg.get("use_full_node")})
             cis_step = SbatchStep(
                 job_name=f"replogle_cis_{gene}_{variant_name}", account=account, log_dir=str(logs_dir),
-                time_hours=cis_cfg["resources"].get("time_hours", TIME_HOURS_DEFAULT),
+                time_hours=cis_resources.get("time_hours", TIME_HOURS_DEFAULT),
                 cpus=cis_cpus, partition=cis_partition, extra_sbatch_lines=cis_extra_lines,
                 repo_dir=repo_dir,
                 commands=[bd_cmd("cis_deferred", cis_cfg_path, python_env)],

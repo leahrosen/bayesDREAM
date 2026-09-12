@@ -201,8 +201,9 @@ unrestricted coverage).
 | stage | data variant | partition | time | cores | status |
 |---|---|---|---|---|---|
 | `ntc_shared` | (all NTC) | GPU (1 gpu) | 24h | 8 | fixed -- GPU jobs don't need profiling (see below) |
-| `subset` (both variants) | full combined panel + `add_cis_gene()` | CPU (`shared`) | 4h | 16 | **REAL sacct measurement, 2026-09-13 (see below)** |
-| `cis` (all 3 variants) | `cis_only` (1 gene) + transient full-panel ntc load | CPU (`shared`) | 24h | 60 | **profiled pre-`lean=True`; re-profile, likely lower (see below)** |
+| `subset` (both variants) | full combined panel + `add_cis_gene()` | CPU (`shared`) | 4h | 16 | **REAL sacct measurement, 2026-09-13** |
+| `cis` (`bm_indmu`/`bm_noindmu`) | `cis_only`, 165 cells | CPU (`shared`) | 24h | 4 | **profiled post-`lean=True`, 2026-09-13: 610 MB** |
+| `cis` (`all_indmu`) | `cis_only`, 85,753 cells (all NTC) | CPU (`shared`) | 24h | 10 | **profiled post-`lean=True`, 2026-09-13: 5,489 MB** |
 | `trans` (`bm_indmu`/`bm_noindmu`) | `full`, batch-matched | CPU (`shared`) | 24h | 8 | **placeholder -- see profiling below** |
 | `trans` (`all_indmu`) | `full`, all NTC | GPU (1 gpu) | 24h | 8 | fixed, not profiled (see rationale below) |
 
@@ -264,7 +265,7 @@ row). But `run_cis_deferred.py`'s setup step
 `add_cis_gene()`) **transiently** loads the shared `ntc_shared` fit's full
 ~8195-feature posterior from disk in order to extract just this gene's own
 alpha before discarding the rest. Real measured peak for this stage
-(`GFI1B`, `bm_indmu`, pre-`lean=True`, 2026-09-13): **49,621 MB** (~55.9
+(`GFI1B`, `bm_indmu`, PRE-`lean=True`, 2026-09-13): **49,621 MB** (~55.9
 cores) -- confirming this transient load, not the tiny 1-gene fit, is what
 actually dominates.
 
@@ -277,50 +278,70 @@ exactly that (median + 95% CI) instead of keeping the full 1000-draw x
 both now pass `lean=True` (also matches the reference notebook's own
 `build_trans_model()`, which does the same for its equivalent load).
 **Applies to Domingo/Morris too** (shared `common/` code) -- a strict
-improvement per the library's own docs, not Replogle-specific. `cis.cores`
-above (60) is still the PRE-fix number + margin; re-profile with the
-command below to get the real post-fix figure, which should be
-meaningfully lower.
+improvement per the library's own docs, not Replogle-specific.
+
+**Post-`lean=True` re-profiling (2026-09-13) confirmed the fix AND
+confirmed `bm`/`all` genuinely need separate sizing** -- an assumption I'd
+made without checking (bad idea, per the `subset` lesson above), which the
+user correctly pushed back on:
+- `bm_indmu`: **610 MB** (~0.7 cores) -- down from 49,621 MB, ~80x.
+- `all_indmu`: **5,489 MB** (~6.2 cores) -- down from an unmeasured
+  (assumed-equal-to-bm) figure, but genuinely ~9x higher than `bm_indmu`
+  despite being "only" 1 feature wide -- `all_indmu`'s `cis_only/` has
+  every NTC cell (85,753 rows) vs. `bm`'s restricted ~165, and that
+  cell-count difference costs more than expected even at 1-feature width.
+
+`config.yaml`'s `cis:` block now has separate `resources`/`all_resources`
+(mirroring `trans`'s `resources`/`gpu_resources` split), each set from its
+own real measurement with margin: `cores: 4` (bm) / `cores: 10` (all).
 
 `cluster.partition_main`/`main_node_cores` (confirmed via `sinfo -p main -o
 "%c %m"`: `main`, 256 cores / ~237,174 MB per node -- "50% of a node" =
 128 cores / ~118,587 MB) are kept as ready-to-use infrastructure in
 `generate_slurm.py`'s `_cpu_placement()` helper for any future stage that
 crosses that line -- no stage currently sets `use_full_node: true`; both
-`subset` and `cis` come in well under it once measured correctly.
+`subset` and `cis` (both variants) come in well under it once measured
+correctly.
 
 **Profiling `cis`/`trans` (`bm` variants)**: `common/profile_memory.py`
 measures real peak RSS around a bare model construction + a cheap
 (`--niters 10`) real fit call -- peak memory is set by tensor shapes, not
 convergence, so a 10-iteration run already shows the real peak. Both need
 a REAL, already-completed `ntc_shared` run on disk first; `cis` additionally
-needs a real, already-completed `01b_subset_<gene>_bm.sh` (so `data.meta`
-in the `_cis.yaml` config exists); `trans` needs a real, already-completed
-`cis` job too (`load_cis.enabled: true` reads a saved `.pt` file
-`profile_memory.py`'s own `--stage cis` run never writes -- only the REAL
-`02_cis_<gene>_<variant>.sh` job calls `save_cis_fit()`). So the real
-sequence is: real `subset` job -> real `cis` job (sized from the profiling
-below, then cross-check with its own `sacct` once it's done) -> profile
-`trans`:
+needs a real, already-completed `01b_subset_<gene>_<bm|all>.sh` (so
+`data.meta` in the `_cis.yaml` config exists) -- profile BOTH data variants
+separately, don't assume one represents the other (see above); `trans`
+needs a real, already-completed `cis` job too (`load_cis.enabled: true`
+reads a saved `.pt` file `profile_memory.py`'s own `--stage cis` run never
+writes -- only the REAL `02_cis_<gene>_<variant>.sh` job calls
+`save_cis_fit()`). So the real sequence is: real `subset` job (either
+variant) -> real `cis` job (sized from the profiling below, then
+cross-check with its own `sacct` once it's done) -> profile `trans`:
 
 ```bash
+# cis -- BOTH data variants, don't assume one represents the other:
 python ../common/profile_memory.py \
   --config slurm/configs/<label_prefix>_GFI1B_bm_indmu_cis.yaml \
   --stage cis --niters 10
 
 python ../common/profile_memory.py \
+  --config slurm/configs/<label_prefix>_GFI1B_all_indmu_cis.yaml \
+  --stage cis --niters 10
+
+# trans -- bm variant only (all_indmu's trans is a fixed GPU allocation, not profiled):
+python ../common/profile_memory.py \
   --config slurm/configs/<label_prefix>_GFI1B_bm_indmu_trans.yaml \
   --stage trans --niters 10
 ```
 
-All 3 cis variants (and both `bm_*` trans variants) share the same data
-shape (only `independent_mu_sigma`, a tiny flag, differs) -- one profiling
-run per gene per stage should be representative of all of them; the `all_*`
-variant's `cis`/`trans` stages read a different (larger, all-NTC) subset for
-`cis_only`'s own construction, but per config.yaml's `cis:` comment that
-difference is negligible (a 1-feature-wide array, cheap regardless of row
-count) -- worth a spot-check once real jobs are running, not required
-before then.
+`bm_indmu`/`bm_noindmu` share one number (identical `cis_only/` data --
+`independent_mu_sigma` is a Pyro-model flag, not a shape difference) -- one
+profiling run covers both. `all_indmu` needed its OWN measurement, not an
+assumption: despite `cis_only/` being only 1 feature wide either way, its
+85,753-row (all-NTC) construction turned out to cost ~9x more than `bm`'s
+165-row one (610 MB vs. 5,489 MB, confirmed 2026-09-13) -- both still tiny
+in absolute terms, but a real, measured difference, not "negligible" as
+originally guessed.
 
 **`trans`'s `all_indmu` variant is NOT profiled** -- fixed at one GPU node
 (1 GPU, 8 cores, 24h) per gene per the user's explicit instruction, since

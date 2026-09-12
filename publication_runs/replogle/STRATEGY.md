@@ -615,3 +615,34 @@ real (not `profile_memory.py`-only) `cis` job completes -- `trans`'s
 `load_cis_fit()` needs a real saved `.pt` file that only the actual
 `02_cis_<gene>_<variant>.sh` job's `save_cis_fit()` call produces;
 `profile_memory.py --stage cis` never persists anything to disk.
+
+## 15. `cis`'s `bm`/`all` split -- confirmed real, not negligible (2026-09-13)
+
+User pushed back on §14's claim that `bm_indmu` alone represented all 3
+`cis_variants`: `all_indmu`'s `cis_only/` file has every NTC cell (85,753
+rows) vs. `bm`'s restricted ~165 -- a genuinely different construction
+input, and my "only 1 feature wide, should be negligible" reasoning was
+exactly the kind of unverified assumption that was already wrong once (the
+`subset` methodology error). Right call: profiled `all_indmu` separately
+rather than trusting the prediction.
+
+Post-`lean=True` measurements, both real (`--stage cis --niters 10`):
+- `bm_indmu`: 610 MB (~0.7 cores) -- down from the pre-lean 49,621 MB
+  (~80x).
+- `all_indmu`: 5,489 MB (~6.2 cores) -- ~9x higher than `bm_indmu` despite
+  the 1-feature width, confirming the row-count difference does cost
+  something even here, just far less than feared (both numbers are tiny in
+  absolute terms).
+
+`config.yaml`'s `cis:` block restructured to mirror `trans`'s
+`resources`/`gpu_resources` split: `resources` (bm, `cores: 4`) and
+`all_resources` (all, `cores: 10`), each with margin over its own real
+measurement. `generate_slurm.py`'s per-gene loop now selects the matching
+block by `variant_spec["data_variant"]` before calling `_cpu_placement()`.
+
+Lesson reinforced: "should be negligible because X" is a prediction, not a
+fact, even when the reasoning sounds sound (as it did here) -- verify
+against a real measurement whenever the two available options are cheap to
+check, same as `subset`'s error and the `all`/`bm` batch-format
+investigation before it. Three for three so far on "check before trusting an
+equivalence claim" paying off in this dataset's profiling work.
