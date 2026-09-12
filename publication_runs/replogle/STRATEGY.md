@@ -646,3 +646,76 @@ against a real measurement whenever the two available options are cheap to
 check, same as `subset`'s error and the `all`/`bm` batch-format
 investigation before it. Three for three so far on "check before trusting an
 equivalence claim" paying off in this dataset's profiling work.
+
+## 16. `subset`'s "gene-independent" claim was also wrong -- OOM on all 6 remaining genes (2026-09-13)
+
+Submitting all 6 remaining genes' `01b_subset_*` jobs (12 total, `bm`+`all`
+each) at `cores: 16` -- the value §10 derived from GFI1B's single real
+10.07 GB completion, on the explicit assumption that subset's cost is
+"gene/data-variant-independent" (always builds from the same full
+86,806-cell combined panel first) -- produced 12 `OUT_OF_MEMORY` kills.
+`sacct` showed `MYB_all` at 13.77 GB and `RUNX1_all` at 10.48 GB, both
+close to or over the 14.208 GB cap; most others died in 18-32s at only
+5-10 MB reported `MaxRSS` (too fast for `sacct`'s periodic sampling to
+catch the real peak before the cgroup OOM-kill -- a low number here is a
+sampling artifact, not evidence the job was actually small). GFI1B's own
+10.07 GB completion was apparently near the low end of the real per-gene
+range, not representative of all 7. All 12 were also submitted
+simultaneously, so co-scheduling on the same `shared`-partition node(s)
+can't be ruled out as a contributing factor -- bumping cores helps either
+way (fewer such jobs then pack onto one node).
+
+Same lesson as §15/#14/subset's original error, generalized one level up:
+even a *methodologically sound* real measurement (this one was a genuine
+completed job, not a mismatched profiling proxy) can still fail to
+generalize across genes if only one gene was ever checked. "One real data
+point, gene-independent by construction-path argument" turned out to
+still need per-gene verification.
+
+Fix: `subset.resources.cores` 16 -> 32 (28.4 GB, ~2x the highest real
+signal seen so far). Re-verify against real `sacct MaxRSS` once the 6
+genes' subset jobs are resubmitted; bump again if anything still
+approaches the cap. Diagnostic commands used:
+
+```bash
+sacct -j <jobids...> --format=JobID,JobName%25,Elapsed,MaxRSS,ReqMem,State -p
+tail -30 logs/replogle_subset_<gene>_<variant>_<jobid>.err   # "Detected 1 oom_kill event..."
+```
+
+## 17. GFI1B's `bm` cis jobs (`bm_indmu`/`bm_noindmu`) fail with NaN priors (2026-09-13, open)
+
+Both real (non-profiling) `02_cis_GFI1B_bm_indmu.sh`/`_bm_noindmu.sh` jobs
+failed in ~2:34 with `ValueError: ... Normal(loc: nan, scale: nan)`, raised
+from `fitting/cis.py`'s `mu`/`mu_target_*` sample sites. `all_indmu` (full
+NTC) did not fail. Traced to `fitting/cis.py:530-531`:
+
+```python
+mu_x_mean_tensor = torch.mean(guide_means)
+mu_x_sd_tensor = torch.std(guide_means)
+```
+
+`torch.std` of a length-1 tensor is `nan` (unbiased estimator, divides by
+N-1=0) -- this only reproduces if exactly one distinct `guide` value
+survives in the `bm` cis_only cell population (165 cells: GFI1B's own
+guide(s) + up to 5 batch-matched, curated NTC guide-pairs from §10). Not
+yet confirmed which side collapsed (GFI1B down to 1 guide? all 5 NTC
+guide-pairs zeroed out by `batch_match_ntc`'s AND with
+`select_ntc_guides`, leaving only GFI1B's guide(s)?) -- open, pending:
+
+```bash
+python3 -c "
+import pandas as pd
+df = pd.read_csv('<data_dir>/BayesianModel_outs/replogle_20260908_GFI1B_bm_subset/cis_only/meta.csv')
+print(df['target'].value_counts())
+print(df['guide'].value_counts())
+"
+```
+
+If confirmed, this is NOT `subset_per_gene.py`-specific -- it's a
+`fitting/cis.py` robustness gap (deserves at minimum a clear error message
+naming the actual guide count, or a real fix, rather than an opaque NaN a
+few frames deep in Pyro) that could affect any dataset/gene combination
+where the retained cis_only population happens to reduce to one guide.
+Needs a decision on whether this NTC subset is simply too narrow for
+`bm`'s intended design and should be revisited, or whether `fitting/cis.py`
+should guard this case explicitly.

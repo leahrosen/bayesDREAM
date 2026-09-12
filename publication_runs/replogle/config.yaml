@@ -164,13 +164,30 @@ subset:
   # proxy -- and confirms subset's real cost is dominated by the big-panel
   # construction alone (~26GB in the earlier, inflated profiling run's own
   # "model construction" step), not by anything resembling the old 102GB
-  # figure. Gene/data-variant-independent (construction always builds from
-  # the full 86,806-cell combined panel regardless of which gene/variant is
-  # being extracted, and batch_match_ntc/select_ntc_guides only filter the
-  # already-small output afterward) -- this one real data point is
-  # representative of all 7 genes x 2 data variants.
-  # cores: 16 -- ~11.3 measured + margin.
-  resources: {cores: 16, time_hours: 4}
+  # figure.
+  #
+  # CORRECTED AGAIN 2026-09-13, cores 16 -> 32: the "gene/data-variant-
+  # independent" claim above was wrong -- GFI1B was not representative.
+  # Submitting all 6 remaining genes' subset jobs (12 jobs, all "bm"+"all",
+  # cores:16/14,208M) at once produced 12 OUT_OF_MEMORY kills (`sacct`):
+  # MYB_all hit 13,770,428K and RUNX1_all hit 10,477,636K -- both close to
+  # or exceeding the 14,208M cap -- while several others died in 18-32s at
+  # only 5-10MB reported MaxRSS (too fast for sacct's periodic RSS sampler
+  # to catch the real peak before the kernel OOM-killed the cgroup; low
+  # reported RSS on a job killed for OOM is a sampling-interval artifact,
+  # not evidence the job was actually small). GFI1B's own real 10.07GB
+  # completion was apparently near the bottom of the real per-gene range,
+  # not a representative midpoint -- true peak varies by gene (guide-count/
+  # cell-count differences in the big-panel construction before
+  # batch_match_ntc/select_ntc_guides pare it down). Also submitted all 12
+  # simultaneously, which cannot be ruled out as a contributing factor
+  # (many co-scheduled `shared`-partition jobs on the same physical node);
+  # bumping cores is the fix regardless, since it also reduces how many
+  # such jobs pack onto one node.
+  # cores: 32 (28,416 MB) -- ~2x the highest real signal (13.77GB) seen so
+  # far. Re-check with real `sacct --format=MaxRSS` once the 6 genes'
+  # subset jobs are resubmitted; bump further if any still approaches this.
+  resources: {cores: 32, time_hours: 4}
 
 # Curated NTC guide list for the "bm" data variant's select_ntc_guides step
 # -- given directly by the user (2026-09-09), reproducing what the original
