@@ -84,7 +84,11 @@ carried is dropped here, so every NTC cell in the final output comes from
 Writes to <outdir> (NOT <indir> -- read-only, see above):
     meta.csv          cell metadata for [full NTC population] union
                        [chosen cis genes' true target cells], sum_factor
-                       RECOMPUTED (not any input column)
+                       RECOMPUTED (not any input column). Also carries a
+                       sum_factor_adj column (adjust_ntc_sum_factor(),
+                       computed ONCE here on this full population -- see
+                       STRATEGY.md §18 -- rather than per-gene later on a
+                       narrow subset).
     gene_counts.npz   sparse (genes x cells), columns matching meta.csv's
                        cell order exactly
     gene_meta.csv     gene_id (Ensembl), gene_name (real symbol) -- row order
@@ -122,7 +126,9 @@ import pandas as pd
 from scipy import sparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from compute_scran_sum_factor import _compute_scran_sizefactors  # noqa: E402
+from bayesDREAM import bayesDREAM  # noqa: E402
 
 # Duplicated from comparative/datasets.py's REPLOGLE_GENE_TO_ID -- see
 # module docstring for why this isn't imported instead.
@@ -352,6 +358,55 @@ def preprocess(indir: str, outdir: str, cis_genes, batch_col: str = "batch", see
           f"min_block_size={min_block_size})...")
     combined_meta["sum_factor"] = _compute_scran_sizefactors(
         combined_counts, scran_meta, batch_col=scran_block_col, seed=seed)
+
+    # ---- sum_factor_adj: guide-level NTC-normalized correction, ALSO computed ONCE here ----
+    # (2026-09-13, STRATEGY.md §18). adjust_ntc_sum_factor() does NOT require
+    # fit_ntc() -- it's a pure function of meta (guide/target/covariates) +
+    # an existing sum_factor column (see bayesDREAM/core.py's
+    # adjust_ntc_sum_factor() docstring: no alpha_x/alpha_y/technical_group_code
+    # involved at all). Computing it here, on the FULL combined population
+    # (every NTC cell backs every technical group's correction), instead of
+    # per-gene later on a narrow subset, is what actually fixes the real
+    # failure this caused: cis's `bm` subset (~165 cells, batch-matched to
+    # only 2-3 of the 5 curated NTC guide-pairs) could leave some technical
+    # groups that a cis gene's OWN target cells fall into with zero backing
+    # NTC cells in that narrow subset, making adjust_ntc_sum_factor() produce
+    # NaN there -- which poisoned fit_cis()'s mu/sigma priors for ALL guides,
+    # not just the affected one (GFI1B's bm_indmu/bm_noindmu, real failure,
+    # 2026-09-13). A model built directly from this combined population's
+    # ~85,753 NTC cells never has this gap.
+    #
+    # A lightweight bayesDREAM object is constructed here (deferred cis_gene,
+    # no fit_ntc/fit_cis) purely to get `guide_used` (guide identity crossed
+    # with guide_covariates/guide_covariates_ntc -- both [] for Replogle, see
+    # config.yaml's model_defaults) built exactly the way the real pipeline
+    # builds it, rather than re-deriving that compound key by hand here and
+    # risking drift from bayesDREAM/core.py's own logic.
+    #
+    # Writing this into meta.csv (an ordinary column, like sum_factor itself)
+    # means every downstream stage picks it up for free at model construction
+    # time -- _init_sum_factors() copies every *sum_factor* column out of
+    # meta into modality.sum_factors at __init__/add_cis_gene() time (see
+    # adjust_ntc_sum_factor()'s own docstring) -- with NO per-gene
+    # adjust_ntc_sum_factor() call needed in run_cis_deferred.py/run_trans.py
+    # at all (generate_slurm.py no longer requests one for either stage).
+    print(f"[preprocess] computing adjust_ntc_sum_factor(covariates=['{batch_col}']) ONCE on the "
+          f"combined population (does not require fit_ntc -- see STRATEGY.md §18)...")
+    _adj_model = bayesDREAM(
+        meta=combined_meta, counts=combined_counts, feature_meta=gene_meta_out,
+        label="replogle_sum_factor_adj_precompute", output_dir=outdir, device="cpu",
+    )
+    _adj_model.adjust_ntc_sum_factor(covariates=[batch_col])
+    _sf_adj = _adj_model.get_modality(_adj_model.primary_modality).sum_factors["sum_factor_adj"]
+    combined_meta["sum_factor_adj"] = combined_meta["cell"].map(_sf_adj)
+    if combined_meta["sum_factor_adj"].isna().any():
+        n_nan = int(combined_meta["sum_factor_adj"].isna().sum())
+        raise ValueError(
+            f"sum_factor_adj is NaN for {n_nan}/{len(combined_meta)} cell(s) even on the FULL "
+            f"combined population -- investigate before proceeding (some technical group has "
+            f"zero NTC cells at all, not just zero within a later per-gene subset)."
+        )
+    del _adj_model
 
     # ---- write combined output ----
     combined_meta.to_csv(os.path.join(outdir, "meta.csv"), index=False)

@@ -741,8 +741,83 @@ affected guide's own entry) -> the `Normal(loc: nan, scale: nan)` crash.
 this because `adjust_ntc_sum_factor()` always has NTC cells backing every
 group there.
 
-Fix: `generate_slurm.py`'s cis stage now uses `sum_factor_col: "sum_factor"`
-(matching the reference exactly). `adjust_ntc_sum_factor()` still runs
-(needed for `fit_trans`'s `sum_factor_adj` column), it's just not fed into
-`fit_cis()` anymore. Not yet re-tested against a real job -- do that before
-trusting this closes the issue.
+**Superseded by §18 below.** First fix attempted here was matching the
+reference exactly (`sum_factor_col: "sum_factor"` for cis). User pushed
+back: cis should keep using `sum_factor_adj` (more signal, deliberately
+NTC-normalized) -- the real problem is WHERE it gets computed, not WHETHER
+it should be used. See §18 for the actual fix.
+
+## 18. Real fix for §17: compute `sum_factor_adj` ONCE upstream, not per-gene (2026-09-13)
+
+User's question, verbatim: "for cis stage sum_factor_adj should be used.
+Can we solve this issue in some better way? Ideally using as many cells as
+possible. Do we need fit_ntc for adjust sum factor? Otherwise we could do
+it during preprocess?"
+
+Checked `bayesDREAM/core.py`'s `adjust_ntc_sum_factor()` (lines 918-1126):
+it is a PURE function of `self.meta` (`target`/`guide_used`/covariate
+columns) and an existing `sum_factor` column in the primary modality's
+`sum_factors` -- no `fit_ntc()`/`alpha_x`/`technical_group_code`
+dependency anywhere in it. Confirms the user's instinct exactly: this can
+run any time after `sum_factor` exists, independent of `fit_ntc()`/
+`add_cis_gene()`.
+
+The real defect in §17 wasn't "cis shouldn't use sum_factor_adj" -- it was
+computing it PER-GENE, on cis's narrow `bm` subset (~165 cells, only 2-3
+of the 5 curated NTC guide-pairs surviving `batch_match_ntc`), where some
+of a cis gene's own technical groups can end up with zero backing NTC
+cells in that small a population. Computing it ONCE on the FULL combined
+population instead (85,753 NTC cells, every technical group well-
+populated) uses "as many cells as possible" per the user's request and
+structurally can't produce this gap -- exactly the same principle already
+established for `sum_factor` itself (`architecture_scran_full_panel_only`
+in memory: full-panel-only, never recomputed on a narrower subset).
+
+Also confirmed: the "doesn't survive a save/load round trip" caveat in
+`config_utils.apply_sum_factor_adjustments()`'s docstring (why Domingo/
+Morris recompute `adjust_ntc_sum_factor()` in every per-gene process) does
+NOT apply here -- that caveat is about a column computed TRANSIENTLY, at
+runtime, in one process's memory, not persisted through `save_cis_fit()`/
+`load_cis_fit()`. A column written directly into `meta.csv` is different:
+`_init_sum_factors()` copies every `*sum_factor*` column out of `meta`
+into `modality.sum_factors` at __init__/`add_cis_gene()` time, in EVERY
+process, straight from the file on disk -- exactly how `sum_factor` itself
+already reaches every stage. Precomputing `sum_factor_adj` into `meta.csv`
+removes the need to re-derive it per-gene entirely, rather than merely
+moving where it's re-derived.
+
+Implementation:
+- `preprocess.py`: right after computing `sum_factor` via scran (on the
+  same full combined population), constructs a lightweight `bayesDREAM`
+  object (deferred `cis_gene`, no `fit_ntc`/`fit_cis` -- just `__init__` +
+  `adjust_ntc_sum_factor(covariates=[batch_col])`) and writes the result
+  into `combined_meta['sum_factor_adj']` before writing `meta.csv`. Raises
+  if any cell is NaN even on this full population (would mean a genuinely
+  NTC-free technical group, a real problem needing investigation, not
+  something to paper over). A real `bayesDREAM` object is used (not a
+  hand-rolled pandas groupby) specifically to get `guide_used` (guide
+  identity crossed with `guide_covariates`/`guide_covariates_ntc`, both
+  `[]` for Replogle) built exactly the way the real pipeline builds it,
+  avoiding drift from `core.py`'s own logic.
+- `generate_slurm.py`: removed the per-gene `adjust_ntc_sum_factor()` call
+  from BOTH cis's and trans's rendered configs (the now-dead
+  `sum_factor_block` variable and `sf_cfg` are gone). Cis's
+  `sum_factor_col` reverted back to `"sum_factor_adj"` (undoing §17's
+  `"sum_factor"` patch) -- it now reads the column `subset_per_gene.py`
+  already carries through unchanged from `meta.csv`.
+- `config.yaml`'s `sum_factor:` block is now documentation-only (records
+  the `['batch']` covariate convention preprocess.py's own `--batch-col`
+  CLI flag uses) -- no longer read by `generate_slurm.py`.
+
+**Consequence: `preprocess.py` must be re-run** (produces a new
+`meta.csv` with the added column) before any `01b_subset_*`/`02_cis_*`
+jobs are (re-)run -- including the 6 genes' subset jobs just resubmitted
+in §16, if they complete before this lands. `meta_ntc.csv` is untouched
+(`ntc_shared` never needs `sum_factor_adj`). This also adds a full
+`bayesDREAM.__init__` (big-panel construction, ~10GB per §10) to
+`preprocess.py`'s own resource cost -- not yet reflected in whatever
+`replogle_preprocess.sh` allocation is currently in use; check real
+`sacct MaxRSS` after the next run and size accordingly.
+
+Not yet re-tested against a real job -- do that before trusting this
+closes the issue.

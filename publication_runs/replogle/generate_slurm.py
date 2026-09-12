@@ -128,7 +128,6 @@ def main() -> None:
     model_defaults = cfg["model_defaults"]
     gene_ids = cfg["cis_gene_ids"]
     ntc_shared_cfg = cfg["ntc_shared"]
-    sf_cfg = cfg["sum_factor"]
     subset_cfg = cfg["subset"]
     bm_selected_ntc_guides = cfg["bm_selected_ntc_guides"]
     cis_variants = cfg["cis_variants"]
@@ -180,9 +179,19 @@ def main() -> None:
     # (tmp/10_bayesDREAM_fit_trans_MYB.ipynb) calls fit_trans() with
     # sum_factor_col="sum_factor_adj" directly, never a refit column. See
     # config.yaml's sum_factor: block comment / STRATEGY.md §7 decision #5.
-    sum_factor_block = {
-        "adjust_ntc_sum_factor": {"enabled": True, "args": {"covariates": sf_cfg["covariates"]}},
-    }
+    #
+    # NOTE (2026-09-13, STRATEGY.md §18): no per-gene adjust_ntc_sum_factor()
+    # call either, for cis OR trans -- unlike Domingo/Morris. preprocess.py
+    # now computes 'sum_factor_adj' ONCE, on the full combined population
+    # (every NTC cell backs every technical group), and writes it into
+    # meta.csv; subset_per_gene.py carries it through unchanged into every
+    # gene/variant's own subset meta.csv (an ordinary column, copied into
+    # modality.sum_factors at model construction, same mechanism 'sum_factor'
+    # itself already relies on -- no re-derivation needed in any per-gene
+    # process). Recomputing it per-gene here, on a narrow bm subset (~165
+    # cells), is what caused a real NaN failure in GFI1B's bm_indmu/
+    # bm_noindmu fit_cis(): some technical groups the cis gene's own cells
+    # fall into had zero backing NTC cells within that narrow subset.
 
     def bd_cmd(kind: str, config_path: Path, env: str, extra_args: str = "") -> str:
         """kind: 'ntc'/'cis_deferred'/'trans' all go through common/run_<kind>.py
@@ -308,28 +317,30 @@ def main() -> None:
                 "data": subset_data_block(gene, data_variant, "cis_only"),
                 "cis_gene": gene_id,
                 "ntc_shared_dir": ntc_shared_dir,
-                "sum_factor": {"adjust_ntc_sum_factor": sum_factor_block["adjust_ntc_sum_factor"]},
+                # No "sum_factor" key -- unlike Domingo/Morris, cis does NOT
+                # call adjust_ntc_sum_factor() itself here. 'sum_factor_adj'
+                # is already a column in this gene/variant's own subset
+                # meta.csv (carried through from preprocess.py's ONE
+                # full-population computation, see STRATEGY.md §18) and gets
+                # copied into modality.sum_factors automatically at model
+                # construction -- same mechanism 'sum_factor' itself already
+                # relies on, no adjust_ntc_sum_factor() call needed here.
                 "cis": {
                     "fit": {**cis_cfg.get("fit", {}),
-                            # sum_factor_col="sum_factor" (NOT "sum_factor_adj"), confirmed
-                            # 2026-09-13 from the actual reference fit_cis implementation
-                            # (tmp/fit_cis_array/fit_cis_array.py, the "missing notebook"
-                            # STRATEGY.md §1 flagged) -- its own README states this
-                            # explicitly: "SUM_FACTOR_COL='sum_factor' matches the notebook
-                            # and is correct as-is ... a separate thing from
-                            # adjust_ntc_sum_factor(), which adjusts the NTC side." Using
-                            # sum_factor_adj here (this pipeline's earlier guess, carried
-                            # over from Domingo/Morris's convention before this reference
-                            # was found) caused real NaN Normal(loc, scale) failures in
-                            # GFI1B's bm_indmu/bm_noindmu cis jobs -- adjust_ntc_sum_factor()
-                            # derives its per-technical-group correction from NTC cells
-                            # only, and the narrow bm subset (165 cells) leaves some of
-                            # GFI1B's own technical groups with zero backing NTC cells,
-                            # making sum_factor_adj undefined there. adjust_ntc_sum_factor()
-                            # itself still runs (see "sum_factor" key below) since fit_trans
-                            # still needs the sum_factor_adj column it writes -- see
-                            # STRATEGY.md §17.
-                            "sum_factor_col": "sum_factor",
+                            # sum_factor_col="sum_factor_adj" -- restored 2026-09-13
+                            # (STRATEGY.md §18) after a brief detour to plain
+                            # "sum_factor" (§17) that matched the reference
+                            # tmp/fit_cis_array/fit_cis_array.py but sacrificed
+                            # signal for correctness. The REAL problem wasn't
+                            # sum_factor_adj itself -- it was computing it
+                            # per-gene on cis's narrow bm subset (~165 cells),
+                            # where some of a cis gene's own technical groups
+                            # can have zero backing NTC cells, making it NaN.
+                            # Now that it's precomputed ONCE upstream on the
+                            # full population (every technical group NTC-backed),
+                            # sum_factor_adj is well-defined and cis can use it
+                            # as originally intended.
+                            "sum_factor_col": "sum_factor_adj",
                             "independent_mu_sigma": variant_spec["independent_mu_sigma"]},
                     "save": True,
                 },
@@ -362,7 +373,9 @@ def main() -> None:
             trans_bd_cfg = render_bayesdream_config(base_cfg, {
                 "model": {"label": label, "cis_gene": gene_id},
                 "data": subset_data_block(gene, data_variant, "full"),
-                "sum_factor": sum_factor_block,
+                # No "sum_factor" key -- same reasoning as cis above
+                # (STRATEGY.md §18): 'sum_factor_adj' is already a column in
+                # this gene/variant's own 'full' subset meta.csv.
                 "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
                 "trans": {
                     # lean=True: matches the reference notebook's own

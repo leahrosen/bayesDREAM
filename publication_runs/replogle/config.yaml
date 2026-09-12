@@ -125,13 +125,18 @@ ntc_shared:
   resources: {cores: 8, time_hours: 24}
   fit: {tolerance: 0}   # niters left at fit_ntc()'s own default/auto-escalation, matching the notebook
 
-# sum_factor adjustments used by cis/trans below. Deliberately does NOT
-# include refit_sumfactor (Domingo/Morris both use it; Replogle's own
-# reference notebook does not -- fit_trans is called with
-# sum_factor_col="sum_factor_adj" directly, never "sum_factor_refit". See
-# STRATEGY.md §7 decision #5 ("carry over notebook values").
+# Documentation only as of 2026-09-13 (STRATEGY.md §18) -- NOT read by
+# generate_slurm.py anymore. adjust_ntc_sum_factor(covariates=["batch"])
+# (confirmed from both notebooks) is now run ONCE, upstream, in
+# preprocess.py, on the FULL combined population, via its own --batch-col
+# CLI flag (default "batch", matching this) -- NOT per-gene at cis/trans
+# time (that caused a real NaN failure on GFI1B's bm subset, see cis:'s
+# comment below). This key is kept only as a human-readable record of the
+# covariate convention; refit_sumfactor is deliberately never used either
+# way -- fit_trans is called with sum_factor_col="sum_factor_adj" directly,
+# per STRATEGY.md §7 decision #5.
 sum_factor:
-  covariates: [batch]   # adjust_ntc_sum_factor(covariates=["batch"]) -- confirmed from both notebooks
+  covariates: [batch]
 
 # 01b_subset_<gene>_<cis_variant_data>.sh: pays bayesDREAM.__init__'s
 # classification cost ONCE per (gene, data variant) -- see
