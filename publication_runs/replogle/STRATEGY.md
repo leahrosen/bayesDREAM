@@ -711,11 +711,38 @@ print(df['guide'].value_counts())
 "
 ```
 
-If confirmed, this is NOT `subset_per_gene.py`-specific -- it's a
-`fitting/cis.py` robustness gap (deserves at minimum a clear error message
-naming the actual guide count, or a real fix, rather than an opaque NaN a
-few frames deep in Pyro) that could affect any dataset/gene combination
-where the retained cis_only population happens to reduce to one guide.
-Needs a decision on whether this NTC subset is simply too narrow for
-`bm`'s intended design and should be revisited, or whether `fitting/cis.py`
-should guard this case explicitly.
+**Root cause found (2026-09-13), NOT the guide-count theory above.** The
+checked data showed 3 distinct guides survive in `bm`'s cis_only
+population (`ntc`: 123 cells across 2 curated pairs, GFI1B: 42 cells, 1
+guide) -- `torch.std` of 3 real numbers is not NaN, so the "N=1 guide"
+hypothesis above was wrong; the actual defect is upstream of
+`guide_means`.
+
+The user supplied `tmp/fit_cis_array/` -- the actual reference `fit_cis`
+implementation, previously missing (see §1's "fit_cis notebook is
+missing" note). It calls `fit_cis(sum_factor_col="sum_factor", ...)` --
+the UNADJUSTED column -- and its own README states this explicitly:
+"`SUM_FACTOR_COL="sum_factor"` matches the notebook and is correct as-is
+... a separate thing from `adjust_ntc_sum_factor()`, which adjusts the NTC
+side." `generate_slurm.py`'s `cis_bd_cfg`, however, set
+`sum_factor_col: "sum_factor_adj"` -- a guess carried over from
+Domingo/Morris's convention, made before this reference was found (§1).
+
+Mechanism: `adjust_ntc_sum_factor()` derives its per-technical-group
+correction factor from NTC cells only. In the narrow `bm` subset (165
+cells, batch-matched to only 2 of the 5 curated NTC guide-pairs), some
+technical groups that GFI1B's own 42 target cells fall into can have zero
+backing NTC cells within this subset -- leaving `sum_factor_adj` undefined
+(NaN) for exactly those cells. That NaN flows into `x_obs_factored` ->
+`guide_means` (for the guide(s) with affected cells) -> `torch.mean`/
+`torch.std` over all guides (NaN poisons the whole reduction, not just the
+affected guide's own entry) -> the `Normal(loc: nan, scale: nan)` crash.
+`all_indmu` (full NTC, every technical group well-populated) doesn't hit
+this because `adjust_ntc_sum_factor()` always has NTC cells backing every
+group there.
+
+Fix: `generate_slurm.py`'s cis stage now uses `sum_factor_col: "sum_factor"`
+(matching the reference exactly). `adjust_ntc_sum_factor()` still runs
+(needed for `fit_trans`'s `sum_factor_adj` column), it's just not fed into
+`fit_cis()` anymore. Not yet re-tested against a real job -- do that before
+trusting this closes the issue.

@@ -311,7 +311,25 @@ def main() -> None:
                 "sum_factor": {"adjust_ntc_sum_factor": sum_factor_block["adjust_ntc_sum_factor"]},
                 "cis": {
                     "fit": {**cis_cfg.get("fit", {}),
-                            "sum_factor_col": "sum_factor_adj",
+                            # sum_factor_col="sum_factor" (NOT "sum_factor_adj"), confirmed
+                            # 2026-09-13 from the actual reference fit_cis implementation
+                            # (tmp/fit_cis_array/fit_cis_array.py, the "missing notebook"
+                            # STRATEGY.md §1 flagged) -- its own README states this
+                            # explicitly: "SUM_FACTOR_COL='sum_factor' matches the notebook
+                            # and is correct as-is ... a separate thing from
+                            # adjust_ntc_sum_factor(), which adjusts the NTC side." Using
+                            # sum_factor_adj here (this pipeline's earlier guess, carried
+                            # over from Domingo/Morris's convention before this reference
+                            # was found) caused real NaN Normal(loc, scale) failures in
+                            # GFI1B's bm_indmu/bm_noindmu cis jobs -- adjust_ntc_sum_factor()
+                            # derives its per-technical-group correction from NTC cells
+                            # only, and the narrow bm subset (165 cells) leaves some of
+                            # GFI1B's own technical groups with zero backing NTC cells,
+                            # making sum_factor_adj undefined there. adjust_ntc_sum_factor()
+                            # itself still runs (see "sum_factor" key below) since fit_trans
+                            # still needs the sum_factor_adj column it writes -- see
+                            # STRATEGY.md §17.
+                            "sum_factor_col": "sum_factor",
                             "independent_mu_sigma": variant_spec["independent_mu_sigma"]},
                     "save": True,
                 },
