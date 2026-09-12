@@ -565,3 +565,53 @@ pre-fix data and must be regenerated -- rerun `preprocess.py`, then redo
 output. No `generate_slurm.py`/`config.yaml` changes needed -- this was
 purely a `preprocess.py` data-construction bug, not a pipeline-structure
 one.
+
+## 14. `lean=True` fix + a profiling-methodology correction (2026-09-13)
+
+**`lean=True`**: user noticed `run_cis_deferred.py`'s
+`load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True)` call wasn't
+using `lean=True`, despite `load_ntc_fit()`'s own docstring stating
+`add_cis_gene()`/`fit_cis()`/`refit_sumfactor()` only ever read point
+estimates from `posterior_samples_ntc` -- i.e. loading the full 1000-draw
+posterior there is pure waste. Fixed in `common/run_cis_deferred.py`
+(shared with Domingo/Morris -- a strict improvement, not Replogle-specific,
+confirmed by the library's own docs) and mirrored in
+`common/profile_memory.py`'s own deferred-config `load_ntc_fit()` call, so
+profiling stays an accurate proxy for the real job. Also added
+`lean: true` to Replogle's own `trans.load_ntc.args` (in
+`replogle/generate_slurm.py` only, not the shared `run_trans.py`) --
+matches the reference notebook's own `build_trans_model()` call exactly
+(`tmp/10_bayesDREAM_fit_trans_MYB.ipynb`: `model.load_ntc_fit(...,
+lean=True)`), so this one isn't even a judgment call.
+
+**Profiling-methodology correction (`subset`)**: `subset.resources.cores`
+was 125, based on a `profile_memory.py`-measured 102,026 MB. That
+measurement was wrong, not just imprecise -- profiling `subset_per_gene.py`
+required reusing `profile_memory.py`'s "cis" stage (via
+`--ntc-shared-dir` on a `*_subset_input.yaml` config), which runs
+`load_ntc_fit()`+`add_cis_gene()`+`fit_cis()` -- but the REAL
+`01b_subset_<gene>_<variant>.sh` job never calls `load_ntc_fit()` at all
+(confirmed: `subset_per_gene.py`'s own docstring, "Does NOT call
+load_ntc_fit()"). The proxy measured a strictly more expensive sequence
+than the real job ever runs. Once a real `01b_subset_GFI1B_bm.sh` job
+actually completed, `sacct -j <jobid> --format=MaxRSS` gave the
+authoritative number directly: **10,308,344 KB (~10.07 GB, ~11.3 cores)**
+-- over 10x lower. Corrected `subset.resources.cores` to 16.
+
+**General lesson, applied going forward**: once a real job has actually
+run, `sacct --format=MaxRSS` is strictly more trustworthy than any
+`profile_memory.py` estimate -- use it to cross-check (and correct) every
+`profile_memory.py`-based number the moment a real completed job exists,
+not just when something looks obviously wrong. `cis`'s own
+`profile_memory.py` measurement (49,621 MB, pre-`lean=True`) is more
+trustworthy than `subset`'s was, since it profiles the exact same
+`_cis.yaml` config `run_cis_deferred.py` itself runs (same call sequence,
+different `niters`) -- but should still be re-measured post-`lean=True`
+and cross-checked against real `sacct` data once `02_cis_GFI1B_bm_indmu.sh`
+has actually run, same as `subset`.
+
+Reordered next steps to reflect that `trans` can only be profiled AFTER a
+real (not `profile_memory.py`-only) `cis` job completes -- `trans`'s
+`load_cis_fit()` needs a real saved `.pt` file that only the actual
+`02_cis_<gene>_<variant>.sh` job's `save_cis_fit()` call produces;
+`profile_memory.py --stage cis` never persists anything to disk.

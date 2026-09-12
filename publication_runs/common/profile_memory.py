@@ -62,12 +62,15 @@ no `model.cis_gene` (deferred/add_cis_gene() pattern, e.g. Domingo/Morris's
   --stage compensation reproduces check_systematic_shift()'s memory-dominant
   step off that same tiny fit_cis() state -- see "compensation" note below.
 - Deferred (`<label>_cis.yaml`): mirrors run_cis_deferred.py exactly --
-  model.load_ntc_fit(ntc_shared_dir, mask_features=True) then
+  model.load_ntc_fit(ntc_shared_dir, mask_features=True, lean=True) then
   model.add_cis_gene(cis_gene), so this DOES require a real completed
   ntc_shared run on disk first (that's the whole point of profiling THIS
   data path -- it measures the real memory load_ntc_fit's full-panel
   posteriors add on top of the tiny cis_only data, which the eager path
-  above never touches). Only --stage init/cis are meaningful here -- ntc is
+  above never touches). `lean=True` matches run_cis_deferred.py's own call
+  (2026-09-13) -- add_cis_gene()/fit_cis() only ever read point estimates
+  from posterior_samples_ntc, so profiling without lean would overstate
+  this stage's real peak. Only --stage init/cis are meaningful here -- ntc is
   shared/already-fit elsewhere and compensation/trans always use a separate
   eager config, so --stage ntc/compensation/trans raise on a deferred config.
 
@@ -234,7 +237,7 @@ def main() -> None:
                 "memory load_ntc_fit()'s full-panel posteriors add on top of the tiny cis_only data."
             )
         with _timed_step("load_ntc_fit + add_cis_gene"):
-            model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True)
+            model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True, lean=True)
             model.add_cis_gene(cfg["cis_gene"])
 
         apply_sum_factor_adjustments(

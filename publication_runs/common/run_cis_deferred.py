@@ -129,12 +129,21 @@ def run_cis_deferred(cfg: dict) -> None:
         if covariates:
             model.set_technical_groups(covariates)
 
-    # load_ntc_fit()/add_cis_gene() are cheap, deterministic setup (NOT the
-    # expensive SVI step) -- they always run regardless of whether fit_cis
-    # itself gets skipped below, since add_cis_gene() is what creates the
-    # 'cis' modality that load_cis_fit() (the resumed path) needs to load
-    # INTO in the first place.
-    model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True)
+    # load_ntc_fit()/add_cis_gene() are deterministic setup (NOT the expensive
+    # SVI step) -- they always run regardless of whether fit_cis itself gets
+    # skipped below, since add_cis_gene() is what creates the 'cis' modality
+    # that load_cis_fit() (the resumed path) needs to load INTO in the first
+    # place. NOT cheap memory-wise, though: load_ntc_fit() transiently holds
+    # the shared ntc_shared fit's FULL per-feature posterior in memory before
+    # add_cis_gene() extracts just this one gene's alpha and discards the
+    # rest -- confirmed via real profiling on Replogle (2026-09-11/13) to
+    # dominate this stage's peak RSS. lean=True collapses posterior_samples_ntc
+    # to point estimates (median + 95% CI) before that happens -- safe here
+    # since add_cis_gene()/fit_cis()/refit_sumfactor() only ever read point
+    # estimates from it (see load_ntc_fit()'s own docstring), and it's what
+    # the reference Replogle notebook's own equivalent load (in its trans-stage
+    # build) already does.
+    model.load_ntc_fit(input_dir=ntc_shared_dir, mask_features=True, lean=True)
     model.add_cis_gene(cis_gene)
 
     apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {}, steps=("compute_scran", "adjust_ntc_sum_factor"))

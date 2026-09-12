@@ -341,7 +341,16 @@ def main() -> None:
                 "sum_factor": sum_factor_block,
                 "exclude_trans_genes": {"enabled": True, "args": trans_cfg["exclude_trans_genes"]},
                 "trans": {
-                    "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True}},
+                    # lean=True: matches the reference notebook's own
+                    # build_trans_model() call exactly
+                    # (tmp/10_bayesDREAM_fit_trans_MYB.ipynb:
+                    # "model.load_ntc_fit(input_dir=NTC_FIT,
+                    # mask_features=True, lean=True)") -- collapses
+                    # posterior_samples_ntc to point estimates before the
+                    # full per-feature posterior is held in memory, same
+                    # rationale as run_cis_deferred.py's own lean=True fix
+                    # (2026-09-13).
+                    "load_ntc": {"args": {"input_dir": ntc_shared_dir, "mask_features": True, "lean": True}},
                     "load_cis": {"enabled": True},
                     "fit": {**trans_cfg.get("fit", {}),
                             "sum_factor_col": "sum_factor_adj",
