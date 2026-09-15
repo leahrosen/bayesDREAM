@@ -13,6 +13,7 @@ from matplotlib.lines import Line2D
 
 from .helpers import to_np, resolve_guide_labels, _guide_ntc_mask, _xtrue_posterior
 from .colors import ColorScheme
+from ..utils import require_full_posterior
 
 
 def _guide_sort_key(g):
@@ -264,6 +265,12 @@ def plot_xtrue_density_by_guide(
     # ---- load posterior or fall back to point estimates ----
     post = _xtrue_posterior(model)          # [S, N_cells] or None
     if post is not None:
+        # A lean-loaded posterior_samples_cis is present but only holds a [1,
+        # N_cells] point estimate — a per-cell KDE needs the real draws, so
+        # this would silently produce a degenerate (or KDE-error) density
+        # rather than the intended plot. Error clearly instead.
+        require_full_posterior(getattr(model, 'posterior_samples_cis', None),
+                                "plot_xtrue_density_by_guide")
         samples = post[:, cell_mask]        # [S, N_kept]
     else:
         x_vals = to_np(model.x_true)[cell_mask]

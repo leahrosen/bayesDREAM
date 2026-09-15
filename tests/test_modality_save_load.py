@@ -28,7 +28,6 @@ def _build_model(meta, gene_counts, atac_counts, atac_meta, splicing_counts, spl
         cis_gene="GFI1B",
         output_dir=str(output_dir),
         label="modality_test",
-        primary_modality="gene",
     )
 
     model.modalities["atac"] = Modality(
@@ -75,7 +74,7 @@ def fitted_model(tmp_path_factory, shared_test_data):
 
     model.set_technical_groups(["cell_line"])
     for mod_name in ["gene", "atac", "splicing"]:
-        model.fit_technical(modality_name=mod_name, sum_factor_col="sum_factor", niters=NITERS)
+        model.fit_ntc(modality_name=mod_name, sum_factor_col="sum_factor", niters=NITERS)
 
     return {
         "model": model,
@@ -89,7 +88,7 @@ def test_save_excludes_primary_by_default(fitted_model):
     outdir = fitted_model["base_dir"] / "test_excl_primary"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    model.save_technical_fit(
+    model.save_ntc_fit(
         output_dir=str(outdir),
         modalities=["atac", "splicing"],
         save_model_level=False,
@@ -105,7 +104,7 @@ def test_save_model_level_false_skips_model_params(fitted_model):
     outdir = fitted_model["base_dir"] / "test_no_model_level"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    model.save_technical_fit(
+    model.save_ntc_fit(
         output_dir=str(outdir),
         modalities=["atac"],
         save_model_level=False,
@@ -120,7 +119,7 @@ def test_save_primary_explicitly(fitted_model):
     outdir = fitted_model["base_dir"] / "test_explicit_primary"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    model.save_technical_fit(
+    model.save_ntc_fit(
         output_dir=str(outdir),
         modalities=["gene"],
         save_model_level=True,
@@ -145,7 +144,7 @@ def test_load_specific_modalities(fitted_model):
     outdir = fitted_model["base_dir"] / "test_load_specific"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    source_model.save_technical_fit(
+    source_model.save_ntc_fit(
         output_dir=str(outdir),
         modalities=["atac", "splicing"],
         save_model_level=False,
@@ -161,7 +160,7 @@ def test_load_specific_modalities(fitted_model):
         splicing_meta,
         output_dir=outdir,
     )
-    model2.load_technical_fit(modalities=["atac", "splicing"], load_model_level=False)
+    model2.load_ntc_fit(modalities=["atac", "splicing"], load_model_level=False)
 
     gene_mod = model2.modalities["gene"]
     atac_mod = model2.modalities["atac"]
@@ -177,7 +176,7 @@ def test_default_save_includes_all_modalities(fitted_model):
     outdir = fitted_model["base_dir"] / "test_save_all"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    model.save_technical_fit(output_dir=str(outdir))
+    model.save_ntc_fit(output_dir=str(outdir))
     for name in ["gene", "atac", "splicing"]:
         assert (outdir / f"alpha_y_prefit_{name}.pt").exists(), (
             f"alpha_y_prefit_{name}.pt should exist when modalities=None"

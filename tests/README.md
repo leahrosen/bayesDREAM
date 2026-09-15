@@ -13,7 +13,7 @@ This directory contains test scripts for bayesDREAM functionality.
 ### Compatibility Tests
 
 - **`test_negbinom_compat.py`** - Backward compatibility test for negative binomial distribution
-- **`test_technical_compat.py`** - Backward compatibility test for `fit_technical()` with negbinom
+- **`test_technical_compat.py`** - Backward compatibility test for `fit_ntc()` with negbinom
 
 ### Feature-Specific Tests
 

@@ -2,7 +2,7 @@
 Distribution-specific observation samplers for multi-modal bayesDREAM.
 
 This module provides observation likelihoods for different distributions.
-These are called by the main Pyro models (_model_y, _model_technical) after
+These are called by the main Pyro models (_model_y, _model_ntc) after
 computing the dose-response function parameters.
 
 Supported distributions:
@@ -16,7 +16,7 @@ Technical group covariate handling:
 - negbinom: Multiplicative effects on mu via alpha_y
 - normal/studentt: Additive effects on mu
 - binomial: Effects on logit scale
-- multinomial: Not supported yet (complex - need to maintain probability simplex)
+- multinomial: Log-additive on log(probs), then masked softmax (alpha_y [C,T,K] per-category)
 """
 
 import torch
@@ -237,7 +237,11 @@ def sample_multinomial_trans(
     zero_mask = (mu_y == 0)  # [N, T, K] (rows identical if mu_y was [T,K])
 
     # Base logits: log(mu_y) where unmasked; will never be taken at masked due to masked softmax
-    safe_log_mu = torch.where(zero_mask, torch.zeros_like(mu_y), mu_y).log()  # avoid log(0)
+    # IMPORTANT: do NOT use where(mask, 0, mu_y).log() — PyTorch still evaluates log(0)=inf in
+    # the backward for the masked branch, then multiplies by the 0 gate, giving 0*inf=NaN.
+    # Instead: clamp first (backward sees 1/1e-12, finite), then restore -inf in forward.
+    _safe_mu_y = mu_y.clamp_min(1e-12)
+    safe_log_mu = torch.where(zero_mask, torch.full_like(_safe_mu_y, float('-inf')), _safe_mu_y.log())
 
     def _probs_from_logits(base_log_mu, alpha):
         logits = base_log_mu + alpha
@@ -246,7 +250,12 @@ def sample_multinomial_trans(
 
     # Add α and compute probabilities
     if alpha_y_full is not None and groups_tensor is not None:
-        if alpha_y_full.dim() == 3:
+        if alpha_y_full.dim() == 2:
+            # [C, T] -> fallback only (multinomial alpha_y should be [C,T,K]);
+            # broadcast the same offset uniformly across all K categories
+            alpha_used = alpha_y_full[groups_tensor, :].unsqueeze(-1)  # [N, T, 1]
+            probs = _probs_from_logits(safe_log_mu, alpha_used)        # [N, T, K]
+        elif alpha_y_full.dim() == 3:
             # [C, T, K] -> index by group per observation -> [N, T, K]
             alpha_used = alpha_y_full[groups_tensor, :, :]
             probs = _probs_from_logits(safe_log_mu, alpha_used)        # [N, T, K]

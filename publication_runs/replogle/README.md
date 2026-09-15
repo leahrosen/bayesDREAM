@@ -1,0 +1,392 @@
+# Replogle dataset
+
+Low-MOI (single-guide), CRISPRi-only, transcriptome-wide trans, K562 cells.
+7 cis genes (GFI1B, MYB, NFE2, TET2, IKZF1, HHEX, RUNX1 -- same panel as
+`comparative/datasets.py`'s `REPLOGLE_GENE_TO_ID`), one shared `fit_ntc()`
+across all of them (all NTC cells), then **3 fit_cis configurations per
+gene**, each with its own matching `fit_trans()`. See `STRATEGY.md` in this
+directory for the full design writeup: what the original ad hoc notebooks
+(`tmp/06_bayesDREAM_fit_ntc_combined.ipynb`,
+`tmp/10_bayesDREAM_fit_trans_MYB.ipynb`) do, how NTC cells are subset, what
+`independent_mu_sigma` does, and every decision made while folding this
+into `publication_runs/`.
+
+**Scope**: preprocess -> ntc_shared -> (fit_cis x3, fit_trans x3) per gene.
+Deliberately does **not** include compensation/permutation/recapitulation/
+extra modalities -- none of those were part of what was asked for, or shown
+in the reference notebooks. Add them later the same way Domingo/Morris did,
+if wanted.
+
+**Before submitting a real run, see `../VERIFICATION.md`** for the general
+checklist.
+
+## Two NTC-subsetting data variants + three fit_cis variants
+
+- **`bm`**: replicates the ORIGINAL ad hoc pipeline's actual NTC subsetting
+  (confirmed with the user, 2026-09-09) -- TWO restrictions compose (ANDed
+  together for the NTC portion; every cis-gene-targeting cell is always
+  kept regardless of either):
+  - **guide selection**: only NTC cells carrying one of 5 curated NTC
+    guides (`config.yaml`'s `bm_selected_ntc_guides`, given directly by the
+    user -- this reproduces what the original pipeline's `NTC_subset/`
+    input silently encoded; `common/subset_per_gene.py`'s new
+    `select_ntc_guides` flag).
+  - **batch match**: of THOSE cells, only ones from a `batch` where this
+    gene was actually targeted -- ported from `load_gene_model_inputs()` in
+    `tmp/10_bayesDREAM_fit_trans_MYB.ipynb` (see `STRATEGY.md` §2), via
+    `common/subset_per_gene.py`'s `batch_match_ntc` flag. Replogle pools
+    cells from many technical batches (`K562_combined`), but any one gene's
+    guides only appear in a handful of them -- comparing against NTCs from
+    unrelated batches would mix in batch-to-batch variation beyond what
+    `sum_factor`/`alpha_y` correct for.
+- **`all`**: every NTC cell, no restriction at all (`add_cis_gene()`'s own
+  default; neither flag applied) -- used for `all_indmu` AND `ntc_shared`
+  (see STRATEGY.md §10 for the correction that fixed both to use the
+  genuinely full NTC population, not the pre-curated `NTC_subset/` input).
+
+Three fit_cis configurations (`config.yaml`'s `cis_variants:`), each reusing
+ONE of the two data variants above:
+
+| variant      | data variant | `independent_mu_sigma` |
+|--------------|-------------|-------------------------|
+| `bm_indmu`   | `bm`        | `True`                  |
+| `bm_noindmu` | `bm`        | `False`                 |
+| `all_indmu`  | `all`       | `True`                  |
+
+`independent_mu_sigma=True` fits separate `mu`/`sigma` hyperparameters for
+the per-guide effect prior by `target` (NTC vs. cis-gene guides) instead of
+pooling them into one shared hyperprior -- see `STRATEGY.md` §3.
+
+Each of the 3 variants gets its own `fit_trans()`, reading that SAME
+variant's own cis fit (cis and trans share one label per variant, so
+`load_cis_fit()`'s default directory lines up) and that variant's matching
+`full/` data subset.
+
+## Pipeline
+
+```
+ntc_shared (fit_ntc, ALL NTC cells, cis_gene deferred,
+            set_technical_groups(["batch","experiment"]))
+   │
+   ├── subset(gene, bm)  -> full/, cis_only/   (batch-matched NTC)
+   │     ├── cis(gene, bm_indmu)   -> trans(gene, bm_indmu)
+   │     └── cis(gene, bm_noindmu) -> trans(gene, bm_noindmu)
+   │
+   └── subset(gene, all) -> full/, cis_only/   (all NTC cells)
+         └── cis(gene, all_indmu)  -> trans(gene, all_indmu)
+```
+
+× 7 genes. `generate_slurm.py` writes 1 (ntc_shared) + 7 × [2 subset jobs +
+3 × (1 cis + 1 trans)] = 57 sbatch scripts, plus `submit_all.sh` (dependency-
+chained: each gene's cis job depends on its own data-variant's subset job;
+each trans job depends on its own cis job) and `submitted_jobs.tsv.template`
+for `common/slurm/list_job_status.py`.
+
+## Before running
+
+1. **Preprocess once** (see `preprocess.py`'s own docstring for full
+   detail). Reads the pre-built, **read-only**
+   `for_bayesDREAM/K562_combined/` parquet tree (confirmed 2026-09-08: no
+   write access there), reassembles [the FULL NTC population] ∪ [the 7
+   chosen cis genes' true target cells], and recomputes `sum_factor`
+   **once** on that combined population via `quickCluster`+
+   `computeSumFactors` blocked by `batch` (Morris-style; NOT Domingo's
+   guide-identity/`ref.clust='ntc'` style) -- discarding whatever
+   `sum_factor` values already existed in the input tree, whose own
+   computation scope isn't visible anywhere in this repo. Requires `rpy2` +
+   R (`scran`/`Matrix`/`SingleCellExperiment`/`S4Vectors`), same as
+   Morris's own preprocessing.
+
+   **NTC source (corrected 2026-09-09):** reads `<indir>/NTC/` -- the SAME
+   directory `tmp/06_bayesDREAM_fit_ntc_combined.ipynb` itself reads (85711
+   cells, every NTC guide) -- NOT `NTC_subset/counts_subset.parquet`, which
+   the user confirmed is already subsetted to a chosen set of NTC guides.
+   This full NTC population feeds both `meta_ntc.csv`/`gene_counts_ntc.npz`
+   (`ntc_shared`) and the combined `meta.csv`/`gene_counts.npz` (the
+   `all_indmu` cis_variant, whose own `subset_per_gene.py` step never
+   narrows the NTC pool further -- so both now correctly get the full
+   population). Each `<gene_id>/counts.parquet` is also no longer trusted
+   to hold only that gene's own cells -- its columns are filtered against
+   `cell_meta_full`'s `target` column first, dropping any stray NTC (or
+   other) cells before combining. See `STRATEGY.md` §10 for the full
+   writeup and the synthetic-fixture test that verified this, and the
+   "Two NTC-subsetting data variants" section above for the `bm` variant's
+   own curated-guide-list restriction (`config.yaml`'s
+   `bm_selected_ntc_guides`).
+
+   **Small `batch` values**: any `batch` value with fewer than
+   `--min-block-size` cells (default 100, matching `quickCluster`'s own
+   `min.size`) is pooled into one bucket for scran's blocking variable
+   only (real `batch` column elsewhere is untouched) -- needed on a real
+   run, where one batch was too small and `quickCluster` raised `fewer
+   cells than the minimum cluster size`. See `STRATEGY.md` §12. Requires
+   `fastparquet` (not the default `pyarrow`, which has a confirmed bug
+   against these exact files) -- install into `bayesdream_cpu` if missing.
+
+   **`batch` format fix (2026-09-11, `STRATEGY.md` §13)**: `NTC/cell_meta.csv`'s
+   `batch` was a bare per-experiment integer, while `cell_meta_full.parquet`
+   (the 7 genes' own source) formats the same real batches as
+   `f"{experiment}-{batch}"` -- meaning NTC and target-gene cells could
+   never match on `batch` at all, even though NTC is genuinely abundant in
+   every real batch. `preprocess.py` now reformats `NTC/cell_meta.csv`'s
+   `batch` to match before combining. **If you already ran `preprocess.py`
+   and/or `01_ntc_shared.sh` before this fix, both are built from the wrong
+   batch identity and must be redone from scratch** -- rerun
+   `preprocess.py`, then resubmit `01_ntc_shared.sh`, then regenerate every
+   gene's `01b_subset_*.sh` output (the already-produced 0-cell GFI1B `bm`
+   subset is stale).
+
+   ```bash
+   python preprocess.py \
+     --indir /cfs/klemming/projects/snic/lappalainen_lab1/users/lisetts/Replogle_data/pr_data/for_bayesDREAM/K562_combined \
+     --outdir /cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Replogle2022/processed_Leah
+   ```
+
+2. Confirm `config.yaml`'s `paths.repo_dir`/`paths.python_env` (assumed
+   same as Domingo/Morris -- not independently confirmed for Replogle).
+3. Run `python generate_slurm.py`, inspect `slurm/`.
+4. After `01_ntc_shared.sh` completes (before submitting the bulk of
+   `cis`/`trans` jobs), sanity-check `technical_group_code` consistency --
+   see "Technical group consistency" below -- then
+   `bash slurm/submit_all.sh` for the rest.
+
+## Known gaps / things NOT independently confirmed (see `STRATEGY.md`)
+
+- **The actual `fit_cis` notebook was never found** anywhere in this repo
+  (only its downstream consumer, `tmp/10_bayesDREAM_fit_trans_MYB.ipynb`,
+  which loads an already-completed cis fit rather than fitting one). Its
+  data-subsetting is assumed identical to the trans notebook's
+  `load_gene_model_inputs()` -- confirmed correct by the user (2026-09-08),
+  but its other hyperparameters (beyond `independent_mu_sigma`, which was
+  explicitly requested) are not otherwise verified.
+- `model_defaults.guide_covariates`/`guide_covariates_ntc` are `[]`
+  (Replogle is single-cell-line K562 throughout, unlike Domingo's
+  CRISPRa/CRISPRi split) -- a reasonable default, not confirmed against the
+  missing fit_cis notebook.
+
+## Technical group consistency
+
+bayesDREAM's `set_technical_groups()` numbers groups via
+`groupby(covariates).ngroup()`, which is only stable for the exact
+dataframe it's run on -- re-running it on a smaller per-gene subset can
+renumber groups and desync `technical_group_code` from the
+`alpha_x_prefit`/`alpha_y_prefit` tensors fit under `ntc_shared`'s own
+numbering (fixed in bayesDREAM as of 2026-09-09: `load_ntc_fit()` now
+authoritatively re-derives `technical_group_code` by joining on actual
+covariate values against a `technical_group_labels.csv` `ntc_shared`
+writes, raising loudly rather than silently misapplying a correction if a
+subset's covariate combination was never seen during the NTC fit -- see
+`common/run_cis_deferred.py`, already applied here unmodified). Sanity-check
+this once `01_ntc_shared.sh` and at least one gene's `01b_subset_*.sh` jobs
+have completed, before submitting the rest:
+
+```bash
+python ../common/check_technical_groups.sh \
+  <output_dir>/<label_prefix>_ntc_shared/meta.csv \
+  <output_dir> \
+  batch,experiment
+```
+
+(`<output_dir>` is `config.yaml`'s `paths.output_dir` = `.../BayesianModel_outs`;
+the script globs `<output_dir>/*/cis_only/meta.csv`, which matches
+Replogle's `<label_prefix>_<gene>_<bm|all>_subset/cis_only/meta.csv` layout
+without modification.) A "MISMATCH ... groups in this subset but NOT in
+ntc_shared" result would mean a gene's own batch has no NTC cells at all in
+the full population -- a real data gap, not something either `bm`'s or
+`all`'s NTC restriction could cause (both draw from `ntc_shared`'s own,
+unrestricted coverage).
+
+## Resources
+
+| stage | data variant | partition | time | cores | status |
+|---|---|---|---|---|---|
+| `ntc_shared` | (all NTC) | GPU (1 gpu) | 24h | 8 | fixed -- GPU jobs don't need profiling (see below) |
+| `subset` (both variants) | full combined panel + `add_cis_gene()` | CPU (`shared`) | 4h | 16 | **REAL sacct measurement, 2026-09-13** |
+| `cis` (`bm_indmu`/`bm_noindmu`) | `cis_only`, 165 cells | CPU (`shared`) | 24h | 4 | **profiled post-`lean=True`, 2026-09-13: 610 MB** |
+| `cis` (`all_indmu`) | `cis_only`, 85,753 cells (all NTC) | CPU (`shared`) | 24h | 10 | **profiled post-`lean=True`, 2026-09-13: 5,489 MB** |
+| `trans` (`bm_indmu`/`bm_noindmu`) | `full`, batch-matched | CPU (`shared`) | 24h | 8 | **placeholder -- see profiling below** |
+| `trans` (`all_indmu`) | `full`, all NTC | GPU (1 gpu) | 24h | 8 | fixed, not profiled (see rationale below) |
+
+## A profiling-methodology lesson: prefer real `sacct` over `profile_memory.py` proxies when you can
+
+**`subset`'s `cores:` was wrong for a while (125, based on a 102,026 MB
+`profile_memory.py` measurement) -- not just imprecise, actually measuring
+the wrong thing.** That number came from profiling `subset_per_gene.py` via
+`profile_memory.py --stage cis --ntc-shared-dir ...` against a
+`*_subset_input.yaml` config -- a trick needed because `profile_memory.py`
+has no dedicated "subset" stage, so it reused the "cis" stage's code path
+(`build_model_from_config` -> `load_ntc_fit()` -> `add_cis_gene()` ->
+`fit_cis(niters=10)`) as an approximation. But the REAL
+`01b_subset_<gene>_<variant>.sh` job (`subset_per_gene.py`) never calls
+`load_ntc_fit()` at all -- it stops at `add_cis_gene()` (see that script's
+own "Does NOT call load_ntc_fit()" docstring section). The proxy was
+measuring a genuinely more expensive sequence than the real job ever runs.
+
+The fix: once a real `01b_subset_GFI1B_bm.sh` job actually completed
+(2026-09-13), `sacct -j <jobid> --format=MaxRSS` gave the authoritative
+number directly -- **10,308,344 KB (~10.07 GB, ~11.3 cores at
+888MB/core)**, over 10x lower than the flawed proxy. `cores: 16` (measured
++ margin). Gene/data-variant-independent (construction always builds from
+the same full 86,806-cell combined panel regardless of which gene/variant
+is being extracted; `batch_match_ntc`/`select_ntc_guides` only filter the
+already-small output afterward) -- this one real data point represents all
+7 genes x 2 data variants.
+
+**Takeaway for `trans` (not yet profiled) and anything else**: once a real
+job has actually run, `sacct --format=MaxRSS` on it is strictly more
+trustworthy than any `profile_memory.py` estimate, proxy or otherwise --
+use it to cross-check (and correct, as here) any `profile_memory.py`-based
+number the moment a real completed job is available. `cis`'s own
+`profile_memory.py` measurement is more trustworthy than `subset`'s was --
+it profiles `_cis.yaml` directly (the actual config `run_cis_deferred.py`
+runs), so both do the exact same `load_ntc_fit()+add_cis_gene()+fit_cis()`
+sequence, just at different `niters` -- but it should still be
+cross-checked against real `sacct` data once `02_cis_GFI1B_bm_indmu.sh`
+itself has actually run.
+
+**`ntc_shared` (and `trans`'s `all_indmu` GPU job) don't need memory
+profiling at all.** Dardel's `888MB/core` rule (`publication_runs/README.md`'s
+"Memory" section) is specific to the `shared` **CPU** partition -- a GPU
+node's host RAM isn't scaled by `--cpus-per-task`, so `cores:` there just
+needs to be "enough for data loading," not a memory proxy. This exact
+`ntc_shared` fit (85711 cells x 8202 features) already ran successfully on
+a real GPU in `tmp/06_bayesDREAM_fit_ntc_combined.ipynb`, and for real here
+too (10h26m, 105GB peak RSS, 2026-09-13, post-batch-format-fix). Domingo/
+Morris's own single-GPU `ntc_shared` jobs were never profiled either
+(Morris just sets `cores: 16` with no "from real profiling" comment,
+unlike its CPU stages). The one real unknown for any GPU job here is VRAM,
+which nothing checks either way -- `profile_memory.py`/`sacct MaxRSS` both
+only measure host RAM.
+
+**Does `fit_cis` load the trans genes too?** No -- the actual SVI fit only
+ever sees the cis gene's own single-feature counts (`cis_only/` subset, 1
+row). But `run_cis_deferred.py`'s setup step
+(`load_ntc_fit(ntc_shared_dir, mask_features=True, lean=True)` then
+`add_cis_gene()`) **transiently** loads the shared `ntc_shared` fit's full
+~8195-feature posterior from disk in order to extract just this gene's own
+alpha before discarding the rest. Real measured peak for this stage
+(`GFI1B`, `bm_indmu`, PRE-`lean=True`, 2026-09-13): **49,621 MB** (~55.9
+cores) -- confirming this transient load, not the tiny 1-gene fit, is what
+actually dominates.
+
+**`lean=True` (2026-09-13)**: `load_ntc_fit()`'s own docstring says
+`add_cis_gene()`/`fit_cis()`/`refit_sumfactor()` only ever read point
+estimates from `posterior_samples_ntc`, and `lean=True` collapses it to
+exactly that (median + 95% CI) instead of keeping the full 1000-draw x
+315-group x 8202-feature tensor -- so loading non-lean here was pure waste.
+`run_cis_deferred.py` and `profile_memory.py`'s own deferred-config path
+both now pass `lean=True` (also matches the reference notebook's own
+`build_trans_model()`, which does the same for its equivalent load).
+**Applies to Domingo/Morris too** (shared `common/` code) -- a strict
+improvement per the library's own docs, not Replogle-specific.
+
+**Post-`lean=True` re-profiling (2026-09-13) confirmed the fix AND
+confirmed `bm`/`all` genuinely need separate sizing** -- an assumption I'd
+made without checking (bad idea, per the `subset` lesson above), which the
+user correctly pushed back on:
+- `bm_indmu`: **610 MB** (~0.7 cores) -- down from 49,621 MB, ~80x.
+- `all_indmu`: **5,489 MB** (~6.2 cores) -- down from an unmeasured
+  (assumed-equal-to-bm) figure, but genuinely ~9x higher than `bm_indmu`
+  despite being "only" 1 feature wide -- `all_indmu`'s `cis_only/` has
+  every NTC cell (85,753 rows) vs. `bm`'s restricted ~165, and that
+  cell-count difference costs more than expected even at 1-feature width.
+
+`config.yaml`'s `cis:` block now has separate `resources`/`all_resources`
+(mirroring `trans`'s `resources`/`gpu_resources` split), each set from its
+own real measurement with margin: `cores: 4` (bm) / `cores: 10` (all).
+
+`cluster.partition_main`/`main_node_cores` (confirmed via `sinfo -p main -o
+"%c %m"`: `main`, 256 cores / ~237,174 MB per node -- "50% of a node" =
+128 cores / ~118,587 MB) are kept as ready-to-use infrastructure in
+`generate_slurm.py`'s `_cpu_placement()` helper for any future stage that
+crosses that line -- no stage currently sets `use_full_node: true`; both
+`subset` and `cis` (both variants) come in well under it once measured
+correctly.
+
+**Profiling `cis`/`trans` (`bm` variants)**: `common/profile_memory.py`
+measures real peak RSS around a bare model construction + a cheap
+(`--niters 10`) real fit call -- peak memory is set by tensor shapes, not
+convergence, so a 10-iteration run already shows the real peak. Both need
+a REAL, already-completed `ntc_shared` run on disk first; `cis` additionally
+needs a real, already-completed `01b_subset_<gene>_<bm|all>.sh` (so
+`data.meta` in the `_cis.yaml` config exists) -- profile BOTH data variants
+separately, don't assume one represents the other (see above); `trans`
+needs a real, already-completed `cis` job too (`load_cis.enabled: true`
+reads a saved `.pt` file `profile_memory.py`'s own `--stage cis` run never
+writes -- only the REAL `02_cis_<gene>_<variant>.sh` job calls
+`save_cis_fit()`). So the real sequence is: real `subset` job (either
+variant) -> real `cis` job (sized from the profiling below, then
+cross-check with its own `sacct` once it's done) -> profile `trans`:
+
+```bash
+# cis -- BOTH data variants, don't assume one represents the other:
+python ../common/profile_memory.py \
+  --config slurm/configs/<label_prefix>_GFI1B_bm_indmu_cis.yaml \
+  --stage cis --niters 10
+
+python ../common/profile_memory.py \
+  --config slurm/configs/<label_prefix>_GFI1B_all_indmu_cis.yaml \
+  --stage cis --niters 10
+
+# trans -- bm variant only (all_indmu's trans is a fixed GPU allocation, not profiled):
+python ../common/profile_memory.py \
+  --config slurm/configs/<label_prefix>_GFI1B_bm_indmu_trans.yaml \
+  --stage trans --niters 10
+```
+
+`bm_indmu`/`bm_noindmu` share one number (identical `cis_only/` data --
+`independent_mu_sigma` is a Pyro-model flag, not a shape difference) -- one
+profiling run covers both. `all_indmu` needed its OWN measurement, not an
+assumption: despite `cis_only/` being only 1 feature wide either way, its
+85,753-row (all-NTC) construction turned out to cost ~9x more than `bm`'s
+165-row one (610 MB vs. 5,489 MB, confirmed 2026-09-13) -- both still tiny
+in absolute terms, but a real, measured difference, not "negligible" as
+originally guessed.
+
+**`trans`'s `all_indmu` variant is NOT profiled** -- fixed at one GPU node
+(1 GPU, 8 cores, 24h) per gene per the user's explicit instruction, since
+every `all_indmu` run has the identical full-~8195-gene panel shape
+regardless of gene (unlike the `bm` variants and `cis`, whose peak memory
+is worth confirming per the transient-full-panel-load reasoning above).
+
+- `cluster.partition_gpu`/`gpu_single_sbatch_lines` and `paths.python_env_gpu`
+  are NOT independently confirmed for Replogle -- mirrored from Domingo/
+  Morris's own `bayesdream_rocm` env and `gpu`/`--gpus=1` conventions.
+  Confirm via `sinfo -p gpu -o "%P %G %c %N"` before submitting.
+
+## sum_factor / no refit_sumfactor
+
+Unlike Domingo/Morris, this pipeline does **not** call `refit_sumfactor()`
+at the trans stage -- `tmp/10_bayesDREAM_fit_trans_MYB.ipynb` calls
+`fit_trans(sum_factor_col="sum_factor_adj", ...)` directly. `cis`/`trans`
+both use `adjust_ntc_sum_factor(covariates=["batch"])` -> `sum_factor_adj`
+(not `sum_factor_refit`).
+
+## exclude_trans_genes / function_type
+
+Trans genes with `log2(mu_ntc) < -4.0` are excluded before `fit_trans()`
+(`model.exclude_trans_genes(min_log2_mu_ntc=-4.0)`, same convention as
+Domingo/Morris). `function_type="single_hill"`, NOT `additive_hill`
+(Domingo/Morris's default) -- confirmed from the actual run log in
+`tmp/10_bayesDREAM_fit_trans_MYB.ipynb`.
+
+## Feature identity (`model_defaults.feature_name_col`, 2026-09-10)
+
+Replogle's counts are a sparse `.npz` with no row labels, so (per
+bayesDREAM commit `24bc2f5`, "Unify feature identity resolution")
+per-feature identity would otherwise be resolved from `gene_meta.csv`'s
+column-priority cascade rather than an explicit choice.
+`model_defaults.feature_name_col: gene_id` pins it explicitly to the
+Ensembl ID, matching how every `cis_gene:`/`cis_gene_ids` config value is
+already expressed. `preprocess.py`'s `gene_meta.csv` keeps the REAL gene
+symbol in `gene_name` (no longer overwritten to equal `gene_id`, unlike an
+earlier version of this pipeline) since the explicit override makes that
+unnecessary. See `STRATEGY.md` §11 for the full writeup, including a
+real (unrelated, pre-existing) bug this surfaced and fixed:
+`base_cfg["data"]` never included `feature_meta` at all, which would have
+made `01b_subset_<gene>_<variant>.sh`'s own model construction raise the
+first time it ran for real (verified via a synthetic sparse-`.npz`
+fixture, not caught by this pipeline's earlier dry-run-only testing). See
+`domingo/README.md`/`morris/README.md`'s own "Feature identity" sections
+for why Morris specifically needed the same fix for a real (not
+defense-in-depth) reason.

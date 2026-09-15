@@ -13,7 +13,7 @@ bayesDREAM provides methods to export model results as R-friendly CSV files for 
 
 | Method | Creates | Contents |
 |--------|---------|----------|
-| `save_technical_summary()` | `technical_feature_summary_{modality}.csv` | Feature-wise overdispersion parameters per group |
+| `save_ntc_summary()` | `ntc_feature_summary_{modality}.csv` | Feature-wise overdispersion parameters per group |
 | `save_cis_summary()` | `cis_guide_summary.csv`<br>`cis_cell_summary.csv` | Guide-level and cell-level x_true with credible intervals |
 | `save_trans_summary()` | `trans_feature_summary_{modality}.csv` | Feature-wise dose-response parameters, log2FC, inflection points |
 
@@ -36,22 +36,22 @@ model = bayesDREAM(
 
 # Run 3-step pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 
 # Export summaries
-model.save_technical_summary()
+model.save_ntc_summary()
 model.save_cis_summary()
 model.save_trans_summary()
 ```
 
-## Technical Fit Summary
+## NTC Fit Summary
 
 ### Method Signature
 
 ```python
-model.save_technical_summary(
+model.save_ntc_summary(
     output_dir=None,
     modality_name=None
 )
@@ -63,7 +63,7 @@ model.save_technical_summary(
 
 ### Output File
 
-**`technical_feature_summary_{modality}.csv`**
+**`ntc_feature_summary_{modality}.csv`**
 
 Columns:
 - `feature`: Feature name
@@ -76,8 +76,8 @@ Columns:
 ### Example
 
 ```python
-# After fit_technical()
-df = model.save_technical_summary()
+# After fit_ntc()
+df = model.save_ntc_summary()
 
 print(df.head())
 #   feature modality distribution  group_0_alpha_y_mean  group_0_alpha_y_lower  ...
@@ -259,7 +259,7 @@ Rscript docs/example_summary_plots.R
 library(tidyverse)
 
 # Load summaries
-tech_summary <- read_csv("results/technical_feature_summary_gene.csv")
+tech_summary <- read_csv("results/ntc_feature_summary_gene.csv")
 cis_guide <- read_csv("results/cis_guide_summary.csv")
 cis_cell <- read_csv("results/cis_cell_summary.csv")
 trans_summary <- read_csv("results/trans_feature_summary_gene.csv")
@@ -323,7 +323,7 @@ trans_summary %>%
 
 ```python
 # Export summaries for specific modality
-model.save_technical_summary(modality_name='atac')
+model.save_ntc_summary(modality_name='atac')
 model.save_trans_summary(modality_name='splicing_donor')
 ```
 
@@ -338,7 +338,7 @@ guide_df = model.save_cis_summary(include_cell_level=False)
 
 ```python
 # Save to custom directory
-model.save_technical_summary(output_dir='./plots_data')
+model.save_ntc_summary(output_dir='./plots_data')
 model.save_cis_summary(output_dir='./plots_data')
 model.save_trans_summary(output_dir='./plots_data')
 ```
@@ -374,19 +374,19 @@ model = bayesDREAM(
 
 # Run full pipeline
 model.set_technical_groups(['cell_line'])
-model.fit_technical(sum_factor_col='sum_factor')
+model.fit_ntc(sum_factor_col='sum_factor')
 model.fit_cis(sum_factor_col='sum_factor')
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')
 
 # Export all summaries
 print("Exporting summaries...")
-model.save_technical_summary()
+model.save_ntc_summary()
 model.save_cis_summary()
 model.save_trans_summary()
 
 print("Done! CSV files saved to ./results/")
 print("Files created:")
-print("  - technical_feature_summary_gene.csv")
+print("  - ntc_feature_summary_gene.csv")
 print("  - cis_guide_summary.csv")
 print("  - cis_cell_summary.csv")
 print("  - trans_feature_summary_gene.csv")
@@ -396,12 +396,12 @@ print("  - trans_feature_summary_gene.csv")
 
 ### Error: "Technical fit not found"
 
-**Cause:** Trying to save technical summary before running `fit_technical()`
+**Cause:** Trying to save technical summary before running `fit_ntc()`
 
 **Solution:**
 ```python
-model.fit_technical(sum_factor_col='sum_factor')
-model.save_technical_summary()  # Now works
+model.fit_ntc(sum_factor_col='sum_factor')
+model.save_ntc_summary()  # Now works
 ```
 
 ### Error: "Cis fit not found"
@@ -426,13 +426,13 @@ model.save_trans_summary()  # Now works
 
 ### Error: "No technical fit parameters found for modality"
 
-**Cause:** Trying to export a modality that wasn't fit in `fit_technical()`
+**Cause:** Trying to export a modality that wasn't fit in `fit_ntc()`
 
 **Solution:**
 ```python
 # Fit the specific modality first
-model.fit_technical(modality_name='atac', sum_factor_col='sum_factor')
-model.save_technical_summary(modality_name='atac')  # Now works
+model.fit_ntc(modality_name='atac', sum_factor_col='sum_factor')
+model.save_ntc_summary(modality_name='atac')  # Now works
 ```
 
 ### Empty or NaN inflection points

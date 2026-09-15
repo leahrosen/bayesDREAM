@@ -71,7 +71,7 @@ def test_quick_system_pipeline_and_roundtrip(tmp_path):
     model.set_technical_groups(["cell_line"])
 
     # Fast settings for system smoke test.
-    model.fit_technical(niters=100, nsamples=10, sum_factor_col="sum_factor")
+    model.fit_ntc(niters=100, nsamples=10, sum_factor_col="sum_factor")
     model.fit_cis(niters=100, nsamples=10, sum_factor_col="sum_factor")
     model.fit_trans(
         sum_factor_col="sum_factor",
@@ -87,7 +87,7 @@ def test_quick_system_pipeline_and_roundtrip(tmp_path):
     assert model.get_modality("gene").posterior_samples_trans is not None
 
     # Save all stages
-    tech_saved = model.save_technical_fit()
+    tech_saved = model.save_ntc_fit()
     cis_saved = model.save_cis_fit()
     trans_saved = model.save_trans_fit()
 
@@ -108,7 +108,7 @@ def test_quick_system_pipeline_and_roundtrip(tmp_path):
     )
 
     model_loaded.set_technical_groups(["cell_line"])
-    model_loaded.load_technical_fit()
+    model_loaded.load_ntc_fit()
     model_loaded.load_cis_fit()
     model_loaded.load_trans_fit()
 

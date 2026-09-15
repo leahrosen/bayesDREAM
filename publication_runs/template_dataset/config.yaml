@@ -1,0 +1,57 @@
+# Template dataset config -- copy this directory to publication_runs/<new_name>/
+# and fill everything in. See publication_runs/README.md for the general
+# conventions and domingo/ (low-MOI, shared ntc) or morris/ (high-MOI,
+# shared ntc -- same add_cis_gene()-based deferred-cis_gene mechanism as
+# Domingo, bayesDREAM's high-MOI mode supports it natively) for worked
+# examples to crib from.
+
+dataset: template_dataset
+label_prefix: template_dataset_YYYYMMDD
+
+paths:
+  repo_dir: /proj/<project>/users/<user>/bayesDREAM_forClaude
+  python_env: /proj/<project>/users/<user>/envs/bayesdream/bin/python
+  data_dir: /proj/<project>/users/<user>/data/<new_name>
+  output_dir: /proj/<project>/users/<user>/output/<new_name>
+  meta: "{data_dir}/meta.csv"
+  counts: "{data_dir}/gene_counts.csv"
+  # high-MOI only -- delete these three if not needed:
+  # guide_assignment: "{data_dir}/guide_assignment.npy"
+  # guide_meta: "{data_dir}/guide_meta.csv"
+  # guide_target: "{data_dir}/guide_target.csv"
+
+cluster:
+  account: "<dardel-account>"
+  partition_cpu: shared
+  gpu_partition: "<confirm via sinfo, only if you need GPU node packing>"
+  max_submit_jobs_hint: 1024
+
+model_defaults:
+  modality_name: gene
+  guide_covariates: [cell_line]
+  guide_covariates_ntc: [cell_line]
+
+cis_genes: [GENE1, GENE2]
+
+# Delete this block (and use per-gene fit_ntc via the plain `bayesDREAM
+# fit-ntc` CLI stage instead) if your dataset DOESN'T share one fit_ntc
+# across genes.
+ntc_shared:
+  set_technical_groups: [cell_line]
+  resources: {cores: 8, time_hours: 4}
+
+cis:
+  resources: {cores: 8, time_hours: 6}
+  adjust_ntc_sum_factor:
+    enabled: true
+    covariates: [cell_line]
+
+compensation:
+  resources: {cores: 4, time_hours: 1}
+  exclude_cells: {}   # {GENE1: [], GENE2: []}
+
+trans:
+  resources: {cores: 16, time_hours: 12}
+  function_type: additive_hill
+  permutation: {n_reps: 20, resources: {cores: 16, time_hours: 12}}
+  simulation: {n_reps: 10, resources: {cores: 8, time_hours: 6}}

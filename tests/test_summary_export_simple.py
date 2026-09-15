@@ -84,7 +84,7 @@ def summary_model(tmp_path_factory):
 
 def test_technical_summary_columns(summary_model):
     model = summary_model['model']
-    tech_df = model.save_technical_summary()
+    tech_df = model.save_ntc_summary()
     for col in ('feature', 'modality', 'distribution'):
         assert col in tech_df.columns
     assert any('alpha_y' in col for col in tech_df.columns)
@@ -93,7 +93,7 @@ def test_technical_summary_columns(summary_model):
 def test_technical_summary_csv_created(summary_model):
     model = summary_model['model']
     outdir = summary_model['outdir']
-    model.save_technical_summary()
+    model.save_ntc_summary()
     csv_path = os.path.join(outdir, 'technical_feature_summary_gene.csv')
     assert os.path.exists(csv_path)
 

@@ -45,7 +45,7 @@ def summary_export_model(tmp_path_factory):
         device='cpu',
     )
     model.set_technical_groups(['cell_line'])
-    model.fit_technical(sum_factor_col='sum_factor', niters=NITERS_TECH, lr=0.001)
+    model.fit_ntc(sum_factor_col='sum_factor', niters=NITERS_TECH, lr=0.001)
     model.fit_cis(sum_factor_col='sum_factor', niters=NITERS_CIS, lr=0.01)
     model.fit_trans(
         sum_factor_col='sum_factor',
@@ -63,7 +63,7 @@ def summary_export_model(tmp_path_factory):
 @pytest.mark.skipif(not TOYDATA_AVAILABLE, reason="toydata not found")
 def test_technical_summary_structure(summary_export_model):
     model = summary_export_model['model']
-    tech_df = model.save_technical_summary()
+    tech_df = model.save_ntc_summary()
     for col in ('feature', 'modality', 'distribution'):
         assert col in tech_df.columns
     alpha_cols = [c for c in tech_df.columns if 'alpha_y' in c]
@@ -74,7 +74,7 @@ def test_technical_summary_structure(summary_export_model):
 def test_technical_summary_csv(summary_export_model):
     model = summary_export_model['model']
     outdir = summary_export_model['outdir']
-    model.save_technical_summary()
+    model.save_ntc_summary()
     assert os.path.exists(os.path.join(outdir, 'technical_feature_summary_gene.csv'))
 
 

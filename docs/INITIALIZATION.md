@@ -1,8 +1,8 @@
-# Technical Fitting Initialization Guide
+# NTC Fitting Initialization Guide
 
 ## Overview
 
-This document describes the empirical Bayes initialization strategies used in bayesDREAM's technical fitting step (`fit_technical`) for removing batch effects. The initialization approach varies by distribution type (negative binomial, binomial, multinomial) but follows a consistent philosophy: **use reference group data to set baseline priors and initialize correction parameters based on empirical group differences**.
+This document describes the empirical Bayes initialization strategies used in bayesDREAM's NTC fitting step (`fit_ntc`) for removing batch effects. The initialization approach varies by distribution type (negative binomial, binomial, multinomial) but follows a consistent philosophy: **use reference group data to set baseline priors and initialize correction parameters based on empirical group differences**.
 
 ## Key Concepts
 
@@ -40,7 +40,7 @@ Different distributions require different transformation scales for modeling cor
 
 **Use Case**: Modeling gene expression counts, transcript counts, or other count data.
 
-**Baseline Prior** (`bayesDREAM/fitting/technical.py:196-239`):
+**Baseline Prior** (`bayesDREAM/fitting/ntc.py:196-239`):
 
 ```python
 # Compute from reference group (group 0) only
@@ -67,7 +67,7 @@ with f_plate:
 
 **Why Reference Group**: The Gamma hyperparameters set the baseline expectation for gene expression. Using only the reference group ensures this baseline accurately reflects the "standard" condition rather than an average across different batch effects.
 
-**Technical Correction Initialization** (`bayesDREAM/fitting/technical.py:307-338`):
+**Batch Correction Initialization** (`bayesDREAM/fitting/ntc.py:307-338`):
 
 ```python
 # Initialize with log2-ratio differences between groups
@@ -113,7 +113,7 @@ return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
 
 **Use Case**: Modeling proportions with denominators, such as splicing percent-spliced-in (PSI), raw splice junction counts, or allelic ratios.
 
-**Baseline Prior** (`bayesDREAM/fitting/technical.py:240-268`):
+**Baseline Prior** (`bayesDREAM/fitting/ntc.py:240-268`):
 
 ```python
 # Compute PSI from reference group (group 0) only
@@ -146,7 +146,7 @@ with f_plate:
 
 **Why Bounded kappa**: The effective sample size `kappa` controls how informative the prior is. We bound it between 20 and 200 to provide reasonable informativeness without overfitting to the observed data. Too low would make the prior uninformative; too high would make it inflexible.
 
-**Technical Correction Initialization** (`bayesDREAM/fitting/technical.py:354-394`):
+**Batch Correction Initialization** (`bayesDREAM/fitting/ntc.py:354-394`):
 
 ```python
 # Initialize with logit-scale differences between groups
@@ -199,7 +199,7 @@ return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
 
 **Use Case**: Modeling categorical outcomes where each feature has multiple mutually exclusive categories, such as transcript isoform usage, donor site usage, or acceptor site usage.
 
-**Baseline Prior** (`bayesDREAM/fitting/technical.py:85-98, 273`):
+**Baseline Prior** (`bayesDREAM/fitting/ntc.py:85-98, 273`):
 
 ```python
 # Step 1: Identify structurally absent categories from ALL NTC data
@@ -230,7 +230,7 @@ with f_plate:
 
 **Why Reference Group for Dirichlet**: The Dirichlet concentration parameter determines the expected proportion of each category. Using the reference group ensures these baseline proportions match the standard condition, not an average across batch effects that might shift category usage.
 
-**Technical Correction Initialization** (`bayesDREAM/fitting/technical.py:421-465`):
+**Batch Correction Initialization** (`bayesDREAM/fitting/ntc.py:421-465`):
 
 ```python
 # Initialize with log-ratio differences between groups
@@ -274,7 +274,7 @@ return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
 
 **Why Centering is Crucial**: Since probabilities must sum to 1, we cannot change all categories independently. Centering the log-ratio differences ensures that the corrections "balance out" - if one category increases, others must decrease proportionally.
 
-**Guide**: Combination of AutoDelta (point-mass) for the baseline probabilities and AutoNormal (Gaussian) for the technical corrections. This reflects that we're very confident about the baseline but uncertain about the corrections.
+**Guide**: Combination of AutoDelta (point-mass) for the baseline probabilities and AutoNormal (Gaussian) for the batch corrections. This reflects that we're very confident about the baseline but uncertain about the corrections.
 
 **Category Masking**: After sampling category probabilities, we apply `zero_cat_mask` twice:
 1. After initial sampling (line ~280)
@@ -331,10 +331,10 @@ All corrections use Student-T priors with `df=3`, which have heavier tails than 
 
 ### Location in Codebase
 
-- **Main implementation**: `bayesDREAM/fitting/technical.py`
-- **Model definition**: `_model_technical` method (lines ~70-300)
+- **Main implementation**: `bayesDREAM/fitting/ntc.py`
+- **Model definition**: `_model_ntc` method (lines ~70-300)
 - **Guide initialization**: `init_loc_fn` function (lines ~305-470)
-- **Fitting interface**: `fit_technical` method (lines ~475-600)
+- **Fitting interface**: `fit_ntc` method (lines ~475-600)
 
 ### Guide Selection
 
@@ -359,7 +359,7 @@ Different distributions use different optimization strategies:
 - **Binomial**: Adam with learning rate 0.01, 3000 steps
 - **Multinomial**: Adam with learning rate 0.01, 5000 steps
 
-These settings are tuned for typical dataset sizes but can be adjusted via `fit_technical` parameters.
+These settings are tuned for typical dataset sizes but can be adjusted via `fit_ntc` parameters.
 
 ---
 
@@ -383,12 +383,12 @@ model = bayesDREAM(
     output_dir='./output'
 )
 
-# Set technical groups (must be called before fit_technical)
+# Set technical groups (must be called before fit_ntc)
 # Group 0 will be the reference
 model.set_technical_groups(['cell_line'])
 
 # Fit technical model (uses reference group for initialization)
-model.fit_technical(
+model.fit_ntc(
     sum_factor_col='sum_factor',
     num_steps=5000,
     learning_rate=0.01
@@ -412,7 +412,7 @@ model.add_splicing_modality(
 model.set_technical_groups(['cell_line'])
 
 # Fit technical model for splicing modality
-# Note: Currently only 'gene' modality supports fit_technical
+# Note: Currently only 'gene' modality supports fit_ntc
 # For other modalities, alpha_y must be set manually
 ```
 
@@ -430,7 +430,7 @@ model.add_transcript_modality(
 model.set_technical_groups(['cell_line'])
 
 # Fit technical model for transcript usage
-# Note: Currently only 'gene' modality supports fit_technical
+# Note: Currently only 'gene' modality supports fit_ntc
 # For other modalities, alpha_y must be set manually
 ```
 
@@ -456,7 +456,7 @@ model.set_technical_groups(['cell_line'])
 
 **Solution**: Increase `num_steps` or adjust `learning_rate`. For difficult datasets, try:
 ```python
-model.fit_technical(num_steps=10000, learning_rate=0.005)
+model.fit_ntc(num_steps=10000, learning_rate=0.005)
 ```
 
 ### Problem: Correction parameters are all near zero

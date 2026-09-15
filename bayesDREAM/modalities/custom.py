@@ -62,7 +62,9 @@ class CustomModalityMixin:
         distribution: str,
         denominator: Optional[np.ndarray] = None,
         cell_names: Optional[List[str]] = None,
-        overwrite: bool = False
+        overwrite: bool = False,
+        feature_name_col: Optional[str] = None,
+        feature_names: Optional[list] = None,
     ):
         """
         Add a custom user-defined modality with distribution-specific filtering.
@@ -89,7 +91,30 @@ class CustomModalityMixin:
             Cell names for the input data (only used when counts is ndarray).
         overwrite : bool, default=False
             Whether to overwrite existing modality with the same name
+        feature_name_col : str, optional
+            Column of `feature_meta` to use as the authoritative per-feature
+            identifier (`feature_id`). Mutually exclusive with
+            `feature_names` — passing both raises ValueError. Every value in
+            this column must be a non-null string and unique among the
+            features actually kept (after zero-variance filtering); violations
+            raise ValueError. See `Modality.__init__`'s "Feature identity
+            resolution" docstring section for the full priority used when
+            neither this nor `feature_names` is given.
+        feature_names : list of str, optional
+            Explicit feature_id list, one entry per row of `feature_meta`
+            (same order), i.e. before zero-variance filtering — sliced down
+            to the features actually kept. Mutually exclusive with
+            `feature_name_col`.
         """
+        if feature_name_col is not None and feature_names is not None:
+            raise ValueError("Provide either feature_name_col or feature_names, not both.")
+        if feature_names is not None and len(feature_names) != len(feature_meta):
+            raise ValueError(
+                f"feature_names has length {len(feature_names)} but feature_meta has "
+                f"{len(feature_meta)} rows. It must be one entry per row of feature_meta "
+                f"(before zero-variance filtering)."
+            )
+
         # Extract counts array and file cell names from input
         if isinstance(counts, pd.DataFrame):
             counts_array = counts.values
@@ -204,6 +229,8 @@ class CustomModalityMixin:
                 feature_meta = feature_meta.iloc[valid_features].copy()
                 if denominator is not None:
                     denominator = denominator[valid_features]
+                if feature_names is not None:
+                    feature_names = [fn for fn, keep in zip(feature_names, valid_features) if keep]
 
         modality = Modality(
             name=name,
@@ -213,5 +240,8 @@ class CustomModalityMixin:
             denominator=denominator,
             cells_axis=1,
             cell_names=effective_cells,
+            feature_name_col=feature_name_col,
+            feature_names=feature_names,
+            is_gene_identity=False,
         )
         self.add_modality(name, modality, overwrite=overwrite)

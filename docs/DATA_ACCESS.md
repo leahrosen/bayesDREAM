@@ -108,7 +108,7 @@ print(f"All genes (for technical fit): {all_counts.shape}")
 **When to use each:**
 - **`cis_mod`**: For `fit_cis()` - modeling direct perturbation effects
 - **`gene_mod`**: For `fit_trans()` - modeling downstream effects
-- **`model.counts`**: For `fit_technical()` - includes cis gene for cell-line effect estimation
+- **`model.counts`**: For `fit_ntc()` - includes cis gene for cell-line effect estimation
 
 ---
 
@@ -121,7 +121,7 @@ print(f"All genes (for technical fit): {all_counts.shape}")
 # model.counts vs modality counts
 
 # 1. model.counts: ALL features (includes cis gene)
-#    Used for fit_technical() on primary modality
+#    Used for fit_ntc() on primary modality
 all_gene_counts = model.counts  # pandas DataFrame (all genes × cells)
 print(all_gene_counts.shape)    # (1000, 500) - includes GFI1B
 
@@ -423,11 +423,11 @@ adata.layers['spliz'] = spliz_mod.counts.T
 ### Technical Model Results
 
 ```python
-# After running fit_technical() on primary modality
+# After running fit_ntc() on primary modality
 # Technical fit uses model.counts (includes cis gene)
 # It extracts SEPARATE parameters for cis vs trans
 
-# 1. Alpha for cis gene (extracted during fit_technical)
+# 1. Alpha for cis gene (extracted during fit_ntc)
 if hasattr(model, 'alpha_x_prefit'):
     alpha_x = model.alpha_x_prefit  # Cis gene overdispersion
     print(f"Alpha_x shape: {alpha_x.shape}")  # (n_samples, n_groups)
@@ -707,8 +707,8 @@ print(f"Current method: {exon_mod.exon_aggregate_method}")  # e.g., 'min'
 exon_mod.set_exon_aggregate_method('mean')
 # This recomputes exon_mod.counts (inclusion) and exon_mod.denominator (total)
 
-# After fit_technical(), changing is prevented by default
-model.fit_technical(covariates=['cell_line'], distribution='binomial', denominator=exon_mod.denominator)
+# After fit_ntc(), changing is prevented by default
+model.fit_ntc(covariates=['cell_line'], distribution='binomial', denominator=exon_mod.denominator)
 exon_mod.mark_technical_fit_complete()  # Lock the aggregation method
 
 try:

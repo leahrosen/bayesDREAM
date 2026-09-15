@@ -33,6 +33,7 @@ dependencies:
   - pip
   - pip:
     - pyro-ppl>=1.9.0
+    - adjustText>=1.0.0  # Non-overlapping label placement for volcano plots
 
   # Statistical modeling (GAMs for systematic shift test)
   - statsmodels>=0.14.0

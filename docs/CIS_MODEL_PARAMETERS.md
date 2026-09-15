@@ -120,7 +120,7 @@ phi_x = 1 / o_x^2                           # NB dispersion parameter
    estimated jointly with the guide effects and captures the noise structure when
    modeling the cis gene expression.
 
-2. **`o_x_trans_posterior.csv`**: Overdispersion estimated during `fit_technical()` on
+2. **`o_x_trans_posterior.csv`**: Overdispersion estimated during `fit_ntc()` on
    NTC cells only. This serves as a baseline estimate of technical noise without
    perturbation effects.
 
