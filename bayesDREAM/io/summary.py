@@ -2051,9 +2051,7 @@ class ModelSummarizer:
         # share a gene), and merge(..., how='left') with no validate= silently turns
         # that into an unrestricted many-to-many join, multiplying rows in the output.
         if modality.feature_meta is not None and len(modality.feature_meta) > 0:
-            feature_meta_df = modality.feature_meta.reset_index()
-            if 'index' in feature_meta_df.columns:
-                feature_meta_df = feature_meta_df.rename(columns={'index': 'feature_meta_idx'})
+            feature_meta_df = modality.feature_meta.reset_index(drop=True)
             feature_meta_df = feature_meta_df.iloc[:n_features]
 
             if len(feature_meta_df) != len(df):
