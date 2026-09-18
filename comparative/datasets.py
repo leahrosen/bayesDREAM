@@ -16,6 +16,19 @@ runs as of 2026-08-26:
   fit with function_type='single_hill'; feature identifiers are Ensembl
   gene IDs (folder names + the 'feature'/'gene_name' column), with the
   real gene symbol carried separately in a 'gene_symbol' column.
+- Panten: low-MOI (single-guide), CRISPRi+CRISPRa (both arms, like Domingo --
+  cell_line here is which effector construct a cell carries, not a literal
+  cell line), transcriptome-wide trans, 10 cis genes, fit with
+  function_type='additive_hill' (Domingo/Morris's default). Feature
+  identifiers are Ensembl gene IDs (Symbol has duplicate values across the
+  full ~30k-gene panel, so gene_id is what's pinned as feature identity) --
+  same shape as Replogle: 'feature' IS the gene_id, the real symbol is
+  carried separately (in a 'gene_name' column, not 'gene_symbol' --
+  Panten's own preprocess.py/pipeline convention, see Panten2026/preprocess.py).
+  Unlike every other dataset here, Panten's own orchestration pipeline lives
+  OUTSIDE this repo (a separate project/repo, Panten2026/) -- see
+  reconstruct_export.py's _CONFIG_DIR for where its rendered configs are
+  actually read from.
 """
 
 import os
@@ -39,6 +52,8 @@ DATASET_COLORS = {
     'Domingo':  '#1b9e77',   # teal / bluish green
     'Morris':   '#7570b3',   # slate purple
     'Replogle': '#a6761d',   # ochre / brown
+    'Panten':   '#d95f02',   # burnt orange -- next unused color in the same
+                              # ColorBrewer "Dark2" vetted colorblind-safe set
 }
 
 
@@ -217,6 +232,28 @@ REPLOGLE_GENE_TO_ID = {
     'GFI1B': 'ENSG00000165702',
     'TET2':  'ENSG00000168769',
     'IKZF1': 'ENSG00000185811',
+}
+
+
+# ── Panten: gene symbol -> Ensembl gene ID ───────────────────────────────────
+# Same role as REPLOGLE_GENE_TO_ID above -- Panten's meta['target']/counts
+# feature identity is Ensembl-ID-based (see Panten2026/preprocess.py's
+# target-remap fix, 2026-09-18), so add_cis_gene()/dose_response_panels.py's
+# load_model_for_plotting() both need the ID, not the bare symbol. Resolved
+# directly from Panten2026's own generate_slurm.py output (2026-09-18) --
+# real Ensembl IDs, confirmed against known gene biology (e.g. GFI1B ==
+# ENSG00000165702, matching REPLOGLE_GENE_TO_ID's own entry for the same gene).
+PANTEN_GENE_TO_ID = {
+    'CXXC1': 'ENSG00000154832',
+    'E4F1':  'ENSG00000167967',
+    'GFI1B': 'ENSG00000165702',
+    'IKZF1': 'ENSG00000185811',
+    'MYB':   'ENSG00000118513',
+    'MYC':   'ENSG00000136997',
+    'RUNX1': 'ENSG00000159216',
+    'SKI':   'ENSG00000157933',
+    'SMAD4': 'ENSG00000141646',
+    'TCF3':  'ENSG00000071564',
 }
 
 
@@ -403,4 +440,33 @@ REPLOGLE = DatasetSpec(
     smoothing_window=30,
 )
 
-ALL_DATASETS = {d.name: d for d in (DOMINGO, MORRIS, REPLOGLE)}
+PANTEN_OUTDIR = (
+    '/cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/data/Panten2026/'
+    'processed_files_Leah/bayesdream_input/BayesianModel_outs'
+)
+
+PANTEN = DatasetSpec(
+    name='Panten',
+    color=DATASET_COLORS['Panten'],
+    # Both CRISPRi and CRISPRa arms genuinely present (like Domingo -- see
+    # module docstring) -- PALETTE_A, not Morris/Replogle's CRISPRi-only
+    # PALETTE_B, and no force_single_cell_line override needed below.
+    cell_line_palette=PALETTE_A,
+    cis_genes=sorted(PANTEN_GENE_TO_ID),
+    # 'gene_name' (Panten2026/preprocess.py's own column, renamed from the
+    # raw export's 'Symbol') -- NOT Replogle's 'gene_symbol'. Confirmed
+    # empirically (2026-09-18) against a real trans_feature_summary_gene.csv
+    # produced by this dataset's own pipeline.
+    symbol_col='gene_name',
+    run_dir_fn=lambda g: os.path.join(PANTEN_OUTDIR, f'panten2026_20260911_{g}'),
+    save_for_plotting_dir_fn=lambda g: os.path.join(COMPARATIVE_INPUT_DIR, f'Panten_{g}_GEX'),
+    cis_gene_id_fn=PANTEN_GENE_TO_ID.get,
+    init_sum_factor_col='sum_factor',
+    # Matches Panten2026/generate_slurm.py's real fit_trans() call, which
+    # (like Domingo) runs with sum_factor_col='sum_factor_refit' (adjust +
+    # refit_sumfactor both enabled) -- NOT Morris/Replogle's 'sum_factor_adj'
+    # (adjust only).
+    plot_sum_factor_col='sum_factor_refit',
+)
+
+ALL_DATASETS = {d.name: d for d in (DOMINGO, MORRIS, REPLOGLE, PANTEN)}

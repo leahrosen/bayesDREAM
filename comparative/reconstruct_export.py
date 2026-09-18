@@ -1,5 +1,5 @@
 """
-Automates save_model_for_plotting() for Domingo and Morris -- plus
+Automates save_model_for_plotting() for Domingo, Morris, and Panten -- plus
 backfilling hill_eval's y_at_x_log2fc{...} columns into each gene's real
 trans_feature_summary_{modality}.csv -- by replaying that gene's REAL
 rendered <label>_trans.yaml config (publication_runs/<dataset>/slurm/configs/),
@@ -54,21 +54,34 @@ from config_utils import (  # noqa: E402
 )
 from save_for_plotting import save_model_for_plotting  # noqa: E402
 
-from .datasets import DatasetSpec, DOMINGO, MORRIS  # noqa: E402
+from .datasets import DatasetSpec, DOMINGO, MORRIS, PANTEN  # noqa: E402
 from .hill_eval import add_log2fc_at_columns, get_x_ntc, HILL_LOG2FC_TARGETS, is_already_backfilled  # noqa: E402
 from .dose_response_panels import (  # noqa: E402
     compute_smoothed_curves, save_smoothed_curves, resolve_sum_factor_col, domingo_union_features,
 )
 
-_SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS}
-_DATASET_DIRNAME = {'Domingo': 'domingo', 'Morris': 'morris'}
-_LABEL_PREFIX = {'Domingo': 'domingo_20260806', 'Morris': 'morris_20260806'}
+_SPEC_BY_NAME = {'Domingo': DOMINGO, 'Morris': MORRIS, 'Panten': PANTEN}
+_LABEL_PREFIX = {'Domingo': 'domingo_20260806', 'Morris': 'morris_20260806', 'Panten': 'panten2026_20260911'}
+
+# Where each dataset's rendered <label>_<gene>_trans.yaml configs actually
+# live. Domingo/Morris follow this repo's own publication_runs/<name>/slurm/
+# convention; Panten's orchestration pipeline is a SEPARATE repo entirely
+# (Panten2026/, confirmed with the user 2026-09-11 -- "a separate project"),
+# so its entry is an absolute path outside REPO_ROOT rather than derived
+# from it. Previously this was hardcoded inline (a _DATASET_DIRNAME lookup
+# assuming every dataset lives under publication_runs/) -- generalized to
+# this dict when Panten was added (2026-09-18) since that assumption doesn't
+# hold for a dataset whose pipeline lives elsewhere.
+_CONFIG_DIR = {
+    'Domingo': os.path.join(REPO_ROOT, 'publication_runs', 'domingo', 'slurm', 'configs'),
+    'Morris': os.path.join(REPO_ROOT, 'publication_runs', 'morris', 'slurm', 'configs'),
+    'Panten': ('/cfs/klemming/projects/snic/lappalainen_lab1/users/Leah/dosage_analysis/'
+               'Panten2026/slurm/configs'),
+}
 
 
 def _trans_config_path(dataset_name: str, cis_gene: str, label_prefix: str) -> str:
-    dirname = _DATASET_DIRNAME[dataset_name]
-    return os.path.join(REPO_ROOT, 'publication_runs', dirname, 'slurm', 'configs',
-                         f'{label_prefix}_{cis_gene}_trans.yaml')
+    return os.path.join(_CONFIG_DIR[dataset_name], f'{label_prefix}_{cis_gene}_trans.yaml')
 
 
 def _load_trans_config(dataset_name: str, cis_gene: str, label_prefix: Optional[str] = None) -> dict:
