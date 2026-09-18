@@ -2052,9 +2052,23 @@ class ModelSummarizer:
         # share a gene), and merge(..., how='left') with no validate= silently turns
         # that into an unrestricted many-to-many join, multiplying rows in the output.
         if modality.feature_meta is not None and len(modality.feature_meta) > 0:
-            feature_meta_df = modality.feature_meta.reset_index()
-            if 'index' in feature_meta_df.columns:
-                feature_meta_df = feature_meta_df.rename(columns={'index': 'feature_meta_idx'})
+            # resolve_feature_ids() (utils.py) always stamps the resolved
+            # feature_id onto BOTH feature_meta['feature_id'] (a column) and
+            # feature_meta.index (named 'feature_id') -- so a plain
+            # reset_index() here would try to insert a second 'feature_id'
+            # column and raise ValueError: cannot insert feature_id, already
+            # exists. The two are guaranteed identical by construction (see
+            # resolve_feature_ids' docstring), so when the index's name
+            # already matches an existing column, drop the (redundant) index
+            # instead of trying to turn it into a column. The plain unnamed
+            # 'index' rename below still handles every other index shape.
+            index_name = modality.feature_meta.index.name
+            if index_name is not None and index_name in modality.feature_meta.columns:
+                feature_meta_df = modality.feature_meta.reset_index(drop=True)
+            else:
+                feature_meta_df = modality.feature_meta.reset_index()
+                if 'index' in feature_meta_df.columns:
+                    feature_meta_df = feature_meta_df.rename(columns={'index': 'feature_meta_idx'})
             feature_meta_df = feature_meta_df.iloc[:n_features]
 
             if len(feature_meta_df) != len(df):
