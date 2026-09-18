@@ -44,6 +44,48 @@ from .diagnostics import DiagnosticsMixin
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
+def is_ntc_target_name(target_name):
+    """Check if target name is NTC"""
+    if target_name is None:
+        return False
+    normalized = str(target_name).strip().lower()
+    return normalized in {
+        "ntc",
+        "non-targeting",
+        "non-targeting-control",
+        "non-targeting_control"
+    }
+
+
+def normalize_guide_target_mapping(guide_target: pd.DataFrame):
+    """Create guide -> list-of-targets mapping"""
+    if guide_target is None:
+        return None
+
+    required_gt_cols = {'guide', 'target'}
+    missing_gt_cols = required_gt_cols - set(guide_target.columns)
+    if missing_gt_cols:
+        raise ValueError(
+            f"guide_target missing required columns: {missing_gt_cols}. "
+            f"Available columns: {list(guide_target.columns)}"
+        )
+    guide_targets_dict = {}
+    for _, row in guide_target.iterrows():
+        guide_name = row["guide"]
+        target = row["target"]
+        guide_targets_dict.setdefault(guide_name, []).append(target)
+    return guide_targets_dict
+
+
+def classify_target_from_guide(guide_name, guide_targets_dict, cis_gene=None):
+    targets = guide_targets_dict.get(guide_name, [])
+    if cis_gene is not None and cis_gene in targets:
+        return cis_gene
+    if any(is_ntc_target_name(t) for t in targets):
+        return "ntc"
+    return "other"
+
+
 class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
     """
     Internal core class for the three-step Bayesian Dosage Response Effects Across Modalities framework:
@@ -264,27 +306,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             # Process guide-target relationships
             # Priority: guide_target > guide_meta['target']
             if guide_target is not None:
-                # Validate guide_target DataFrame
-                required_gt_cols = {'guide', 'target'}
-                missing_gt_cols = required_gt_cols - set(guide_target.columns)
-                if missing_gt_cols:
-                    raise ValueError(
-                        f"guide_target missing required columns: {missing_gt_cols}. "
-                        f"Available columns: {list(guide_target.columns)}"
-                    )
-
-                # Create guide -> list of targets mapping
-                guide_targets_dict = {}
-                for _, row in guide_target.iterrows():
-                    guide_name = row['guide']
-                    target = row['target']
-                    if guide_name not in guide_targets_dict:
-                        guide_targets_dict[guide_name] = []
-                    guide_targets_dict[guide_name].append(target)
-
-                # Store for later use
-                self.guide_targets_dict = guide_targets_dict
-
+                self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
             elif 'target' in guide_meta.columns:
                 # Use simple one-to-one mapping from guide_meta
                 guide_targets_dict = {
@@ -311,17 +333,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             # currently being fit. Same schema as high-MOI's guide_target: rows
             # of {'guide', 'target'}, with multiple rows allowed per guide.
             if guide_target is not None:
-                required_gt_cols = {'guide', 'target'}
-                missing_gt_cols = required_gt_cols - set(guide_target.columns)
-                if missing_gt_cols:
-                    raise ValueError(
-                        f"guide_target missing required columns: {missing_gt_cols}. "
-                        f"Available columns: {list(guide_target.columns)}"
-                    )
-                guide_targets_dict = {}
-                for _, row in guide_target.iterrows():
-                    guide_targets_dict.setdefault(row['guide'], []).append(row['target'])
-                self.guide_targets_dict = guide_targets_dict
+                self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -365,20 +377,13 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 # Priority mirrors high-MOI classification: cis_gene > NTC > 'other'.
                 # A guide with multiple plausible targets resolves differently
                 # depending on which cis_gene is currently being fit.
-                def _is_ntc_target(target_name):
-                    """Check if target name is NTC (flexible matching)."""
-                    ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-                    return target_name in ntc_variants
-
-                def _classify_guide(guide_name):
-                    targets = self.guide_targets_dict.get(guide_name, [])
-                    if self.cis_gene is not None and self.cis_gene in targets:
-                        return self.cis_gene
-                    if any(_is_ntc_target(t) for t in targets):
-                        return 'ntc'
-                    return 'other'
-
-                self.meta['target'] = self.meta['guide'].map(_classify_guide)
+                self.meta['target'] = self.meta['guide'].map(
+                    lambda guide_name: classify_target_from_guide(
+                        guide_name,
+                        self.guide_targets_dict,
+                        self.cis_gene,
+                    )
+                )
 
                 if exclude_targets is not None:
                     def _has_excluded_target(guide_name):
@@ -422,24 +427,18 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 
         # For high MOI mode, create 'target' column based on guide assignment
         if self.is_high_moi:
-            # Helper function to normalize NTC target names (case-insensitive)
-            def is_ntc_target(target_name):
-                """Check if target name is NTC (flexible matching)."""
-                ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-                return target_name in ntc_variants
-
             # Classify each guide based on its targets (from guide_targets_dict)
             # A guide can have multiple targets, so we check if any match NTC, cis, or excluded
             ntc_guide_indices = []
             cis_guide_indices = []
             exclude_guide_indices = []
 
-            for pos_idx, (guide_idx, guide_row) in enumerate(self.guide_meta.iterrows()):
+            for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
                 guide_name = guide_row['guide']
                 targets = self.guide_targets_dict.get(guide_name, [])
 
                 # Check if this guide has ANY NTC target
-                if any(is_ntc_target(t) for t in targets):
+                if any(is_ntc_target_name(t) for t in targets):
                     ntc_guide_indices.append(pos_idx)
 
                 # Check if this guide has ANY cis_gene target
@@ -582,12 +581,12 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
                 return target_name in ntc_variants
 
-            for pos_idx, (guide_idx, guide_row) in enumerate(self.guide_meta.iterrows()):
+            for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
                 guide_name = guide_row['guide']
                 targets = self.guide_targets_dict.get(guide_name, [])
 
                 # Keep if ANY target is NTC or cis_gene
-                if any(is_ntc_target(t) for t in targets) or self.cis_gene in targets:
+                if any(is_ntc_target_name(t) for t in targets) or self.cis_gene in targets:
                     keep_guide_indices.append(pos_idx)
 
             keep_guide_indices = np.array(keep_guide_indices)
