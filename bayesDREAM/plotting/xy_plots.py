@@ -2431,11 +2431,11 @@ def predict_trans_function(
         return None
 
     feature_idx = feature_list.index(feature)
-    A = A_mean[feature_idx].item() if hasattr(A_mean, 'item') else A_mean[feature_idx]
+    A = _extract_param_median(A_samples, feature_idx)
 
     # Determine function type from available parameters
     if debug:
-        print(f"[predict_trans_function] A={A_mean[feature_idx]:.4g}, feature_idx={feature_idx}")
+        print(f"[predict_trans_function] A={A:.4g}, feature_idx={feature_idx}")
         print(f"[predict_trans_function] branch check: Vmax_a={'Vmax_a' in posterior}, Vmax_b={'Vmax_b' in posterior}, upper_limit={'upper_limit' in posterior}, theta={'theta' in posterior}")
 
     if 'Vmax_a' in posterior and 'Vmax_b' in posterior:
