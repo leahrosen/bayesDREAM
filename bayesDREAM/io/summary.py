@@ -1864,8 +1864,7 @@ class ModelSummarizer:
 
         # Add function-specific parameters
         _S = next((v.shape[0] for v in posterior.values()
-                   if isinstance(v, (np.ndarray, torch.Tensor)) and
-                   (v.numpy() if isinstance(v, torch.Tensor) else v).ndim >= 2), '?')
+                   if isinstance(v, (np.ndarray, torch.Tensor)) and v.ndim >= 2), '?')
         if verbose:
             print(f"\n[save_trans_summary] function_type={function_type}  "
                   f"n_features={n_features}  posterior_samples={_S}")
