@@ -354,7 +354,7 @@ def compute_smoothed_curves(
         alpha_y_full = alpha_y_full.cpu().numpy()
     alpha_y_full = np.asarray(alpha_y_full)  # [C, T] or [S, C, T]
 
-    all_feature_names = list(modality.feature_names)
+    all_feature_names = list(modality.feature_ids)
     if features is None:
         selected = list(enumerate(all_feature_names))  # [(fi, name), ...], full panel
     else:
