@@ -1197,15 +1197,19 @@ class ModelSummarizer:
         - guide_used: Guide + guide_covariates identity (e.g. CRISPRi/CRISPRa arm) --
           the row grain here, 1:1 with the model's own guide_code
         - guide: Bare guide identifier (may repeat across rows if reused across arms)
+        - <guide_covariates/guide_covariates_ntc column(s)>: e.g. the arm/cell_line
+          column guide_used was split by, surfaced directly (one value per row)
         - target: Target gene
         - n_cells: Number of cells
-        - x_true_mean: Mean x_true (averaged over cells in guide_used, then over posterior samples)
+        - x_true_median: Median (across posterior draws) of the per-draw cross-cell
+          mean x_true within guide_used -- matches self.model.x_true's own
+          median-as-point-estimate convention
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
-        - raw_counts_mean: Average raw counts
-        - x_eff_g_mean/lower/upper: Per-guide_code effective expression latent (if available)
-        - sigma_eff_mean: Per-guide_code effect uncertainty latent (if available)
-        - x_ntc, log2fc_x_true_mean/lower/upper, log2fc_x_eff_g_mean/lower/upper:
+        - raw_counts_median: Median raw counts across the guide_used's cells
+        - x_eff_g_median/lower/upper: Per-guide_code effective expression latent (if available)
+        - sigma_eff_median: Per-guide_code effect uncertainty latent (if available)
+        - x_ntc, log2fc_x_true_median/lower/upper, log2fc_x_eff_g_median/lower/upper:
           log2(value) - log2(x_ntc), i.e. fold-change relative to the cis gene's own
           NTC baseline (omitted if x_ntc can't be resolved -- see x_ntc parameter)
 
@@ -1213,23 +1217,25 @@ class ModelSummarizer:
         - guide: Guide name
         - targets: Comma-separated target gene(s)
         - n_cells: Number of cells carrying this guide
-        - x_eff_g_mean: Mean per-guide effective expression
+        - x_eff_g_median: Median per-guide effective expression
         - x_eff_g_lower: 2.5% quantile
         - x_eff_g_upper: 97.5% quantile
-        - sigma_eff_mean: Mean per-guide effect uncertainty
-        - raw_counts_mean: Average raw counts for cells carrying this guide
-        - x_ntc, log2fc_x_eff_g_mean/lower/upper: as above
+        - sigma_eff_median: Median per-guide effect uncertainty
+        - raw_counts_median: Median raw counts for cells carrying this guide
+        - x_ntc, log2fc_x_eff_g_median/lower/upper: as above
 
         Cell-level columns:
         - cell: Cell barcode
         - guide, guide_used: Guide identity (single-guide mode only; see guide_df above)
+        - <guide_covariates/guide_covariates_ntc column(s)>: as in guide_df (single-guide mode only)
         - target: Target classification (cis gene or 'ntc')
         - technical_group_code: Technical group (if available)
-        - x_true_mean: Mean cell-level x_true
+        - x_true_median: Cell-level x_true, median across posterior draws -- identical
+          to self.model.x_true for this cell
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts: Raw counts for this cell
-        - x_ntc, log2fc_x_true_mean/lower/upper: as above
+        - x_ntc, log2fc_x_true_median/lower/upper: as above
 
         Parameters
         ----------
@@ -1340,14 +1346,14 @@ class ModelSummarizer:
             guide_assignment = self.model.guide_assignment  # numpy [N, G]
             n_cells_per_guide = guide_assignment.sum(axis=0).astype(int)  # [G]
 
-            # Average raw counts for cells carrying each guide
-            raw_counts_mean = []
+            # Median raw counts for cells carrying each guide
+            raw_counts_median = []
             for gi in range(G):
                 cell_mask = guide_assignment[:, gi].astype(bool)
                 if cell_mask.any():
-                    raw_counts_mean.append(float(cis_counts[cell_mask].mean()))
+                    raw_counts_median.append(float(np.median(cis_counts[cell_mask])))
                 else:
-                    raw_counts_mean.append(float('nan'))
+                    raw_counts_median.append(float('nan'))
 
             # Targets: comma-separated list from guide_targets_dict
             gtd = getattr(self.model, 'guide_targets_dict', {})
@@ -1366,21 +1372,21 @@ class ModelSummarizer:
                 x_eff_g_lower = np.quantile(x_eff_g_samples, 0.025, axis=0)
                 x_eff_g_upper = np.quantile(x_eff_g_samples, 0.975, axis=0)
 
-            x_eff_g_mean = x_eff_g_samples.mean(axis=0)
+            x_eff_g_median = np.median(x_eff_g_samples, axis=0)
 
             guide_df = pd.DataFrame({
                 'guide': guides,
                 'targets': targets_col,
                 'n_cells': n_cells_per_guide,
-                'x_eff_g_mean': x_eff_g_mean,
+                'x_eff_g_median': x_eff_g_median,
                 'x_eff_g_lower': x_eff_g_lower,
                 'x_eff_g_upper': x_eff_g_upper,
-                'sigma_eff_mean': sigma_eff_samples.mean(axis=0),
-                'raw_counts_mean': raw_counts_mean,
+                'sigma_eff_median': np.median(sigma_eff_samples, axis=0),
+                'raw_counts_median': raw_counts_median,
             })
             if _x_ntc is not None:
                 guide_df['x_ntc'] = _x_ntc
-                guide_df['log2fc_x_eff_g_mean'] = _log2fc(x_eff_g_mean)
+                guide_df['log2fc_x_eff_g_median'] = _log2fc(x_eff_g_median)
                 guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
                 guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
 
@@ -1396,11 +1402,27 @@ class ModelSummarizer:
             # latents) is 1:1 with guide_used, NOT with 'guide' alone: the same guide
             # sequence can be reused across arms/covariates, so grouping by 'guide'
             # would silently average CRISPRi and CRISPRa cells/effects together.
+            # guide_covariates/guide_covariates_ntc are the meta column(s) guide_used
+            # was built from (e.g. the CRISPRi/CRISPRa arm column) -- surface them as
+            # their own columns too. 'first' is exact for non-NTC rows (these columns
+            # are exactly what defines the guide_used split there); for NTC rows only
+            # guide_covariates_ntc participated in the split, so a guide_covariates-only
+            # column could in principle vary within an NTC guide_used group -- 'first'
+            # then just reports one representative value.
+            guide_covariate_cols = [
+                c for c in dict.fromkeys(
+                    list(getattr(self.model, 'guide_covariates', []) or [])
+                    + list(getattr(self.model, 'guide_covariates_ntc', []) or [])
+                )
+                if c in self.model.meta.columns
+            ]
+
             guide_meta = self.model.meta.groupby('guide_used').agg({
                 'guide': 'first',
                 'target': 'first',
                 'guide_code': 'first',
-                'cell': 'count'
+                'cell': 'count',
+                **{c: 'first' for c in guide_covariate_cols},
             }).rename(columns={'cell': 'n_cells'})
 
             guides = guide_meta.index.tolist()  # each entry is a guide_used value
@@ -1420,7 +1442,7 @@ class ModelSummarizer:
             _x_eff_g_ci = _lean_ci('x_eff_g') if is_lean_cis else None
 
             if x_eff_g_samples is not None:
-                x_eff_g_mean = x_eff_g_samples[:, guide_codes].mean(axis=0)
+                x_eff_g_median = np.median(x_eff_g_samples[:, guide_codes], axis=0)
                 if _x_eff_g_ci is not None:
                     code_lower, code_upper = _x_eff_g_ci
                     x_eff_g_lower = code_lower[guide_codes]
@@ -1429,9 +1451,9 @@ class ModelSummarizer:
                     x_eff_g_lower = np.quantile(x_eff_g_samples[:, guide_codes], 0.025, axis=0)
                     x_eff_g_upper = np.quantile(x_eff_g_samples[:, guide_codes], 0.975, axis=0)
             else:
-                x_eff_g_mean = x_eff_g_lower = x_eff_g_upper = None
+                x_eff_g_median = x_eff_g_lower = x_eff_g_upper = None
 
-            sigma_eff_mean = sigma_eff_samples[:, guide_codes].mean(axis=0) if sigma_eff_samples is not None else None
+            sigma_eff_median = np.median(sigma_eff_samples[:, guide_codes], axis=0) if sigma_eff_samples is not None else None
 
             # Aggregate x_true from cell-level to guide_used-level (mean over cells per guide_used)
             # Use positional indices (iloc) because meta.index may be cell-name strings
@@ -1448,14 +1470,14 @@ class ModelSummarizer:
                 cell_idx = guide_to_cell_indices[g]
                 x_true_guide_samples[:, gi] = x_true_cell_samples[:, cell_idx].mean(axis=1)
 
-            # Compute mean and CI per guide. Under lean loading, x_true_cell_samples
-            # holds each cell's posterior MEDIAN (not mean) as a single "sample" (see
-            # bayesDREAM.io.load._reduce_posterior_samples), so this "mean" is really
-            # the mean of per-cell medians — a standard, reasonable point-estimate
-            # substitution (matches how alpha_x_prefit/alpha_y_prefit already use the
-            # median as their stored point estimate at fit time), but not identical
-            # to the true mean of per-cell posterior means.
-            x_true_mean = x_true_guide_samples.mean(axis=0)
+            # Point estimate = median across posterior draws of the per-draw cross-cell
+            # mean, matching the median-as-point-estimate convention used everywhere
+            # else in the pipeline (self.model.x_true itself is posterior_samples_x['x_true']
+            # .median(dim=0), alpha_x_prefit/alpha_y_prefit likewise). Under lean loading,
+            # x_true_cell_samples holds each cell's posterior MEDIAN as a single "sample"
+            # (see bayesDREAM.io.load._reduce_posterior_samples), so the median here is
+            # trivially that same value (only one sample along axis 0).
+            x_true_median = np.median(x_true_guide_samples, axis=0)
             _x_true_cell_ci = _lean_ci('x_true') if is_lean_cis else None
             if _x_true_cell_ci is not None:
                 # Quantile does NOT commute with cell-averaging: the true
@@ -1475,40 +1497,42 @@ class ModelSummarizer:
                 x_true_lower = np.quantile(x_true_guide_samples, 0.025, axis=0)
                 x_true_upper = np.quantile(x_true_guide_samples, 0.975, axis=0)
 
-            # Compute average raw counts per guide_used
+            # Compute median raw counts per guide_used
             guide_to_cells = self.model.meta.groupby('guide_used')['cell'].apply(list).to_dict()
-            raw_counts_mean = []
+            raw_counts_median = []
             for guide in guides:
                 guide_cells = guide_to_cells.get(guide, [])
                 guide_cell_indices = [i for i, cell in enumerate(self.model.meta['cell']) if cell in guide_cells]
                 if len(guide_cell_indices) > 0:
-                    raw_counts_mean.append(cis_counts[guide_cell_indices].mean())
+                    raw_counts_median.append(np.median(cis_counts[guide_cell_indices]))
                 else:
-                    raw_counts_mean.append(np.nan)
+                    raw_counts_median.append(np.nan)
 
             guide_df = pd.DataFrame({
                 'guide_used': guides,
                 'guide': guide_meta['guide'].values,
                 'target': guide_meta['target'].values,
                 'n_cells': guide_meta['n_cells'].values,
-                'x_true_mean': x_true_mean,
+                'x_true_median': x_true_median,
                 'x_true_lower': x_true_lower,
                 'x_true_upper': x_true_upper,
-                'raw_counts_mean': raw_counts_mean
+                'raw_counts_median': raw_counts_median
             })
-            if x_eff_g_mean is not None:
-                guide_df['x_eff_g_mean'] = x_eff_g_mean
+            for c in guide_covariate_cols:
+                guide_df[c] = guide_meta[c].values
+            if x_eff_g_median is not None:
+                guide_df['x_eff_g_median'] = x_eff_g_median
                 guide_df['x_eff_g_lower'] = x_eff_g_lower
                 guide_df['x_eff_g_upper'] = x_eff_g_upper
-            if sigma_eff_mean is not None:
-                guide_df['sigma_eff_mean'] = sigma_eff_mean
+            if sigma_eff_median is not None:
+                guide_df['sigma_eff_median'] = sigma_eff_median
             if _x_ntc is not None:
                 guide_df['x_ntc'] = _x_ntc
-                guide_df['log2fc_x_true_mean'] = _log2fc(x_true_mean)
+                guide_df['log2fc_x_true_median'] = _log2fc(x_true_median)
                 guide_df['log2fc_x_true_lower'] = _log2fc(x_true_lower)
                 guide_df['log2fc_x_true_upper'] = _log2fc(x_true_upper)
-                if x_eff_g_mean is not None:
-                    guide_df['log2fc_x_eff_g_mean'] = _log2fc(x_eff_g_mean)
+                if x_eff_g_median is not None:
+                    guide_df['log2fc_x_eff_g_median'] = _log2fc(x_eff_g_median)
                     guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
                     guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
 
@@ -1531,15 +1555,21 @@ class ModelSummarizer:
             if not is_high_moi:
                 cell_data['guide'] = self.model.meta['guide'].values
                 cell_data['guide_used'] = self.model.meta['guide_used'].values
+                for c in guide_covariate_cols:
+                    if c not in cell_data:
+                        cell_data[c] = self.model.meta[c].values
 
             # Add technical_group_code if available
             if 'technical_group_code' in self.model.meta.columns:
                 cell_data['technical_group_code'] = self.model.meta['technical_group_code'].values
 
-            # Use cell-level x_true directly from posterior samples. Cell-level
-            # CI is exact even under lean loading (no cross-cell aggregation
-            # involved), via the precomputed sibling keys.
-            cell_data['x_true_mean'] = x_true_cell_samples.mean(axis=0)
+            # Use cell-level x_true directly from posterior samples, median across
+            # draws -- this is exactly self.model.x_true itself (see fit_cis:
+            # posterior_samples_x['x_true'].median(dim=0)), so this column is the
+            # model's own canonical per-cell point estimate, not a separate stat.
+            # Cell-level CI is exact even under lean loading (no cross-cell
+            # aggregation involved), via the precomputed sibling keys.
+            cell_data['x_true_median'] = np.median(x_true_cell_samples, axis=0)
             _x_true_cell_ci2 = _lean_ci('x_true') if is_lean_cis else None
             if _x_true_cell_ci2 is not None:
                 cell_data['x_true_lower'], cell_data['x_true_upper'] = _x_true_cell_ci2
@@ -1549,7 +1579,7 @@ class ModelSummarizer:
             cell_data['raw_counts'] = cis_counts
             if _x_ntc is not None:
                 cell_data['x_ntc'] = _x_ntc
-                cell_data['log2fc_x_true_mean'] = _log2fc(cell_data['x_true_mean'])
+                cell_data['log2fc_x_true_median'] = _log2fc(cell_data['x_true_median'])
                 cell_data['log2fc_x_true_lower'] = _log2fc(cell_data['x_true_lower'])
                 cell_data['log2fc_x_true_upper'] = _log2fc(cell_data['x_true_upper'])
 
