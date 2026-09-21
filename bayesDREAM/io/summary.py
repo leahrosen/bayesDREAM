@@ -1183,7 +1183,8 @@ class ModelSummarizer:
     def save_cis_summary(
         self,
         output_dir: Optional[str] = None,
-        include_cell_level: bool = True
+        include_cell_level: bool = True,
+        x_ntc: Optional[float] = None
     ):
         """
         Save cis fit parameters as guide-wise and cell-wise CSVs.
@@ -1193,13 +1194,20 @@ class ModelSummarizer:
         - cis_cell_summary.csv: Cell-level data (if include_cell_level=True)
 
         Guide-level columns (single-guide mode):
-        - guide: Guide name
+        - guide_used: Guide + guide_covariates identity (e.g. CRISPRi/CRISPRa arm) --
+          the row grain here, 1:1 with the model's own guide_code
+        - guide: Bare guide identifier (may repeat across rows if reused across arms)
         - target: Target gene
         - n_cells: Number of cells
-        - x_true_mean: Mean x_true (averaged over cells in guide, then over posterior samples)
+        - x_true_mean: Mean x_true (averaged over cells in guide_used, then over posterior samples)
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts_mean: Average raw counts
+        - x_eff_g_mean/lower/upper: Per-guide_code effective expression latent (if available)
+        - sigma_eff_mean: Per-guide_code effect uncertainty latent (if available)
+        - x_ntc, log2fc_x_true_mean/lower/upper, log2fc_x_eff_g_mean/lower/upper:
+          log2(value) - log2(x_ntc), i.e. fold-change relative to the cis gene's own
+          NTC baseline (omitted if x_ntc can't be resolved -- see x_ntc parameter)
 
         Guide-level columns (high MOI mode):
         - guide: Guide name
@@ -1210,16 +1218,18 @@ class ModelSummarizer:
         - x_eff_g_upper: 97.5% quantile
         - sigma_eff_mean: Mean per-guide effect uncertainty
         - raw_counts_mean: Average raw counts for cells carrying this guide
+        - x_ntc, log2fc_x_eff_g_mean/lower/upper: as above
 
         Cell-level columns:
         - cell: Cell barcode
-        - guide: Guide name (single-guide mode only)
+        - guide, guide_used: Guide identity (single-guide mode only; see guide_df above)
         - target: Target classification (cis gene or 'ntc')
         - technical_group_code: Technical group (if available)
         - x_true_mean: Mean cell-level x_true
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts: Raw counts for this cell
+        - x_ntc, log2fc_x_true_mean/lower/upper: as above
 
         Parameters
         ----------
@@ -1227,6 +1237,12 @@ class ModelSummarizer:
             Output directory (default: model.output_dir/model.label)
         include_cell_level : bool
             Whether to save cell-level summary (default: True)
+        x_ntc : float, optional
+            Cis gene's own NTC-baseline expression (linear scale), used as the
+            reference for log2fc_* columns. If not given, resolved from the cis
+            modality's own NTC fit (mean of posterior_samples_ntc['mu_ntc']) --
+            the same source/convention save_trans_summary() uses. If neither is
+            available, log2fc_* columns are omitted.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -1277,6 +1293,31 @@ class ModelSummarizer:
             # index scipy's first axis (length 1) instead of the cell axis.
             cis_counts = cis_counts.toarray().ravel()
 
+        # Resolve x_ntc (cis gene's own NTC-baseline expression, linear scale) for
+        # log2FC columns below -- same convention/source as save_trans_summary():
+        # mean of the cis modality's own mu_ntc posterior draws.
+        _x_ntc = float(x_ntc) if x_ntc is not None else None
+        if _x_ntc is None:
+            try:
+                if hasattr(cis_mod, 'posterior_samples_ntc') and cis_mod.posterior_samples_ntc is not None:
+                    if 'mu_ntc' in cis_mod.posterior_samples_ntc:
+                        mu_ntc_cis = cis_mod.posterior_samples_ntc['mu_ntc']
+                        if isinstance(mu_ntc_cis, torch.Tensor):
+                            mu_ntc_cis = mu_ntc_cis.cpu().numpy()
+                        _x_ntc = float(np.asarray(mu_ntc_cis).mean())
+            except Exception:
+                pass
+        if _x_ntc is None:
+            print("[WARNING] save_cis_summary: x_ntc not available from the cis modality's "
+                  "NTC fit -- log2fc_* columns will be omitted. Pass x_ntc explicitly to "
+                  "save_cis_summary() to enable them.")
+
+        def _log2fc(arr):
+            """log2(arr) - log2(x_ntc), or None if either side is unavailable."""
+            if arr is None or _x_ntc is None:
+                return None
+            return np.log2(np.maximum(np.asarray(arr, dtype=float), 1e-10)) - np.log2(max(_x_ntc, 1e-10))
+
         os.makedirs(output_dir, exist_ok=True)
 
         # ── Guide-level summary ───────────────────────────────────────────────
@@ -1325,16 +1366,23 @@ class ModelSummarizer:
                 x_eff_g_lower = np.quantile(x_eff_g_samples, 0.025, axis=0)
                 x_eff_g_upper = np.quantile(x_eff_g_samples, 0.975, axis=0)
 
+            x_eff_g_mean = x_eff_g_samples.mean(axis=0)
+
             guide_df = pd.DataFrame({
                 'guide': guides,
                 'targets': targets_col,
                 'n_cells': n_cells_per_guide,
-                'x_eff_g_mean': x_eff_g_samples.mean(axis=0),
+                'x_eff_g_mean': x_eff_g_mean,
                 'x_eff_g_lower': x_eff_g_lower,
                 'x_eff_g_upper': x_eff_g_upper,
                 'sigma_eff_mean': sigma_eff_samples.mean(axis=0),
                 'raw_counts_mean': raw_counts_mean,
             })
+            if _x_ntc is not None:
+                guide_df['x_ntc'] = _x_ntc
+                guide_df['log2fc_x_eff_g_mean'] = _log2fc(x_eff_g_mean)
+                guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
+                guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
 
             guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
             guide_df.to_csv(guide_file, index=False)
@@ -1454,6 +1502,15 @@ class ModelSummarizer:
                 guide_df['x_eff_g_upper'] = x_eff_g_upper
             if sigma_eff_mean is not None:
                 guide_df['sigma_eff_mean'] = sigma_eff_mean
+            if _x_ntc is not None:
+                guide_df['x_ntc'] = _x_ntc
+                guide_df['log2fc_x_true_mean'] = _log2fc(x_true_mean)
+                guide_df['log2fc_x_true_lower'] = _log2fc(x_true_lower)
+                guide_df['log2fc_x_true_upper'] = _log2fc(x_true_upper)
+                if x_eff_g_mean is not None:
+                    guide_df['log2fc_x_eff_g_mean'] = _log2fc(x_eff_g_mean)
+                    guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
+                    guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
 
             guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
             guide_df.to_csv(guide_file, index=False)
@@ -1467,9 +1524,13 @@ class ModelSummarizer:
                 'target': self.model.meta['target'].values,
             }
 
-            # In single-guide mode, include per-cell guide assignment
+            # In single-guide mode, include per-cell guide assignment. guide_used
+            # is the arm-aware identity (see cis_guide_summary's guide_used vs
+            # guide) -- included here too so cell-level rows can be joined back
+            # to the right guide_df row.
             if not is_high_moi:
                 cell_data['guide'] = self.model.meta['guide'].values
+                cell_data['guide_used'] = self.model.meta['guide_used'].values
 
             # Add technical_group_code if available
             if 'technical_group_code' in self.model.meta.columns:
@@ -1486,6 +1547,11 @@ class ModelSummarizer:
                 cell_data['x_true_lower'] = np.quantile(x_true_cell_samples, 0.025, axis=0)
                 cell_data['x_true_upper'] = np.quantile(x_true_cell_samples, 0.975, axis=0)
             cell_data['raw_counts'] = cis_counts
+            if _x_ntc is not None:
+                cell_data['x_ntc'] = _x_ntc
+                cell_data['log2fc_x_true_mean'] = _log2fc(cell_data['x_true_mean'])
+                cell_data['log2fc_x_true_lower'] = _log2fc(cell_data['x_true_lower'])
+                cell_data['log2fc_x_true_upper'] = _log2fc(cell_data['x_true_upper'])
 
             cell_df = pd.DataFrame(cell_data)
 
