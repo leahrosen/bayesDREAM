@@ -15,7 +15,6 @@ Supports three function types:
 
 import os
 import time
-import warnings
 import numpy as np
 import pandas as pd
 import torch
@@ -1346,7 +1345,6 @@ class ModelSummarizer:
             # Get guide-level metadata
             guide_meta = self.model.meta.groupby('guide').agg({
                 'target': 'first',
-                'guide_code': 'first',
                 'cell': 'count'
             }).rename(columns={'cell': 'n_cells'})
 
@@ -1355,18 +1353,19 @@ class ModelSummarizer:
             # x_eff_g/sigma_eff are guide_code-indexed model latents, sampled over
             # guides_plate in _model_x() regardless of MOI mode, so Predictive()
             # returns them here too -- they were just never read out in this
-            # (single-guide) branch before. 'guide' can in principle map to more
-            # than one guide_code (guide_used splits by guide_covariates), so
-            # verify the mapping is 1:1 before indexing by it.
-            n_codes_per_guide = self.model.meta.groupby('guide')['guide_code'].nunique()
-            ambiguous_guides = set(n_codes_per_guide[n_codes_per_guide > 1].index.tolist())
-            if ambiguous_guides:
-                warnings.warn(
-                    f"{len(ambiguous_guides)} guide(s) map to multiple guide_code values "
-                    f"(guide_covariates splits them) -- x_eff_g/sigma_eff will be NaN for "
-                    f"these in cis_guide_summary.csv: {sorted(ambiguous_guides)[:5]}"
-                    f"{'...' if len(ambiguous_guides) > 5 else ''}"
-                )
+            # (single-guide) branch before. A 'guide' can span multiple guide_code
+            # values (guide_used further splits by guide_covariates, e.g. batch/
+            # lane -- not necessarily CRISPRi/CRISPRa arm), so aggregate up to
+            # 'guide' via a cells-weighted average across its guide_code(s),
+            # mirroring how x_true below is aggregated from cells up to 'guide'.
+            code_counts = self.model.meta['guide_code'].value_counts()
+            guide_to_codes = self.model.meta.groupby('guide')['guide_code'].unique().to_dict()
+            n_multi_code = sum(1 for codes in guide_to_codes.values() if len(codes) > 1)
+            if n_multi_code:
+                print(f"[INFO] cis_guide_summary: {n_multi_code}/{len(guides)} guide(s) span "
+                      f"multiple guide_code values (guide_covariates splits them, e.g. by "
+                      f"batch/lane); x_eff_g_mean/x_eff_g_lower/upper/sigma_eff_mean are "
+                      f"cells-weighted averages across those guide_codes.")
 
             x_eff_g_samples = cis_ps_all.get('x_eff_g')
             sigma_eff_samples = cis_ps_all.get('sigma_eff')
@@ -1375,32 +1374,32 @@ class ModelSummarizer:
             if isinstance(sigma_eff_samples, torch.Tensor):
                 sigma_eff_samples = sigma_eff_samples.cpu().numpy()
 
-            guide_codes = guide_meta['guide_code'].values
-            valid_code = np.array([g not in ambiguous_guides for g in guides])
-
             _x_eff_g_ci = _lean_ci('x_eff_g') if is_lean_cis else None
 
-            if x_eff_g_samples is not None:
-                x_eff_g_mean = np.full(len(guides), np.nan)
-                x_eff_g_lower = np.full(len(guides), np.nan)
-                x_eff_g_upper = np.full(len(guides), np.nan)
+            x_eff_g_mean = np.full(len(guides), np.nan) if x_eff_g_samples is not None else None
+            x_eff_g_lower = np.full(len(guides), np.nan) if x_eff_g_samples is not None else None
+            x_eff_g_upper = np.full(len(guides), np.nan) if x_eff_g_samples is not None else None
+            sigma_eff_mean = np.full(len(guides), np.nan) if sigma_eff_samples is not None else None
 
-                x_eff_g_mean[valid_code] = x_eff_g_samples[:, guide_codes[valid_code]].mean(axis=0)
-                if _x_eff_g_ci is not None:
-                    code_lower, code_upper = _x_eff_g_ci
-                    x_eff_g_lower[valid_code] = code_lower[guide_codes[valid_code]]
-                    x_eff_g_upper[valid_code] = code_upper[guide_codes[valid_code]]
-                else:
-                    x_eff_g_lower[valid_code] = np.quantile(x_eff_g_samples[:, guide_codes[valid_code]], 0.025, axis=0)
-                    x_eff_g_upper[valid_code] = np.quantile(x_eff_g_samples[:, guide_codes[valid_code]], 0.975, axis=0)
-            else:
-                x_eff_g_mean = x_eff_g_lower = x_eff_g_upper = None
+            if x_eff_g_samples is not None or sigma_eff_samples is not None:
+                for gi, g in enumerate(guides):
+                    codes = guide_to_codes[g]
+                    weights = code_counts.reindex(codes).values.astype(float)
+                    weights = weights / weights.sum()
 
-            if sigma_eff_samples is not None:
-                sigma_eff_mean = np.full(len(guides), np.nan)
-                sigma_eff_mean[valid_code] = sigma_eff_samples[:, guide_codes[valid_code]].mean(axis=0)
-            else:
-                sigma_eff_mean = None
+                    if x_eff_g_samples is not None:
+                        per_sample = (x_eff_g_samples[:, codes] * weights).sum(axis=1)  # [n_samples]
+                        x_eff_g_mean[gi] = per_sample.mean()
+                        if _x_eff_g_ci is not None:
+                            code_lower, code_upper = _x_eff_g_ci
+                            x_eff_g_lower[gi] = (code_lower[codes] * weights).sum()
+                            x_eff_g_upper[gi] = (code_upper[codes] * weights).sum()
+                        else:
+                            x_eff_g_lower[gi] = np.quantile(per_sample, 0.025)
+                            x_eff_g_upper[gi] = np.quantile(per_sample, 0.975)
+
+                    if sigma_eff_samples is not None:
+                        sigma_eff_mean[gi] = (sigma_eff_samples[:, codes] * weights).sum(axis=1).mean()
 
             # Aggregate x_true from cell-level to guide-level (mean over cells per guide)
             # Use positional indices (iloc) because meta.index may be cell-name strings
