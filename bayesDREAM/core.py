@@ -224,140 +224,21 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             or when NTC cells are not needed (e.g., stress testing without NTC).
         """
         
-        if label is None and cis_gene is not None:
-            label = cis_gene
-        elif label is None:
-            raise ValueError(
-                "label must be provided when cis_gene is not specified at initialization. "
-                "When cis_gene is provided, label defaults to the gene name."
-            )
+        self._initialize_input_state(
+            meta,
+            counts,
+            cis_gene,
+            output_dir,
+            label,
+            require_ntc,
+        )
 
-        # Basic assignments
-        self.meta = meta.copy()
-
-        # Handle counts - can be DataFrame or sparse matrix
-        self.is_sparse_counts = sparse.issparse(counts)
-        if self.is_sparse_counts:
-            self.counts = counts.copy() if hasattr(counts, 'copy') else counts.tocsr()
-            self._cell_names = counts.columns.tolist() if isinstance(counts, pd.DataFrame) else None
-        else:
-            if isinstance(counts, pd.DataFrame):
-                self.counts = counts.copy()
-                self._cell_names = counts.columns.tolist()
-            else:
-                self.counts = counts.copy() if hasattr(counts, 'copy') else counts
-                self._cell_names = None
-
-        self.cis_gene = cis_gene
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.label = label
-        self.require_ntc = require_ntc
-
-        # ==============================================================================
-        # Detect high MOI mode and validate
-        # ==============================================================================
-        if guide_assignment is not None or guide_meta is not None:
-            if guide_assignment is None or guide_meta is None:
-                raise ValueError(
-                    "Both guide_assignment and guide_meta must be provided for high MOI mode. "
-                    "Got guide_assignment={}, guide_meta={}".format(
-                        type(guide_assignment).__name__ if guide_assignment is not None else None,
-                        type(guide_meta).__name__ if guide_meta is not None else None
-                    )
-                )
-            self.is_high_moi = True
-
-            # Validate guide_assignment shape
-            if guide_assignment.ndim != 2:
-                raise ValueError(
-                    f"guide_assignment must be a 2D matrix (cells × guides), "
-                    f"but got shape {guide_assignment.shape} with {guide_assignment.ndim} dimensions"
-                )
-
-            # Auto-detect and transpose if dimensions are swapped
-            # Expected: (n_cells, n_guides)
-            # If user provides (n_guides, n_cells), transpose it
-            dim0, dim1 = guide_assignment.shape
-            n_guides_meta = len(guide_meta)
-            n_cells_meta = len(meta)
-
-            # Check if dimensions match expected orientation
-            if dim1 == n_guides_meta and dim0 == n_cells_meta:
-                # Correct orientation: (cells, guides)
-                N_cells_assignment, G_guides = dim0, dim1
-            elif dim0 == n_guides_meta and dim1 == n_cells_meta:
-                # Transposed: (guides, cells) - auto-fix
-                warnings.warn(
-                    f"[HIGH MOI] guide_assignment appears to be transposed (shape {guide_assignment.shape} = guides × cells). "
-                    f"Expected (cells × guides). Auto-transposing to ({dim1}, {dim0}).",
-                    UserWarning
-                )
-                guide_assignment = guide_assignment.T
-                N_cells_assignment, G_guides = guide_assignment.shape
-            else:
-                # Cannot determine orientation - provide helpful error
-                raise ValueError(
-                    f"guide_assignment shape {guide_assignment.shape} does not match expected dimensions:\n"
-                    f"  - guide_meta has {n_guides_meta} guides\n"
-                    f"  - meta has {n_cells_meta} cells\n"
-                    f"Expected guide_assignment shape: ({n_cells_meta}, {n_guides_meta}) [cells × guides]\n"
-                    f"Got: {guide_assignment.shape}\n"
-                    f"Please check your guide_assignment matrix orientation."
-                )
-
-            # Validate guide_meta matches resolved dimensions
-            if len(guide_meta) != G_guides:
-                raise ValueError(
-                    f"guide_meta has {len(guide_meta)} rows but guide_assignment has {G_guides} guides (columns). "
-                    f"These dimensions must match."
-                )
-
-            # Validate guide_meta has 'guide' column
-            if 'guide' not in guide_meta.columns:
-                raise ValueError(
-                    f"guide_meta missing required column 'guide'. "
-                    f"Available columns: {list(guide_meta.columns)}"
-                )
-
-            # Store guide assignment and metadata
-            self.guide_assignment = guide_assignment.copy()
-            self.guide_meta = guide_meta.copy()
-
-            # Create guide_code mapping for guide_meta
-            self.guide_meta['guide_code'] = range(G_guides)
-
-            # Process guide-target relationships
-            # Priority: guide_target > guide_meta['target']
-            if guide_target is not None:
-                self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
-            elif 'target' in guide_meta.columns:
-                # Use simple one-to-one mapping from guide_meta
-                guide_targets_dict = {
-                    row['guide']: [row['target']]
-                    for _, row in guide_meta.iterrows()
-                }
-                self.guide_targets_dict = guide_targets_dict
-            else:
-                raise ValueError(
-                    "Either guide_target DataFrame or guide_meta['target'] column must be provided "
-                    "to specify guide-target relationships in high MOI mode."
-                )
-
-            print(f"[INFO] High MOI: {G_guides} guides, avg {guide_assignment.sum(axis=1).mean():.2f} per cell")
-
-        else:
-            self.is_high_moi = False
-            self.guide_targets_dict = None
-
-            # Single-guide mode may still resolve target(s) from a guide_target
-            # DataFrame instead of a pre-computed meta['target'] column — this
-            # allows a guide with multiple plausible targets (e.g. ambiguous
-            # off-target effects) to be resolved against whichever cis_gene is
-            # currently being fit. Same schema as high-MOI's guide_target: rows
-            # of {'guide', 'target'}, with multiple rows allowed per guide.
-            if guide_target is not None:
-                self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
+        N_cells_assignment = self._initialize_guide_state(
+            meta,
+            guide_assignment,
+            guide_meta,
+            guide_target,
+        )
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -450,7 +331,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         # For high MOI mode, create 'target' column based on guide assignment
         if self.is_high_moi:
             guide_names = self.guide_meta['guide'].tolist()
-            self.meta['target'] = [
+            targets = [
                 classify_target_from_guides(
                     [guide_names[index] for index, assigned in enumerate(assignment) if assigned],
                     self.guide_targets_dict,
@@ -460,6 +341,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 )
                 for assignment in self.guide_assignment
             ]
+            self.meta['target'] = targets
 
             # Add guide_code column (not meaningful in high MOI, marked as -1)
             self.meta['guide_code'] = -1
@@ -687,6 +569,119 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         # After all init logic above has consumed self.counts, drop it to save RAM.
         self.counts = None
         self.is_sparse_counts = None  # no longer meaningful without the matrix
+
+    def _initialize_input_state(
+        self,
+        meta,
+        counts,
+        cis_gene,
+        output_dir,
+        label,
+        require_ntc,
+    ):
+        if label is None and cis_gene is not None:
+            label = cis_gene
+        elif label is None:
+            raise ValueError(
+                "label must be provided when cis_gene is not specified at initialization. "
+                "When cis_gene is provided, label defaults to the gene name."
+            )
+
+        self.meta = meta.copy()
+        self.is_sparse_counts = sparse.issparse(counts)
+        if self.is_sparse_counts:
+            self.counts = counts.copy() if hasattr(counts, 'copy') else counts.tocsr()
+            self._cell_names = counts.columns.tolist() if isinstance(counts, pd.DataFrame) else None
+        elif isinstance(counts, pd.DataFrame):
+            self.counts = counts.copy()
+            self._cell_names = counts.columns.tolist()
+        else:
+            self.counts = counts.copy() if hasattr(counts, 'copy') else counts
+            self._cell_names = None
+
+        self.cis_gene = cis_gene
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.label = label
+        self.require_ntc = require_ntc
+
+    def _initialize_guide_state(self, meta, guide_assignment, guide_meta, guide_target):
+        if guide_assignment is None and guide_meta is None:
+            self.is_high_moi = False
+            self.guide_targets_dict = None
+            if guide_target is not None:
+                self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
+            return None
+
+        if guide_assignment is None or guide_meta is None:
+            raise ValueError(
+                "Both guide_assignment and guide_meta must be provided for high MOI mode. "
+                "Got guide_assignment={}, guide_meta={}".format(
+                    type(guide_assignment).__name__ if guide_assignment is not None else None,
+                    type(guide_meta).__name__ if guide_meta is not None else None
+                )
+            )
+        self.is_high_moi = True
+
+        if guide_assignment.ndim != 2:
+            raise ValueError(
+                f"guide_assignment must be a 2D matrix (cells × guides), "
+                f"but got shape {guide_assignment.shape} with {guide_assignment.ndim} dimensions"
+            )
+
+        dim0, dim1 = guide_assignment.shape
+        n_guides_meta = len(guide_meta)
+        n_cells_meta = len(meta)
+        if dim1 == n_guides_meta and dim0 == n_cells_meta:
+            n_cells_assignment, n_guides = dim0, dim1
+        elif dim0 == n_guides_meta and dim1 == n_cells_meta:
+            warnings.warn(
+                f"[HIGH MOI] guide_assignment appears to be transposed (shape {guide_assignment.shape} = guides × cells). "
+                f"Expected (cells × guides). Auto-transposing to ({dim1}, {dim0}).",
+                UserWarning
+            )
+            guide_assignment = guide_assignment.T
+            n_cells_assignment, n_guides = guide_assignment.shape
+        else:
+            raise ValueError(
+                f"guide_assignment shape {guide_assignment.shape} does not match expected dimensions:\n"
+                f"  - guide_meta has {n_guides_meta} guides\n"
+                f"  - meta has {n_cells_meta} cells\n"
+                f"Expected guide_assignment shape: ({n_cells_meta}, {n_guides_meta}) [cells × guides]\n"
+                f"Got: {guide_assignment.shape}\n"
+                f"Please check your guide_assignment matrix orientation."
+            )
+
+        if len(guide_meta) != n_guides:
+            raise ValueError(
+                f"guide_meta has {len(guide_meta)} rows but guide_assignment has {n_guides} guides (columns). "
+                f"These dimensions must match."
+            )
+        if 'guide' not in guide_meta.columns:
+            raise ValueError(
+                f"guide_meta missing required column 'guide'. "
+                f"Available columns: {list(guide_meta.columns)}"
+            )
+
+        self.guide_assignment = guide_assignment.copy()
+        self.guide_meta = guide_meta.copy()
+        self.guide_meta['guide_code'] = range(n_guides)
+
+        if guide_target is not None:
+            self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
+        elif 'target' in guide_meta.columns:
+            self.guide_targets_dict = {
+                row['guide']: [row['target']]
+                for _, row in guide_meta.iterrows()
+            }
+        else:
+            raise ValueError(
+                "Either guide_target DataFrame or guide_meta['target'] column must be provided "
+                "to specify guide-target relationships in high MOI mode."
+            )
+
+        print(f"[INFO] High MOI: {n_guides} guides, avg {guide_assignment.sum(axis=1).mean():.2f} per cell")
+        return n_cells_assignment
 
     def _expand_guide_assignment_by_covariates(self, guide_covariates, guide_covariates_ntc):
         """
