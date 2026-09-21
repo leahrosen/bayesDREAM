@@ -1246,8 +1246,11 @@ class ModelSummarizer:
         - target: Target gene
         - n_cells: Number of cells
         - x_true_median: Median (across posterior draws) of the per-draw cross-cell
-          mean x_true within guide_used -- matches self.model.x_true's own
-          median-as-point-estimate convention
+          MEDIAN x_true within guide_used (not a mean -- a cross-cell mean would
+          be inflated relative to x_eff_g by a Jensen's-gap factor, the same
+          mean-vs-median issue x_ntc_matched addresses elsewhere in this
+          docstring) -- matches self.model.x_true's own median-as-point-estimate
+          convention, and is directly comparable to x_eff_g_median for the same guide
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts_median: Median raw counts across the guide_used's cells
@@ -1609,23 +1612,35 @@ class ModelSummarizer:
 
             sigma_eff_median = np.median(sigma_eff_samples[:, guide_codes], axis=0) if sigma_eff_samples is not None else None
 
-            # Aggregate x_true from cell-level to guide_used-level (mean over cells per guide_used)
+            # Aggregate x_true from cell-level to guide_used-level (MEDIAN over cells
+            # per guide_used, not mean -- see below for why).
             # Use positional indices (iloc) because meta.index may be cell-name strings
             guide_to_cell_indices = {
                 g: np.where(self.model.meta['guide_used'].values == g)[0].tolist()
                 for g in guides
             }
 
-            # Build [n_samples, n_guides] by averaging cells within each guide_used
+            # Build [n_samples, n_guides] by taking the MEDIAN across a guide_used's
+            # cells, per posterior draw -- NOT the mean. x_true|guide is log-normally
+            # distributed around x_eff_g (log2(x_true) ~ Normal(log2(x_eff_g),
+            # sigma_eff)), so the arithmetic MEAN across a guide's cells is inflated
+            # relative to x_eff_g by the same Jensen's-gap factor documented for
+            # x_ntc vs x_true elsewhere in this file (2**(0.5*ln(2)*sigma_eff**2)) --
+            # confirmed empirically (2026-09-21, IKZF1/Panten): log2fc_x_true_median
+            # sat systematically ABOVE log2fc_x_eff_g_median by a near-constant
+            # amount across the whole guide range when this used .mean(axis=1). The
+            # per-draw cross-cell MEDIAN is a consistent estimator of that draw's
+            # true x_eff_g (no Jensen's gap), making x_true_median directly
+            # comparable to x_eff_g_median for the same guide.
             n_samples = x_true_cell_samples.shape[0]
             n_guides = len(guides)
             x_true_guide_samples = np.zeros((n_samples, n_guides))
             for gi, g in enumerate(guides):
                 cell_idx = guide_to_cell_indices[g]
-                x_true_guide_samples[:, gi] = x_true_cell_samples[:, cell_idx].mean(axis=1)
+                x_true_guide_samples[:, gi] = np.median(x_true_cell_samples[:, cell_idx], axis=1)
 
             # Point estimate = median across posterior draws of the per-draw cross-cell
-            # mean, matching the median-as-point-estimate convention used everywhere
+            # median, matching the median-as-point-estimate convention used everywhere
             # else in the pipeline (self.model.x_true itself is posterior_samples_x['x_true']
             # .median(dim=0), alpha_x_prefit/alpha_y_prefit likewise). Under lean loading,
             # x_true_cell_samples holds each cell's posterior MEDIAN as a single "sample"
@@ -1634,17 +1649,18 @@ class ModelSummarizer:
             x_true_median = np.median(x_true_guide_samples, axis=0)
             _x_true_cell_ci = _lean_ci('x_true') if is_lean_cis else None
             if _x_true_cell_ci is not None:
-                # Quantile does NOT commute with cell-averaging: the true
-                # guide-level CI needs the per-draw cross-cell average, which
-                # lean mode discarded. Approximate by averaging the per-cell
-                # lower/upper bounds within each guide instead. This is not
+                # Quantile does NOT commute with cell-aggregation: the true
+                # guide-level CI needs the per-draw cross-cell median, which
+                # lean mode discarded. Approximate with the MEDIAN of the per-cell
+                # lower/upper bounds within each guide instead (matching the
+                # median-not-mean cross-cell aggregation above). This is not
                 # exact (ignores cross-cell posterior correlation), but is a
-                # standard interval-averaging approximation.
+                # standard interval-aggregation approximation.
                 cell_lower, cell_upper = _x_true_cell_ci
-                x_true_lower = np.array([cell_lower[guide_to_cell_indices[g]].mean() for g in guides])
-                x_true_upper = np.array([cell_upper[guide_to_cell_indices[g]].mean() for g in guides])
+                x_true_lower = np.array([np.median(cell_lower[guide_to_cell_indices[g]]) for g in guides])
+                x_true_upper = np.array([np.median(cell_upper[guide_to_cell_indices[g]]) for g in guides])
                 print("[SAVE] cis_guide_summary: x_true CI is lean-mode approximated "
-                      "(mean of per-cell 2.5%/97.5% bounds within each guide, not the "
+                      "(median of per-cell 2.5%/97.5% bounds within each guide, not the "
                       "true joint per-draw guide-level quantile). Reload with lean=False "
                       "for an exact CI.")
             else:
