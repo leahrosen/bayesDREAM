@@ -21,19 +21,9 @@ from scipy import sparse
 # Import utility functions and modules
 from .utils import (
     set_max_threads,
-    find_beta,
-    calculate_mu_x_guide,
-    Hill_based_positive,
-    Hill_based_negative,
-    Hill_based_piecewise,
-    Polynomial_function,
-    cutoff_sigmoid,
     sample_or_use_point,
-    check_tensor,
     is_lean_posterior
 )
-from .modality import Modality
-from .fitting.distributions import get_observation_sampler, requires_denominator, is_3d_distribution
 
 # Import fitters
 from .fitting import NTCFitter, CisFitter, TransFitter
@@ -75,6 +65,18 @@ def normalize_guide_target_mapping(guide_target: pd.DataFrame):
         target = row["target"]
         guide_targets_dict.setdefault(guide_name, []).append(target)
     return guide_targets_dict
+
+
+def resolve_guide_target_mapping(guide_target=None, guide_meta=None):
+    """Resolve the preferred guide-to-target mapping for a model."""
+    if guide_target is not None:
+        return normalize_guide_target_mapping(guide_target)
+    if guide_meta is not None and 'target' in guide_meta.columns:
+        return {
+            row['guide']: [row['target']]
+            for _, row in guide_meta.iterrows()
+        }
+    return None
 
 
 def classify_target_from_guide(guide_name, guide_targets_dict, cis_gene=None, exclude_targets=None, exclude_guides=None):
@@ -423,11 +425,6 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             # A guide is kept if it has ANY NTC or cis target among its possible targets
             keep_guide_indices = []
 
-            def is_ntc_target(target_name):
-                """Check if target name is NTC (flexible matching)."""
-                ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-                return target_name in ntc_variants
-
             for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
                 guide_name = guide_row['guide']
                 targets = self.guide_targets_dict.get(guide_name, [])
@@ -474,7 +471,6 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             gene_sums = self.counts.sum(axis=1)
 
         detected_mask = gene_sums > 0
-        num_removed = (~detected_mask).sum()
 
         # Cis gene existence and zero-variance are already validated by _extract_cis_from_gene
         # (called in bayesDREAM.__init__ before super().__init__).
@@ -608,9 +604,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
     def _initialize_guide_state(self, meta, guide_assignment, guide_meta, guide_target):
         if guide_assignment is None and guide_meta is None:
             self.is_high_moi = False
-            self.guide_targets_dict = None
-            if guide_target is not None:
-                self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
+            self.guide_targets_dict = resolve_guide_target_mapping(guide_target)
             return None
 
         if guide_assignment is None or guide_meta is None:
@@ -667,14 +661,8 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         self.guide_meta = guide_meta.copy()
         self.guide_meta['guide_code'] = range(n_guides)
 
-        if guide_target is not None:
-            self.guide_targets_dict = normalize_guide_target_mapping(guide_target)
-        elif 'target' in guide_meta.columns:
-            self.guide_targets_dict = {
-                row['guide']: [row['target']]
-                for _, row in guide_meta.iterrows()
-            }
-        else:
+        self.guide_targets_dict = resolve_guide_target_mapping(guide_target, guide_meta)
+        if self.guide_targets_dict is None:
             raise ValueError(
                 "Either guide_target DataFrame or guide_meta['target'] column must be provided "
                 "to specify guide-target relationships in high MOI mode."
