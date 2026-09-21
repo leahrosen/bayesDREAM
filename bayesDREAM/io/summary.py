@@ -1193,6 +1193,35 @@ class ModelSummarizer:
         - cis_guide_summary.csv: Guide-level summary
         - cis_cell_summary.csv: Cell-level data (if include_cell_level=True)
 
+        log2FC reference -- x_ntc vs. x_ntc_matched (IMPORTANT):
+        Two different "NTC baseline" quantities are reported. `x_ntc` comes from
+        fit_ntc()'s mu_ntc -- the direct mean parameter of a single-layer
+        NegBinomial (mu_final = mu_ntc*alpha*sum_factor *is* the NB mean), i.e. an
+        arithmetic mean. `x_true`/`x_eff_g` (everything else in these CSVs) come
+        from fit_cis(), which has an EXTRA layer on top: log2(x_true) ~
+        Normal(log2(x_eff_g), sigma_eff), so x_true is log-normally distributed
+        around x_eff_g at the cell level, and x_eff_g is the MEDIAN of that
+        log-normal, not its mean (mean = median * 2**(0.5*ln(2)*sigma_eff**2)).
+        log2FC-ing x_eff_g/x_true against x_ntc therefore mixes a median-type and
+        a mean-type quantity, baking a systematic offset (~0.5*ln(2)*sigma_eff**2
+        in log2 units) into every guide's log2FC -- confirmed empirically
+        (2026-09-21, IKZF1/Panten): with independent_mu_sigma, the model's own
+        fitted NTC-group mu_target came out ~0.08 log2 units below x_ntc, matching
+        that formula for sigma_eff~0.5, while a normal-normal shrinkage estimate
+        showed the prior was far too weak to produce a shift that size on its own.
+        `x_ntc_matched` (median of self.model.x_true restricted to NTC cells) is
+        the correct reference for log2FC here -- same model, same median-of-
+        log-normal scale as everything it's compared against -- and is what
+        log2fc_* actually uses below. `x_ntc` is still reported for reference/
+        backward compatibility, but comparisons between guides are the only thing
+        unaffected by using it (they share the same offset); the absolute
+        "0 = no change from NTC" calibration is not. This same mismatch does NOT
+        apply to save_trans_summary()'s y_ntc -- the trans (Hill) model has no
+        analogous extra latent layer (mu_y feeds directly into the NB mean, see
+        bayesDREAM.fitting.distributions.sample_negbinom_trans), so y_ntc and
+        trans-fitted quantities are already the same (arithmetic-mean) kind of
+        quantity.
+
         Guide-level columns (single-guide mode):
         - guide_used: Guide + guide_covariates identity (e.g. CRISPRi/CRISPRa arm) --
           the row grain here, 1:1 with the model's own guide_code
@@ -1209,9 +1238,10 @@ class ModelSummarizer:
         - raw_counts_median: Median raw counts across the guide_used's cells
         - x_eff_g_median/lower/upper: Per-guide_code effective expression latent (if available)
         - sigma_eff_median: Per-guide_code effect uncertainty latent (if available)
-        - x_ntc, log2fc_x_true_median/lower/upper, log2fc_x_eff_g_median/lower/upper:
-          log2(value) - log2(x_ntc), i.e. fold-change relative to the cis gene's own
-          NTC baseline (omitted if x_ntc can't be resolved -- see x_ntc parameter)
+        - x_ntc: fit_ntc()'s NTC baseline (reference only -- see note above, NOT the log2FC denominator)
+        - x_ntc_matched, log2fc_x_true_median/lower/upper, log2fc_x_eff_g_median/lower/upper:
+          x_ntc_matched is the actual log2FC denominator (see note above); log2fc_* =
+          log2(value) - log2(x_ntc_matched) (omitted if x_ntc_matched can't be resolved)
 
         Guide-level columns (high MOI mode):
         - guide: Guide name
@@ -1222,7 +1252,7 @@ class ModelSummarizer:
         - x_eff_g_upper: 97.5% quantile
         - sigma_eff_median: Median per-guide effect uncertainty
         - raw_counts_median: Median raw counts for cells carrying this guide
-        - x_ntc, log2fc_x_eff_g_median/lower/upper: as above
+        - x_ntc, x_ntc_matched, log2fc_x_eff_g_median/lower/upper: as above
 
         Cell-level columns:
         - cell: Cell barcode
@@ -1235,7 +1265,7 @@ class ModelSummarizer:
         - x_true_lower: 2.5% quantile
         - x_true_upper: 97.5% quantile
         - raw_counts: Raw counts for this cell
-        - x_ntc, log2fc_x_true_median/lower/upper: as above
+        - x_ntc, x_ntc_matched, log2fc_x_true_median/lower/upper: as above
 
         Parameters
         ----------
@@ -1244,11 +1274,11 @@ class ModelSummarizer:
         include_cell_level : bool
             Whether to save cell-level summary (default: True)
         x_ntc : float, optional
-            Cis gene's own NTC-baseline expression (linear scale), used as the
-            reference for log2fc_* columns. If not given, resolved from the cis
-            modality's own NTC fit (mean of posterior_samples_ntc['mu_ntc']) --
-            the same source/convention save_trans_summary() uses. If neither is
-            available, log2fc_* columns are omitted.
+            Manual override for the reported (reference-only, NOT the log2FC
+            denominator -- see note above) fit_ntc()-derived NTC baseline. If not
+            given, resolved from the cis modality's own NTC fit (mean of
+            posterior_samples_ntc['mu_ntc']) -- the same source/convention
+            save_trans_summary() uses.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -1299,9 +1329,13 @@ class ModelSummarizer:
             # index scipy's first axis (length 1) instead of the cell axis.
             cis_counts = cis_counts.toarray().ravel()
 
-        # Resolve x_ntc (cis gene's own NTC-baseline expression, linear scale) for
-        # log2FC columns below -- same convention/source as save_trans_summary():
-        # mean of the cis modality's own mu_ntc posterior draws.
+        # Resolve x_ntc (cis gene's own NTC-baseline expression, linear scale) --
+        # same convention/source as save_trans_summary(): mean of the cis modality's
+        # own mu_ntc posterior draws (fit_ntc(), a single-layer NegBinomial where
+        # mu_ntc directly *is* the NB mean -- an arithmetic-mean-type quantity).
+        # Kept and reported (as the 'x_ntc' column) for reference/backward
+        # compatibility, but NOT used as the log2FC denominator below -- see
+        # x_ntc_matched.
         _x_ntc = float(x_ntc) if x_ntc is not None else None
         if _x_ntc is None:
             try:
@@ -1313,16 +1347,65 @@ class ModelSummarizer:
                         _x_ntc = float(np.asarray(mu_ntc_cis).mean())
             except Exception:
                 pass
-        if _x_ntc is None:
-            print("[WARNING] save_cis_summary: x_ntc not available from the cis modality's "
-                  "NTC fit -- log2fc_* columns will be omitted. Pass x_ntc explicitly to "
-                  "save_cis_summary() to enable them.")
+
+        # Resolve x_ntc_matched: the median of the model's own x_true, restricted
+        # to NTC cells -- the actual log2FC denominator used below.
+        #
+        # Why not x_ntc: fit_ntc()'s mu_ntc is the direct mean parameter of a
+        # single-layer NegBinomial (mu_final = mu_ntc * alpha * sum_factor is
+        # literally the NB's mean) -- an arithmetic mean, with no per-cell latent
+        # layer underneath it. fit_cis()'s x_true has an EXTRA layer on top of
+        # x_eff_g: log2(x_true) ~ Normal(log2(x_eff_g), sigma_eff), i.e. x_true is
+        # log-normally distributed around x_eff_g at the cell level, and x_eff_g
+        # (hence every x_eff_g_median/x_true_median value in this file) is the
+        # MEDIAN of that log-normal, not its mean. For a log-normal,
+        # mean = median * 2**(0.5*ln(2)*sigma_eff**2), so log2(x_ntc) sits above
+        # log2(x_ntc_matched) by roughly that same gap whenever sigma_eff > 0 --
+        # confirmed empirically (2026-09-21, IKZF1/Panten, independent_mu_sigma):
+        # the model's own fitted mu_target for the 'ntc' target group came out
+        # ~0.08 log2 units below x_ntc, matching 0.5*ln(2)*sigma_eff**2 for
+        # sigma_eff~0.5 almost exactly, while a normal-normal shrinkage estimate
+        # showed the prior was far too weak (n=30 NTC guides) to produce that
+        # shift on its own. Comparing x_eff_g/x_true (median-of-lognormal) against
+        # x_ntc (arithmetic mean) therefore bakes a systematic, roughly-constant
+        # log2FC offset into EVERY guide (not just NTC) -- comparisons BETWEEN
+        # guides are unaffected (they share the same offset), but the absolute
+        # "0 = no change from NTC" calibration is off. x_ntc_matched sidesteps
+        # this entirely by comparing x_true against x_true (same model, same
+        # median-of-lognormal scale, restricted to NTC cells) instead of against
+        # a differently-defined quantity from a structurally different model.
+        # This also means x_ntc_matched works identically whether or not
+        # independent_mu_sigma was used -- x_eff_g/x_true are always computed
+        # per guide/cell regardless (see fit_cis's guides_plate), unlike a
+        # per-target mu_target, which independent_mu_sigma=False doesn't produce.
+        #
+        # NOTE: this same mismatch does NOT apply to save_trans_summary()'s
+        # y_ntc -- the trans (Hill) model has no analogous extra latent layer:
+        # mu_y (the Hill dose-response output) feeds directly into the NB mean
+        # (mu_final = mu_y * alpha_y * sum_factor, see
+        # bayesDREAM.fitting.distributions.sample_negbinom_trans), exactly like
+        # fit_ntc's mu_ntc. y_ntc and trans-fitted quantities are already the
+        # same (arithmetic-mean) kind of quantity, so no y_ntc_matched is needed.
+        _x_ntc_matched = None
+        ntc_cell_mask = (self.model.meta['target'].values == 'ntc')
+        if ntc_cell_mask.any():
+            _x_true_full = self.model.x_true
+            if isinstance(_x_true_full, torch.Tensor):
+                _x_true_full = _x_true_full.cpu().numpy()
+            _x_ntc_matched = float(np.median(np.asarray(_x_true_full)[ntc_cell_mask]))
+        else:
+            print("[WARNING] save_cis_summary: no cells with target=='ntc' found -- "
+                  "x_ntc_matched (and log2fc_* columns) will be omitted.")
+
+        if _x_ntc is None and _x_ntc_matched is None:
+            print("[WARNING] save_cis_summary: neither x_ntc nor x_ntc_matched could be "
+                  "resolved -- log2fc_* columns will be omitted.")
 
         def _log2fc(arr):
-            """log2(arr) - log2(x_ntc), or None if either side is unavailable."""
-            if arr is None or _x_ntc is None:
+            """log2(arr) - log2(x_ntc_matched), or None if either side is unavailable."""
+            if arr is None or _x_ntc_matched is None:
                 return None
-            return np.log2(np.maximum(np.asarray(arr, dtype=float), 1e-10)) - np.log2(max(_x_ntc, 1e-10))
+            return np.log2(np.maximum(np.asarray(arr, dtype=float), 1e-10)) - np.log2(max(_x_ntc_matched, 1e-10))
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -1386,6 +1469,8 @@ class ModelSummarizer:
             })
             if _x_ntc is not None:
                 guide_df['x_ntc'] = _x_ntc
+            if _x_ntc_matched is not None:
+                guide_df['x_ntc_matched'] = _x_ntc_matched
                 guide_df['log2fc_x_eff_g_median'] = _log2fc(x_eff_g_median)
                 guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
                 guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
@@ -1528,6 +1613,8 @@ class ModelSummarizer:
                 guide_df['sigma_eff_median'] = sigma_eff_median
             if _x_ntc is not None:
                 guide_df['x_ntc'] = _x_ntc
+            if _x_ntc_matched is not None:
+                guide_df['x_ntc_matched'] = _x_ntc_matched
                 guide_df['log2fc_x_true_median'] = _log2fc(x_true_median)
                 guide_df['log2fc_x_true_lower'] = _log2fc(x_true_lower)
                 guide_df['log2fc_x_true_upper'] = _log2fc(x_true_upper)
@@ -1579,6 +1666,8 @@ class ModelSummarizer:
             cell_data['raw_counts'] = cis_counts
             if _x_ntc is not None:
                 cell_data['x_ntc'] = _x_ntc
+            if _x_ntc_matched is not None:
+                cell_data['x_ntc_matched'] = _x_ntc_matched
                 cell_data['log2fc_x_true_median'] = _log2fc(cell_data['x_true_median'])
                 cell_data['log2fc_x_true_lower'] = _log2fc(cell_data['x_true_lower'])
                 cell_data['log2fc_x_true_upper'] = _log2fc(cell_data['x_true_upper'])
@@ -1776,12 +1865,38 @@ class ModelSummarizer:
             Roots are found empirically over the observed x_range.
         compute_log2fc_params : bool
             If True (default), compute parameters in log2FC space relative to NTC:
-            - x-axis: log2(x) - log2(x_ntc) where x_ntc is cis gene NTC mean
+            - x-axis: log2(x) - log2(x_ntc_matched) (see x_ntc_matched note below)
             - y-axis: log2(y) - log2(y_ntc) where y_ntc is trans gene NTC mean
             Requires posterior_samples_ntc to be available, or x_ntc/y_ntc to be
             provided manually.
+
+            x_ntc vs. x_ntc_matched (IMPORTANT, mirrors save_cis_summary()'s own
+            note): the x-axis being log2FC'd here is self.model.x_true (the cis
+            gene's fitted dose per cell), which fit_cis() defines as the MEDIAN of
+            an extra log-normal layer on top of x_eff_g (log2(x_true) ~
+            Normal(log2(x_eff_g), sigma_eff)). x_ntc (from fit_ntc()'s mu_ntc) is
+            instead the direct MEAN parameter of a single-layer NegBinomial, with
+            no such per-cell layer. Comparing x_true (median-type) against x_ntc
+            (mean-type) biases every x-axis log2FC -- and therefore every
+            log2fc-space parameter (K_a_log2fc, EC50_*_log2fc, log2fc-space root
+            transforms, ...) -- by a roughly constant offset
+            (~0.5*ln(2)*sigma_eff**2 in log2 units; confirmed empirically,
+            2026-09-21, IKZF1/Panten, via bayesDREAM.io.summary.ModelSummarizer.
+            save_cis_summary()'s independent_mu_sigma diagnosis). This method
+            therefore computes x_ntc_matched (median of self.model.x_true
+            restricted to NTC cells -- same scale as x_true) internally and uses
+            THAT as the actual x-axis reference, falling back to x_ntc only if
+            x_ntc_matched can't be resolved (e.g. no NTC cells present). Both are
+            reported as their own columns ('x_ntc', 'x_ntc_matched') for
+            transparency. y_ntc has NO analogous mismatch and needs no such
+            fallback: the Hill dose-response output feeds directly into the NB
+            mean (see bayesDREAM.fitting.distributions.sample_negbinom_trans),
+            exactly like fit_ntc's mu_ntc -- both are the same (arithmetic-mean)
+            kind of quantity.
         x_ntc : float, optional
-            Manually provided NTC mean for the cis gene (x-axis reference point).
+            Manually provided NTC mean for the cis gene (reported for reference;
+            used for the x-axis log2FC computation only as a fallback when
+            x_ntc_matched can't be resolved -- see note above).
             If None (default), computed from posterior_samples_ntc of the cis modality.
             Useful when fit_technical was not run (e.g., single-group subsets).
         y_ntc : array-like, optional
@@ -1942,6 +2057,35 @@ class ModelSummarizer:
             except Exception:
                 pass
 
+        # x_ntc_matched: the actual x-axis log2FC reference used below (NOT _x_ntc).
+        # See save_cis_summary()'s docstring for the full derivation -- in short,
+        # x_ntc (above) is fit_ntc()'s mu_ntc, the direct mean parameter of a
+        # single-layer NegBinomial (an arithmetic mean), while the x-values being
+        # log2FC'd here (self.model.x_true, the cis gene's fitted dose per cell)
+        # are the MEDIAN of an extra log-normal layer fit_cis() adds on top of
+        # x_eff_g. Comparing x_true against x_ntc mixes a median-type and a
+        # mean-type quantity, biasing every x-axis log2FC (and therefore every
+        # log2fc-space parameter below: K_a_log2fc, EC50_*_log2fc, root
+        # transforms, ...) by a roughly constant offset
+        # (~0.5*ln(2)*sigma_eff**2 in log2 units; confirmed empirically,
+        # 2026-09-21, IKZF1/Panten). x_ntc_matched -- the median of the model's
+        # own x_true restricted to NTC cells -- is on the same scale as x_true
+        # and sidesteps this. It is NOT overridden by a manually-passed x_ntc
+        # (that stays as the reported 'x_ntc' column and only feeds this
+        # computation as a last-resort fallback, when x_ntc_matched can't be
+        # resolved at all -- e.g. no NTC cells present).
+        _x_ntc_matched = None
+        try:
+            ntc_cell_mask = (self.model.meta['target'].values == 'ntc')
+            if ntc_cell_mask.any():
+                _x_true_full = self.model.x_true
+                if isinstance(_x_true_full, torch.Tensor):
+                    _x_true_full = _x_true_full.cpu().numpy()
+                _x_ntc_matched = float(np.median(np.asarray(_x_true_full)[ntc_cell_mask]))
+        except Exception:
+            pass
+        _x_ntc_for_log2fc = _x_ntc_matched if _x_ntc_matched is not None else _x_ntc
+
         # y_ntc: from trans modality's technical fit (mu_ntc averaged over posterior samples → [T])
         if _y_ntc is None:
             if hasattr(modality, 'posterior_samples_ntc') and modality.posterior_samples_ntc is not None:
@@ -1990,16 +2134,20 @@ class ModelSummarizer:
                 )
                 _y_ntc = None
 
-        # Always add x_ntc / y_ntc to data if available (useful metadata even without log2fc params)
+        # Always add x_ntc / x_ntc_matched / y_ntc to data if available (useful
+        # metadata even without log2fc params). x_ntc_for_log2fc (below) -- not
+        # x_ntc -- is what actually feeds the log2FC computations.
         if _x_ntc is not None:
             data['x_ntc'] = _x_ntc
+        if _x_ntc_matched is not None:
+            data['x_ntc_matched'] = _x_ntc_matched
         if _y_ntc is not None:
             data['y_ntc'] = _y_ntc
 
         if compute_log2fc_params:
-            if _x_ntc is None:
-                print("[WARNING] Cannot compute log2FC params: x_ntc not available from cis modality. "
-                      "Provide x_ntc manually to save_trans_summary().")
+            if _x_ntc_for_log2fc is None:
+                print("[WARNING] Cannot compute log2FC params: neither x_ntc_matched nor x_ntc "
+                      "available. Provide x_ntc manually to save_trans_summary().")
                 compute_log2fc_params = False
             if _y_ntc is None:
                 print("[WARNING] Cannot compute log2FC params: y_ntc not available from trans modality. "
@@ -2016,7 +2164,8 @@ class ModelSummarizer:
             print(f"  compute_derivative_roots={compute_derivative_roots}  "
                   f"compute_log2fc_params={compute_log2fc_params}  "
                   f"compute_inflection={compute_inflection}")
-            print(f"  x_ntc={'set' if _x_ntc is not None else 'None'}  "
+            print(f"  x_ntc_for_log2fc={'set' if _x_ntc_for_log2fc is not None else 'None'} "
+                  f"(matched={_x_ntc_matched is not None})  "
                   f"y_ntc={'set' if _y_ntc is not None else 'None'}")
         _t0 = time.time()
 
@@ -2025,7 +2174,7 @@ class ModelSummarizer:
                 data, posterior, n_features,
                 compute_inflection,
                 compute_derivative_roots, x_range,
-                compute_log2fc_params, _x_ntc, _y_ntc,
+                compute_log2fc_params, _x_ntc_for_log2fc, _y_ntc,
                 x_obs_min, x_obs_max,
                 n_cats_per_feature=n_cats_per_feature,
                 compute_lfc_ci=compute_lfc_ci,
@@ -2041,7 +2190,7 @@ class ModelSummarizer:
                 x_obs_max=x_obs_max,
                 compute_log2fc_params=compute_log2fc_params,
                 compute_lfc_ci=compute_lfc_ci,
-                x_ntc=_x_ntc,
+                x_ntc=_x_ntc_for_log2fc,
                 y_ntc=_y_ntc,
                 verbose=verbose,
             )
