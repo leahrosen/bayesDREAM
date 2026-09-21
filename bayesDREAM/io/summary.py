@@ -1270,6 +1270,12 @@ class ModelSummarizer:
         # Get raw counts from cis modality
         cis_mod = self.model.get_modality('cis')
         cis_counts = cis_mod.counts[0, :]  # [n_cells]
+        if hasattr(cis_counts, 'toarray'):
+            # cis_mod.counts is sparse: counts[0, :] is a (1, n_cells) sparse row
+            # matrix, not a dense 1D array. Downstream fancy/boolean indexing
+            # (cis_counts[guide_cell_indices], cis_counts[cell_mask]) would then
+            # index scipy's first axis (length 1) instead of the cell axis.
+            cis_counts = cis_counts.toarray().ravel()
 
         os.makedirs(output_dir, exist_ok=True)
 
