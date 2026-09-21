@@ -1210,17 +1210,32 @@ class ModelSummarizer:
         that formula for sigma_eff~0.5, while a normal-normal shrinkage estimate
         showed the prior was far too weak to produce a shift that size on its own.
         `x_ntc_matched` (median of self.model.x_true restricted to NTC cells) is
-        the correct reference for log2FC here -- same model, same median-of-
-        log-normal scale as everything it's compared against -- and is what
-        log2fc_* actually uses below. `x_ntc` is still reported for reference/
-        backward compatibility, but comparisons between guides are the only thing
-        unaffected by using it (they share the same offset); the absolute
-        "0 = no change from NTC" calibration is not. This same mismatch does NOT
-        apply to save_trans_summary()'s y_ntc -- the trans (Hill) model has no
-        analogous extra latent layer (mu_y feeds directly into the NB mean, see
+        the correct CELL-level reference and is what cell_df's log2fc_x_true_*
+        uses. `x_ntc` is still reported for reference/backward compatibility,
+        but comparisons between guides are the only thing unaffected by using it
+        (they share the same offset); the absolute "0 = no change from NTC"
+        calibration is not. This same mismatch does NOT apply to
+        save_trans_summary()'s y_ntc -- the trans (Hill) model has no analogous
+        extra latent layer (mu_y feeds directly into the NB mean, see
         bayesDREAM.fitting.distributions.sample_negbinom_trans), so y_ntc and
         trans-fitted quantities are already the same (arithmetic-mean) kind of
         quantity.
+
+        A SECOND, separate aggregation-level mismatch applies within guide_df:
+        x_true_median/x_eff_g_median there are GUIDE-level (one value per
+        guide_used/guide row, unweighted by how many cells that guide has), so
+        log2FC-ing them against `x_ntc_matched` (a CELL-level median, weighted
+        toward whichever NTC guide happens to have more cells) is *itself* a
+        mismatch, of the same flavor as x_ntc vs x_true above -- confirmed
+        empirically (2026-09-21, IKZF1/Panten): the unweighted median of NTC
+        guides' own x_eff_g_median values differed from the cell-weighted
+        x_ntc_matched by ~0.03 log2 units, matching the residual offset seen
+        after the x_ntc fix above. guide_df therefore computes its own
+        guide-level references -- `x_true_ntc_matched` (median of x_true_median
+        among NTC guide_used rows) and `x_eff_g_ntc_matched` (median of
+        x_eff_g_median among NTC rows) -- and log2fc_x_true_*/log2fc_x_eff_g_*
+        use THOSE, not `x_ntc_matched`. cell_df has no such issue: its
+        x_true_median is already cell-level, matching `x_ntc_matched` exactly.
 
         Guide-level columns (single-guide mode):
         - guide_used: Guide + guide_covariates identity (e.g. CRISPRi/CRISPRa arm) --
@@ -1238,10 +1253,15 @@ class ModelSummarizer:
         - raw_counts_median: Median raw counts across the guide_used's cells
         - x_eff_g_median/lower/upper: Per-guide_code effective expression latent (if available)
         - sigma_eff_median: Per-guide_code effect uncertainty latent (if available)
-        - x_ntc: fit_ntc()'s NTC baseline (reference only -- see note above, NOT the log2FC denominator)
-        - x_ntc_matched, log2fc_x_true_median/lower/upper, log2fc_x_eff_g_median/lower/upper:
-          x_ntc_matched is the actual log2FC denominator (see note above); log2fc_* =
-          log2(value) - log2(x_ntc_matched) (omitted if x_ntc_matched can't be resolved)
+        - x_ntc: fit_ntc()'s NTC baseline (reference only -- see note above, NOT a log2FC denominator)
+        - x_ntc_matched: cell-level NTC reference (reference only here -- NOT what
+          log2fc_x_true_*/log2fc_x_eff_g_* below use; see the aggregation-level note above)
+        - x_true_ntc_matched, log2fc_x_true_median/lower/upper: x_true_ntc_matched is the
+          median of x_true_median among NTC guide_used rows; log2fc_* = log2(value) -
+          log2(x_true_ntc_matched) (omitted if it can't be resolved)
+        - x_eff_g_ntc_matched, log2fc_x_eff_g_median/lower/upper: x_eff_g_ntc_matched is the
+          median of x_eff_g_median among NTC guide_used rows; log2fc_* = log2(value) -
+          log2(x_eff_g_ntc_matched) (omitted if it can't be resolved)
 
         Guide-level columns (high MOI mode):
         - guide: Guide name
@@ -1252,7 +1272,9 @@ class ModelSummarizer:
         - x_eff_g_upper: 97.5% quantile
         - sigma_eff_median: Median per-guide effect uncertainty
         - raw_counts_median: Median raw counts for cells carrying this guide
-        - x_ntc, x_ntc_matched, log2fc_x_eff_g_median/lower/upper: as above
+        - x_ntc, x_ntc_matched: reference only (see note above); NOT the log2FC denominator
+        - x_eff_g_ntc_matched, log2fc_x_eff_g_median/lower/upper: as x_eff_g_ntc_matched
+          above (median of x_eff_g_median among NTC guides)
 
         Cell-level columns:
         - cell: Cell barcode
@@ -1401,11 +1423,38 @@ class ModelSummarizer:
             print("[WARNING] save_cis_summary: neither x_ntc nor x_ntc_matched could be "
                   "resolved -- log2fc_* columns will be omitted.")
 
-        def _log2fc(arr):
-            """log2(arr) - log2(x_ntc_matched), or None if either side is unavailable."""
-            if arr is None or _x_ntc_matched is None:
+        def _log2fc_ref(arr, ref):
+            """log2(arr) - log2(ref), or None if either side is unavailable."""
+            if arr is None or ref is None:
                 return None
-            return np.log2(np.maximum(np.asarray(arr, dtype=float), 1e-10)) - np.log2(max(_x_ntc_matched, 1e-10))
+            return np.log2(np.maximum(np.asarray(arr, dtype=float), 1e-10)) - np.log2(max(ref, 1e-10))
+
+        def _log2fc(arr):
+            """log2(arr) - log2(x_ntc_matched) -- the CELL-level reference. Only
+            correct for cell-level quantities (cell_df's own x_true_median);
+            guide-level quantities (guide_df's x_true_median/x_eff_g_median) need
+            their own guide-level reference instead -- see _guide_level_ntc_ref()
+            and each guide_df branch below for why: pooling x_true at the cell
+            level weights the reference toward whichever NTC guide has more
+            cells, which is a different (and, empirically, ~0.03 log2 units off)
+            quantity from the unweighted median across NTC guides' own
+            x_eff_g_median/x_true_median values that log2fc_x_eff_g/log2fc_x_true
+            in guide_df are actually computed relative to.
+            """
+            return _log2fc_ref(arr, _x_ntc_matched)
+
+        def _guide_level_ntc_ref(values, ntc_row_mask):
+            """Median of `values` restricted to NTC rows (guide_used/guide rows
+            where target is NTC) -- the correct, aggregation-matched log2FC
+            reference for a GUIDE-level quantity (x_true_median/x_eff_g_median
+            in guide_df), as opposed to _x_ntc_matched (a CELL-level median of
+            model.x_true, appropriate only for cell_df's cell-level
+            x_true_median). See _log2fc()'s docstring for why these differ.
+            """
+            if values is None or ntc_row_mask is None or not np.any(ntc_row_mask):
+                return None
+            ref = float(np.median(np.asarray(values, dtype=float)[ntc_row_mask]))
+            return ref if np.isfinite(ref) and ref > 0 else None
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -1445,6 +1494,17 @@ class ModelSummarizer:
                 for g in guides
             ]
 
+            # Guide-level NTC mask, for _guide_level_ntc_ref() below -- same
+            # NTC-variant set used elsewhere for high-MOI NTC identification
+            # (see fit_cis's _ntc_guide_mask / adjust_ntc_sum_factor).
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            if 'target' in self.model.guide_meta.columns:
+                is_ntc_guide = self.model.guide_meta['target'].isin(_ntc_variants).values
+            else:
+                is_ntc_guide = np.array([
+                    any(t in _ntc_variants for t in gtd.get(g, [])) for g in guides
+                ])
+
             # x_eff_g/sigma_eff are already guide-level (no cross-cell aggregation
             # needed), so in lean mode the precomputed sibling keys give an exact
             # (not approximated) CI — unlike the single-guide x_true case below.
@@ -1471,9 +1531,18 @@ class ModelSummarizer:
                 guide_df['x_ntc'] = _x_ntc
             if _x_ntc_matched is not None:
                 guide_df['x_ntc_matched'] = _x_ntc_matched
-                guide_df['log2fc_x_eff_g_median'] = _log2fc(x_eff_g_median)
-                guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
-                guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
+            # Guide-level reference (median x_eff_g_median among NTC guides) --
+            # NOT _x_ntc_matched (cell-level): pooling at the cell level would
+            # weight the reference toward whichever NTC guide has more cells,
+            # a different quantity from the unweighted median across NTC
+            # guides' own x_eff_g_median values that log2fc_x_eff_g is actually
+            # computed relative to (see _guide_level_ntc_ref()'s docstring).
+            x_eff_g_ntc_ref = _guide_level_ntc_ref(x_eff_g_median, is_ntc_guide)
+            if x_eff_g_ntc_ref is not None:
+                guide_df['x_eff_g_ntc_matched'] = x_eff_g_ntc_ref
+                guide_df['log2fc_x_eff_g_median'] = _log2fc_ref(x_eff_g_median, x_eff_g_ntc_ref)
+                guide_df['log2fc_x_eff_g_lower'] = _log2fc_ref(x_eff_g_lower, x_eff_g_ntc_ref)
+                guide_df['log2fc_x_eff_g_upper'] = _log2fc_ref(x_eff_g_upper, x_eff_g_ntc_ref)
 
             guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
             guide_df.to_csv(guide_file, index=False)
@@ -1615,13 +1684,30 @@ class ModelSummarizer:
                 guide_df['x_ntc'] = _x_ntc
             if _x_ntc_matched is not None:
                 guide_df['x_ntc_matched'] = _x_ntc_matched
-                guide_df['log2fc_x_true_median'] = _log2fc(x_true_median)
-                guide_df['log2fc_x_true_lower'] = _log2fc(x_true_lower)
-                guide_df['log2fc_x_true_upper'] = _log2fc(x_true_upper)
-                if x_eff_g_median is not None:
-                    guide_df['log2fc_x_eff_g_median'] = _log2fc(x_eff_g_median)
-                    guide_df['log2fc_x_eff_g_lower'] = _log2fc(x_eff_g_lower)
-                    guide_df['log2fc_x_eff_g_upper'] = _log2fc(x_eff_g_upper)
+
+            # Guide-level NTC mask (guide_used rows, not cells) for the
+            # guide-level references below.
+            ntc_row_mask = (guide_meta['target'].values == 'ntc')
+
+            # x_true_median's own guide-level reference: median of x_true_median
+            # among NTC guide_used rows -- NOT _x_ntc_matched (cell-level): the
+            # cell-level median weights the reference toward whichever NTC guide
+            # has more cells, a different quantity from this unweighted,
+            # per-guide_used median (see _guide_level_ntc_ref()'s docstring).
+            x_true_ntc_ref = _guide_level_ntc_ref(x_true_median, ntc_row_mask)
+            if x_true_ntc_ref is not None:
+                guide_df['x_true_ntc_matched'] = x_true_ntc_ref
+                guide_df['log2fc_x_true_median'] = _log2fc_ref(x_true_median, x_true_ntc_ref)
+                guide_df['log2fc_x_true_lower'] = _log2fc_ref(x_true_lower, x_true_ntc_ref)
+                guide_df['log2fc_x_true_upper'] = _log2fc_ref(x_true_upper, x_true_ntc_ref)
+
+            if x_eff_g_median is not None:
+                x_eff_g_ntc_ref = _guide_level_ntc_ref(x_eff_g_median, ntc_row_mask)
+                if x_eff_g_ntc_ref is not None:
+                    guide_df['x_eff_g_ntc_matched'] = x_eff_g_ntc_ref
+                    guide_df['log2fc_x_eff_g_median'] = _log2fc_ref(x_eff_g_median, x_eff_g_ntc_ref)
+                    guide_df['log2fc_x_eff_g_lower'] = _log2fc_ref(x_eff_g_lower, x_eff_g_ntc_ref)
+                    guide_df['log2fc_x_eff_g_upper'] = _log2fc_ref(x_eff_g_upper, x_eff_g_ntc_ref)
 
             guide_file = os.path.join(output_dir, 'cis_guide_summary.csv')
             guide_df.to_csv(guide_file, index=False)
