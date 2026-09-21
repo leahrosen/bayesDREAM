@@ -498,6 +498,51 @@ def _to_scalar(val):
     # Already scalar
     return float(val)
 
+
+def _get_x_ntc_matched(model) -> Optional[float]:
+    """Median of model.x_true among NTC cells (target=='ntc') -- the correct
+    x-axis log2FC reference for x_true/x_eff_g-based quantities (used
+    throughout this module's predict_trans_log2fc/predict_trans_delta_p and
+    their *_samples variants), in place of the cis modality's fit_ntc-derived
+    mu_ntc (used here previously).
+
+    Why: fit_ntc()'s mu_ntc is the direct mean parameter of a single-layer
+    NegBinomial -- an arithmetic mean. fit_cis()'s x_true has an EXTRA layer
+    on top of x_eff_g (log2(x_true) ~ Normal(log2(x_eff_g), sigma_eff)), so
+    x_true's own location is the MEDIAN of that log-normal, not its mean.
+    Using mu_ntc as the x-axis reference here mixes a mean-type value into a
+    median-type x-axis, biasing every u_range/log2FC value by a roughly
+    constant offset (~0.5*ln(2)*sigma_eff**2 in log2 units; confirmed
+    empirically, 2026-09-21, IKZF1/Panten -- see
+    bayesDREAM.io.summary.ModelSummarizer.save_cis_summary()'s
+    x_ntc_matched docstring for the full derivation, and
+    comparative/hill_eval.py's get_x_ntc()/comparative/dose_response_panels.py's
+    _row_x_ntc() for the same fix applied to the comparative/ plotting
+    helpers). Also a weaker precondition than the old mu_ntc-based lookup:
+    only needs model.x_true and model.meta['target'], not the cis modality's
+    posterior_samples_ntc to have been extracted.
+
+    Returns None if x_true, meta['target'], or any NTC cells with positive,
+    finite x_true aren't available.
+    """
+    x_true = getattr(model, 'x_true', None)
+    if x_true is None:
+        return None
+    if hasattr(x_true, 'cpu'):
+        x_true = x_true.cpu().numpy()
+    x_true = np.asarray(x_true)
+    if 'target' not in model.meta.columns:
+        return None
+    ntc_mask = (model.meta['target'].values == 'ntc')
+    if not ntc_mask.any():
+        return None
+    ntc_vals = x_true[ntc_mask]
+    ntc_vals = ntc_vals[np.isfinite(ntc_vals) & (ntc_vals > 0)]
+    if len(ntc_vals) == 0:
+        return None
+    return float(np.median(ntc_vals))
+
+
 def _multinomial_correct_binned_probs(
     props_binned: np.ndarray,         # (n_bins, K) proportions from aggregated counts
     alpha_y_add,                      # [S, C, T, K] or [C, T, K]
@@ -1228,7 +1273,7 @@ def predict_trans_log2fc(
     - x-axis: u = log2(x) - log2(x_ntc)  (cis gene log2FC)
     - y-axis: g(u) = log2(S(x(u))) - log2(y_ntc)  (trans gene log2FC)
 
-    Where x_ntc is the NTC mean for the cis gene, and y_ntc is the NTC mean for the trans gene.
+    Where x_ntc is the median x_true among NTC cells (x_ntc_matched -- see _get_x_ntc_matched()), and y_ntc is the NTC mean for the trans gene.
 
     Derivative formulas:
     - dg/du = x * S'(x) / S(x)
@@ -1264,28 +1309,11 @@ def predict_trans_log2fc(
     if y_pred is None:
         return None, None, None, None, None
 
-    # Get NTC means
-    # Cis NTC (for x-axis transformation)
-    cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
+    # x-axis reference: median of x_true among NTC cells (NOT the cis
+    # modality's mu_ntc -- see _get_x_ntc_matched()'s docstring for why).
+    x_ntc = _get_x_ntc_matched(model)
+    if x_ntc is None:
         return None, None, None, None, None
-
-    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
-    if cis_mu_ntc is None:
-        return None, None, None, None, None
-
-    if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
-    else:
-        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
-
-    # Handle case where x_ntc is a scalar or 1-element array
-    if np.ndim(x_ntc) == 0:
-        x_ntc = float(x_ntc)
-    elif len(x_ntc) == 1:
-        x_ntc = float(x_ntc[0])
-    else:
-        x_ntc = float(x_ntc[0])  # Take first if multiple (shouldn't happen for cis)
 
     # Trans NTC (for y-axis transformation)
     if modality_name is None:
@@ -1383,26 +1411,11 @@ def predict_trans_log2fc_samples(
     if y_samples is None:
         return None, None
 
-    # Get NTC means (same logic as predict_trans_log2fc)
-    cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
+    # x-axis reference: median of x_true among NTC cells (same as
+    # predict_trans_log2fc -- see _get_x_ntc_matched()'s docstring).
+    x_ntc = _get_x_ntc_matched(model)
+    if x_ntc is None:
         return None, None
-
-    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
-    if cis_mu_ntc is None:
-        return None, None
-
-    if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
-    else:
-        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
-
-    if np.ndim(x_ntc) == 0:
-        x_ntc = float(x_ntc)
-    elif len(x_ntc) == 1:
-        x_ntc = float(x_ntc[0])
-    else:
-        x_ntc = float(x_ntc[0])
 
     # Trans NTC
     if modality_name is None:
@@ -1458,7 +1471,7 @@ def predict_trans_delta_p(
     - x-axis: u = log2(x) - log2(x_ntc)  (cis gene log2FC)
     - y-axis: delta_p(u) = p(x(u)) - p_ntc  (probability difference from NTC)
 
-    Where x_ntc is the NTC mean for the cis gene, and p_ntc is the NTC probability for the trans feature.
+    Where x_ntc is the median x_true among NTC cells (x_ntc_matched -- see _get_x_ntc_matched()), and p_ntc is the NTC probability for the trans feature.
 
     Parameters
     ----------
@@ -1490,28 +1503,11 @@ def predict_trans_delta_p(
     if y_pred is None:
         return None, None, None, None, None
 
-    # Get NTC means
-    # Cis NTC (for x-axis transformation)
-    cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
+    # x-axis reference: median of x_true among NTC cells (NOT the cis
+    # modality's mu_ntc -- see _get_x_ntc_matched()'s docstring for why).
+    x_ntc = _get_x_ntc_matched(model)
+    if x_ntc is None:
         return None, None, None, None, None
-
-    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
-    if cis_mu_ntc is None:
-        return None, None, None, None, None
-
-    if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
-    else:
-        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
-
-    # Handle case where x_ntc is a scalar or 1-element array
-    if np.ndim(x_ntc) == 0:
-        x_ntc = float(x_ntc)
-    elif len(x_ntc) == 1:
-        x_ntc = float(x_ntc[0])
-    else:
-        x_ntc = float(x_ntc[0])  # Take first if multiple
 
     # Trans NTC (for y-axis transformation)
     if modality_name is None:
@@ -1622,26 +1618,11 @@ def predict_trans_delta_p_samples(
     if y_samples is None:
         return None, None
 
-    # Get NTC means (same logic as predict_trans_delta_p)
-    cis_mod = model.get_modality('cis')
-    if cis_mod is None or not hasattr(cis_mod, 'posterior_samples_ntc'):
+    # x-axis reference: median of x_true among NTC cells (same as
+    # predict_trans_delta_p -- see _get_x_ntc_matched()'s docstring).
+    x_ntc = _get_x_ntc_matched(model)
+    if x_ntc is None:
         return None, None
-
-    cis_mu_ntc = cis_mod.posterior_samples_ntc.get('mu_ntc', None)
-    if cis_mu_ntc is None:
-        return None, None
-
-    if hasattr(cis_mu_ntc, 'mean'):
-        x_ntc = torch.quantile(cis_mu_ntc.float(), 0.5, dim=0).squeeze().cpu().numpy()
-    else:
-        x_ntc = np.median(cis_mu_ntc, axis=0).squeeze()
-
-    if np.ndim(x_ntc) == 0:
-        x_ntc = float(x_ntc)
-    elif len(x_ntc) == 1:
-        x_ntc = float(x_ntc[0])
-    else:
-        x_ntc = float(x_ntc[0])
 
     # Trans NTC
     if modality_name is None:
@@ -1894,21 +1875,18 @@ def plot_trans_functions(
         else:
             raise ValueError("x_range must be provided if model.x_true is not set")
 
-    # Check if NTC data is available for log2FC/delta_p; fall back to log2 if not
+    # Check if an x-axis NTC reference is available for log2FC/delta_p (see
+    # predict_trans_log2fc()/predict_trans_delta_p(), which this function
+    # calls downstream -- both use _get_x_ntc_matched(), not cis_mod's
+    # mu_ntc); fall back to log2 if not.
     if use_log2fc or use_delta_p:
-        cis_mod = model.get_modality('cis')
-        ntc_available = (
-            cis_mod is not None
-            and hasattr(cis_mod, 'posterior_samples_ntc')
-            and cis_mod.posterior_samples_ntc is not None
-            and 'mu_ntc' in cis_mod.posterior_samples_ntc
-        )
+        ntc_available = _get_x_ntc_matched(model) is not None
         if not ntc_available:
             import warnings
             flag = 'use_log2fc' if use_log2fc else 'use_delta_p'
             warnings.warn(
-                f"{flag}=True requested but NTC technical fit (posterior_samples_ntc) "
-                f"is not available. Falling back to log2(x) x-axis.",
+                f"{flag}=True requested but no NTC cells with a valid x_true were "
+                f"found. Falling back to log2(x) x-axis.",
                 UserWarning
             )
             use_log2fc = False
@@ -3555,6 +3533,19 @@ def _compute_global_log2fc_offsets(
     so that all panels for the same feature share an identical NTC reference —
     even panels that contain no NTC cells (e.g. a "Targeting" facet column).
 
+    x_offset uses the MEDIAN (not mean) of NTC x_true -- this is
+    x_ntc_matched (see bayesDREAM.io.summary.ModelSummarizer.
+    save_cis_summary()'s docstring for the full derivation): x_true's own
+    location is the median of an extra log-normal layer fit_cis() adds on
+    top of x_eff_g (log2(x_true) ~ Normal(log2(x_eff_g), sigma_eff)), so
+    the arithmetic mean of x_true across NTC cells is inflated relative to
+    that location by ~0.5*ln(2)*sigma_eff**2 (in log2 units) -- using it as
+    the log2FC=0 reference would bias every plotted x-value by that same
+    roughly-constant offset. (This is a DIFFERENT x_ntc source from the
+    module-level *_get_x_ntc_matched()/predict_trans_log2fc's fit_ntc
+    mu_ntc-replacement fix -- this one was already using x_true, not
+    mu_ntc, just with the wrong reduction across NTC cells.)
+
     y_offset priority (consistent with ``save_trans_summary``):
     1. ``mu_ntc`` from ``modality.posterior_samples_ntc`` (model-smoothed reference-
        group NTC expression rate from ``fit_technical``).  Shape [n_samples, T]; we take
@@ -3585,9 +3576,10 @@ def _compute_global_log2fc_offsets(
 
     is_ntc = (meta_aligned['target'].str.lower() == 'ntc').values
 
-    # x_offset: mean log2 NTC x_true (pooled, group-independent)
+    # x_offset: MEDIAN log2 NTC x_true (pooled, group-independent) -- x_ntc_matched,
+    # not a mean (see this function's docstring for why mean would be biased).
     x_ntc = x_true_aligned[is_ntc & (x_true_aligned > 0)]
-    x_offset = np.log2(float(x_ntc.mean())) if len(x_ntc) > 0 else 0.0
+    x_offset = np.log2(float(np.median(x_ntc))) if len(x_ntc) > 0 else 0.0
 
     # y_offset: use mu_ntc from technical fit when available (matches save_trans_summary).
     # mu_ntc shape in posterior_samples_ntc: [n_samples, T].
@@ -3818,7 +3810,11 @@ def plot_negbinom_xy(
             ntc_df = df[is_ntc]
             x_ntc_valid = ntc_df['x_true'][ntc_df['x_true'] > 0]
             if len(x_ntc_valid) > 0:
-                x_offset = np.log2(float(x_ntc_valid.mean()))
+                # MEDIAN (x_ntc_matched), not mean -- see
+                # _compute_global_log2fc_offsets()'s docstring for why a
+                # mean would be biased relative to x_eff_g/x_true's own
+                # (median-of-log-normal) location.
+                x_offset = np.log2(float(x_ntc_valid.median()))
             else:
                 warnings.warn("log2fc=True: no valid NTC cells found for x; plotting raw log2 instead.")
                 x_offset = 0.0
@@ -4343,7 +4339,7 @@ def plot_binomial_xy(
         bounded proportion, so only the x-axis shifts. A grey dotted vertical
         line is drawn at x=0 to mark the NTC reference.
     ntc_x_offset : float, optional
-        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Precomputed log2(median NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
         Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
         and passes this automatically.
     ylabel : str, optional
@@ -4619,7 +4615,7 @@ def plot_multinomial_xy(
         relative to NTC) instead of raw log2(x_true). The y-axis (proportion) is
         left as-is. A grey dotted vertical line is drawn at x=0 (NTC reference).
     ntc_x_offset : float, optional
-        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Precomputed log2(median NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
         Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
         and passes this automatically.
 
@@ -4943,7 +4939,7 @@ def plot_normal_xy(
         relative to NTC) instead of raw log2(x_true). The y-axis (raw value) is
         left as-is. A grey dotted vertical line is drawn at x=0 (NTC reference).
     ntc_x_offset : float, optional
-        Precomputed log2(mean NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
+        Precomputed log2(median NTC x_true) offset (see ``_compute_global_log2fc_offsets``).
         Required for ``log2fc=True`` to have any effect; ``plot_xy_data`` computes
         and passes this automatically.
     """
