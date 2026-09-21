@@ -77,11 +77,35 @@ def normalize_guide_target_mapping(guide_target: pd.DataFrame):
     return guide_targets_dict
 
 
-def classify_target_from_guide(guide_name, guide_targets_dict, cis_gene=None):
+def classify_target_from_guide(guide_name, guide_targets_dict, cis_gene=None, exclude_targets=None, exclude_guides=None):
     targets = guide_targets_dict.get(guide_name, [])
+    if exclude_guides is not None and guide_name in exclude_guides:
+        return "excluded"
+    if exclude_targets is not None and any(t in exclude_targets for t in targets):
+        return "excluded"
     if cis_gene is not None and cis_gene in targets:
         return cis_gene
     if any(is_ntc_target_name(t) for t in targets):
+        return "ntc"
+    return "other"
+
+
+def classify_target_from_guides(guide_names, guide_targets_dict, cis_gene=None, exclude_targets=None, exclude_guides=None):
+    guide_classes = [
+        classify_target_from_guide(
+            guide_name,
+            guide_targets_dict,
+            cis_gene,
+            exclude_targets,
+            exclude_guides,
+        )
+        for guide_name in guide_names
+    ]
+    if "excluded" in guide_classes:
+        return "excluded"
+    if cis_gene in guide_classes:
+        return cis_gene
+    if "ntc" in guide_classes:
         return "ntc"
     return "other"
 
@@ -378,22 +402,20 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 # A guide with multiple plausible targets resolves differently
                 # depending on which cis_gene is currently being fit.
                 self.meta['target'] = self.meta['guide'].map(
-                    lambda guide_name: classify_target_from_guide(
-                        guide_name,
+                    lambda guide_name: classify_target_from_guides(
+                        [guide_name],
                         self.guide_targets_dict,
                         self.cis_gene,
+                        exclude_targets=exclude_targets,
+                        exclude_guides=exclude_guides,
                     )
                 )
 
-                if exclude_targets is not None:
-                    def _has_excluded_target(guide_name):
-                        targets = self.guide_targets_dict.get(guide_name, [])
-                        return any(t in exclude_targets for t in targets)
-                    n_before = len(self.meta)
-                    self.meta = self.meta[~self.meta['guide'].map(_has_excluded_target)].copy()
-                    n_excluded = n_before - len(self.meta)
-                    if n_excluded > 0:
-                        print(f"[INFO] Excluded {n_excluded} cells (guide targets a gene in exclude_targets={exclude_targets})")
+                n_before = len(self.meta)
+                self.meta = self.meta[self.meta['target'] != 'excluded'].copy()
+                n_excluded = n_before - len(self.meta)
+                if n_excluded > 0:
+                    print(f"[INFO] Excluded {n_excluded} cells (guide targets a gene in exclude_targets={exclude_targets})")
 
                 target_counts = self.meta['target'].value_counts()
                 print(f"[INFO] Single-guide target classification from guide_target mapping:")
@@ -427,74 +449,17 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 
         # For high MOI mode, create 'target' column based on guide assignment
         if self.is_high_moi:
-            # Classify each guide based on its targets (from guide_targets_dict)
-            # A guide can have multiple targets, so we check if any match NTC, cis, or excluded
-            ntc_guide_indices = []
-            cis_guide_indices = []
-            exclude_guide_indices = []
-
-            for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
-                guide_name = guide_row['guide']
-                targets = self.guide_targets_dict.get(guide_name, [])
-
-                # Check if this guide has ANY NTC target
-                if any(is_ntc_target_name(t) for t in targets):
-                    ntc_guide_indices.append(pos_idx)
-
-                # Check if this guide has ANY cis_gene target
-                if self.cis_gene in targets:
-                    cis_guide_indices.append(pos_idx)
-
-                # Check if this guide has ANY excluded target
-                if exclude_targets is not None and any(t in exclude_targets for t in targets):
-                    exclude_guide_indices.append(pos_idx)
-
-                # Check if this guide itself is excluded by name
-                if exclude_guides is not None and guide_name in exclude_guides:
-                    exclude_guide_indices.append(pos_idx)
-
-            ntc_guide_indices = np.array(ntc_guide_indices)
-            cis_guide_indices = np.array(cis_guide_indices)
-            exclude_guide_indices = np.array(list(dict.fromkeys(exclude_guide_indices)))  # deduplicate, preserve order
-
-            # Determine which cells have these guide types
-            if len(exclude_guide_indices) > 0:
-                has_excluded_guide = self.guide_assignment[:, exclude_guide_indices].sum(axis=1) > 0
-            else:
-                has_excluded_guide = np.zeros(len(self.guide_assignment), dtype=bool)
-
-            if len(ntc_guide_indices) > 0:
-                has_ntc_guide = self.guide_assignment[:, ntc_guide_indices].sum(axis=1) > 0
-            else:
-                has_ntc_guide = np.zeros(len(self.guide_assignment), dtype=bool)
-
-            if len(cis_guide_indices) > 0:
-                has_cis_guide = self.guide_assignment[:, cis_guide_indices].sum(axis=1) > 0
-            else:
-                has_cis_guide = np.zeros(len(self.guide_assignment), dtype=bool)
-
-            # Cell classification:
-            # - If cell has ANY excluded guides -> target = 'excluded' (will be removed)
-            # - Else if cell has ANY cis guides -> target = cis_gene
-            # - Else if cell has ANY NTC guides (but no cis) -> target = 'ntc'
-            # - Else -> target = 'other' (will be removed)
-            targets = []
-            for i in range(len(self.guide_assignment)):
-                if has_excluded_guide[i]:
-                    # Cell has guide(s) targeting excluded gene(s) - remove
-                    targets.append('excluded')
-                elif has_cis_guide[i]:
-                    # Cell has cis guide(s) - regardless of other guides
-                    targets.append(self.cis_gene)
-                elif has_ntc_guide[i]:
-                    # Cell has NTC guide(s) but no cis guides
-                    # (may also have "other" guides - these are ignored)
-                    targets.append('ntc')
-                else:
-                    # Cell has ONLY "other" guides (no NTC, no cis, no excluded)
-                    targets.append('other')
-
-            self.meta['target'] = targets
+            guide_names = self.guide_meta['guide'].tolist()
+            self.meta['target'] = [
+                classify_target_from_guides(
+                    [guide_names[index] for index, assigned in enumerate(assignment) if assigned],
+                    self.guide_targets_dict,
+                    self.cis_gene,
+                    exclude_targets=exclude_targets,
+                    exclude_guides=exclude_guides,
+                )
+                for assignment in self.guide_assignment
+            ]
 
             # Add guide_code column (not meaningful in high MOI, marked as -1)
             self.meta['guide_code'] = -1
@@ -521,7 +486,7 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 _ga_original_cell_names = list(self._cell_names) if hasattr(self, '_cell_names') and self._cell_names else []
 
         # Drop cells carrying explicitly excluded guides (single-guide mode only;
-        # high MOI handles this above via exclude_guide_indices → target='excluded')
+        # high MOI handles this above via target='excluded')
         if exclude_guides is not None and not self.is_high_moi:
             excluded_guide_set = set(exclude_guides)
             n_before = len(self.meta)
