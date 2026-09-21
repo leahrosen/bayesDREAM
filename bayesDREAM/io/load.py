@@ -7,7 +7,7 @@ import pickle
 import torch
 import pandas as pd
 
-from ..utils import make_names_unique, LEAN_POSTERIOR_KEY
+from ..utils import make_names_unique, LEAN_POSTERIOR_KEY, get_guide_axis_labels
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +279,15 @@ def _subset_model_cells_inplace(model, keep_cells):
                     mod.sum_factors.index.isin(keep_set)
                 ].copy()
 
+    # GOTCHA: this does NOT re-compact meta['guide_code'] (single-guide mode). If the
+    # subset removes every cell of a guide, guide_code is left with gaps while the
+    # guide-axis latents (x_eff_g, sigma_eff, ...) stay positional over the guides the
+    # fit was made with, so guide_code no longer indexes them. _align_cis_guide_axis()
+    # (called by load_cis_fit right after this) repairs that -- aligns the latents by
+    # name and re-compacts guide_code -- but only for fits that saved guide_axis_labels.
+    # A legacy fit without them takes its early-return path: no alignment, no
+    # re-compaction, and guide-level results can be silently mis-indexed after a
+    # subset_cells=True load that drops a guide.
     # Also subset guide-level info if it lives on meta
     if hasattr(model, 'guide_meta') and 'cell' in model.guide_meta.columns:
         model.guide_meta = model.guide_meta[
@@ -302,6 +311,92 @@ def _torch_load(path, map_location=None):
         if "Weights only load failed" in str(e):
             return torch.load(path, map_location=map_location, weights_only=False)
         raise
+
+
+# Guide-axis sites of _model_x (positional over guide_code / guide_assignment columns);
+# a lean posterior adds '<site>_lower' / '<site>_upper' siblings.
+_GUIDE_AXIS_SITES = ('eps_x_eff_g', 'x_eff_g', 'sigma_eff')
+
+
+def _is_guide_axis_key(key):
+    base = key[:-6] if key.endswith(('_lower', '_upper')) else key
+    return base in _GUIDE_AXIS_SITES
+
+
+def _align_cis_guide_axis(model, posterior_raw, saved_labels, saved_group_labels,
+                          saved_guide_groups):
+    """
+    Align the guide-level cis latents in `posterior_raw` to the current model's guides
+    by name, and restore the fit's mu/sigma group labels.
+
+    Guide-level latents (x_eff_g, sigma_eff, eps_x_eff_g) are positional; without the
+    names saved by save_cis_fit() a model with a different guide / covariate-level set
+    would silently pair them with the wrong guides. Same set in a different order is
+    reordered; extra saved guides are dropped; a current guide missing from the fit
+    raises. The mu_target_i/sigma_target_i sites are group hyperparameters, not
+    guide-indexed, so they are left as fit and interpreted via `saved_group_labels`.
+
+    Fits saved before these names existed load unchanged (positional), with a warning.
+    Returns the (possibly re-indexed) posterior dict.
+    """
+    import warnings
+    model.mu_sigma_group_labels = list(saved_group_labels) if saved_group_labels is not None else None
+    if saved_group_labels is not None:
+        n_sites = sum(1 for k in posterior_raw if k.startswith('mu_target_') and k[len('mu_target_'):].isdigit())
+        if n_sites != len(saved_group_labels):
+            raise ValueError(
+                f"load_cis_fit(): saved mu_sigma_group_labels has {len(saved_group_labels)} groups "
+                f"but the posterior has {n_sites} mu_target_i sites.")
+
+    if saved_labels is None:
+        model.cis_guide_labels = None
+        model.mu_sigma_guide_groups = None
+        warnings.warn(
+            "load_cis_fit(): this cis fit predates saved guide-axis labels, so guide-level "
+            "latents (x_eff_g, sigma_eff, ...) are assumed to match the current model's guides "
+            "positionally (not checked). Re-run save_cis_fit() from the fitting session to add them.")
+        return posterior_raw
+
+    saved_labels = list(saved_labels)
+    current = get_guide_axis_labels(model)
+    if saved_labels == current:
+        model.cis_guide_labels = saved_labels
+        model.mu_sigma_guide_groups = saved_guide_groups
+        return posterior_raw
+
+    saved_set = set(saved_labels)
+    missing = [n for n in current if n not in saved_set]
+    if missing:
+        raise ValueError(
+            f"load_cis_fit(): the current model has {len(missing)} guide effect(s) that are not in "
+            f"the saved cis fit, so guide-level latents cannot be aligned: {missing[:5]}"
+            f"{' ...' if len(missing) > 5 else ''}. The model must be built with the same guides and "
+            f"guide_covariates/guide_covariates_ntc as the fit (or a subset of its guides).")
+
+    n_saved = len(saved_labels)
+    for k in list(posterior_raw):
+        v = posterior_raw[k]
+        if _is_guide_axis_key(k) and isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[-1] == n_saved:
+            posterior_raw[k], _ = _align_tensor(v, saved_labels, current, dim=-1)
+
+    model.cis_guide_labels = current
+    if saved_guide_groups is not None:
+        idx = {n: i for i, n in enumerate(saved_labels)}
+        model.mu_sigma_guide_groups = [saved_guide_groups[idx[n]] for n in current]
+    else:
+        model.mu_sigma_guide_groups = None
+
+    # Dropped guides leave gaps in the single-guide guide_code; re-compact so it indexes
+    # the aligned guide axis (order is unchanged: both are alphabetical over guide_used).
+    if not getattr(model, 'is_high_moi', False):
+        codes = sorted(model.meta['guide_code'].unique())
+        if codes != list(range(len(codes))):
+            import pandas as _pd
+            model.meta['guide_code'] = _pd.Categorical(model.meta['guide_used']).codes
+
+    print(f"[LOAD] cis guide-level latents aligned by name: {n_saved} saved -> {len(current)} current guide effects"
+          + (f" ({n_saved - len(current)} dropped)" if n_saved != len(current) else " (reordered)"))
+    return posterior_raw
 
 
 def _reduce_posterior_samples(posterior: dict) -> dict:
@@ -834,6 +929,12 @@ class ModelLoader:
                           "not reduce peak memory/disk I/O during this load). Re-run "
                           "save_cis_fit() to write the lean file for next time.")
                     posterior_raw = _reduce_posterior_samples(posterior_raw)
+                posterior_raw = _align_cis_guide_axis(
+                    self.model, posterior_raw,
+                    loaded_data.get('guide_axis_labels'),
+                    loaded_data.get('mu_sigma_group_labels'),
+                    loaded_data.get('mu_sigma_guide_groups'),
+                )
                 self.model.posterior_samples_cis = posterior_raw
 
                 if loaded_data.get('feature_meta') is not None:

@@ -43,6 +43,31 @@ def set_max_threads(cores: int):
 # Name Handling
 ########################################
 
+def get_guide_axis_labels(model):
+    """
+    Names of the entries along the guide axis of guide-level cis latents
+    (``x_eff_g``, ``sigma_eff``, ...), in positional order.
+
+    Those latents are indexed positionally by ``guide_code`` (single-guide mode:
+    ``Categorical(guide_used).codes``, i.e. alphabetical over the guides present in
+    the current cells) or by ``guide_assignment`` column (high-MOI mode), so the
+    index only has meaning together with this list. ``fit_cis`` records it and
+    ``save_cis_fit`` / ``load_cis_fit`` use it to align by name instead of by position.
+
+    Single-guide mode: the ``guide_used`` value per ``guide_code``.
+    High-MOI mode: ``guide_meta['guide']``, suffixed with ``|<guide_covariate_key>``
+    when the guide's column was split by ``guide_covariates``.
+    """
+    if getattr(model, 'is_high_moi', False):
+        gm = model.guide_meta
+        names = gm['guide'].astype(str)
+        if 'guide_covariate_key' in gm.columns:
+            key = gm['guide_covariate_key'].fillna('').astype(str)
+            names = names.where(key == '', names + '|' + key)
+        return names.tolist()
+    return model.meta.groupby('guide_code')['guide_used'].first().sort_index().astype(str).tolist()
+
+
 def make_names_unique(names, join: str = "-"):
     """
     Disambiguate duplicate names, AnnData/scanpy style.

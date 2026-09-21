@@ -103,7 +103,10 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             among cells carrying that guide (see _expand_guide_assignment_by_covariates).
         guide_covariates_ntc : list of str or None
             Same as guide_covariates, but for NTC guides (used instead of guide_covariates
-            when a guide's target is an NTC variant).
+            when a guide's target is an NTC variant). The two lists are never combined:
+            NTC guides are split only by guide_covariates_ntc, all other guides only by
+            guide_covariates. Default (None/[]) leaves NTC guides unsplit (one effect per
+            guide). Also the default grouping for NTC in fit_cis(independent_mu_sigma=True).
         output_dir : str
             Where to save results
         label : str
@@ -661,8 +664,11 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
 
         # Construct guide_used column (single-guide mode only)
         if not self.is_high_moi:
+            # NTC guides are split only by guide_covariates_ntc; all other guides only by
+            # guide_covariates (the two lists are never combined). Order follows the
+            # user-supplied list, so labels are deterministic.
             self.meta["guide_used"] = self.meta.apply(
-                lambda row: f"{row['guide']}_{'_'.join(str(row[cov]) for cov in (guide_covariates_ntc if row['target'] == 'ntc' else set(guide_covariates_ntc + guide_covariates)))}",
+                lambda row: f"{row['guide']}_{'_'.join(str(row[cov]) for cov in (guide_covariates_ntc if row['target'] == 'ntc' else guide_covariates))}",
                 axis=1
             )
             # one-hot encode guides
@@ -706,6 +712,10 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         # Bookkeeping for results
         self.alpha_x_prefit = None    # from step1: shape [C], always a mean point estimate
         # NOTE: alpha_y_prefit is stored per-modality as a mean point estimate [C, T]
+        # fit_cis bookkeeping for guide-axis latents (x_eff_g, sigma_eff, mu_target_i, ...)
+        self.cis_guide_labels = None          # name of each guide-axis position (see utils.get_guide_axis_labels)
+        self.mu_sigma_group_labels = None     # independent_mu_sigma: label of group i <-> mu_target_i/sigma_target_i
+        self.mu_sigma_guide_groups = None     # independent_mu_sigma: group label per guide-axis position
         self.trace_cellline = None    # from step1
         self.trace_x = None          # from step2
         self.trace_y = None          # from step3
@@ -1808,6 +1818,8 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
                 model_new.posterior_samples_cis = subsetted_cis
             if hasattr(self, 'loss_x') and self.loss_x is not None:
                 model_new.loss_x = self.loss_x
+            # group labels index the mu_target_i/sigma_target_i sites, which cell subsetting leaves intact
+            model_new.mu_sigma_group_labels = getattr(self, 'mu_sigma_group_labels', None)
             if hasattr(self, 'posterior_samples_trans') and self.posterior_samples_trans is not None:
                 model_new.posterior_samples_trans = self.posterior_samples_trans
             if hasattr(self, 'losses_trans') and self.losses_trans is not None:

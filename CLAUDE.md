@@ -95,7 +95,7 @@ The main class in `bayesDREAM/model.py` implements multi-modal Bayesian modeling
 - `set_alpha_x(alpha_x, covariates)`: Sets cis gene overdispersion parameters
 - `set_alpha_y(alpha_y, covariates)`: Sets trans gene overdispersion parameters
 - `adjust_ntc_sum_factor(covariates, ...)`: Adjusts NTC sum factors for covariates
-- `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`
+- `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`. `independent_mu_sigma=True` fits `mu`/`sigma` per group = (NTC | cis) x covariates: cis guides by `mu_sigma_covariates` (default `guide_covariates`), NTC by `mu_sigma_covariates_ntc` (default `guide_covariates_ntc`). `guide_covariates` splits only non-NTC guides and `guide_covariates_ntc` only NTC guides (never combined)
 - `set_x_true(x_true)`: Sets true cis expression for trans modeling
 - `permute_genes(genes2permute, ...)`: Permutes guide-gene associations for null testing
 - `refit_sumfactor(covariates, ...)`: Re-estimates sum factors based on posterior cis expression

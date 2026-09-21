@@ -1561,11 +1561,11 @@ class ModelSummarizer:
             # would silently average CRISPRi and CRISPRa cells/effects together.
             # guide_covariates/guide_covariates_ntc are the meta column(s) guide_used
             # was built from (e.g. the CRISPRi/CRISPRa arm column) -- surface them as
-            # their own columns too. 'first' is exact for non-NTC rows (these columns
-            # are exactly what defines the guide_used split there); for NTC rows only
-            # guide_covariates_ntc participated in the split, so a guide_covariates-only
-            # column could in principle vary within an NTC guide_used group -- 'first'
-            # then just reports one representative value.
+            # their own columns too. NTC rows are split only by guide_covariates_ntc and
+            # non-NTC rows only by guide_covariates (never combined), so 'first' is exact
+            # for a row's own covariate columns; a column belonging only to the *other*
+            # list could in principle vary within a guide_used group -- 'first' then just
+            # reports one representative value.
             guide_covariate_cols = [
                 c for c in dict.fromkeys(
                     list(getattr(self.model, 'guide_covariates', []) or [])

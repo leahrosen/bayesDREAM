@@ -41,8 +41,13 @@ log2(x_eff_g) ~ Normal(mu, sigma) * eps,  where eps ~ StudentT(df=3)
 x_eff_g = 2^(log2(x_eff_g))
 ```
 
-Where `mu` and `sigma` are shared hyperparameters across all guides (or per-target if
-`independent_mu_sigma=True`).
+Where `mu` and `sigma` are shared hyperparameters across all guides by default. With
+`independent_mu_sigma=True` they are fit independently per group (sites `mu_target_i`/
+`sigma_target_i`), where a group is NTC-vs-cis crossed with a covariate combination: cis
+guides by `mu_sigma_covariates` (default: the model's `guide_covariates`, e.g. CRISPRi vs
+CRISPRa) and NTC guides by `mu_sigma_covariates_ntc` (default: `guide_covariates_ntc`; one
+NTC group if empty). Group labels are in `model.mu_sigma_group_labels`. See
+`API_REFERENCE.md` (`fit_cis`).
 
 **Interpretation:**
 - Higher `x_eff_g` = stronger knockdown/activation effect (depending on perturbation type)
