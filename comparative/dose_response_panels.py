@@ -49,6 +49,7 @@ from scipy.stats import gaussian_kde
 from bayesDREAM import bayesDREAM
 from bayesDREAM.plotting.xy_plots import predict_hill_from_summary_row
 from .datasets import DatasetSpec, morris_symbol_to_id, morris_id_to_symbol, DOMINGO
+from .hill_eval import get_x_ntc
 
 
 # ── Loading ────────────────────────────────────────────────────────────────
@@ -290,15 +291,22 @@ def compute_smoothed_curves(
     Deliberately does NOT bake in the log2FC(x)/log2FC(y) NTC offset that
     plot_xy_data(log2fc=True) applies -- returns absolute log2(x)/log2(y)
     curves instead. plot_gene_lightweight() applies the offset later, at
-    plot time, from that gene's own trans_feature_summary row (x_ntc/y_ntc)
-    -- the SAME offset source _overlay_extra_curve() already uses for a
-    cross-dataset Hill-curve overlay, so a lightweight panel's smoothed
-    trend and its Hill curve are guaranteed to line up using one consistent
-    convention, even though this differs slightly from plot_xy_data's own
-    live mu_ntc-based offset (already true today: _overlay_extra_curve's
-    curves use row-based offsets while plot_xy_data's OWN curve+data use its
-    live offset -- an established, working precedent this reuses, not a new
-    inconsistency).
+    plot time, from that gene's own trans_feature_summary row via
+    _row_x_ntc()/'y_ntc' -- the SAME offset source _overlay_extra_curve()
+    already uses for a cross-dataset Hill-curve overlay, so a lightweight
+    panel's smoothed trend and its Hill curve are guaranteed to line up
+    using one consistent convention, even though this differs slightly from
+    plot_xy_data's own live mu_ntc-based x-offset (already true today:
+    _overlay_extra_curve's curves use row-based offsets while plot_xy_data's
+    OWN curve+data use its live offset -- an established, working precedent
+    this reuses, not a new inconsistency). NOTE (2026-09-21): plot_xy_data's
+    live x-offset has the same mu_ntc mean-vs-median mismatch _row_x_ntc()
+    was introduced to fix here (see bayesDREAM.io.summary.ModelSummarizer.
+    save_cis_summary()'s x_ntc_matched docstring) -- NOT yet fixed in
+    bayesDREAM/plotting/xy_plots.py itself, so this module's row-based
+    offset and plot_xy_data's own live offset now differ by more than just
+    "which dataset/timing" (the pre-existing, accepted discrepancy above);
+    they're on two different reference conventions.
 
     Meant to be called ONCE per (dataset, cis_gene), on the fully-loaded
     model, right where reconstruct_export.py/reconstruct_export_replogle.py
@@ -711,6 +719,24 @@ def ensure_smoothed_curve(
     return True
 
 
+def _row_x_ntc(row) -> float:
+    """x-axis NTC reference from a trans_feature_summary row: prefers the
+    row's 'x_ntc_matched' column (median of the model's own x_true among NTC
+    cells -- the scale K_a/EC50_a_log2fc were actually computed against, see
+    bayesDREAM.io.summary.ModelSummarizer.save_trans_summary()'s docstring),
+    falling back to the older 'x_ntc' column (fit_ntc's mu_ntc, an
+    arithmetic-mean-type quantity -- biased relative to K_a by roughly
+    0.5*ln(2)*sigma_eff**2 log2 units) only for summary CSVs written before
+    x_ntc_matched existed. Returns NaN if row is None or has neither column.
+    """
+    if row is None:
+        return np.nan
+    matched = row.get('x_ntc_matched', np.nan) if hasattr(row, 'get') else np.nan
+    if pd.notna(matched):
+        return float(matched)
+    return float(row.get('x_ntc', np.nan)) if hasattr(row, 'get') else np.nan
+
+
 def plot_gene_lightweight(
     ax: plt.Axes, feature: str, row: Optional[pd.Series], smoothed: Dict[str, object], spec: DatasetSpec,
     *, cis_gene: Optional[str] = None, fdr_threshold: float = 0.05, show_hill_function: bool = True,
@@ -746,7 +772,7 @@ def plot_gene_lightweight(
     if row is None:
         return False
     y_ntc = float(row.get('y_ntc', np.nan))
-    x_ntc = float(row.get('x_ntc', np.nan))
+    x_ntc = _row_x_ntc(row)
     if not (np.isfinite(y_ntc) and y_ntc > 0 and np.isfinite(x_ntc) and x_ntc > 0):
         return False
     x_off, y_off = np.log2(x_ntc), np.log2(y_ntc)
@@ -827,7 +853,7 @@ def _overlay_extra_curve(ax: plt.Axes, ref_row: pd.Series, spec: DatasetSpec,
     x_ntc/y_ntc or all predicted y were non-positive).
     """
     y_ntc = float(ref_row.get('y_ntc', np.nan)) if hasattr(ref_row, 'get') else float('nan')
-    x_ntc = float(ref_row.get('x_ntc', np.nan)) if hasattr(ref_row, 'get') else float('nan')
+    x_ntc = _row_x_ntc(ref_row)
     if not (np.isfinite(y_ntc) and y_ntc > 0 and np.isfinite(x_ntc) and x_ntc > 0):
         return False
 
@@ -1108,18 +1134,13 @@ def make_panel_lightweight(
 # ── Cis-side guide-density panel ─────────────────────────────────────────────
 
 def _get_x_ntc_log2(model) -> float:
-    try:
-        cis_mod = model.get_modality('cis')
-        psn = getattr(cis_mod, 'posterior_samples_ntc', None)
-        if psn is not None and 'mu_ntc' in psn:
-            mu = np.asarray(psn['mu_ntc']).mean()
-            if np.isfinite(mu) and mu > 0:
-                return float(np.log2(mu))
-    except Exception:
-        pass
-    ntc = model.meta.loc[model.meta['target'] == 'ntc', 'x_true']
-    ntc = ntc[ntc > 0]
-    return float(np.log2(ntc.mean())) if len(ntc) > 0 else 0.0
+    """log2 of hill_eval.get_x_ntc(model) -- the median of the model's own
+    x_true among NTC cells (NOT fit_ntc's mu_ntc; see get_x_ntc()'s own
+    docstring for why -- same mean-vs-median mismatch this whole module's
+    x_ntc/x_ntc_matched fixes address). Delegates rather than reimplementing
+    so this can't drift out of sync with get_x_ntc()'s own fallback logic.
+    """
+    return float(np.log2(get_x_ntc(model)))
 
 
 def _expand_cell_guide_data(model, meta_filtered: pd.DataFrame) -> pd.DataFrame:

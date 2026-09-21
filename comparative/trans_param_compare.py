@@ -1090,11 +1090,20 @@ def compare_all_cis_genes_grid(
 
 # ── EC50 vs Hill coefficient, with an x_true coverage panel underneath ───────
 
-def _load_x_true_coverage(spec: DatasetSpec, cis_gene: str, x_ntc: float) -> pd.DataFrame:
-    """Per-cell log2FC(x_true) (relative to `x_ntc`, matching EC50_a_log2fc's
-    own baseline -- see bayesDREAM/io/summary.py's compute_log2fc_params(),
-    which centers EC50_a_log2fc on the exact same x_ntc value) plus a
-    'group' label in {'NTC', 'CRISPRi', 'CRISPRa'}.
+def _load_x_true_coverage(spec: DatasetSpec, cis_gene: str) -> pd.DataFrame:
+    """Per-cell log2FC(x_true), relative to this (dataset, gene)'s OWN
+    x_ntc_matched (median of x_true among its NTC cells), matching
+    EC50_a_log2fc's own baseline -- see
+    bayesDREAM.io.summary.ModelSummarizer.save_trans_summary()'s
+    x_ntc_matched docstring, which centers EC50_a_log2fc on the exact same
+    reference. Computed here directly from meta_plot.csv/x_true.pt (NOT
+    read from a trans_feature_summary 'x_ntc' column, which is a
+    differently-scaled quantity -- fit_ntc()'s mu_ntc, an arithmetic mean,
+    vs. x_true's own median-of-log-normal location; see that docstring for
+    the full derivation) so this always matches whatever save_trans_summary()
+    itself used, without depending on which columns happen to be present in
+    a given trans_feature_summary CSV. Plus a 'group' label in {'NTC',
+    'CRISPRi', 'CRISPRa'}.
 
     Reads directly from save_model_for_plotting()'s lightweight per-cell
     export (meta_plot.csv + x_true.pt) -- no full model reload, so this
@@ -1122,9 +1131,14 @@ def _load_x_true_coverage(spec: DatasetSpec, cis_gene: str, x_ntc: float) -> pd.
 
     meta = meta.assign(x_true=x_true)
     meta = meta.loc[meta['x_true'] > 0].copy()
-    meta['log2fc_x'] = np.log2(meta['x_true']) - np.log2(max(float(x_ntc), 1e-10))
 
-    is_ntc = meta['target'].astype(str).str.lower() == 'ntc'
+    ntc_mask = meta['target'].astype(str).str.lower() == 'ntc'
+    if not ntc_mask.any():
+        raise ValueError(f"[{spec.name}/{cis_gene}] no NTC cells (target=='ntc') in meta_plot.csv.")
+    x_ntc_matched = float(np.median(meta.loc[ntc_mask, 'x_true']))
+    meta['log2fc_x'] = np.log2(meta['x_true']) - np.log2(max(x_ntc_matched, 1e-10))
+
+    is_ntc = ntc_mask
     # force_single_cell_line datasets (Morris/Replogle: CRISPRi-only) may have
     # a missing/inconsistent raw 'cell_line' column -- same override
     # dose_response_panels.load_model_for_plotting() applies after reload.
@@ -1159,14 +1173,17 @@ def plot_ec50_hill_with_coverage(
     """
     if df is None:
         df = load_trans_summary(spec, cis_gene)
-    if 'x_ntc' not in df.columns:
+    if ec50_col not in df.columns:
         raise KeyError(
-            f"[{spec.name}/{cis_gene}] no 'x_ntc' column in trans_feature_summary -- "
-            "re-run save_trans_summary() with the cis modality's NTC fit available."
+            f"[{spec.name}/{cis_gene}] no {ec50_col!r} column in trans_feature_summary -- "
+            "re-run save_trans_summary() with compute_log2fc_params=True and the cis "
+            "modality's NTC fit (or an NTC-cell x_true, for x_ntc_matched) available."
         )
-    x_ntc = float(df['x_ntc'].iloc[0])
 
-    coverage = _load_x_true_coverage(spec, cis_gene, x_ntc)
+    # x_ntc_matched computed independently here (not read from df['x_ntc'], a
+    # differently-scaled quantity -- see _load_x_true_coverage()'s docstring),
+    # matching how save_trans_summary() itself computed ec50_col's reference.
+    coverage = _load_x_true_coverage(spec, cis_gene)
 
     ec50_vals = df[ec50_col]
     finite_ec50 = ec50_vals[np.isfinite(ec50_vals)]
