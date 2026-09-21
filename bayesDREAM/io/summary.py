@@ -2125,7 +2125,11 @@ class ModelSummarizer:
             if isinstance(x_true, torch.Tensor):
                 x_true = x_true.cpu().numpy()
             if x_true.ndim > 1:
-                x_true = x_true.mean(axis=0)  # Average over posterior samples
+                # Median, not mean, over posterior samples -- matches fit_cis()'s own
+                # point-estimate convention (posterior_samples_x['x_true'].median(dim=0)).
+                # Legacy-format fallback only: self.model.x_true is normally already the
+                # reduced 1D point estimate by this point.
+                x_true = np.median(x_true, axis=0)
             # Subset to modality cells when the modality covers fewer cells than the model
             if modality.cell_names is not None:
                 all_model_cells = self.model.meta['cell'].tolist()

@@ -865,7 +865,12 @@ class ModelLoader:
         if os.path.exists(x_true_path):
             x_true = _torch_load(x_true_path, map_location=self.model.device)
             if isinstance(x_true, torch.Tensor) and x_true.ndim >= 2:
-                x_true = x_true.mean(dim=0)
+                # median, not mean, to match fit_cis()'s own point-estimate convention
+                # (posterior_samples_x['x_true'].median(dim=0)) -- this branch only
+                # fires for a legacy x_true.pt saved as the full [n_samples, n_cells]
+                # posterior instead of the already-reduced 1D point estimate
+                # save_cis_fit() writes today.
+                x_true = x_true.median(dim=0).values
             if (current_cell_names is not None and saved_cell_names is not None
                     and current_cell_names != saved_cell_names
                     and x_true.ndim == 1 and x_true.shape[0] == len(saved_cell_names)):
@@ -888,7 +893,8 @@ class ModelLoader:
         if os.path.exists(log2_x_true_path):
             log2_x_true = _torch_load(log2_x_true_path, map_location=self.model.device)
             if isinstance(log2_x_true, torch.Tensor) and log2_x_true.ndim >= 2:
-                log2_x_true = log2_x_true.mean(dim=0)
+                # median, not mean -- same legacy-format fallback as x_true above
+                log2_x_true = log2_x_true.median(dim=0).values
             if (current_cell_names is not None and saved_cell_names is not None
                     and current_cell_names != saved_cell_names
                     and log2_x_true.ndim == 1 and log2_x_true.shape[0] == len(saved_cell_names)):
@@ -906,7 +912,8 @@ class ModelLoader:
                     and 'log_x_true' in self.model.posterior_samples_cis):
                 log_x_true = self.model.posterior_samples_cis['log_x_true']
                 if isinstance(log_x_true, torch.Tensor) and log_x_true.ndim >= 2:
-                    log_x_true = log_x_true.mean(dim=0)
+                    # median, not mean -- same point-estimate convention as x_true above
+                    log_x_true = log_x_true.median(dim=0).values
                 self.model.log2_x_true = log_x_true
                 loaded['log2_x_true'] = True
                 if verbose:
