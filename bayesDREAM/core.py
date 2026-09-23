@@ -253,169 +253,20 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         self.guide_covariates = guide_covariates
         self.guide_covariates_ntc = guide_covariates_ntc
 
-        # Input checks - different requirements for single-guide vs high MOI mode
-        if self.is_high_moi:
-            # High MOI mode: do NOT require 'guide' or 'target' in meta
-            required_cols = {"cell", sum_factor_col} | set(guide_covariates) | set(guide_covariates_ntc)
-            missing_cols = required_cols - set(self.meta.columns)
-            if missing_cols:
-                raise ValueError(f"[High MOI] Missing required columns in meta: {missing_cols}")
-
-            # Validate guide_assignment matches meta length
-            if len(self.meta) != N_cells_assignment:
-                raise ValueError(
-                    f"[High MOI] guide_assignment has {N_cells_assignment} rows but meta has {len(self.meta)} rows. "
-                    f"These dimensions must match."
-                )
-
-        else:
-            # Single-guide mode: require 'guide' in meta. 'target' is required only
-            # when no guide_target mapping was supplied — otherwise it's derived
-            # per-cell from guide_targets_dict below.
-            required_cols = {"cell", sum_factor_col, "guide"} | set(guide_covariates) | set(guide_covariates_ntc)
-            if self.guide_targets_dict is None:
-                required_cols.add("target")
-            missing_cols = required_cols - set(self.meta.columns)
-            if missing_cols:
-                raise ValueError(f"[Single-guide] Missing required columns in meta: {missing_cols}")
-
-            if self.guide_targets_dict is not None:
-                # Derive 'target' per cell from its guide's list of plausible targets.
-                # Priority mirrors high-MOI classification: cis_gene > NTC > 'other'.
-                # A guide with multiple plausible targets resolves differently
-                # depending on which cis_gene is currently being fit.
-                self.meta['target'] = self.meta['guide'].map(
-                    lambda guide_name: classify_target_from_guides(
-                        [guide_name],
-                        self.guide_targets_dict,
-                        self.cis_gene,
-                        exclude_targets=exclude_targets,
-                        exclude_guides=exclude_guides,
-                    )
-                )
-
-                n_before = len(self.meta)
-                self.meta = self.meta[self.meta['target'] != 'excluded'].copy()
-                n_excluded = n_before - len(self.meta)
-                if n_excluded > 0:
-                    print(f"[INFO] Excluded {n_excluded} cells (guide targets a gene in exclude_targets={exclude_targets})")
-
-                target_counts = self.meta['target'].value_counts()
-                print(f"[INFO] Single-guide target classification from guide_target mapping:")
-                print(f"  NTC cells: {target_counts.get('ntc', 0)}")
-                if self.cis_gene is not None:
-                    print(f"  {self.cis_gene}-targeting cells: {target_counts.get(self.cis_gene, 0)}")
-                    print(f"  Other-only cells (will be removed): {target_counts.get('other', 0)}")
-                else:
-                    print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {target_counts.get('other', 0)}")
-
-            if require_ntc and "ntc" not in self.meta["target"].values:
-                raise ValueError(
-                    "No NTC detected in the 'target' column. "
-                    "If this is correct (e.g., you have already run fit_ntc() or don't need NTC cells), "
-                    "use require_ntc=False."
-                )
-
-        # Populate cell names if not already set
-        if self._cell_names is None:
-            if isinstance(counts, pd.DataFrame):
-                self._cell_names = counts.columns.tolist()
-            else:
-                # Use meta['cell'] as cell names
-                self._cell_names = self.meta['cell'].tolist()
-
-        if not set(self.meta["cell"]).issubset(set(self._cell_names)):
-            raise ValueError("The 'cell' column in meta must correspond 1:1 with the cell names in counts.")
-
-        if (self.meta[sum_factor_col] <= 0).any():
-            raise ValueError(f"All values in sum_factor_col={sum_factor_col} column must be strictly greater than 0.")
-
-        # For high MOI mode, create 'target' column based on guide assignment
-        if self.is_high_moi:
-            guide_names = self.guide_meta['guide'].tolist()
-            targets = [
-                classify_target_from_guides(
-                    [guide_names[index] for index, assigned in enumerate(assignment) if assigned],
-                    self.guide_targets_dict,
-                    self.cis_gene,
-                    exclude_targets=exclude_targets,
-                    exclude_guides=exclude_guides,
-                )
-                for assignment in self.guide_assignment
-            ]
-            self.meta['target'] = targets
-
-            # Add guide_code column (not meaningful in high MOI, marked as -1)
-            self.meta['guide_code'] = -1
-
-            ntc_count = (np.array(targets) == 'ntc').sum()
-            other_count = (np.array(targets) == 'other').sum()
-            excluded_count = (np.array(targets) == 'excluded').sum()
-            print(f"[INFO] Cell classification before subsetting:")
-            print(f"  NTC cells (NTC guides, no cis): {ntc_count}")
-            if self.cis_gene is not None:
-                cis_count = (np.array(targets) == self.cis_gene).sum()
-                print(f"  {self.cis_gene}-targeting cells (any cis guides): {cis_count}")
-                print(f"  Other-only cells (will be removed): {other_count}")
-            else:
-                print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {other_count}")
-            if exclude_targets is not None or exclude_guides is not None:
-                print(f"  Excluded cells (exclude_targets/exclude_guides): {excluded_count}")
-
-        # Save original cell order before subsetting (for guide_assignment row alignment in high MOI)
-        if self.is_high_moi:
-            if isinstance(self.counts, pd.DataFrame):
-                _ga_original_cell_names = list(self.counts.columns)
-            else:
-                _ga_original_cell_names = list(self._cell_names) if hasattr(self, '_cell_names') and self._cell_names else []
-
-        # Drop cells carrying explicitly excluded guides (single-guide mode only;
-        # high MOI handles this above via target='excluded')
-        if exclude_guides is not None and not self.is_high_moi:
-            excluded_guide_set = set(exclude_guides)
-            n_before = len(self.meta)
-            self.meta = self.meta[~self.meta['guide'].isin(excluded_guide_set)].copy()
-            n_excluded = n_before - len(self.meta)
-            if n_excluded > 0:
-                print(f"[INFO] Excluded {n_excluded} cells carrying guides in exclude_guides={exclude_guides}")
-
-        # For high MOI mode, drop 'excluded' cells unconditionally (independent of cis_gene,
-        # since exclusion is determined purely by exclude_targets/exclude_guides). Doing this
-        # here — rather than folding it into the cis_gene-dependent filter below — ensures
-        # excluded cells don't linger into fit_ntc() when cis_gene is deferred.
-        if self.is_high_moi:
-            n_before_excl = len(self.meta)
-            self.meta = self.meta[self.meta["target"] != "excluded"].copy()
-            n_after_excl = len(self.meta)
-            if n_after_excl < n_before_excl:
-                print(f"[INFO] Excluded {n_before_excl - n_after_excl} cells (target='excluded')")
-
-        # Subset meta and counts to relevant cells
-        if self.cis_gene is not None:
-            valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
-            n_cells_before = len(self.meta["cell"].unique())
-            if len(valid_cells) < n_cells_before:
-                print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
-            self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
-        else:
-            # cis_gene not yet specified — keep all cells; add_cis_gene() will subset later
-            valid_cells = self.meta["cell"].unique()
-            print(f"[INFO] No cis_gene at init — keeping all {len(valid_cells)} cells. "
-                  "Call add_cis_gene() before fit_cis().")
-
-        # Subset counts by cells - works for both DataFrame and sparse
-        if isinstance(self.counts, pd.DataFrame):
-            self.counts = self.counts[valid_cells].copy()
-        else:
-            # Sparse or dense array - subset by column indices
-            valid_cells_set = set(valid_cells)
-            cell_indices = [i for i, cell in enumerate(self._cell_names) if cell in valid_cells_set]
-            if self.is_sparse_counts:
-                self.counts = self.counts[:, cell_indices]
-            else:
-                self.counts = self.counts[:, cell_indices]
-            # Update cell names
-            self._cell_names = [self._cell_names[i] for i in cell_indices]
+        self._validate_and_classify_metadata(
+            counts,
+            sum_factor_col,
+            guide_covariates,
+            guide_covariates_ntc,
+            N_cells_assignment,
+            exclude_targets,
+            exclude_guides,
+            require_ntc,
+        )
+        _ga_original_cell_names, valid_cells = self._prepare_cell_subset(
+            exclude_targets,
+            exclude_guides,
+        )
 
         # For high MOI: subset guide_assignment to remove "other"-targeting guide columns.
         # Only possible once cis_gene is known — if deferred, keep the full guide panel;
@@ -565,6 +416,154 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         # After all init logic above has consumed self.counts, drop it to save RAM.
         self.counts = None
         self.is_sparse_counts = None  # no longer meaningful without the matrix
+
+    def _validate_and_classify_metadata(
+        self,
+        counts,
+        sum_factor_col,
+        guide_covariates,
+        guide_covariates_ntc,
+        n_cells_assignment,
+        exclude_targets,
+        exclude_guides,
+        require_ntc,
+    ):
+        """Validate cell metadata and assign target classes before filtering."""
+        if self.is_high_moi:
+            required_cols = {"cell", sum_factor_col} | set(guide_covariates) | set(guide_covariates_ntc)
+            missing_cols = required_cols - set(self.meta.columns)
+            if missing_cols:
+                raise ValueError(f"[High MOI] Missing required columns in meta: {missing_cols}")
+            if len(self.meta) != n_cells_assignment:
+                raise ValueError(
+                    f"[High MOI] guide_assignment has {n_cells_assignment} rows but meta has {len(self.meta)} rows. "
+                    "These dimensions must match."
+                )
+        else:
+            required_cols = {"cell", sum_factor_col, "guide"} | set(guide_covariates) | set(guide_covariates_ntc)
+            if self.guide_targets_dict is None:
+                required_cols.add("target")
+            missing_cols = required_cols - set(self.meta.columns)
+            if missing_cols:
+                raise ValueError(f"[Single-guide] Missing required columns in meta: {missing_cols}")
+
+            if self.guide_targets_dict is not None:
+                self.meta['target'] = self.meta['guide'].map(
+                    lambda guide_name: classify_target_from_guides(
+                        [guide_name],
+                        self.guide_targets_dict,
+                        self.cis_gene,
+                        exclude_targets=exclude_targets,
+                        exclude_guides=exclude_guides,
+                    )
+                )
+                n_before = len(self.meta)
+                self.meta = self.meta[self.meta['target'] != 'excluded'].copy()
+                n_excluded = n_before - len(self.meta)
+                if n_excluded > 0:
+                    print(f"[INFO] Excluded {n_excluded} cells (guide targets a gene in exclude_targets={exclude_targets})")
+
+                target_counts = self.meta['target'].value_counts()
+                print("[INFO] Single-guide target classification from guide_target mapping:")
+                print(f"  NTC cells: {target_counts.get('ntc', 0)}")
+                if self.cis_gene is not None:
+                    print(f"  {self.cis_gene}-targeting cells: {target_counts.get(self.cis_gene, 0)}")
+                    print(f"  Other-only cells (will be removed): {target_counts.get('other', 0)}")
+                else:
+                    print(
+                        "  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): "
+                        f"{target_counts.get('other', 0)}"
+                    )
+
+            if require_ntc and "ntc" not in self.meta["target"].values:
+                raise ValueError(
+                    "No NTC detected in the 'target' column. "
+                    "If this is correct (e.g., you have already run fit_ntc() or don't need NTC cells), "
+                    "use require_ntc=False."
+                )
+
+        if self._cell_names is None:
+            self._cell_names = (
+                counts.columns.tolist()
+                if isinstance(counts, pd.DataFrame)
+                else self.meta['cell'].tolist()
+            )
+        if not set(self.meta["cell"]).issubset(set(self._cell_names)):
+            raise ValueError("The 'cell' column in meta must correspond 1:1 with the cell names in counts.")
+        if (self.meta[sum_factor_col] <= 0).any():
+            raise ValueError(f"All values in sum_factor_col={sum_factor_col} column must be strictly greater than 0.")
+
+        if self.is_high_moi:
+            guide_names = self.guide_meta['guide'].tolist()
+            targets = [
+                classify_target_from_guides(
+                    [guide_names[index] for index, assigned in enumerate(assignment) if assigned],
+                    self.guide_targets_dict,
+                    self.cis_gene,
+                    exclude_targets=exclude_targets,
+                    exclude_guides=exclude_guides,
+                )
+                for assignment in self.guide_assignment
+            ]
+            self.meta['target'] = targets
+            self.meta['guide_code'] = -1
+
+            ntc_count = (np.array(targets) == 'ntc').sum()
+            other_count = (np.array(targets) == 'other').sum()
+            excluded_count = (np.array(targets) == 'excluded').sum()
+            print("[INFO] Cell classification before subsetting:")
+            print(f"  NTC cells (NTC guides, no cis): {ntc_count}")
+            if self.cis_gene is not None:
+                cis_count = (np.array(targets) == self.cis_gene).sum()
+                print(f"  {self.cis_gene}-targeting cells (any cis guides): {cis_count}")
+                print(f"  Other-only cells (will be removed): {other_count}")
+            else:
+                print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {other_count}")
+            if exclude_targets is not None or exclude_guides is not None:
+                print(f"  Excluded cells (exclude_targets/exclude_guides): {excluded_count}")
+
+    def _prepare_cell_subset(self, exclude_targets, exclude_guides):
+        """Apply exclusions and subset metadata and counts to the active cells."""
+        if self.is_high_moi:
+            original_cell_names = list(self._cell_names)
+        else:
+            original_cell_names = []
+
+        if exclude_guides is not None and not self.is_high_moi:
+            excluded_guide_set = set(exclude_guides)
+            n_before = len(self.meta)
+            self.meta = self.meta[~self.meta['guide'].isin(excluded_guide_set)].copy()
+            n_excluded = n_before - len(self.meta)
+            if n_excluded > 0:
+                print(f"[INFO] Excluded {n_excluded} cells carrying guides in exclude_guides={exclude_guides}")
+
+        if self.is_high_moi:
+            n_before_excl = len(self.meta)
+            self.meta = self.meta[self.meta["target"] != "excluded"].copy()
+            n_after_excl = len(self.meta)
+            if n_after_excl < n_before_excl:
+                print(f"[INFO] Excluded {n_before_excl - n_after_excl} cells (target='excluded')")
+
+        if self.cis_gene is not None:
+            valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
+            n_cells_before = len(self.meta["cell"].unique())
+            if len(valid_cells) < n_cells_before:
+                print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
+            self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
+        else:
+            valid_cells = self.meta["cell"].unique()
+            print(f"[INFO] No cis_gene at init — keeping all {len(valid_cells)} cells. "
+                  "Call add_cis_gene() before fit_cis().")
+
+        if isinstance(self.counts, pd.DataFrame):
+            self.counts = self.counts[valid_cells].copy()
+        else:
+            valid_cells_set = set(valid_cells)
+            cell_indices = [i for i, cell in enumerate(self._cell_names) if cell in valid_cells_set]
+            self.counts = self.counts[:, cell_indices]
+            self._cell_names = [self._cell_names[i] for i in cell_indices]
+
+        return original_cell_names, valid_cells
 
     def _initialize_input_state(
         self,
