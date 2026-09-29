@@ -17,6 +17,8 @@ import pyro.optim as optim
 import pyro.infer as infer
 import multiprocessing
 
+from ..utils import compute_technical_group_code
+
 # Optional dependency for memory detection
 try:
     import psutil
@@ -611,7 +613,7 @@ class NTCFitter:
         if missing_cols:
             raise ValueError(f"Missing columns in meta: {missing_cols}")
 
-        self.model.meta["technical_group_code"] = self.model.meta.groupby(covariates).ngroup()
+        self.model.meta["technical_group_code"] = compute_technical_group_code(self.model.meta, covariates)
         self.model._technical_group_covariates = list(covariates)
         print(f"[INFO] Set technical_group_code with {self.model.meta['technical_group_code'].nunique()} groups based on {covariates}")
     
