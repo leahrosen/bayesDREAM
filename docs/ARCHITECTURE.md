@@ -18,7 +18,7 @@
              ↓                                    ↓
 ┌────────────────────────┐          ┌────────────────────────────┐
 │  _BayesDREAMCore       │          │  modalities: Dict[str,     │
-│  (core.py)             │          │                 Modality]  │
+│  (core/__init__.py)    │          │                 Modality]  │
 │                        │          │                            │
 │  - set_technical_      │          │  Required: 'cis'           │
 │    groups()            │          │  Primary: 'gene' (default) │
@@ -356,7 +356,7 @@ normal                    2D: (F, C)             SpliZ scores
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    _BayesDREAMCore (base class)                  │
-│  Located in: bayesDREAM/core.py                                 │
+│  Located in: bayesDREAM/core/__init__.py                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  Attributes:                                                     │
 │    - meta: pd.DataFrame (cell metadata)                         │
@@ -454,7 +454,7 @@ Future:
 ```
 model.py (~311 lines)
   ├── pandas, numpy
-  ├── core.py (_BayesDREAMCore)
+  ├── core/ (_BayesDREAMCore package; imported as bayesDREAM.core)
   ├── modality.py (Modality class)
   └── modalities/ (mixin classes)
       ├── transcript.py
@@ -462,10 +462,9 @@ model.py (~311 lines)
       ├── atac.py
       └── custom.py
 
-core.py (~909 lines)
+core/__init__.py
   ├── pandas, numpy, torch, pyro
   ├── scipy, sklearn
-  ├── distributions.py (observation samplers)
   ├── fitting/ (delegated fitters)
   │   ├── technical.py (NTCFitter)
   │   ├── cis.py (CisFitter)
@@ -473,6 +472,18 @@ core.py (~909 lines)
   └── io/ (save/load)
       ├── save.py (ModelSaver)
       └── load.py (ModelLoader)
+
+core/data_setup.py
+  ├── input state normalization
+  ├── cell metadata and target validation
+  └── cell subset preparation
+
+core/technical_state.py
+  └── externally supplied alpha_x and alpha_y state
+
+guides.py
+  ├── guide-target mapping and classification
+  └── high-MOI assignment validation and covariate expansion
 
 modality.py
   ├── pandas, numpy
@@ -504,7 +515,7 @@ modalities/
 
 __init__.py
   ├── model.py (bayesDREAM)
-  ├── core.py (_BayesDREAMCore)
+  ├── core/ (_BayesDREAMCore)
   ├── modality.py (Modality)
   ├── splicing.py
   ├── distributions.py
