@@ -466,7 +466,7 @@ core/__init__.py
   ├── pandas, numpy, torch, pyro
   ├── scipy, sklearn
   ├── fitting/ (delegated fitters)
-  │   ├── technical.py (NTCFitter)
+  │   ├── ntc.py (NTCFitter)
   │   ├── cis.py (CisFitter)
   │   └── trans.py (TransFitter)
   └── io/ (save/load)
@@ -480,6 +480,9 @@ core/data_setup.py
 
 core/technical_state.py
   └── externally supplied alpha_x and alpha_y state
+
+fitting/ntc_tuning.py
+  └── RAM/SLURM-based Predictive minibatch and parallelism planning
 
 guides.py
   ├── guide-target mapping and classification
