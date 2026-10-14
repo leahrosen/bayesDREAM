@@ -42,7 +42,7 @@ Priors (s_t = 1 for negbinom/binomial, s_t = per-feature data SD for normal/stud
 
 Dispersion: negbinom uses o_t ~ Exp(beta_o), beta_o ~ Gamma(9, 3), phi = 1/o^2, as in the
 other models; normal/studentt use sigma_t ~ HalfNormal(2 s_t), and studentt nu_t ~ Gamma(10, 2).
-Technical group effects are taken from `fit_technical` and held fixed.
+Technical group effects are taken from `fit_ntc` and held fixed.
 
 ## Differences from additive_hill, and why
 

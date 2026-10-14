@@ -47,10 +47,10 @@ def fitted_model(tmp_path_factory):
                        output_dir=str(tmp_path_factory.mktemp("logistic")),
                        label="logistic_test", device="cpu")
     model.set_technical_groups(["cell_line"])
-    model.fit_technical(niters=100, nsamples=10, sum_factor_col="sum_factor")
+    model.fit_ntc(niters=100, nsamples=10, sum_factor_col="sum_factor")
     x_true = torch.tensor(x, dtype=torch.float32)
-    model.x_true, model.x_true_type = x_true, "point"
-    model.log2_x_true, model.log2_x_true_type = torch.log2(x_true), "point"
+    model.x_true = x_true
+    model.log2_x_true = torch.log2(x_true)
     return model
 
 

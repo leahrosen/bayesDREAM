@@ -136,10 +136,10 @@ if __name__ == '__main__':
     model = bayesDREAM(meta=meta, counts=counts, cis_gene='CIS', output_dir='./benchmark_output',
                        label='logistic_benchmark', device='cpu')
     model.set_technical_groups(['cell_line'])
-    model.fit_technical(sum_factor_col='sum_factor', niters=3000, nsamples=200)
+    model.fit_ntc(sum_factor_col='sum_factor', niters=3000, nsamples=200)
     x = torch.tensor(truth['x_true'], dtype=torch.float32)
-    model.x_true, model.x_true_type = x, 'point'
-    model.log2_x_true, model.log2_x_true_type = torch.log2(x), 'point'
+    model.x_true = x
+    model.log2_x_true = torch.log2(x)
 
     t0 = time.time()
     model.fit_trans(sum_factor_col='sum_factor', function_type=function_type, niters=niters,

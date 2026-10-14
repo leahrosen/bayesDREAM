@@ -1505,6 +1505,7 @@ class TransFitter:
         self,
         N,
         T,
+        x_true,
         y_obs_tensor,
         y_obs_for_prior,
         sum_factor_tensor,
@@ -1544,8 +1545,7 @@ class TransFitter:
         # ---------------------------------------------
         # Standardised input u = (log2 x - center) / scale
         # ---------------------------------------------
-        log2_x = self.model.log2_x_true.to(device)
-        log2_x_point = log2_x.mean(dim=0) if self.model.log2_x_true_type == 'posterior' else log2_x
+        log2_x_point = torch.log2(x_true.to(device))  # [N], cells of this modality
         ntc_mask_t = torch.tensor(np.asarray(ntc_mask, dtype=bool), device=device)
         if ntc_mask_t.sum() == 0:
             warnings.warn("logistic_hill: no NTC cells found; centring u on the mean over all cells.")
@@ -1583,7 +1583,7 @@ class TransFitter:
         k_scale, log_n_loc, log_n_scale = 1.5, 0.5, 0.75
 
         # ---------------------------------------------
-        # Technical group effects (fixed from fit_technical)
+        # Technical group effects (fixed from fit_ntc)
         # ---------------------------------------------
         alpha_is_posterior = alpha_y_prefit is not None and alpha_y_prefit.dim() >= 3
         alpha_point = None
@@ -1658,7 +1658,6 @@ class TransFitter:
         lrd = 0.1 ** (1.0 / max(niters, 1))  # learning rate decays to 10 % over the run
 
         u_point = to_u(log2_x_point)
-        x_is_posterior = self.model.log2_x_true_type == 'posterior' and log2_x.dim() >= 2
 
         print(f"[INFO] logistic_hill: J={J} components, guide={logistic_guide}, "
               f"u_center={u_center:.3f}, u_scale={u_scale:.3f}, tau0={tau0}, slab={slab_scale}")
@@ -1680,8 +1679,6 @@ class TransFitter:
             for step in range(phase_steps):
                 u_step = u_point
                 alpha_step = alpha_point
-                if x_is_posterior:
-                    u_step = to_u(log2_x[torch.randint(log2_x.shape[0], (1,)).item()])
                 if alpha_is_posterior and groups_tensor is not None:
                     samp = torch.randint(alpha_y_prefit.shape[0], (1,)).item()
                     alpha_step = self._alpha_y_with_reference(alpha_y_prefit[samp], C, T, distribution)
@@ -2447,6 +2444,7 @@ class TransFitter:
             ntc_mask = (meta_subset['target'].astype(str).str.lower() == 'ntc').values
             posterior_samples_y = self._fit_trans_logistic(
                 N=N, T=T,
+                x_true=x_true_subset,
                 y_obs_tensor=y_obs_tensor,
                 y_obs_for_prior=y_obs_for_prior,
                 sum_factor_tensor=sum_factor_tensor,
