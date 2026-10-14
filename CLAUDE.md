@@ -108,6 +108,7 @@ The `fit_trans` method supports multiple functional forms for modeling how trans
 - `single_hill`: Single Hill equation (positive or negative)
 - `additive_hill`: Additive combination of positive and negative Hill functions
 - `polynomial`: Polynomial function with configurable degree (default: 6)
+- `logistic_hill`: Link-scale baseline plus logistic curves in standardised log2 x with horseshoe priors; separate model `_model_y_logistic` (see `docs/LOGISTIC_HILL.md`)
 
 ### Probabilistic Models
 
@@ -228,7 +229,7 @@ for gene in ['GFI1B', 'MYB', 'TET2']:
 - At init: cells are classified as `'excluded'` / `'ntc'` / `'other'` (cis identity unknown yet); excluded cells are dropped immediately; the full guide panel is kept (no pruning) since which guides are "cis" isn't known until `add_cis_gene()`.
 - `fit_ntc(use_all_cells=...)` defaults to `True` when `cis_gene` is still unset in high-MOI mode (cell classification into NTC/cis/other isn't possible yet, so a per-gene NTC-only fit isn't well-defined). Pass `use_all_cells=False` explicitly to force NTC-only fitting instead (still correct, since 'ntc' cells are already properly classified at this point).
 - `add_cis_gene(gene)` additionally: reclassifies any cell carrying a guide targeting `gene` from `'ntc'`/`'other'` to `gene` (excluded cells are never reclassified — same `excluded > cis > ntc > other` priority used in eager high-MOI init), then prunes `guide_assignment`/`guide_meta`/`guide_targets_dict` down to NTC + cis-gene guides only and rebuilds `guide_assignment_tensor`.
-- Known pre-existing issue (not introduced by deferred-cis-gene support): `fit_cis()` in high-MOI mode currently raises `RuntimeError: expected scalar type Float but found Double` from a dtype mismatch between `guide_assignment_tensor` and `log2_x_eff_g` in `_model_x` — reproduces identically in eager high-MOI mode (`cis_gene` set at init), so it's an existing bug in `fitting/cis.py`, not specific to the deferred workflow.
+- Fixed: `fit_cis()` in high-MOI mode used to raise a Float/Double dtype mismatch in `_model_x`, because the high-MOI guide means were computed in float64 from the numpy `guide_assignment`; they are now cast to float32 in `fitting/cis.py`.
 
 ### Single-Guide Mode with `guide_target` (Ambiguous/Multi-Target Guides)
 

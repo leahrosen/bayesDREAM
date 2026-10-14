@@ -36,7 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--meta", required=True, help="Path to metadata CSV")
     parser.add_argument("--counts", required=True, help="Path to counts CSV")
     parser.add_argument("--function_type", default='additive_hill',
-                       choices=['single_hill', 'additive_hill', 'polynomial'],
+                       choices=['single_hill', 'additive_hill', 'polynomial', 'logistic_hill'],
                        help="Function type for trans effects")
     parser.add_argument("--modality", default='gene', help="Modality to fit trans on")
     parser.add_argument("--cores", type=int, default=1, help="Number of CPU cores")

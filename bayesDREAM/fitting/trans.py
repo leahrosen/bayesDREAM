@@ -48,6 +48,86 @@ def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Te
     return center + half * torch.tanh(x / half)
 
 
+class _FeatureBlockGuide:
+    """
+    Variational family for the per-feature latent variables of the logistic_hill model.
+
+    For every feature t, the unconstrained values of all per-feature sites are stacked
+    into one vector eta_t of length d and given a full-rank Gaussian,
+
+        eta_t ~ MVN(loc_t, L_t L_t^T),
+
+    independently across features. This is block-diagonal over features, so the cost is
+    O(T d^2) and the correlations within a feature (amplitude vs. midpoint vs. slope) are
+    kept. Each site is mapped to its support with biject_to and the log-Jacobian is
+    attached through a Delta site, as in pyro's AutoContinuous. Global scalar sites get
+    independent Gaussians in unconstrained space.
+
+    Parameters
+    ----------
+    T : int
+        Number of features.
+    J : int
+        Number of logistic components.
+    site_specs : list of (name, per_component, constraint)
+        per_component=False -> site has shape [T]; True -> shape [J, T].
+    init_loc : torch.Tensor
+        Initial location in unconstrained space, shape [T, d].
+    init_scale : torch.Tensor
+        Initial standard deviations (diagonal of L_t), shape [T, d].
+    global_specs : list of (name, constraint, init_loc, init_scale)
+        Scalar sites shared by all features, in unconstrained space.
+    """
+
+    def __init__(self, T, J, site_specs, init_loc, init_scale, global_specs=()):
+        self.T = T
+        self.J = J
+        self.site_specs = site_specs
+        self.global_specs = list(global_specs)
+        self.init_loc = init_loc.detach().clone()
+        self.init_scale = init_scale.detach().clone()
+        self.d = init_loc.shape[-1]
+
+    def __call__(self, *args, **kwargs):
+        from torch.distributions import biject_to, constraints
+
+        device = self.init_loc.device
+        for name, constraint, init_loc, init_scale in self.global_specs:
+            g_loc = pyro.param(f"logistic_{name}_loc", lambda: torch.as_tensor(init_loc, device=device).clone())
+            g_scale = pyro.param(f"logistic_{name}_scale", lambda: torch.as_tensor(init_scale, device=device).clone(),
+                                 constraint=constraints.positive)
+            pyro.sample(name, dist.TransformedDistribution(dist.Normal(g_loc, g_scale), biject_to(constraint)))
+
+        loc = pyro.param("logistic_block_loc", lambda: self.init_loc.clone())
+        scale_tril = pyro.param(
+            "logistic_block_scale_tril",
+            lambda: torch.diag_embed(self.init_scale),
+            constraint=constraints.lower_cholesky,
+        )
+        component_plate = pyro.plate("logistic_component_plate", self.J, dim=-2)
+        with pyro.plate("trans_plate", self.T, dim=-1):
+            eta = pyro.sample(
+                "_logistic_block_latent",
+                dist.MultivariateNormal(loc, scale_tril=scale_tril),
+                infer={"is_auxiliary": True},
+            )  # [..., T, d]
+            pos = 0
+            for name, per_component, constraint in self.site_specs:
+                width = self.J if per_component else 1
+                unconstrained = eta[..., pos:pos + width]  # [..., T, width]
+                pos += width
+                transform = biject_to(constraint)
+                value = transform(unconstrained)
+                log_density = -transform.log_abs_det_jacobian(unconstrained, value)
+                if per_component:
+                    with component_plate:
+                        pyro.sample(name, dist.Delta(value.transpose(-1, -2),
+                                                     log_density=log_density.transpose(-1, -2)))
+                else:
+                    pyro.sample(name, dist.Delta(value[..., 0], log_density=log_density[..., 0]))
+
+
+
 class TransFitter:
     """Handles trans effects fitting."""
 
@@ -1045,21 +1125,23 @@ class TransFitter:
                     if latents_only:
                         return
 
-                    # Compute polynomial for each category
-                    # coeffs: [degree, K, T]
-                    # Need to permute to [degree, T, K] for Polynomial_function to work correctly
-                    coeffs_permuted = coeffs.permute(0, 2, 1)  # [degree, T, K]
-                    poly_val = Polynomial_function(x_true_sample, coeffs_permuted)  # [N, T, K]
+                    # Compute polynomial for each category: sum_d coeffs[d, k, t] * x^d
+                    # coeffs: [..., degree, K, T]  ->  poly_val: [..., N, T, K]
+                    x_powers = x_true_sample.unsqueeze(-1) ** torch.arange(
+                        1, polynomial_degree + 1, device=x_true_sample.device)  # [N, degree]
+                    poly_val = torch.einsum('nd,...dkt->...ntk', x_powers, coeffs)
 
-                    # A is baseline logit for each category (need K logits)
-                    # Sample K baseline logits (unbounded)
-                    with pyro.plate("category_plate_A", K, dim=-2):
-                        A_clamped = torch.clamp(A.unsqueeze(-2), min=epsilon_tensor, max=1.0 - epsilon_tensor)  # [1, T]
-                        logit_A_transpose = torch.log(A_clamped) - torch.log(1 - A_clamped)  # [K, T] logits
-                    logit_A = logit_A_transpose.transpose(-1, -2)  # [T, K]
+                    # A is the baseline probability per category, [T, K] from the Dirichlet prior
+                    A_clamped = torch.clamp(A, min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                    logit_A = torch.log(A_clamped) - torch.log(1 - A_clamped)  # [T, K]
+
+                    # Per-category gates: alpha is [T, K-1]; the Kth category is on iff
+                    # at least one of the K-1 categories is on (same rule as the Hill path).
+                    gate_K = 1.0 - torch.prod(1.0 - alpha, dim=-1, keepdim=True)  # [T, 1]
+                    gates = torch.cat([alpha, gate_K], dim=-1)  # [T, K]
 
                     # Compute logits for each category
-                    logits_K = logit_A.unsqueeze(0) + alpha.unsqueeze(0).unsqueeze(-1) * poly_val  # [N, T, K]
+                    logits_K = logit_A.unsqueeze(-3) + gates.unsqueeze(-3) * poly_val  # [N, T, K]
 
                     # Apply softmax to get probabilities that sum to 1
                     y_dose_response = torch.softmax(logits_K, dim=-1)  # [N, T, K]
@@ -1296,6 +1378,378 @@ class TransFitter:
             raise ValueError(f"Unknown distribution: {distribution}")
 
     ########################################################
+    # Step 3b: logistic_hill trans model (model_y_logistic)
+    ########################################################
+    def _model_y_logistic(
+        self,
+        N,
+        T,
+        J,
+        y_obs_tensor,
+        u_tensor,
+        sum_factor_tensor,
+        b0_tensor,
+        b_scale_tensor,
+        data_scale_tensor,
+        tau0,
+        slab_scale,
+        k_scale,
+        log_n_loc,
+        log_n_scale,
+        beta_o_alpha_tensor,
+        beta_o_beta_tensor,
+        u_center,
+        u_scale,
+        alpha_y_full=None,
+        groups_tensor=None,
+        C=None,
+        distribution='negbinom',
+        denominator_tensor=None,
+        use_epsilon=False,
+    ):
+        """
+        Trans model with a sum of logistic curves in standardised log2 x.
+
+        With u = (log2 x - u_center) / u_scale (u = 0 at the NTC level), the linear
+        predictor for feature t is
+
+            eta_t(u) = b_t + sum_j V_jt [ sigmoid(n_jt (u - k_jt)) - sigmoid(-n_jt k_jt) ],
+
+        so b_t is the value at the NTC level. The link is log2 (negbinom), logit
+        (binomial) or identity (normal, studentt). Each logistic term is a Hill
+        function in x with Hill coefficient n / (u_scale ln 2) and log2 K = u_center + u_scale k.
+
+        Priors:
+            b_t      ~ Normal(b0_t, b_scale_t)
+            V_jt     = s_t tau lambda~_jt z_jt     (regularised horseshoe, signed amplitude)
+            z_jt     ~ Normal(0, 1),  lambda_jt ~ HalfCauchy(1),  tau ~ HalfCauchy(tau0)
+            lambda~  = c lambda / sqrt(c^2 + tau^2 lambda^2)   (slab scale c)
+            log n_jt ~ Normal(log_n_loc, log_n_scale)          (n > 0, sign carried by V)
+            k_1t ~ Normal(0, k_scale),  k_jt = k_(j-1)t + softplus(r_jt), r_jt ~ Normal(0, 1)
+
+        s_t is 1 for negbinom/binomial and the per-feature data SD for normal/studentt.
+        """
+        trans_plate = pyro.plate("trans_plate", T, dim=-1)
+        component_plate = pyro.plate("logistic_component_plate", J, dim=-2)
+
+        tau = pyro.sample("tau", dist.HalfCauchy(self._t(tau0)))
+        if distribution == 'negbinom':
+            beta_o = pyro.sample("beta_o", dist.Gamma(beta_o_alpha_tensor, beta_o_beta_tensor))
+
+        with trans_plate:
+            b = pyro.sample("b", dist.Normal(b0_tensor, b_scale_tensor))
+            if distribution == 'negbinom':
+                o_y = pyro.sample("o_y", dist.Exponential(beta_o))
+                phi_y = 1.0 / (o_y ** 2)
+            elif distribution in ('normal', 'studentt'):
+                sigma_y = pyro.sample("sigma_y", dist.HalfNormal(2.0 * data_scale_tensor))
+                if distribution == 'studentt':
+                    nu_y = pyro.sample("nu_y", dist.Gamma(self._t(10.0), self._t(2.0)))
+            with component_plate:
+                z = pyro.sample("z", dist.Normal(self._t(0.0), self._t(1.0)))
+                lam = pyro.sample("lam", dist.HalfCauchy(self._t(1.0)))
+                log_n = pyro.sample("log_n", dist.Normal(self._t(log_n_loc), self._t(log_n_scale)))
+                k_raw = pyro.sample("k_raw", dist.Normal(self._t(0.0), self._t(1.0)))
+
+        c2 = self._t(slab_scale) ** 2
+        lam_reg = torch.sqrt(c2 * lam ** 2 / (c2 + tau ** 2 * lam ** 2))
+        V = pyro.deterministic("V", data_scale_tensor * tau * lam_reg * z)          # [J, T]
+        k = pyro.deterministic("k", torch.cumsum(
+            torch.cat([k_scale * k_raw[..., :1, :],
+                       torch.nn.functional.softplus(k_raw[..., 1:, :])], dim=-2), dim=-2))
+        n = pyro.deterministic("n", torch.exp(log_n))
+        # Interpretable Hill parameters on the original x scale
+        pyro.deterministic("log2_K", u_center + u_scale * k)
+        pyro.deterministic("hill_n", n / (u_scale * np.log(2.0)))
+
+        u = u_tensor.view(-1, 1, 1)                                                  # [N, 1, 1]
+        g = (V * (torch.sigmoid(n * (u - k)) - torch.sigmoid(-n * k))).sum(dim=-2)   # [N, T]
+        eta = b + g                                                                  # [N, T]
+
+        from .distributions import get_observation_sampler
+        observation_sampler = get_observation_sampler(distribution, 'trans')
+        if distribution == 'negbinom':
+            observation_sampler(
+                y_obs_tensor=y_obs_tensor, mu_y=torch.exp2(eta), phi_y_used=phi_y.unsqueeze(-2),
+                alpha_y_full=alpha_y_full, groups_tensor=groups_tensor,
+                sum_factor_tensor=sum_factor_tensor, N=N, T=T, C=C, use_epsilon=use_epsilon,
+            )
+        elif distribution == 'binomial':
+            observation_sampler(
+                y_obs_tensor=y_obs_tensor, denominator_tensor=denominator_tensor,
+                mu_y=torch.sigmoid(eta), alpha_y_full=alpha_y_full,
+                groups_tensor=groups_tensor, N=N, T=T, C=C,
+            )
+        elif distribution == 'normal':
+            observation_sampler(
+                y_obs_tensor=y_obs_tensor, mu_y=eta, sigma_y=sigma_y,
+                alpha_y_full=alpha_y_full, groups_tensor=groups_tensor, N=N, T=T, C=C,
+            )
+        elif distribution == 'studentt':
+            observation_sampler(
+                y_obs_tensor=y_obs_tensor, mu_y=eta, sigma_y=sigma_y, nu_y=nu_y,
+                alpha_y_full=alpha_y_full, groups_tensor=groups_tensor, N=N, T=T, C=C,
+            )
+        else:
+            raise ValueError(f"logistic_hill does not support distribution '{distribution}'")
+
+    def _alpha_y_with_reference(self, alpha_y, C, T, distribution):
+        """Return alpha_y with the reference group (row 0) included, shape [C, T]."""
+        if alpha_y is None:
+            return None
+        if alpha_y.shape[0] == C:
+            return alpha_y
+        ref_value = 1.0 if distribution == 'negbinom' else 0.0
+        ref = torch.full((1, T), ref_value, device=alpha_y.device, dtype=alpha_y.dtype)
+        return torch.cat([ref, alpha_y], dim=0)
+
+    def _fit_trans_logistic(
+        self,
+        N,
+        T,
+        x_true,
+        y_obs_tensor,
+        y_obs_for_prior,
+        sum_factor_tensor,
+        denominator_tensor,
+        alpha_y_prefit,
+        groups_tensor,
+        C,
+        ntc_mask,
+        distribution,
+        niters,
+        lr,
+        nsamples,
+        tolerance,
+        beta_o_alpha_tensor,
+        beta_o_beta_tensor,
+        use_epsilon,
+        n_components=2,
+        logistic_guide='block_mvn',
+        horseshoe_tau0=None,
+        horseshoe_slab_scale=None,
+    ):
+        """Fit the logistic_hill trans model with SVI and return posterior samples."""
+        from torch.distributions import constraints
+        from pyro.infer.autoguide import AutoNormal
+        from pyro.infer.autoguide.initialization import init_to_median, init_to_value
+
+        if distribution not in ('negbinom', 'binomial', 'normal', 'studentt'):
+            raise NotImplementedError(
+                f"function_type='logistic_hill' supports negbinom, binomial, normal and studentt, not '{distribution}'"
+            )
+        if logistic_guide not in ('block_mvn', 'normal'):
+            raise ValueError("logistic_guide must be 'block_mvn' or 'normal'")
+        J = int(n_components)
+        device = self.model.device
+        pyro.clear_param_store()
+
+        # ---------------------------------------------
+        # Standardised input u = (log2 x - center) / scale
+        # ---------------------------------------------
+        log2_x_point = torch.log2(x_true.to(device))  # [N], cells of this modality
+        ntc_mask_t = torch.tensor(np.asarray(ntc_mask, dtype=bool), device=device)
+        if ntc_mask_t.sum() == 0:
+            warnings.warn("logistic_hill: no NTC cells found; centring u on the mean over all cells.")
+            ntc_mask_t = torch.ones(N, dtype=torch.bool, device=device)
+        u_center = log2_x_point[ntc_mask_t].mean().item()
+        u_scale = max(log2_x_point.std().item(), 1e-3)
+
+        def to_u(l2x):
+            return (l2x - u_center) / u_scale
+
+        # ---------------------------------------------
+        # Baseline (link scale) and data scale per feature
+        # ---------------------------------------------
+        y_ntc = y_obs_for_prior[ntc_mask_t]
+        if distribution == 'negbinom':
+            y_bar = torch.nanmean(y_ntc, dim=0).clamp_min(1.0 / max(int(ntc_mask_t.sum()), 1))
+            b0 = torch.log2(y_bar)
+            b_scale = torch.ones(T, device=device)
+            data_scale = torch.ones(T, device=device)
+        elif distribution == 'binomial':
+            p_bar = torch.nanmean(y_ntc, dim=0)
+            p_bar = torch.where(torch.isfinite(p_bar), p_bar, torch.full_like(p_bar, 0.5)).clamp(1e-3, 1 - 1e-3)
+            b0 = torch.log(p_bar) - torch.log1p(-p_bar)
+            b_scale = torch.full((T,), 1.5, device=device)
+            data_scale = torch.ones(T, device=device)
+        else:
+            b0 = torch.nanmean(y_ntc, dim=0)
+            centred = y_obs_for_prior - torch.nanmean(y_obs_for_prior, dim=0)
+            sd = torch.sqrt(torch.nanmean(centred ** 2, dim=0))
+            data_scale = torch.where(torch.isfinite(sd) & (sd > 0), sd, torch.ones_like(sd)).clamp_min(1e-3)
+            b0 = torch.where(torch.isfinite(b0), b0, torch.zeros_like(b0))
+            b_scale = data_scale
+        tau0 = 0.1 if horseshoe_tau0 is None else horseshoe_tau0
+        slab_scale = 3.0 if horseshoe_slab_scale is None else horseshoe_slab_scale
+        k_scale, log_n_loc, log_n_scale = 1.5, 0.5, 0.75
+
+        # ---------------------------------------------
+        # Technical group effects (fixed from fit_ntc)
+        # ---------------------------------------------
+        alpha_is_posterior = alpha_y_prefit is not None and alpha_y_prefit.dim() >= 3
+        alpha_point = None
+        if alpha_y_prefit is not None and groups_tensor is not None:
+            alpha_point = self._alpha_y_with_reference(
+                alpha_y_prefit.mean(dim=0) if alpha_is_posterior else alpha_y_prefit, C, T, distribution)
+
+        def model_args(u_tensor, alpha_y_full):
+            return dict(
+                N=N, T=T, J=J, y_obs_tensor=y_obs_tensor, u_tensor=u_tensor,
+                sum_factor_tensor=sum_factor_tensor, b0_tensor=b0, b_scale_tensor=b_scale,
+                data_scale_tensor=data_scale, tau0=tau0, slab_scale=slab_scale, k_scale=k_scale,
+                log_n_loc=log_n_loc, log_n_scale=log_n_scale,
+                beta_o_alpha_tensor=beta_o_alpha_tensor, beta_o_beta_tensor=beta_o_beta_tensor,
+                u_center=u_center, u_scale=u_scale, alpha_y_full=alpha_y_full,
+                groups_tensor=groups_tensor, C=C, distribution=distribution,
+                denominator_tensor=denominator_tensor, use_epsilon=use_epsilon,
+            )
+
+        # ---------------------------------------------
+        # Variational family
+        # ---------------------------------------------
+        feature_sites = [("b", False, constraints.real)]
+        if distribution == 'negbinom':
+            feature_sites.append(("o_y", False, constraints.positive))
+        elif distribution in ('normal', 'studentt'):
+            feature_sites.append(("sigma_y", False, constraints.positive))
+            if distribution == 'studentt':
+                feature_sites.append(("nu_y", False, constraints.positive))
+        feature_sites += [
+            ("z", True, constraints.real),
+            ("lam", True, constraints.positive),
+            ("log_n", True, constraints.real),
+            ("k_raw", True, constraints.real),
+        ]
+        feature_site_names = [name for name, _, _ in feature_sites]
+        global_site_names = ["tau"] + (["beta_o"] if distribution == 'negbinom' else [])
+
+        mean_field = AutoNormal(
+            self._model_y_logistic,
+            init_loc_fn=init_to_value(values={"b": b0}, fallback=init_to_median),
+        )
+
+        def block_from_mean_field():
+            """Full-rank per-feature guide, initialised at the current mean-field solution."""
+            locs, scales = [], []
+            for name, per_component, _ in feature_sites:
+                loc = getattr(mean_field.locs, name).detach()
+                scale = getattr(mean_field.scales, name).detach()
+                if per_component:
+                    locs.append(loc.T)                 # [J, T] -> [T, J]
+                    scales.append(scale.T)
+                else:
+                    locs.append(loc.unsqueeze(-1))
+                    scales.append(scale.unsqueeze(-1))
+            global_specs = [(name, constraints.positive,
+                             getattr(mean_field.locs, name).detach(),
+                             getattr(mean_field.scales, name).detach()) for name in global_site_names]
+            return _FeatureBlockGuide(T, J, feature_sites, torch.cat(locs, dim=-1),
+                                      torch.cat(scales, dim=-1), global_specs)
+
+        # The full-rank guide is warm-started from a mean-field fit: started cold it
+        # tends to get stuck in poorer optima.
+        if logistic_guide == 'block_mvn':
+            n_mean_field = niters // 2
+            phases = [('mean_field', n_mean_field), ('block_mvn', niters - n_mean_field)]
+        else:
+            phases = [('mean_field', niters)]
+
+        if lr is None:
+            lr = 1e-2
+        lrd = 0.1 ** (1.0 / max(niters, 1))  # learning rate decays to 10 % over the run
+
+        u_point = to_u(log2_x_point)
+
+        print(f"[INFO] logistic_hill: J={J} components, guide={logistic_guide}, "
+              f"u_center={u_center:.3f}, u_scale={u_scale:.3f}, tau0={tau0}, slab={slab_scale}")
+
+        self.losses_trans = []
+        window = 1000
+        guide = mean_field
+        failed = False
+        for phase, phase_steps in phases:
+            if failed or phase_steps == 0:
+                break
+            if phase == 'block_mvn':
+                guide = block_from_mean_field()
+            optimizer = pyro.optim.ClippedAdam({
+                "lr": lr * lrd ** len(self.losses_trans), "clip_norm": 10.0, "lrd": lrd,
+            })
+            svi = pyro.infer.SVI(self._model_y_logistic, guide, optimizer, loss=pyro.infer.Trace_ELBO())
+            phase_losses = []
+            for step in range(phase_steps):
+                u_step = u_point
+                alpha_step = alpha_point
+                if alpha_is_posterior and groups_tensor is not None:
+                    samp = torch.randint(alpha_y_prefit.shape[0], (1,)).item()
+                    alpha_step = self._alpha_y_with_reference(alpha_y_prefit[samp], C, T, distribution)
+
+                loss = svi.step(**model_args(u_step, alpha_step))
+                if not np.isfinite(loss):
+                    print(f"[WARNING] Non-finite loss at step {len(self.losses_trans)}; stopping optimisation.")
+                    failed = True
+                    break
+                phase_losses.append(loss)
+                self.losses_trans.append(loss)
+                if step % 1000 == 0:
+                    print(f"Step {len(self.losses_trans) - 1} ({phase}) : loss = {loss:.5e}")
+                # Stop the phase when the mean loss over the last window improves on the
+                # previous window by less than `tolerance` (relative).
+                if (step + 1) % window == 0 and step + 1 >= 2 * window:
+                    prev = np.mean(phase_losses[-2 * window:-window])
+                    cur = np.mean(phase_losses[-window:])
+                    if (prev - cur) / abs(prev) < tolerance:
+                        print(f"[INFO] {phase} phase converged at step {len(self.losses_trans) - 1}; "
+                              f"mean loss over last {window} steps = {cur:.5e}")
+                        break
+
+        return_sites = ["b", "tau", "z", "lam", "log_n", "k_raw", "V", "k", "n", "log2_K", "hill_n"]
+        return_sites += [name for name in ("o_y", "sigma_y", "nu_y") if name in feature_site_names]
+        if distribution == 'negbinom':
+            return_sites.append("beta_o")
+        predictive = pyro.infer.Predictive(
+            self._model_y_logistic, guide=guide, num_samples=nsamples, return_sites=return_sites,
+        )
+        with torch.no_grad():
+            posterior_samples_y = dict(predictive(**model_args(u_point, alpha_point)))
+        # Predictive pads sample shapes with plate dimensions; normalise to [S], [S, T], [S, J, T]
+        component_sites = {"z", "lam", "log_n", "k_raw", "V", "k", "n", "log2_K", "hill_n"}
+        global_sites = {"tau", "beta_o"}
+        for name, value in posterior_samples_y.items():
+            if name in component_sites:
+                posterior_samples_y[name] = value.reshape(nsamples, J, T)
+            elif name in global_sites:
+                posterior_samples_y[name] = value.reshape(nsamples)
+            else:
+                posterior_samples_y[name] = value.reshape(nsamples, T)
+        if "o_y" in posterior_samples_y:
+            posterior_samples_y["phi_y"] = 1.0 / posterior_samples_y["o_y"] ** 2
+        posterior_samples_y = {k: self._to_cpu(v) for k, v in posterior_samples_y.items()}
+        posterior_samples_y.update({
+            "u_center": u_center,
+            "u_scale": u_scale,
+            "n_components": J,
+            "link": {"negbinom": "log2", "binomial": "logit"}.get(distribution, "identity"),
+        })
+        return posterior_samples_y
+
+    def _store_logistic_results(self, modality, modality_name, posterior_samples_y):
+        """Store logistic_hill posterior samples and losses in the modality (and model, if primary)."""
+        modality.posterior_samples_trans = posterior_samples_y
+        modality.trans_prior_params = None
+        modality.losses_trans = self.losses_trans
+        if modality_name == self.model.primary_modality:
+            self.model.posterior_samples_trans = posterior_samples_y
+            self.model.losses_trans = self.losses_trans
+            self.model.trans_prior_params = None
+            print(f"[INFO] Stored results in modality '{modality_name}' and at model level (primary modality)")
+        else:
+            print(f"[INFO] Stored results in modality '{modality_name}'")
+        pyro.clear_param_store()
+        print("Finished fit_trans.")
+
+    ########################################################
     # Step 3: Fit trans effects (model_y)
     ########################################################
     def fit_trans(
@@ -1334,6 +1788,11 @@ class TransFitter:
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
         debug: bool = False,
+        n_components: int = 2,
+        logistic_guide: str = 'block_mvn',
+        horseshoe_tau0: float = None,
+        horseshoe_slab_scale: float = None,
+        logistic_tolerance: float = 1e-4,
         **kwargs
     ):
         """
@@ -1431,7 +1890,24 @@ class TransFitter:
             Structural mismatches (N, T, K, C) raise an error; ``distribution``
             mismatches produce a warning.
         function_type : str
-            Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
+            Dose-response function: 'single_hill', 'additive_hill', 'polynomial', 'logistic_hill'.
+            'logistic_hill' models the link-scale mean (log2 for negbinom, logit for binomial,
+            identity for normal/studentt) as a baseline plus n_components logistic curves in
+            standardised log2 x, with horseshoe-shrunk signed amplitudes. See
+            docs/LOGISTIC_HILL.md. Not available for multinomial.
+        n_components : int, default=2
+            logistic_hill only: number of logistic components (ordered by midpoint).
+        logistic_guide : str, default='block_mvn'
+            logistic_hill only: 'block_mvn' (mean-field warm start, then a full-covariance
+            Gaussian per feature) or 'normal' (mean-field AutoNormal only).
+        horseshoe_tau0 : float, optional
+            logistic_hill only: scale of the HalfCauchy prior on the global shrinkage tau
+            (default 0.1, in link units; for normal/studentt in units of the feature SD).
+        horseshoe_slab_scale : float, optional
+            logistic_hill only: slab scale of the regularised horseshoe (default 3.0).
+        logistic_tolerance : float, default=1e-4
+            logistic_hill only: each optimisation phase stops when the mean loss over the
+            last 1000 steps improves on the previous 1000 by less than this (relative).
         debug : bool, optional
             If True, run the slow debug SVI step that checks all parameters for
             non-finite values at every iteration and prints detailed diagnostics
@@ -1470,6 +1946,9 @@ class TransFitter:
         if distribution is None:
             distribution = modality.distribution
 
+        if function_type == 'logistic_hill' and distribution == 'multinomial':
+            raise NotImplementedError("function_type='logistic_hill' is not implemented for multinomial")
+
         # Auto-detect denominator from modality (for binomial)
         if denominator is None and modality.denominator is not None:
             denominator = modality.denominator
@@ -1488,6 +1967,9 @@ class TransFitter:
                 niters = 200_000
                 if predictive_checkpoint is None:
                     print(f"[INFO] Using default niters=200,000 for polynomial function")
+            elif function_type == 'logistic_hill':
+                niters = 20_000
+                print(f"[INFO] Using default niters=20,000 for logistic_hill function")
             else:
                 niters = 100_000
                 if predictive_checkpoint is None:
@@ -1957,6 +2439,37 @@ class TransFitter:
             n_masked = (~valid_mask_multinomial).sum().item()
             n_total = valid_mask_multinomial.numel()
             print(f"[INFO] Masked {n_masked}/{n_total} ({100*n_masked/n_total:.2f}%) low-coverage observations (total counts < {min_denominator})")
+
+        if function_type == 'logistic_hill':
+            if self.model.x_true is None:
+                raise ValueError("function_type='logistic_hill' requires x_true; run fit_cis() first.")
+            ntc_mask = (meta_subset['target'].astype(str).str.lower() == 'ntc').values
+            posterior_samples_y = self._fit_trans_logistic(
+                N=N, T=T,
+                x_true=x_true_subset,
+                y_obs_tensor=y_obs_tensor,
+                y_obs_for_prior=y_obs_for_prior,
+                sum_factor_tensor=sum_factor_tensor,
+                denominator_tensor=denominator_tensor,
+                alpha_y_prefit=alpha_y_prefit,
+                groups_tensor=groups_tensor,
+                C=C,
+                ntc_mask=ntc_mask,
+                distribution=distribution,
+                niters=niters,
+                lr=lr,
+                nsamples=nsamples,
+                tolerance=logistic_tolerance,
+                beta_o_alpha_tensor=beta_o_alpha_tensor,
+                beta_o_beta_tensor=beta_o_beta_tensor,
+                use_epsilon=use_epsilon,
+                n_components=n_components,
+                logistic_guide=logistic_guide,
+                horseshoe_tau0=horseshoe_tau0,
+                horseshoe_slab_scale=horseshoe_slab_scale,
+            )
+            self._store_logistic_results(modality, modality_name, posterior_samples_y)
+            return
 
         unique_guides = torch.unique(guides_tensor)
 
@@ -2457,9 +2970,11 @@ class TransFitter:
 
         def init_loc_fn(site):
             name = site["name"]
+            median = pyro.infer.autoguide.initialization.init_to_median(site)
             if "poly_coeff" in name:
-                return torch.zeros(T)
-            return pyro.infer.autoguide.initialization.init_to_median(site)
+                # zeros with the site's own shape: [T], or [K, T] for multinomial
+                return torch.zeros_like(median)
+            return median
         
         from torch.optim.lr_scheduler import OneCycleLR
         if function_type == "polynomial":
@@ -3254,5 +3769,3 @@ class TransFitter:
                   f"{os.path.dirname(checkpoint_path)}")
 
         print("Finished fit_trans.")
-
-

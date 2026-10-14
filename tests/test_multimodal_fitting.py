@@ -77,7 +77,9 @@ def test_gene_modality_excludes_cis_gene(multimodal_model):
     assert len(gene_names) == n_genes
 
 
-def test_base_class_retains_cis_gene(multimodal_model):
+def test_cis_modality_retains_cis_gene(multimodal_model):
+    # The raw counts matrix is freed after init; the cis gene lives in the 'cis' modality.
     model = multimodal_model['model']
-    assert 'GFI1B' in model.counts.index
+    assert model.counts is None
+    assert list(model.get_modality('cis').feature_ids) == ['GFI1B']
     assert model.cis_gene == 'GFI1B'

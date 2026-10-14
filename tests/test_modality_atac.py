@@ -102,6 +102,7 @@ def atac_only_model():
         meta=meta,
         counts=None,
         modality_name='atac',
+        label='atac_only_test',  # required when cis_gene is not given at init
     )
 
     n_regions = 10
