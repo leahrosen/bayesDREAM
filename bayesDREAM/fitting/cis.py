@@ -490,7 +490,8 @@ class CisFitter:
             assign_np = self.model.guide_assignment  # [N, G] numpy array
             cell_counts_np = assign_np.sum(axis=0).clip(min=1)  # [G]
             guide_sums_np = x_np @ assign_np  # [G]
-            guide_means_np = np.log2(np.clip(guide_sums_np / cell_counts_np, epsilon, None))
+            # float32: assign_np is float64, and a double mu breaks the matmul in _model_x
+            guide_means_np = np.log2(np.clip(guide_sums_np / cell_counts_np, epsilon, None)).astype(np.float32)
 
             log2_x_np = np.log2(np.clip(x_np, epsilon, None))
             guide_mads_np = np.zeros(G, dtype=np.float32)

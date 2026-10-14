@@ -1125,21 +1125,23 @@ class TransFitter:
                     if latents_only:
                         return
 
-                    # Compute polynomial for each category
-                    # coeffs: [degree, K, T]
-                    # Need to permute to [degree, T, K] for Polynomial_function to work correctly
-                    coeffs_permuted = coeffs.permute(0, 2, 1)  # [degree, T, K]
-                    poly_val = Polynomial_function(x_true_sample, coeffs_permuted)  # [N, T, K]
+                    # Compute polynomial for each category: sum_d coeffs[d, k, t] * x^d
+                    # coeffs: [..., degree, K, T]  ->  poly_val: [..., N, T, K]
+                    x_powers = x_true_sample.unsqueeze(-1) ** torch.arange(
+                        1, polynomial_degree + 1, device=x_true_sample.device)  # [N, degree]
+                    poly_val = torch.einsum('nd,...dkt->...ntk', x_powers, coeffs)
 
-                    # A is baseline logit for each category (need K logits)
-                    # Sample K baseline logits (unbounded)
-                    with pyro.plate("category_plate_A", K, dim=-2):
-                        A_clamped = torch.clamp(A.unsqueeze(-2), min=epsilon_tensor, max=1.0 - epsilon_tensor)  # [1, T]
-                        logit_A_transpose = torch.log(A_clamped) - torch.log(1 - A_clamped)  # [K, T] logits
-                    logit_A = logit_A_transpose.transpose(-1, -2)  # [T, K]
+                    # A is the baseline probability per category, [T, K] from the Dirichlet prior
+                    A_clamped = torch.clamp(A, min=epsilon_tensor, max=1.0 - epsilon_tensor)
+                    logit_A = torch.log(A_clamped) - torch.log(1 - A_clamped)  # [T, K]
+
+                    # Per-category gates: alpha is [T, K-1]; the Kth category is on iff
+                    # at least one of the K-1 categories is on (same rule as the Hill path).
+                    gate_K = 1.0 - torch.prod(1.0 - alpha, dim=-1, keepdim=True)  # [T, 1]
+                    gates = torch.cat([alpha, gate_K], dim=-1)  # [T, K]
 
                     # Compute logits for each category
-                    logits_K = logit_A.unsqueeze(0) + alpha.unsqueeze(0).unsqueeze(-1) * poly_val  # [N, T, K]
+                    logits_K = logit_A.unsqueeze(-3) + gates.unsqueeze(-3) * poly_val  # [N, T, K]
 
                     # Apply softmax to get probabilities that sum to 1
                     y_dose_response = torch.softmax(logits_K, dim=-1)  # [N, T, K]
@@ -2968,9 +2970,11 @@ class TransFitter:
 
         def init_loc_fn(site):
             name = site["name"]
+            median = pyro.infer.autoguide.initialization.init_to_median(site)
             if "poly_coeff" in name:
-                return torch.zeros(T)
-            return pyro.infer.autoguide.initialization.init_to_median(site)
+                # zeros with the site's own shape: [T], or [K, T] for multinomial
+                return torch.zeros_like(median)
+            return median
         
         from torch.optim.lr_scheduler import OneCycleLR
         if function_type == "polynomial":
