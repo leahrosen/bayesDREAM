@@ -108,6 +108,7 @@ The `fit_trans` method supports multiple functional forms for modeling how trans
 - `single_hill`: Single Hill equation (positive or negative)
 - `additive_hill`: Additive combination of positive and negative Hill functions
 - `polynomial`: Polynomial function with configurable degree (default: 6)
+- `logistic_hill`: Link-scale baseline plus logistic curves in standardised log2 x with horseshoe priors; separate model `_model_y_logistic` (see `docs/LOGISTIC_HILL.md`)
 
 ### Probabilistic Models
 

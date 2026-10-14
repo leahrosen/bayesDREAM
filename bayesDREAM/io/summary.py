@@ -1730,7 +1730,9 @@ class ModelSummarizer:
 
         # Determine function type from posterior keys
         keys = set(posterior.keys())
-        if {'poly_coefs'} <= keys:
+        if {'V', 'k', 'n', 'u_center', 'u_scale'} <= keys:
+            function_type = 'logistic_hill'
+        elif {'poly_coefs'} <= keys:
             function_type = 'polynomial'
         elif {'Vmax_a','K_a','n_a','Vmax_b','K_b','n_b'} <= keys:
             # Could be additive or nested; decide by presence of an indicator you store,
@@ -1899,6 +1901,10 @@ class ModelSummarizer:
                 x_ntc=_x_ntc,
                 y_ntc=_y_ntc,
                 verbose=verbose,
+            )
+        elif function_type == 'logistic_hill':
+            data = self._add_logistic_hill_params(
+                data, posterior, modality.distribution, x_obs_min=x_obs_min, x_obs_max=x_obs_max
             )
         elif function_type == 'polynomial':
             data = self._add_polynomial_params(
@@ -2388,6 +2394,51 @@ class ModelSummarizer:
 
         # Unknown function type — return NaN
         return {'fdr_alpha': nan_col.copy(), 'fdr_beta': nan_col.copy()}
+
+    def _add_logistic_hill_params(self, data, posterior, distribution, x_obs_min=None, x_obs_max=None, n_grid=200):
+        """
+        Add logistic_hill parameters to data dict.
+
+        Columns (each with _median, _lower, _upper; 95 % intervals):
+        - b: baseline on the link scale at the NTC level (log2 mean for negbinom,
+          logit for binomial, identity for normal/studentt)
+        - V_j, log2_K_j, hill_n_j for component j = 1..J: signed amplitude (link scale),
+          log2 of the half-maximal x, and the Hill coefficient on the x scale
+        - observed_log2fc (negbinom), observed_delta_p (binomial) or observed_delta
+          (normal/studentt): max - min of the fitted curve over the observed x range
+        """
+        def as_np(v):
+            return v.cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
+
+        def add(name, samples):
+            data[f'{name}_median'] = np.median(samples, axis=0)
+            data[f'{name}_lower'] = np.quantile(samples, 0.025, axis=0)
+            data[f'{name}_upper'] = np.quantile(samples, 0.975, axis=0)
+
+        b = as_np(posterior['b'])                     # [S, T]
+        V = as_np(posterior['V'])                     # [S, J, T]
+        k = as_np(posterior['k'])
+        n = as_np(posterior['n'])
+        add('b', b)
+        for j in range(V.shape[1]):
+            add(f'V_{j + 1}', V[:, j, :])
+            add(f'log2_K_{j + 1}', as_np(posterior['log2_K'])[:, j, :])
+            add(f'hill_n_{j + 1}', as_np(posterior['hill_n'])[:, j, :])
+
+        if x_obs_min is not None and x_obs_max is not None:
+            sig = lambda z: 1.0 / (1.0 + np.exp(-z))
+            log2_grid = np.linspace(np.log2(x_obs_min), np.log2(x_obs_max), n_grid)
+            u_grid = (log2_grid - float(posterior['u_center'])) / float(posterior['u_scale'])
+            offset = sig(-n * k)
+            lo = hi = None
+            for u in u_grid:                                   # running extrema, [S, T] each
+                eta = b + (V * (sig(n * (u - k)) - offset)).sum(axis=1)
+                y = sig(eta) if distribution == 'binomial' else eta
+                lo = y if lo is None else np.minimum(lo, y)
+                hi = y if hi is None else np.maximum(hi, y)
+            name = {'binomial': 'observed_delta_p', 'negbinom': 'observed_log2fc'}.get(distribution, 'observed_delta')
+            add(name, hi - lo)
+        return data
 
     def _add_additive_hill_params(self, data, posterior, n_features, compute_inflection,
                                     compute_derivative_roots=True, x_range=None,
