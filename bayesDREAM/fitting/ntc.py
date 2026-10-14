@@ -4,7 +4,6 @@ NTC fitting for bayesDREAM.
 This module contains the NTC model and fitting logic (overdispersion estimation and batch effect correction).
 """
 
-import os
 import warnings
 import numpy as np
 import pandas as pd
@@ -15,16 +14,9 @@ import pyro.distributions as dist
 from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
-import multiprocessing
 
-# Optional dependency for memory detection
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-
-
+from ..utils import compute_technical_group_code
+from .ntc_tuning import estimate_predictive_memory_and_set_minibatch
 
 class NTCFitter:
     """Handles NTC fitting: estimates gene-specific overdispersion and batch effects."""
@@ -47,130 +39,6 @@ class NTCFitter:
         if isinstance(x, torch.Tensor):
             return x.detach().cpu()
         return x
-
-    def _estimate_predictive_memory_and_set_minibatch(
-        self,
-        N, T, C, nsamples, minibatch_size=None,
-        distribution='negbinom',
-        safety_factor=None  # Auto-determined: 0.7 for SLURM, 0.35 for shared nodes
-    ):
-        """
-        Estimate memory requirements for Predictive and auto-set minibatch_size.
-
-        Parameters
-        ----------
-        N : int
-            Number of observations (cells)
-        T : int
-            Number of features
-        C : int
-            Number of technical groups
-        nsamples : int
-            Number of posterior samples requested
-        minibatch_size : int or None
-            If provided, use this value. If None, auto-compute.
-        distribution : str
-            Distribution type
-        safety_factor : float or None
-            Fraction of available RAM to use. If None (default), auto-determined:
-            - 0.7 (70%) when SLURM allocation detected (dedicated resources)
-            - 0.35 (35%) on shared nodes without SLURM (conservative)
-
-        Returns
-        -------
-        minibatch_size : int or None
-            Recommended minibatch size, or None if full batch fits
-        use_parallel : bool
-            Whether to use parallel=True in Predictive
-        """
-        # If user explicitly set minibatch_size, respect it
-        if minibatch_size is not None:
-            print(f"[MEMORY] Using user-specified minibatch_size={minibatch_size}")
-            return minibatch_size, True
-
-        # If psutil not available, use conservative defaults
-        if not HAS_PSUTIL:
-            print("[INFO] psutil not available - using conservative defaults (minibatch_size=50)")
-            return 50, False
-
-        # Get available CPU RAM
-        mem = psutil.virtual_memory()
-        available_gb = mem.available / (1024**3)
-
-        # Check for SLURM allocation (more accurate on HPC)
-        slurm_mem_gb = None
-
-        # Try SLURM_MEM_PER_NODE first (older SLURM versions)
-        if 'SLURM_MEM_PER_NODE' in os.environ:
-            try:
-                slurm_mem_mb = int(os.environ['SLURM_MEM_PER_NODE'])
-                slurm_mem_gb = slurm_mem_mb / 1024
-            except (ValueError, KeyError):
-                pass
-
-        # Try SLURM_MEM_PER_CPU * SLURM_CPUS_ON_NODE (more common)
-        if slurm_mem_gb is None and 'SLURM_MEM_PER_CPU' in os.environ:
-            try:
-                mem_per_cpu_mb = int(os.environ['SLURM_MEM_PER_CPU'])
-
-                # Try different CPU count variables
-                n_cpus = None
-                if 'SLURM_CPUS_ON_NODE' in os.environ:
-                    n_cpus = int(os.environ['SLURM_CPUS_ON_NODE'])
-                elif 'SLURM_CPUS_PER_TASK' in os.environ:
-                    n_cpus = int(os.environ['SLURM_CPUS_PER_TASK'])
-                elif 'SLURM_JOB_CPUS_PER_NODE' in os.environ:
-                    n_cpus = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
-
-                if n_cpus is not None:
-                    slurm_mem_gb = (mem_per_cpu_mb * n_cpus) / 1024
-            except (ValueError, KeyError):
-                pass
-
-        # Use SLURM allocation if available, otherwise use available memory
-        # Auto-determine safety factor based on whether we have dedicated SLURM allocation
-        if slurm_mem_gb is not None:
-            usable_gb = slurm_mem_gb
-            if safety_factor is None:
-                safety_factor = 0.7  # 70% for dedicated SLURM allocation
-        else:
-            usable_gb = available_gb
-            if safety_factor is None:
-                safety_factor = 0.35  # 35% for shared nodes
-
-        # Estimate memory per sample (in GB)
-        params_per_sample_gb = (C * T + C * T + 3 * T) * 4 / (1024**3)
-        input_data_gb = (N * T + N) * 4 / (1024**3)
-
-        # CRITICAL: Multiple temporary [N, T] tensors exist simultaneously during forward pass:
-        # 1. alpha_y_used [S, N, T] from gather
-        # 2. mu_final [S, N, T] from broadcasting
-        # 3. mean_param [S, N, T] from arithmetic
-        # 4. observation sample [S, N, T] (filtered by keep_sites but still created)
-        # Conservative estimate: 4× the single tensor size
-        temp_per_sample_gb = 4 * (N * T) * 4 / (1024**3)
-        memory_per_sample_gb = params_per_sample_gb + temp_per_sample_gb
-
-        # Check if parallel execution fits
-        n_workers = min(multiprocessing.cpu_count(), 32)
-        mem_per_worker_gb = input_data_gb + params_per_sample_gb * 10
-        total_parallel_gb = n_workers * mem_per_worker_gb
-        use_parallel = total_parallel_gb <= usable_gb * safety_factor
-
-        # Determine if minibatching is needed
-        safe_memory_gb = usable_gb * safety_factor
-        available_for_sampling_gb = safe_memory_gb - input_data_gb
-        max_samples_at_once = int(available_for_sampling_gb / memory_per_sample_gb)
-
-        if max_samples_at_once >= nsamples:
-            return None, use_parallel
-        else:
-            # Need minibatching - disable parallel to avoid memory spike
-            use_parallel = False
-            recommended_batch = max(10, min(100, max_samples_at_once)) if max_samples_at_once >= 10 else max(1, max_samples_at_once)
-            n_batches = int(np.ceil(nsamples / recommended_batch))
-            print(f"[INFO] Minibatching: {recommended_batch} samples/batch × {n_batches} batches (parallel=False)")
-            return recommended_batch, use_parallel
 
     def _model_ntc(
         self,
@@ -611,7 +479,7 @@ class NTCFitter:
         if missing_cols:
             raise ValueError(f"Missing columns in meta: {missing_cols}")
 
-        self.model.meta["technical_group_code"] = self.model.meta.groupby(covariates).ngroup()
+        self.model.meta["technical_group_code"] = compute_technical_group_code(self.model.meta, covariates)
         self.model._technical_group_covariates = list(covariates)
         print(f"[INFO] Set technical_group_code with {self.model.meta['technical_group_code'].nunique()} groups based on {covariates}")
     
@@ -1847,7 +1715,7 @@ class NTCFitter:
         # ========================================
         # AUTO-DETECT MEMORY AND SET MINIBATCH
         # ========================================
-        minibatch_size, use_parallel = self._estimate_predictive_memory_and_set_minibatch(
+        minibatch_size, use_parallel = estimate_predictive_memory_and_set_minibatch(
             N=N, T=T_fit, C=C, nsamples=nsamples,
             minibatch_size=minibatch_size,
             distribution=distribution

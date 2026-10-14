@@ -5,7 +5,6 @@ This module contains the _BayesDREAMCore base class with delegation to
 specialized fitters for technical, cis, and trans modeling.
 """
 
-import os
 import functools
 import warnings
 from typing import Union
@@ -19,32 +18,29 @@ from sklearn.linear_model import Ridge
 from scipy import sparse
 
 # Import utility functions and modules
-from .utils import (
+from bayesDREAM.utils import (
     set_max_threads,
-    find_beta,
-    calculate_mu_x_guide,
-    Hill_based_positive,
-    Hill_based_negative,
-    Hill_based_piecewise,
-    Polynomial_function,
-    cutoff_sigmoid,
     sample_or_use_point,
-    check_tensor,
     is_lean_posterior
 )
-from .modality import Modality
-from .fitting.distributions import get_observation_sampler, requires_denominator, is_3d_distribution
+from bayesDREAM.guides import (
+    is_ntc_target_name,
+    build_guide_state,
+    expand_guide_assignment,
+)
 
 # Import fitters
-from .fitting import NTCFitter, CisFitter, TransFitter
-from .io import ModelSaver, ModelLoader, ModelSummarizer
-from .plotting.model_plots import ModelPlottingMixin
-from .diagnostics import DiagnosticsMixin
+from bayesDREAM.fitting import NTCFitter, CisFitter, TransFitter
+from bayesDREAM.io import ModelSaver, ModelLoader, ModelSummarizer
+from bayesDREAM.plotting.model_plots import ModelPlottingMixin
+from bayesDREAM.diagnostics import DiagnosticsMixin
+from bayesDREAM.core.data_setup import initialize_input_state, validate_and_classify_metadata, prepare_cell_subset
+from bayesDREAM.core.technical_state import TechnicalStateMixin
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
+class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin):
     """
     Internal core class for the three-step Bayesian Dosage Response Effects Across Modalities framework:
 
@@ -158,170 +154,22 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             or when NTC cells are not needed (e.g., stress testing without NTC).
         """
         
-        if label is None and cis_gene is not None:
-            label = cis_gene
-        elif label is None:
-            raise ValueError(
-                "label must be provided when cis_gene is not specified at initialization. "
-                "When cis_gene is provided, label defaults to the gene name."
-            )
+        initialize_input_state(
+            self,
+            meta,
+            counts,
+            cis_gene,
+            output_dir,
+            label,
+            require_ntc,
+        )
 
-        # Basic assignments
-        self.meta = meta.copy()
-
-        # Handle counts - can be DataFrame or sparse matrix
-        self.is_sparse_counts = sparse.issparse(counts)
-        if self.is_sparse_counts:
-            self.counts = counts.copy() if hasattr(counts, 'copy') else counts.tocsr()
-            self._cell_names = counts.columns.tolist() if isinstance(counts, pd.DataFrame) else None
-        else:
-            if isinstance(counts, pd.DataFrame):
-                self.counts = counts.copy()
-                self._cell_names = counts.columns.tolist()
-            else:
-                self.counts = counts.copy() if hasattr(counts, 'copy') else counts
-                self._cell_names = None
-
-        self.cis_gene = cis_gene
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.label = label
-        self.require_ntc = require_ntc
-
-        # ==============================================================================
-        # Detect high MOI mode and validate
-        # ==============================================================================
-        if guide_assignment is not None or guide_meta is not None:
-            if guide_assignment is None or guide_meta is None:
-                raise ValueError(
-                    "Both guide_assignment and guide_meta must be provided for high MOI mode. "
-                    "Got guide_assignment={}, guide_meta={}".format(
-                        type(guide_assignment).__name__ if guide_assignment is not None else None,
-                        type(guide_meta).__name__ if guide_meta is not None else None
-                    )
-                )
-            self.is_high_moi = True
-
-            # Validate guide_assignment shape
-            if guide_assignment.ndim != 2:
-                raise ValueError(
-                    f"guide_assignment must be a 2D matrix (cells × guides), "
-                    f"but got shape {guide_assignment.shape} with {guide_assignment.ndim} dimensions"
-                )
-
-            # Auto-detect and transpose if dimensions are swapped
-            # Expected: (n_cells, n_guides)
-            # If user provides (n_guides, n_cells), transpose it
-            dim0, dim1 = guide_assignment.shape
-            n_guides_meta = len(guide_meta)
-            n_cells_meta = len(meta)
-
-            # Check if dimensions match expected orientation
-            if dim1 == n_guides_meta and dim0 == n_cells_meta:
-                # Correct orientation: (cells, guides)
-                N_cells_assignment, G_guides = dim0, dim1
-            elif dim0 == n_guides_meta and dim1 == n_cells_meta:
-                # Transposed: (guides, cells) - auto-fix
-                warnings.warn(
-                    f"[HIGH MOI] guide_assignment appears to be transposed (shape {guide_assignment.shape} = guides × cells). "
-                    f"Expected (cells × guides). Auto-transposing to ({dim1}, {dim0}).",
-                    UserWarning
-                )
-                guide_assignment = guide_assignment.T
-                N_cells_assignment, G_guides = guide_assignment.shape
-            else:
-                # Cannot determine orientation - provide helpful error
-                raise ValueError(
-                    f"guide_assignment shape {guide_assignment.shape} does not match expected dimensions:\n"
-                    f"  - guide_meta has {n_guides_meta} guides\n"
-                    f"  - meta has {n_cells_meta} cells\n"
-                    f"Expected guide_assignment shape: ({n_cells_meta}, {n_guides_meta}) [cells × guides]\n"
-                    f"Got: {guide_assignment.shape}\n"
-                    f"Please check your guide_assignment matrix orientation."
-                )
-
-            # Validate guide_meta matches resolved dimensions
-            if len(guide_meta) != G_guides:
-                raise ValueError(
-                    f"guide_meta has {len(guide_meta)} rows but guide_assignment has {G_guides} guides (columns). "
-                    f"These dimensions must match."
-                )
-
-            # Validate guide_meta has 'guide' column
-            if 'guide' not in guide_meta.columns:
-                raise ValueError(
-                    f"guide_meta missing required column 'guide'. "
-                    f"Available columns: {list(guide_meta.columns)}"
-                )
-
-            # Store guide assignment and metadata
-            self.guide_assignment = guide_assignment.copy()
-            self.guide_meta = guide_meta.copy()
-
-            # Create guide_code mapping for guide_meta
-            self.guide_meta['guide_code'] = range(G_guides)
-
-            # Process guide-target relationships
-            # Priority: guide_target > guide_meta['target']
-            if guide_target is not None:
-                # Validate guide_target DataFrame
-                required_gt_cols = {'guide', 'target'}
-                missing_gt_cols = required_gt_cols - set(guide_target.columns)
-                if missing_gt_cols:
-                    raise ValueError(
-                        f"guide_target missing required columns: {missing_gt_cols}. "
-                        f"Available columns: {list(guide_target.columns)}"
-                    )
-
-                # Create guide -> list of targets mapping
-                guide_targets_dict = {}
-                for _, row in guide_target.iterrows():
-                    guide_name = row['guide']
-                    target = row['target']
-                    if guide_name not in guide_targets_dict:
-                        guide_targets_dict[guide_name] = []
-                    guide_targets_dict[guide_name].append(target)
-
-                # Store for later use
-                self.guide_targets_dict = guide_targets_dict
-
-            elif 'target' in guide_meta.columns:
-                # Use simple one-to-one mapping from guide_meta
-                guide_targets_dict = {
-                    row['guide']: [row['target']]
-                    for _, row in guide_meta.iterrows()
-                }
-                self.guide_targets_dict = guide_targets_dict
-            else:
-                raise ValueError(
-                    "Either guide_target DataFrame or guide_meta['target'] column must be provided "
-                    "to specify guide-target relationships in high MOI mode."
-                )
-
-            print(f"[INFO] High MOI: {G_guides} guides, avg {guide_assignment.sum(axis=1).mean():.2f} per cell")
-
-        else:
-            self.is_high_moi = False
-            self.guide_targets_dict = None
-
-            # Single-guide mode may still resolve target(s) from a guide_target
-            # DataFrame instead of a pre-computed meta['target'] column — this
-            # allows a guide with multiple plausible targets (e.g. ambiguous
-            # off-target effects) to be resolved against whichever cis_gene is
-            # currently being fit. Same schema as high-MOI's guide_target: rows
-            # of {'guide', 'target'}, with multiple rows allowed per guide.
-            if guide_target is not None:
-                required_gt_cols = {'guide', 'target'}
-                missing_gt_cols = required_gt_cols - set(guide_target.columns)
-                if missing_gt_cols:
-                    raise ValueError(
-                        f"guide_target missing required columns: {missing_gt_cols}. "
-                        f"Available columns: {list(guide_target.columns)}"
-                    )
-                guide_targets_dict = {}
-                for _, row in guide_target.iterrows():
-                    guide_targets_dict.setdefault(row['guide'], []).append(row['target'])
-                self.guide_targets_dict = guide_targets_dict
+        N_cells_assignment = self._initialize_guide_state(
+            meta,
+            guide_assignment,
+            guide_meta,
+            guide_target,
+        )
 
         # Ensure guide_covariates and guide_covariates_ntc are always lists
         if guide_covariates is None:
@@ -334,240 +182,22 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         self.guide_covariates = guide_covariates
         self.guide_covariates_ntc = guide_covariates_ntc
 
-        # Input checks - different requirements for single-guide vs high MOI mode
-        if self.is_high_moi:
-            # High MOI mode: do NOT require 'guide' or 'target' in meta
-            required_cols = {"cell", sum_factor_col} | set(guide_covariates) | set(guide_covariates_ntc)
-            missing_cols = required_cols - set(self.meta.columns)
-            if missing_cols:
-                raise ValueError(f"[High MOI] Missing required columns in meta: {missing_cols}")
-
-            # Validate guide_assignment matches meta length
-            if len(self.meta) != N_cells_assignment:
-                raise ValueError(
-                    f"[High MOI] guide_assignment has {N_cells_assignment} rows but meta has {len(self.meta)} rows. "
-                    f"These dimensions must match."
-                )
-
-        else:
-            # Single-guide mode: require 'guide' in meta. 'target' is required only
-            # when no guide_target mapping was supplied — otherwise it's derived
-            # per-cell from guide_targets_dict below.
-            required_cols = {"cell", sum_factor_col, "guide"} | set(guide_covariates) | set(guide_covariates_ntc)
-            if self.guide_targets_dict is None:
-                required_cols.add("target")
-            missing_cols = required_cols - set(self.meta.columns)
-            if missing_cols:
-                raise ValueError(f"[Single-guide] Missing required columns in meta: {missing_cols}")
-
-            if self.guide_targets_dict is not None:
-                # Derive 'target' per cell from its guide's list of plausible targets.
-                # Priority mirrors high-MOI classification: cis_gene > NTC > 'other'.
-                # A guide with multiple plausible targets resolves differently
-                # depending on which cis_gene is currently being fit.
-                def _is_ntc_target(target_name):
-                    """Check if target name is NTC (flexible matching)."""
-                    ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-                    return target_name in ntc_variants
-
-                def _classify_guide(guide_name):
-                    targets = self.guide_targets_dict.get(guide_name, [])
-                    if self.cis_gene is not None and self.cis_gene in targets:
-                        return self.cis_gene
-                    if any(_is_ntc_target(t) for t in targets):
-                        return 'ntc'
-                    return 'other'
-
-                self.meta['target'] = self.meta['guide'].map(_classify_guide)
-
-                if exclude_targets is not None:
-                    def _has_excluded_target(guide_name):
-                        targets = self.guide_targets_dict.get(guide_name, [])
-                        return any(t in exclude_targets for t in targets)
-                    n_before = len(self.meta)
-                    self.meta = self.meta[~self.meta['guide'].map(_has_excluded_target)].copy()
-                    n_excluded = n_before - len(self.meta)
-                    if n_excluded > 0:
-                        print(f"[INFO] Excluded {n_excluded} cells (guide targets a gene in exclude_targets={exclude_targets})")
-
-                target_counts = self.meta['target'].value_counts()
-                print(f"[INFO] Single-guide target classification from guide_target mapping:")
-                print(f"  NTC cells: {target_counts.get('ntc', 0)}")
-                if self.cis_gene is not None:
-                    print(f"  {self.cis_gene}-targeting cells: {target_counts.get(self.cis_gene, 0)}")
-                    print(f"  Other-only cells (will be removed): {target_counts.get('other', 0)}")
-                else:
-                    print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {target_counts.get('other', 0)}")
-
-            if require_ntc and "ntc" not in self.meta["target"].values:
-                raise ValueError(
-                    "No NTC detected in the 'target' column. "
-                    "If this is correct (e.g., you have already run fit_ntc() or don't need NTC cells), "
-                    "use require_ntc=False."
-                )
-
-        # Populate cell names if not already set
-        if self._cell_names is None:
-            if isinstance(counts, pd.DataFrame):
-                self._cell_names = counts.columns.tolist()
-            else:
-                # Use meta['cell'] as cell names
-                self._cell_names = self.meta['cell'].tolist()
-
-        if not set(self.meta["cell"]).issubset(set(self._cell_names)):
-            raise ValueError("The 'cell' column in meta must correspond 1:1 with the cell names in counts.")
-
-        if (self.meta[sum_factor_col] <= 0).any():
-            raise ValueError(f"All values in sum_factor_col={sum_factor_col} column must be strictly greater than 0.")
-
-        # For high MOI mode, create 'target' column based on guide assignment
-        if self.is_high_moi:
-            # Helper function to normalize NTC target names (case-insensitive)
-            def is_ntc_target(target_name):
-                """Check if target name is NTC (flexible matching)."""
-                ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-                return target_name in ntc_variants
-
-            # Classify each guide based on its targets (from guide_targets_dict)
-            # A guide can have multiple targets, so we check if any match NTC, cis, or excluded
-            ntc_guide_indices = []
-            cis_guide_indices = []
-            exclude_guide_indices = []
-
-            for pos_idx, (guide_idx, guide_row) in enumerate(self.guide_meta.iterrows()):
-                guide_name = guide_row['guide']
-                targets = self.guide_targets_dict.get(guide_name, [])
-
-                # Check if this guide has ANY NTC target
-                if any(is_ntc_target(t) for t in targets):
-                    ntc_guide_indices.append(pos_idx)
-
-                # Check if this guide has ANY cis_gene target
-                if self.cis_gene in targets:
-                    cis_guide_indices.append(pos_idx)
-
-                # Check if this guide has ANY excluded target
-                if exclude_targets is not None and any(t in exclude_targets for t in targets):
-                    exclude_guide_indices.append(pos_idx)
-
-                # Check if this guide itself is excluded by name
-                if exclude_guides is not None and guide_name in exclude_guides:
-                    exclude_guide_indices.append(pos_idx)
-
-            ntc_guide_indices = np.array(ntc_guide_indices)
-            cis_guide_indices = np.array(cis_guide_indices)
-            exclude_guide_indices = np.array(list(dict.fromkeys(exclude_guide_indices)))  # deduplicate, preserve order
-
-            # Determine which cells have these guide types
-            if len(exclude_guide_indices) > 0:
-                has_excluded_guide = self.guide_assignment[:, exclude_guide_indices].sum(axis=1) > 0
-            else:
-                has_excluded_guide = np.zeros(len(self.guide_assignment), dtype=bool)
-
-            if len(ntc_guide_indices) > 0:
-                has_ntc_guide = self.guide_assignment[:, ntc_guide_indices].sum(axis=1) > 0
-            else:
-                has_ntc_guide = np.zeros(len(self.guide_assignment), dtype=bool)
-
-            if len(cis_guide_indices) > 0:
-                has_cis_guide = self.guide_assignment[:, cis_guide_indices].sum(axis=1) > 0
-            else:
-                has_cis_guide = np.zeros(len(self.guide_assignment), dtype=bool)
-
-            # Cell classification:
-            # - If cell has ANY excluded guides -> target = 'excluded' (will be removed)
-            # - Else if cell has ANY cis guides -> target = cis_gene
-            # - Else if cell has ANY NTC guides (but no cis) -> target = 'ntc'
-            # - Else -> target = 'other' (will be removed)
-            targets = []
-            for i in range(len(self.guide_assignment)):
-                if has_excluded_guide[i]:
-                    # Cell has guide(s) targeting excluded gene(s) - remove
-                    targets.append('excluded')
-                elif has_cis_guide[i]:
-                    # Cell has cis guide(s) - regardless of other guides
-                    targets.append(self.cis_gene)
-                elif has_ntc_guide[i]:
-                    # Cell has NTC guide(s) but no cis guides
-                    # (may also have "other" guides - these are ignored)
-                    targets.append('ntc')
-                else:
-                    # Cell has ONLY "other" guides (no NTC, no cis, no excluded)
-                    targets.append('other')
-
-            self.meta['target'] = targets
-
-            # Add guide_code column (not meaningful in high MOI, marked as -1)
-            self.meta['guide_code'] = -1
-
-            ntc_count = (np.array(targets) == 'ntc').sum()
-            other_count = (np.array(targets) == 'other').sum()
-            excluded_count = (np.array(targets) == 'excluded').sum()
-            print(f"[INFO] Cell classification before subsetting:")
-            print(f"  NTC cells (NTC guides, no cis): {ntc_count}")
-            if self.cis_gene is not None:
-                cis_count = (np.array(targets) == self.cis_gene).sum()
-                print(f"  {self.cis_gene}-targeting cells (any cis guides): {cis_count}")
-                print(f"  Other-only cells (will be removed): {other_count}")
-            else:
-                print(f"  Other/unclassified cells (cis_gene deferred — target unknown until add_cis_gene()): {other_count}")
-            if exclude_targets is not None or exclude_guides is not None:
-                print(f"  Excluded cells (exclude_targets/exclude_guides): {excluded_count}")
-
-        # Save original cell order before subsetting (for guide_assignment row alignment in high MOI)
-        if self.is_high_moi:
-            if isinstance(self.counts, pd.DataFrame):
-                _ga_original_cell_names = list(self.counts.columns)
-            else:
-                _ga_original_cell_names = list(self._cell_names) if hasattr(self, '_cell_names') and self._cell_names else []
-
-        # Drop cells carrying explicitly excluded guides (single-guide mode only;
-        # high MOI handles this above via exclude_guide_indices → target='excluded')
-        if exclude_guides is not None and not self.is_high_moi:
-            excluded_guide_set = set(exclude_guides)
-            n_before = len(self.meta)
-            self.meta = self.meta[~self.meta['guide'].isin(excluded_guide_set)].copy()
-            n_excluded = n_before - len(self.meta)
-            if n_excluded > 0:
-                print(f"[INFO] Excluded {n_excluded} cells carrying guides in exclude_guides={exclude_guides}")
-
-        # For high MOI mode, drop 'excluded' cells unconditionally (independent of cis_gene,
-        # since exclusion is determined purely by exclude_targets/exclude_guides). Doing this
-        # here — rather than folding it into the cis_gene-dependent filter below — ensures
-        # excluded cells don't linger into fit_ntc() when cis_gene is deferred.
-        if self.is_high_moi:
-            n_before_excl = len(self.meta)
-            self.meta = self.meta[self.meta["target"] != "excluded"].copy()
-            n_after_excl = len(self.meta)
-            if n_after_excl < n_before_excl:
-                print(f"[INFO] Excluded {n_before_excl - n_after_excl} cells (target='excluded')")
-
-        # Subset meta and counts to relevant cells
-        if self.cis_gene is not None:
-            valid_cells = self.meta[self.meta["target"].isin(["ntc", self.cis_gene])]["cell"].unique()
-            n_cells_before = len(self.meta["cell"].unique())
-            if len(valid_cells) < n_cells_before:
-                print(f"[INFO] Cells: {n_cells_before} → {len(valid_cells)} (kept NTC + {self.cis_gene} only)")
-            self.meta = self.meta[self.meta["cell"].isin(valid_cells)].copy()
-        else:
-            # cis_gene not yet specified — keep all cells; add_cis_gene() will subset later
-            valid_cells = self.meta["cell"].unique()
-            print(f"[INFO] No cis_gene at init — keeping all {len(valid_cells)} cells. "
-                  "Call add_cis_gene() before fit_cis().")
-
-        # Subset counts by cells - works for both DataFrame and sparse
-        if isinstance(self.counts, pd.DataFrame):
-            self.counts = self.counts[valid_cells].copy()
-        else:
-            # Sparse or dense array - subset by column indices
-            valid_cells_set = set(valid_cells)
-            cell_indices = [i for i, cell in enumerate(self._cell_names) if cell in valid_cells_set]
-            if self.is_sparse_counts:
-                self.counts = self.counts[:, cell_indices]
-            else:
-                self.counts = self.counts[:, cell_indices]
-            # Update cell names
-            self._cell_names = [self._cell_names[i] for i in cell_indices]
+        validate_and_classify_metadata(
+            self,
+            counts,
+            sum_factor_col,
+            guide_covariates,
+            guide_covariates_ntc,
+            N_cells_assignment,
+            exclude_targets,
+            exclude_guides,
+            require_ntc,
+        )
+        _ga_original_cell_names, valid_cells = prepare_cell_subset(
+            self,
+            exclude_targets,
+            exclude_guides,
+        )
 
         # For high MOI: subset guide_assignment to remove "other"-targeting guide columns.
         # Only possible once cis_gene is known — if deferred, keep the full guide panel;
@@ -577,17 +207,12 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             # A guide is kept if it has ANY NTC or cis target among its possible targets
             keep_guide_indices = []
 
-            def is_ntc_target(target_name):
-                """Check if target name is NTC (flexible matching)."""
-                ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-                return target_name in ntc_variants
-
-            for pos_idx, (guide_idx, guide_row) in enumerate(self.guide_meta.iterrows()):
+            for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
                 guide_name = guide_row['guide']
                 targets = self.guide_targets_dict.get(guide_name, [])
 
                 # Keep if ANY target is NTC or cis_gene
-                if any(is_ntc_target(t) for t in targets) or self.cis_gene in targets:
+                if any(is_ntc_target_name(t) for t in targets) or self.cis_gene in targets:
                     keep_guide_indices.append(pos_idx)
 
             keep_guide_indices = np.array(keep_guide_indices)
@@ -628,7 +253,6 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
             gene_sums = self.counts.sum(axis=1)
 
         detected_mask = gene_sums > 0
-        num_removed = (~detected_mask).sum()
 
         # Cis gene existence and zero-variance are already validated by _extract_cis_from_gene
         # (called in bayesDREAM.__init__ before super().__init__).
@@ -724,164 +348,20 @@ class _BayesDREAMCore(ModelPlottingMixin, DiagnosticsMixin):
         self.counts = None
         self.is_sparse_counts = None  # no longer meaningful without the matrix
 
+    def _initialize_guide_state(self, meta, guide_assignment, guide_meta, guide_target):
+        state = build_guide_state(meta, guide_assignment, guide_meta, guide_target)
+        self.is_high_moi = state.is_high_moi
+        self.guide_targets_dict = state.guide_targets_dict
+        if state.is_high_moi:
+            self.guide_assignment = state.guide_assignment
+            self.guide_meta = state.guide_meta
+        return state.n_cells_assignment
+
     def _expand_guide_assignment_by_covariates(self, guide_covariates, guide_covariates_ntc):
-        """
-        High-MOI analogue of single-guide mode's ``guide_used`` column (see the
-        ``if not self.is_high_moi`` branch just above this method's call site).
-
-        Splits each guide's column in ``self.guide_assignment``/``self.guide_meta``
-        into one column per distinct combination of covariate values observed
-        among the cells carrying that guide, so the same physical guide can have
-        an independent ``x_eff_g`` effect per covariate level (e.g. per lane).
-        NTC-classified guides (any target in the NTC variants) are split by
-        ``guide_covariates_ntc``; all other guides (cis-targeting, or
-        not-yet-classified 'other' when cis_gene is still deferred) are split by
-        ``guide_covariates``. No-op if both lists are empty (preserves prior
-        behavior exactly — this is the default).
-
-        ``_model_x`` needs no changes for this: it already treats each
-        ``guide_assignment`` column as an independent latent effect and sums
-        per-cell via matmul, so this is purely a data-prep step. Requires
-        ``self.meta`` to already be row-aligned (by position) with
-        ``self.guide_assignment`` when called.
-
-        ``guide_meta['guide']`` is preserved unchanged (original guide name,
-        possibly now duplicated across the guide's split columns) so that
-        ``self.guide_targets_dict`` lookups elsewhere (NTC-mask computation,
-        ``add_cis_gene()``'s guide pruning, etc.) keep working without any
-        changes — they iterate ``guide_meta`` rows and look up
-        ``guide_targets_dict.get(row['guide'], [])``, which tolerates duplicate
-        keys since it's never used as a name -> single-row mapping. Downstream
-        per-guide plots/summaries that key off ``guide_meta['guide']`` will show
-        one row per (guide, covariate) column rather than one row per guide —
-        the correct behavior here, since each column now has its own effect.
-        """
-        if not guide_covariates and not guide_covariates_ntc:
-            return
-
-        ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-
-        def _is_ntc_guide(guide_name):
-            targets = self.guide_targets_dict.get(guide_name, [])
-            return any(t in ntc_variants for t in targets)
-
-        def _covariate_key(cols):
-            if not cols:
-                return None
-            return self.meta[cols].astype(str).agg('|'.join, axis=1).values
-
-        key_ntc = _covariate_key(guide_covariates_ntc)
-        key_non_ntc = _covariate_key(guide_covariates)
-
-        n_guides_before = self.guide_assignment.shape[1]
-        new_columns = []
-        new_meta_rows = []
-        for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows()):
-            guide_name = guide_row['guide']
-            is_ntc = _is_ntc_guide(guide_name)
-            key_arr = key_ntc if is_ntc else key_non_ntc
-            col = self.guide_assignment[:, pos_idx]
-            cell_mask = col.astype(bool)
-
-            if key_arr is None or not cell_mask.any():
-                new_columns.append(col)
-                row = guide_row.copy()
-                row['guide_covariate_key'] = ''
-                new_meta_rows.append(row)
-                continue
-
-            for key in sorted(set(key_arr[cell_mask])):
-                new_col = np.zeros_like(col)
-                new_col[cell_mask & (key_arr == key)] = 1
-                new_columns.append(new_col)
-                row = guide_row.copy()
-                row['guide_covariate_key'] = key
-                new_meta_rows.append(row)
-
-        self.guide_assignment = np.stack(new_columns, axis=1)
-        self.guide_meta = pd.DataFrame(new_meta_rows).reset_index(drop=True)
-        self.guide_meta['guide_code'] = range(len(self.guide_meta))
-
-        n_guides_after = len(new_columns)
-        if n_guides_after != n_guides_before:
-            print(f"[INFO] High MOI: expanded {n_guides_before} guides to {n_guides_after} "
-                  f"(guide, covariate)-columns (guide_covariates={guide_covariates}, "
-                  f"guide_covariates_ntc={guide_covariates_ntc})")
-
-    def set_alpha_x(
-        self,
-        alpha_x,
-        covariates: list[str] = None,
-    ):
-        """
-        Set cis-gene overdispersion scaling factors from a pre-fitted or external estimate.
-
-        Stores ``alpha_x`` as a point-estimate tensor of shape ``[C]``, where index 0
-        is the reference group (value fixed to 1.0).  Must be called before
-        ``fit_cis()`` when overdispersion is supplied externally rather than estimated
-        by ``fit_ntc()``.
-
-        Parameters
-        ----------
-        alpha_x : array-like or torch.Tensor
-            Overdispersion scale factors, shape ``[C]`` (including reference group at
-            index 0).  Accepts numpy arrays, lists, or tensors.
-        covariates : list of str, optional
-            Column names in ``meta`` used to define technical groups (e.g.,
-            ``['cell_line']``).  If provided, creates/overwrites
-            ``meta['technical_group_code']``.  If ``None``, assumes
-            ``technical_group_code`` was already set (raises ``ValueError`` if not).
-        """
-        if covariates:
-            if "technical_group_code" in self.meta.columns:
-                warnings.warn("technical_group already set. Overwriting.")
-            self.meta["technical_group_code"] = self.meta.groupby(covariates).ngroup()
-        elif not "technical_group_code" in self.meta.columns:
-            raise ValueError(f"No column 'technical_group_code' found in meta, and no covariates provided.")
-        else:
-            warnings.warn("technical_group previously set. Assuming alpha_x corresponds.")
-        self.alpha_x_prefit = sample_or_use_point("alpha_x_posterior", alpha_x, self.device).flatten()
-
-    def set_alpha_y(
-        self,
-        alpha_y,
-        covariates: list[str] = None,
-    ):
-        """
-        Set trans-gene overdispersion scaling factors from a pre-fitted or external estimate.
-
-        Stores ``alpha_y`` as a point-estimate tensor of shape ``[C, T]`` on the
-        primary modality, where ``C`` is the number of technical groups (index 0 =
-        reference group) and ``T`` is the number of trans features.  Must be called
-        before ``fit_trans()`` when overdispersion is supplied externally rather than
-        estimated by ``fit_ntc()``.
-
-        Parameters
-        ----------
-        alpha_y : array-like or torch.Tensor
-            Overdispersion scale factors, shape ``[C, T]`` (reference group at index 0).
-            Accepts numpy arrays, lists, or tensors.
-        covariates : list of str, optional
-            Column names in ``meta`` used to define technical groups (e.g.,
-            ``['cell_line']``).  If provided, creates/overwrites
-            ``meta['technical_group_code']``.  If ``None``, assumes
-            ``technical_group_code`` was already set (raises ``ValueError`` if not).
-        """
-        if covariates:
-            if "technical_group_code" in self.meta.columns:
-                warnings.warn("technical_group already set. Overwriting.")
-            self.meta["technical_group_code"] = self.meta.groupby(covariates).ngroup()
-        elif not "technical_group_code" in self.meta.columns:
-            raise ValueError(f"No column 'technical_group_code' found in meta, and no covariates provided.")
-        else:
-            warnings.warn("technical_group previously set. Assuming alpha_xy corresponds.")
-
-        # Convert alpha_y to tensor
-        alpha_y = sample_or_use_point("alpha_y_posterior", alpha_y, self.device)
-
-        # Store in primary modality (not model-level)
-        primary_mod = self.get_modality(self.primary_modality)
-        primary_mod.alpha_y_prefit = alpha_y  # Uses property to store in distribution-specific attribute
+        self.guide_assignment, self.guide_meta = expand_guide_assignment(
+            self.guide_assignment, self.guide_meta, self.guide_targets_dict,
+            self.meta, guide_covariates, guide_covariates_ntc,
+        )
 
     def set_x_true(
         self,

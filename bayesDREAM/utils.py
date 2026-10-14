@@ -19,6 +19,27 @@ from scipy.special import betainc
 from scipy.optimize import brentq
 
 
+def compute_technical_group_code(meta: pd.DataFrame, covariates: list) -> pd.Series:
+    """Compute integer group codes from covariate combinations."""
+    return meta.groupby(list(covariates)).ngroup()
+
+
+def assign_or_warn_technical_group_code(
+    meta: pd.DataFrame,
+    covariates: list,
+    reuse_warning: str = "technical_group previously set. Assuming values correspond.",
+) -> pd.Series:
+    """Compute or reuse the technical_group_code column."""
+    if covariates:
+        if "technical_group_code" in meta.columns:
+            warnings.warn("technical_group already set. Overwriting.")
+        return compute_technical_group_code(meta, covariates)
+    if "technical_group_code" not in meta.columns:
+        raise ValueError("No column 'technical_group_code' found in meta, and no covariates provided.")
+    warnings.warn(reuse_warning)
+    return meta["technical_group_code"]
+
+
 ########################################
 # Thread Configuration
 ########################################
