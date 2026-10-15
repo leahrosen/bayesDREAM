@@ -68,6 +68,37 @@ The table gives RMSE / coverage of 90 % intervals for one seed:
 Over five seeds (same design, CAVI only), the mean coverage was 0.89 for log2 a, 0.89 for
 log mu and 0.91 for log phi, with RMSE 0.105, 0.050 and 0.43.
 
+## Real counts: split-half check
+
+`examples/diagnostics/compare_ntc_svi_cavi_realdata.py` was run on the counts in
+`toydata/gene_counts.csv` (92 genes), subsampled to 4000 cells.
+- The barcode prefixes L1 and L2 are the technical groups, and sum factors are library
+  size over its median.
+- There is no matching metadata, so all cells, including perturbed ones, are fitted as if
+  they were NTC. The check is therefore about computation and calibration, not biology.
+- Each method fitted two random halves (stratified by group). If the reported SDs are
+  right, |z| < 1.645 should hold for about 90 % of genes.
+
+| | SVI (default, 100,000 steps) | PG-CAVI + Laplace |
+|---|---|---|
+| \|z\| < 1.645, log2 a (L2 vs L1) | 0.65 (sd(z) 1.80) | 0.74 (sd(z) 1.38) |
+| \|z\| < 1.645, log mu | 0.87 | 0.96 |
+| \|z\| < 1.645, log phi | 0.75 | 0.71 |
+| mean abs. error, zero fraction per gene | 0.011 | 0.011 |
+| time per half (2000 cells) | 2850 to 2880 s | 52 to 110 s |
+| time on 4000 cells | 4934 s | 223 s |
+
+The fits ran six at a time on four cores, so all times are inflated.
+
+On the full 4000 cells the two methods agree closely:
+- log mu: r = 0.99999, median difference 0.001;
+- log phi: r = 0.9995, median difference 0.003;
+- log2 a: r = 0.95, median difference 0.002 (the effects are small, which lowers r).
+
+Both methods under-cover the group effect and log phi on these data. That points to
+misspecification rather than to the inference. Perturbed cells are mixed in, and sum
+factors from 92 genes are crude, so model-based SEs are too small for both methods.
+
 ## Limitations
 
 - negbinom only; the other distributions still use SVI.
