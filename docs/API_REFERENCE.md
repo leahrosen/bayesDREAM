@@ -620,7 +620,12 @@ Fit trans model to estimate downstream effects as a function of cis expression.
   - `'single_hill'`: Single Hill equation
   - `'additive_hill'`: Sum of positive and negative Hill functions
   - `'polynomial'`: Polynomial function
+  - `'logistic_hill'`: Baseline plus a sum of logistic curves in standardised log2 x on the link scale, with horseshoe-shrunk signed amplitudes. Reparameterised for SVI; see `docs/LOGISTIC_HILL.md`. Not available for multinomial.
 - `polynomial_degree` (int): Degree for polynomial function. Default: 6
+- `n_components` (int): `logistic_hill` only. Number of logistic components. Default: 2
+- `logistic_guide` (str): `logistic_hill` only. `'block_mvn'` (mean-field warm start, then a full-covariance Gaussian per feature) or `'normal'` (mean-field only). Default: `'block_mvn'`
+- `horseshoe_tau0` (float): `logistic_hill` only. Scale of the HalfCauchy prior on the global shrinkage. Default: 0.1
+- `horseshoe_slab_scale` (float): `logistic_hill` only. Slab scale of the regularised horseshoe. Default: 3.0
 - `lr` (float, optional): Learning rate. Default: None (auto-selects based on distribution)
   - negbinom: 0.05, others: 0.01
 - `niters` (int, optional): Number of optimization steps. Default: None (auto-selects)
@@ -1666,7 +1671,7 @@ Plot prior vs posterior for trans fit parameters.
 - `subset_features` (list, optional): Subset to specific features
 - `order_by` (str): Feature ordering
 - `plot_type` (str): `'auto'`, `'violin'`, or `'scatter'`
-- `function_type` (str): Function type used: `'additive_hill'`, `'single_hill'`, `'polynomial'`
+- `function_type` (str): Function type used: `'additive_hill'`, `'single_hill'`, `'polynomial'`, `'logistic_hill'`
 - `metric` (str): Comparison metric
 
 **Returns:** matplotlib Figure

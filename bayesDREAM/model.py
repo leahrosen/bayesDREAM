@@ -344,6 +344,7 @@ class bayesDREAM(
             counts_for_base,
             modality_name,
             feature_meta,
+            n_cells=len(meta),
         )
 
         super().__init__(
@@ -471,14 +472,16 @@ class bayesDREAM(
                 UserWarning
             )
 
-    def _prepare_base_counts_for_core(self, counts_for_base, modality_name, feature_meta):
+    def _prepare_base_counts_for_core(self, counts_for_base, modality_name, feature_meta, n_cells):
         """Get the correct raw counts and base gene_meta for the core initializer."""
         if counts_for_base is None:
             if modality_name in self.modalities:
                 mod = self.modalities[modality_name]
                 primary_counts = mod.counts
             else:
-                primary_counts = np.ones((1, 1))
+                # Placeholder until the primary modality is added; one column per
+                # cell so the core initializer can subset it by cell.
+                primary_counts = np.ones((1, n_cells))
         else:
             primary_counts = counts_for_base
         gene_meta_for_base = feature_meta if modality_name == 'gene' else None

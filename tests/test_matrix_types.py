@@ -63,8 +63,11 @@ def test_dataframe_input():
         label='test_dataframe',
         device='cpu',
     )
-    assert isinstance(model.counts, pd.DataFrame)
+    # The raw matrix is freed after init; the data lives in the modalities.
+    assert model.counts is None
     gene_mod = model.get_modality('gene')
+    assert isinstance(gene_mod.counts, np.ndarray)
+    assert 'GFI1B' not in list(gene_mod.feature_ids)  # cis gene moved to the 'cis' modality
     assert len(gene_mod.feature_meta) == gene_mod.counts.shape[0]
 
 
@@ -80,8 +83,9 @@ def test_dense_numpy_input():
         label='test_dense',
         device='cpu',
     )
-    assert isinstance(model.counts, np.ndarray)
+    assert model.counts is None
     gene_mod = model.get_modality('gene')
+    assert isinstance(gene_mod.counts, np.ndarray)
     assert len(gene_mod.feature_meta) == gene_mod.counts.shape[0]
 
 
@@ -97,6 +101,7 @@ def test_sparse_scipy_input():
         label='test_sparse',
         device='cpu',
     )
-    assert sparse.issparse(model.counts)
+    assert model.counts is None
     gene_mod = model.get_modality('gene')
+    assert sparse.issparse(gene_mod.counts)
     assert len(gene_mod.feature_meta) == gene_mod.counts.shape[0]

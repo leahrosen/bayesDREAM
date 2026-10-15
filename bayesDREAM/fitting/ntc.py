@@ -448,6 +448,43 @@ class NTCFitter:
             # Only raise error if we're actually trying to sample observations
             raise ValueError(f"Unknown distribution: {distribution}")
     
+    def _ntc_cavi_posterior_samples(self, y_obs, groups, sum_factor, C,
+                                    beta_o_alpha, beta_o_beta, nsamples, cavi_options):
+        """Run PG-CAVI and draw posterior samples shaped like the SVI Predictive output."""
+        import math
+        from .ntc_cavi import fit_ntc_negbinom_cavi
+
+        res = fit_ntc_negbinom_cavi(
+            y_obs, groups, sum_factor, n_groups=C,
+            beta_o_alpha=float(beta_o_alpha), beta_o_beta=float(beta_o_beta),
+            device=self.model.device, **cavi_options,
+        )
+        self.cavi_result = res
+        print(f"[INFO] fit_ntc (cavi): converged={res['converged']}, "
+              f"iterations={res['n_iter']}, {res['time_s']:.1f} s")
+        if res["n_phi_boundary"]:
+            print(f"[INFO] fit_ntc (cavi): {res['n_phi_boundary']} feature(s) show no detectable "
+                  f"overdispersion (phi at its upper bound); their log phi uncertainty is set to SD 1")
+
+        z_mean = torch.as_tensor(res["z_mean"], dtype=torch.float64)     # [T, C+1]
+        z_cov = torch.as_tensor(res["z_cov"], dtype=torch.float64)       # [T, C+1, C+1]
+        z_cov = 0.5 * (z_cov + z_cov.transpose(-1, -2))
+        jitter = 1e-10 * torch.eye(C + 1, dtype=torch.float64)
+        L = torch.linalg.cholesky(z_cov + jitter)
+        eps = torch.randn(nsamples, z_mean.shape[0], C + 1, dtype=torch.float64)
+        z = z_mean + torch.einsum('tij,stj->sti', L, eps)                  # [S, T, C+1]
+
+        log2_alpha = (z[..., 1:C] / math.log(2.0)).permute(0, 2, 1)        # [S, C-1, T]
+        out = {
+            "log2_alpha_y": log2_alpha,
+            "alpha_y_mul": 2.0 ** log2_alpha,
+            "delta_y_add": log2_alpha.clone(),
+            "mu_ntc": torch.exp(z[..., 0]).unsqueeze(1),                    # [S, 1, T]
+            "o_y": torch.exp(-0.5 * z[..., C]).unsqueeze(1),                # [S, 1, T]
+            "beta_o": torch.full((nsamples, 1, 1), res["beta_o"], dtype=torch.float64),
+        }
+        return {k: v.float() for k, v in out.items()}
+
     def set_technical_groups(self, covariates: list[str]):
         """
         Assign a technical-group code to every cell based on covariate combinations.
@@ -521,6 +558,8 @@ class NTCFitter:
         modality_name: str = None,
         use_all_cells: bool = None,
         force_iaf: bool = False,
+        method: str = 'svi',
+        cavi_options: dict = None,
         **kwargs
     ):
         """
@@ -597,6 +636,18 @@ class NTCFitter:
             shared network couples all features together, so one such feature's
             exploding gradient can corrupt every other feature's parameters in one
             SVI step.
+        method : {'svi', 'cavi'}, default 'svi'
+            'cavi' (negbinom only) replaces SVI by Polya-Gamma coordinate-ascent VI with
+            a Laplace correction (``bayesDREAM.fitting.ntc_cavi``): closed-form updates,
+            no learning rate or iteration count, and better calibrated intervals; see
+            docs/NTC_CAVI.md. ``lr``, ``niters``, ``minibatch_size`` and ``force_iaf``
+            are ignored. Posterior samples are drawn from the Gaussian approximation in
+            (log mu, log a, log phi) and stored with the same keys and shapes as SVI.
+            Note the prior on log mu differs: Normal(log normalised mean, 2^2) rather
+            than the data-driven LogNormal used by the SVI model.
+        cavi_options : dict, optional
+            Extra keyword arguments for ``fit_ntc_negbinom_cavi`` (e.g. ``tol``,
+            ``max_chunk_bytes``, ``log_mu_prior_scale``).
 
         Warnings
         --------
@@ -626,6 +677,13 @@ class NTCFitter:
 
         if distribution is None:
             distribution = modality.distribution
+
+        if method not in ('svi', 'cavi'):
+            raise ValueError(f"method must be 'svi' or 'cavi', got {method!r}")
+        if method == 'cavi' and distribution != 'negbinom':
+            raise NotImplementedError(
+                f"method='cavi' is implemented for negbinom only (got '{distribution}')"
+            )
 
         # cis_only models (see bayesDREAM.__init__'s cis_only docstring
         # entry) have ~0 trans genes in the primary modality by design --
@@ -1318,490 +1376,500 @@ class NTCFitter:
                 if _ref_m_multi.sum() > 0 else y_obs_ntc_tensor.sum(dim=0).float()
             )
 
-        # ---------------------------
-        # Guide + init functions
-        # ---------------------------
-        import pyro.poutine as poutine
-        from pyro.infer.autoguide import AutoNormal, AutoNormalMessenger, AutoIAFNormal
-        from pyro.infer.autoguide.initialization import init_to_median
-        
-        def _safe_simplex_from_counts(total_counts_TK: torch.Tensor, interior_floor=1e-3) -> torch.Tensor:
-            """
-            total_counts_TK: [T, K] float
-            Returns p: [T, K] on the simplex, strictly interior (all entries in (eps, 1-eps)).
-            """
-            p = total_counts_TK + 1.0
-            p = p / p.sum(dim=-1, keepdim=True)
-            K = p.shape[-1]
-            eps = interior_floor / K
-            p = (1.0 - K * eps) * p + eps
-            p = p / p.sum(dim=-1, keepdim=True)
-            return p
-        
-        def init_loc_fn(site):
-            name = site["name"]
-
-            # Derive local shapes from the actual tensors used in the model
-            if y_obs_ntc_tensor.dim() == 3:
-                T_local = int(y_obs_ntc_tensor.shape[1])
-                K_local = int(y_obs_ntc_tensor.shape[2])
-            else:
-                T_local = int(y_obs_ntc_tensor.shape[1])
-                K_local = None
-
-            # -------------------------
-            # Multinomial-only inits
-            # -------------------------
-            if distribution == 'multinomial':
-                # probs_baseline_raw is guided by the softmax pyro.param directly —
-                # init_loc_fn is never called for it. Only alpha_logits_y reaches here.
-                if name == "alpha_logits_y":
-                    # Initialize with logit-scale differences between groups vs reference
-                    shape = site["fn"].batch_shape  # [C-1, T_fit, K]
-                    if len(shape) != 3:
-                        # Fallback to zeros if unexpected shape
-                        return torch.zeros(shape, dtype=torch.float32, device=self.model.device)
-
-                    Cminus1, T_fit_local, K_local = shape
-
-                    # Compute empirical proportions per group
-                    group_codes_np = groups_ntc_tensor.cpu().numpy()
-                    y_obs_np = y_obs_ntc_tensor.cpu().numpy()  # [N, T, K]
-
-                    # Reference group (group 0) proportions
-                    ref_mask = (group_codes_np == 0)
-                    if ref_mask.sum() > 0:
-                        ref_counts = y_obs_np[ref_mask, :, :].sum(axis=0) + 0.5  # [T, K] with pseudocount
-                        ref_props = ref_counts / ref_counts.sum(axis=1, keepdims=True)
-                    else:
-                        # Fallback uniform
-                        ref_props = np.ones((T_fit_local, K_local)) / K_local
-
-                    # Initialize alpha for each non-reference group
-                    alpha_init = np.zeros((Cminus1, T_fit_local, K_local), dtype=np.float32)
-
-                    non_ref_groups = sorted(set(group_codes_np) - {0})
-                    for idx, g in enumerate(non_ref_groups[:Cminus1]):  # Ensure we don't exceed C-1
-                        group_mask = (group_codes_np == g)
-                        if group_mask.sum() > 0:
-                            group_counts = y_obs_np[group_mask, :, :].sum(axis=0) + 0.5  # [T, K]
-                            group_props = group_counts / group_counts.sum(axis=1, keepdims=True)
-
-                            # Logit-scale difference: log(P_group / P_ref)
-                            epsilon = 1e-6
-                            ref_clipped = np.clip(ref_props, epsilon, 1 - epsilon)
-                            group_clipped = np.clip(group_props, epsilon, 1 - epsilon)
-                            alpha_init[idx, :, :] = np.log(group_clipped / ref_clipped)
-
-                    return torch.tensor(alpha_init, dtype=torch.float32, device=self.model.device)
-        
-            # -------------------------
-            # Other distributions — with binomial and negbinom inits
-            # -------------------------
-            if name == "log2_alpha_y":
-                if distribution == 'negbinom':
-                    group_codes = meta_ntc["technical_group_code"].values
-                    group_labels = np.array(sorted(set(group_codes) - {0}))
-                    init_values = []
-                    # Use helper to safely extract baseline group (handles sparse matrices)
-                    baseline_data = _extract_rows_sparse_safe(y_obs_ntc_factored, group_codes == 0)
-                    baseline_mean = np.mean(baseline_data, axis=0) + 1e-8
-                    for g in group_labels:
-                        # Use helper for each group
-                        group_data = _extract_rows_sparse_safe(y_obs_ntc_factored, group_codes == g)
-                        group_mean = np.mean(group_data, axis=0) + 1e-8
-                        init_values.append(np.log2(group_mean / baseline_mean))
-                    init_arr = np.stack(init_values) if len(init_values) else np.zeros((0, T_local), dtype=np.float32)
-                    return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
-
-                elif distribution == 'binomial':
-                    # Initialize with logit-scale differences between groups (on logit scale)
-                    group_codes_np = groups_ntc_tensor.cpu().numpy()
-                    y_obs_np = y_obs_ntc_tensor.cpu().numpy()  # [N, T]
-                    denom_np = denominator_ntc_tensor.cpu().numpy()  # [N, T]
-
-                    # Compute PSI per group
-                    epsilon = 1e-6
-
-                    # Reference group (group 0) PSI
-                    ref_mask = (group_codes_np == 0)
-                    if ref_mask.sum() > 0:
-                        ref_numer = y_obs_np[ref_mask, :].sum(axis=0) + 0.5  # [T] with pseudocount
-                        ref_denom = denom_np[ref_mask, :].sum(axis=0) + 1.0   # [T] with pseudocount
-                        ref_psi = np.clip(ref_numer / ref_denom, epsilon, 1 - epsilon)
-                    else:
-                        # Fallback uniform
-                        ref_psi = np.ones(T_local) * 0.5
-
-                    # Compute logit of reference PSI
-                    ref_logit = np.log(ref_psi / (1 - ref_psi))
-
-                    # Initialize alpha for each non-reference group
-                    init_values = []
-                    non_ref_groups = sorted(set(group_codes_np) - {0})
-
-                    for g in non_ref_groups[:C-1]:  # Ensure we don't exceed C-1
-                        group_mask = (group_codes_np == g)
-                        if group_mask.sum() > 0:
-                            group_numer = y_obs_np[group_mask, :].sum(axis=0) + 0.5  # [T]
-                            group_denom = denom_np[group_mask, :].sum(axis=0) + 1.0   # [T]
-                            group_psi = np.clip(group_numer / group_denom, epsilon, 1 - epsilon)
-
-                            # Logit-scale difference: logit(PSI_group) - logit(PSI_ref)
-                            group_logit = np.log(group_psi / (1 - group_psi))
-                            init_values.append(group_logit - ref_logit)
-                        else:
-                            init_values.append(np.zeros(T_local, dtype=np.float32))
-
-                    init_arr = np.stack(init_values) if len(init_values) else np.zeros((0, T_local), dtype=np.float32)
-                    return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
-
-                else:
-                    return torch.zeros((C - 1, T_local), dtype=torch.float32, device=self.model.device)
-        
-            # Default for everything else
-            return init_to_median(site)
-        
-        pyro.clear_param_store()
-
-        # ---------------------------
-        # Guide choice with memory check
-        # ---------------------------
-        if distribution == 'multinomial':
-            # Softmax guide for probs_baseline_raw: avoids the stick-breaking gradient
-            # compression that caused AutoDelta to overshoot near the simplex boundary.
-            # We parameterise log-proportions in ℝ^K and apply softmax — gradients are
-            # uniform everywhere, no vanishing near p→1.
-            _zmask_guide  = self._multinomial_zero_cat_mask   # [T, K]  captured in closure
-            _log_p_init_g = self._multinomial_log_p_init      # [T, K]
-            _T_guide      = T_fit
-            _plate_name   = "feature_plate_technical"
-
-            # AutoNormal for alpha_logits_y (all sites except probs_baseline_raw)
-            _guide_alpha = AutoNormal(
-                poutine.block(self._model_ntc, hide=["probs_baseline_raw"]),
-                init_loc_fn=init_loc_fn,
+        if method == 'cavi':
+            # Polya-Gamma CAVI + Laplace (negbinom only); draws posterior samples with the
+            # same sites and shapes as the SVI Predictive below, so everything downstream
+            # (feature reconstruction, cis extraction, storage) is shared.
+            posterior_samples = self._ntc_cavi_posterior_samples(
+                y_obs_ntc_tensor, groups_ntc_tensor, sum_factor_ntc_tensor, C,
+                beta_o_alpha, beta_o_beta, nsamples, cavi_options or {},
             )
-
-            def ntc_guide(*args, **kwargs):
-                # ---- probs_baseline_raw: softmax-parameterised point estimate ----
-                log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
-                log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
-                probs = torch.softmax(log_p_masked, dim=-1)                  # [T, K]
-                # Clamp masked categories away from exact 0.0 (float32 underflow of
-                # softmax(-1e9)).  xlogy(concentration-1, probs) backward = 0/0 = NaN
-                # when concentration=1 (masked) and probs=0.  Any probs>0 gives finite
-                # gradient = 0.  1e-30 >> float32 subnormal floor (~1.2e-38).
-                probs = probs.clamp_min(1e-30)
-                probs = probs / probs.sum(dim=-1, keepdim=True)
-                with pyro.plate(_plate_name, _T_guide, dim=-1):
-                    pyro.sample("probs_baseline_raw", dist.Delta(probs, event_dim=1))
-                # ---- everything else: AutoNormal ----
-                _guide_alpha(*args, **kwargs)
-
-        elif distribution in ['binomial', 'normal', 'studentt']:
-            # Calmer guide for these distributions
-            ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
-
+            losses = []
         else:
-            # AutoNormal (mean-field) is the default guide for negbinom/other
-            # distributions, regardless of device or dataset size -- it's robust
-            # across dataset sizes and sparsity levels. AutoIAFNormal (a single
-            # jointly-coupled autoregressive flow over ALL T features) is opt-in via
-            # force_iaf=True: it can give a more expressive posterior for small,
-            # deeply-sequenced datasets, but its shared network means one sparse
-            # gene's exploding gradient (near-zero mu_final -> huge d/dx log(x+eps)
-            # as x->0) can corrupt every other feature's parameters in a single step.
-            # A prior memory-based auto-selection (IAF whenever estimated memory fit
-            # the budget, which is almost always true at realistic gene counts)
-            # silently exposed every user to this failure mode without them asking
-            # for IAF or knowing the risk -- see docs/SIMULATION_STUDY_PLAN.md's
-            # fit_ntc NaN diagnosis for the full trace.
-            if distribution == 'negbinom':
-                # log2_alpha_y: (C-1) × T_fit
-                # o_y: T_fit
-                # mu_ntc: T_fit
-                n_latent = (C - 1 + 2) * T_fit
-            else:
-                # Conservative estimate for unknown distributions
-                n_latent = C * T_fit
+            # ---------------------------
+            # Guide + init functions
+            # ---------------------------
+            import pyro.poutine as poutine
+            from pyro.infer.autoguide import AutoNormal, AutoNormalMessenger, AutoIAFNormal
+            from pyro.infer.autoguide.initialization import init_to_median
+        
+            def _safe_simplex_from_counts(total_counts_TK: torch.Tensor, interior_floor=1e-3) -> torch.Tensor:
+                """
+                total_counts_TK: [T, K] float
+                Returns p: [T, K] on the simplex, strictly interior (all entries in (eps, 1-eps)).
+                """
+                p = total_counts_TK + 1.0
+                p = p / p.sum(dim=-1, keepdim=True)
+                K = p.shape[-1]
+                eps = interior_floor / K
+                p = (1.0 - K * eps) * p + eps
+                p = p / p.sum(dim=-1, keepdim=True)
+                return p
+        
+            def init_loc_fn(site):
+                name = site["name"]
 
-            # IAF memory estimate (rough approximation), informational only now that
-            # the choice is explicit rather than memory-driven:
-            # - Transformation matrices: n_latent × n_latent × 4 bytes (float32)
-            # - Hidden states: ~2× the matrix size
-            # - Safety margin: 1.5×
-            iaf_memory_gb = (n_latent ** 2 * 4 * 3 * 1.5) / 1e9
-
-            use_iaf = force_iaf
-            if use_iaf:
-                if self.model.device.type == 'cuda':
-                    try:
-                        # torch is already imported at module level
-                        total_memory_gb = torch.cuda.get_device_properties(self.model.device).total_memory / 1e9
-                        # Reserve 10 GB for data, gradients, and other operations
-                        available_for_guide_gb = total_memory_gb - 10.0
-                        oom_note = (" — OOM risk if estimate is accurate"
-                                    if iaf_memory_gb >= available_for_guide_gb else "")
-                        print(f"[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_memory_gb:.1f} GB, "
-                              f"{available_for_guide_gb:.1f} GB available{oom_note})")
-                    except Exception as e:
-                        print(f"[WARNING] force_iaf=True but could not check VRAM ({e})")
+                # Derive local shapes from the actual tensors used in the model
+                if y_obs_ntc_tensor.dim() == 3:
+                    T_local = int(y_obs_ntc_tensor.shape[1])
+                    K_local = int(y_obs_ntc_tensor.shape[2])
                 else:
-                    print(f"[INFO] force_iaf=True: using AutoIAFNormal ({n_latent} latent variables, "
-                          f"estimated {iaf_memory_gb:.1f} GB) on CPU")
-            else:
-                print(f"[INFO] Using AutoNormal (default; pass force_iaf=True for AutoIAFNormal) "
-                      f"for {n_latent} latent variables")
-                # Increase niters for AutoNormal if using default (AutoNormal needs more iterations)
-                if niters_was_default and niters < 100_000:
-                    old_niters = niters
-                    niters = 100_000
-                    print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
+                    T_local = int(y_obs_ntc_tensor.shape[1])
+                    K_local = None
 
-            if use_iaf:
-                ntc_guide = AutoIAFNormal(self._model_ntc, init_loc_fn=init_loc_fn)
-                # Initialize the guide by calling it once with the model
-                with torch.no_grad():
-                    ntc_guide(
-                        N, T_fit, C,
-                        groups_ntc_tensor,
-                        y_obs_ntc_tensor,
-                        sum_factor_ntc_tensor,
-                        beta_o_alpha_tensor,
-                        beta_o_beta_tensor,
-                        mu_x_mean_tensor,
-                        mu_x_sd_tensor,
-                        epsilon_tensor,
-                        distribution,
-                        denominator_ntc_tensor,
-                        K,
-                        sigma_hat_tensor,
-                        **_model_precomp,
-                    )
-                ntc_guide.to(self.model.device)
-            else:
-                # Fallback to memory-efficient AutoNormal
+                # -------------------------
+                # Multinomial-only inits
+                # -------------------------
+                if distribution == 'multinomial':
+                    # probs_baseline_raw is guided by the softmax pyro.param directly —
+                    # init_loc_fn is never called for it. Only alpha_logits_y reaches here.
+                    if name == "alpha_logits_y":
+                        # Initialize with logit-scale differences between groups vs reference
+                        shape = site["fn"].batch_shape  # [C-1, T_fit, K]
+                        if len(shape) != 3:
+                            # Fallback to zeros if unexpected shape
+                            return torch.zeros(shape, dtype=torch.float32, device=self.model.device)
+
+                        Cminus1, T_fit_local, K_local = shape
+
+                        # Compute empirical proportions per group
+                        group_codes_np = groups_ntc_tensor.cpu().numpy()
+                        y_obs_np = y_obs_ntc_tensor.cpu().numpy()  # [N, T, K]
+
+                        # Reference group (group 0) proportions
+                        ref_mask = (group_codes_np == 0)
+                        if ref_mask.sum() > 0:
+                            ref_counts = y_obs_np[ref_mask, :, :].sum(axis=0) + 0.5  # [T, K] with pseudocount
+                            ref_props = ref_counts / ref_counts.sum(axis=1, keepdims=True)
+                        else:
+                            # Fallback uniform
+                            ref_props = np.ones((T_fit_local, K_local)) / K_local
+
+                        # Initialize alpha for each non-reference group
+                        alpha_init = np.zeros((Cminus1, T_fit_local, K_local), dtype=np.float32)
+
+                        non_ref_groups = sorted(set(group_codes_np) - {0})
+                        for idx, g in enumerate(non_ref_groups[:Cminus1]):  # Ensure we don't exceed C-1
+                            group_mask = (group_codes_np == g)
+                            if group_mask.sum() > 0:
+                                group_counts = y_obs_np[group_mask, :, :].sum(axis=0) + 0.5  # [T, K]
+                                group_props = group_counts / group_counts.sum(axis=1, keepdims=True)
+
+                                # Logit-scale difference: log(P_group / P_ref)
+                                epsilon = 1e-6
+                                ref_clipped = np.clip(ref_props, epsilon, 1 - epsilon)
+                                group_clipped = np.clip(group_props, epsilon, 1 - epsilon)
+                                alpha_init[idx, :, :] = np.log(group_clipped / ref_clipped)
+
+                        return torch.tensor(alpha_init, dtype=torch.float32, device=self.model.device)
+        
+                # -------------------------
+                # Other distributions — with binomial and negbinom inits
+                # -------------------------
+                if name == "log2_alpha_y":
+                    if distribution == 'negbinom':
+                        group_codes = meta_ntc["technical_group_code"].values
+                        group_labels = np.array(sorted(set(group_codes) - {0}))
+                        init_values = []
+                        # Use helper to safely extract baseline group (handles sparse matrices)
+                        baseline_data = _extract_rows_sparse_safe(y_obs_ntc_factored, group_codes == 0)
+                        baseline_mean = np.mean(baseline_data, axis=0) + 1e-8
+                        for g in group_labels:
+                            # Use helper for each group
+                            group_data = _extract_rows_sparse_safe(y_obs_ntc_factored, group_codes == g)
+                            group_mean = np.mean(group_data, axis=0) + 1e-8
+                            init_values.append(np.log2(group_mean / baseline_mean))
+                        init_arr = np.stack(init_values) if len(init_values) else np.zeros((0, T_local), dtype=np.float32)
+                        return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
+
+                    elif distribution == 'binomial':
+                        # Initialize with logit-scale differences between groups (on logit scale)
+                        group_codes_np = groups_ntc_tensor.cpu().numpy()
+                        y_obs_np = y_obs_ntc_tensor.cpu().numpy()  # [N, T]
+                        denom_np = denominator_ntc_tensor.cpu().numpy()  # [N, T]
+
+                        # Compute PSI per group
+                        epsilon = 1e-6
+
+                        # Reference group (group 0) PSI
+                        ref_mask = (group_codes_np == 0)
+                        if ref_mask.sum() > 0:
+                            ref_numer = y_obs_np[ref_mask, :].sum(axis=0) + 0.5  # [T] with pseudocount
+                            ref_denom = denom_np[ref_mask, :].sum(axis=0) + 1.0   # [T] with pseudocount
+                            ref_psi = np.clip(ref_numer / ref_denom, epsilon, 1 - epsilon)
+                        else:
+                            # Fallback uniform
+                            ref_psi = np.ones(T_local) * 0.5
+
+                        # Compute logit of reference PSI
+                        ref_logit = np.log(ref_psi / (1 - ref_psi))
+
+                        # Initialize alpha for each non-reference group
+                        init_values = []
+                        non_ref_groups = sorted(set(group_codes_np) - {0})
+
+                        for g in non_ref_groups[:C-1]:  # Ensure we don't exceed C-1
+                            group_mask = (group_codes_np == g)
+                            if group_mask.sum() > 0:
+                                group_numer = y_obs_np[group_mask, :].sum(axis=0) + 0.5  # [T]
+                                group_denom = denom_np[group_mask, :].sum(axis=0) + 1.0   # [T]
+                                group_psi = np.clip(group_numer / group_denom, epsilon, 1 - epsilon)
+
+                                # Logit-scale difference: logit(PSI_group) - logit(PSI_ref)
+                                group_logit = np.log(group_psi / (1 - group_psi))
+                                init_values.append(group_logit - ref_logit)
+                            else:
+                                init_values.append(np.zeros(T_local, dtype=np.float32))
+
+                        init_arr = np.stack(init_values) if len(init_values) else np.zeros((0, T_local), dtype=np.float32)
+                        return torch.tensor(init_arr, dtype=torch.float32, device=self.model.device)
+
+                    else:
+                        return torch.zeros((C - 1, T_local), dtype=torch.float32, device=self.model.device)
+        
+                # Default for everything else
+                return init_to_median(site)
+        
+            pyro.clear_param_store()
+
+            # ---------------------------
+            # Guide choice with memory check
+            # ---------------------------
+            if distribution == 'multinomial':
+                # Softmax guide for probs_baseline_raw: avoids the stick-breaking gradient
+                # compression that caused AutoDelta to overshoot near the simplex boundary.
+                # We parameterise log-proportions in ℝ^K and apply softmax — gradients are
+                # uniform everywhere, no vanishing near p→1.
+                _zmask_guide  = self._multinomial_zero_cat_mask   # [T, K]  captured in closure
+                _log_p_init_g = self._multinomial_log_p_init      # [T, K]
+                _T_guide      = T_fit
+                _plate_name   = "feature_plate_technical"
+
+                # AutoNormal for alpha_logits_y (all sites except probs_baseline_raw)
+                _guide_alpha = AutoNormal(
+                    poutine.block(self._model_ntc, hide=["probs_baseline_raw"]),
+                    init_loc_fn=init_loc_fn,
+                )
+
+                def ntc_guide(*args, **kwargs):
+                    # ---- probs_baseline_raw: softmax-parameterised point estimate ----
+                    log_p = pyro.param("probs_baseline_logits", _log_p_init_g)  # [T, K]
+                    log_p_masked = log_p.masked_fill(_zmask_guide, -1e9)
+                    probs = torch.softmax(log_p_masked, dim=-1)                  # [T, K]
+                    # Clamp masked categories away from exact 0.0 (float32 underflow of
+                    # softmax(-1e9)).  xlogy(concentration-1, probs) backward = 0/0 = NaN
+                    # when concentration=1 (masked) and probs=0.  Any probs>0 gives finite
+                    # gradient = 0.  1e-30 >> float32 subnormal floor (~1.2e-38).
+                    probs = probs.clamp_min(1e-30)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                    with pyro.plate(_plate_name, _T_guide, dim=-1):
+                        pyro.sample("probs_baseline_raw", dist.Delta(probs, event_dim=1))
+                    # ---- everything else: AutoNormal ----
+                    _guide_alpha(*args, **kwargs)
+
+            elif distribution in ['binomial', 'normal', 'studentt']:
+                # Calmer guide for these distributions
                 ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
-        # Choose ELBO based on guide type
-        if isinstance(ntc_guide, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
-            # lower-variance estimator for mean-field Normal
-            elbo = pyro.infer.TraceMeanField_ELBO(num_particles=1)
-        else:
-            elbo = pyro.infer.Trace_ELBO(num_particles=1)   # you can bump num_particles later if needed
-
-        # Use OneCycleLR scheduler for stable convergence
-        from torch.optim.lr_scheduler import OneCycleLR
-        base_lr = lr
-
-        # OneCycleLR requires pct_start * total_steps > 1 to avoid ZeroDivisionError.
-        # With pct_start=0.1, minimum total_steps is 11 (0.1*11-1=0.1>0).
-        _pct_start = 0.1
-        _min_total_steps = int(1.0 / _pct_start) + 1  # = 11
-        _scheduler_total_steps = max(niters, _min_total_steps)
-
-        optimizer = pyro.optim.PyroLRScheduler(
-            scheduler_constructor=OneCycleLR,
-            optim_args={
-                # underlying torch optimizer
-                "optimizer": torch.optim.Adam,
-                "optim_args": {
-                    "lr": base_lr,      # initial lr (OneCycle will move it)
-                    "betas": (0.9, 0.999),
-                },
-                # OneCycleLR hyperparameters
-                "max_lr":          base_lr * 10,  # peak at 10x base_lr
-                "total_steps":     _scheduler_total_steps,
-                "pct_start":       _pct_start,    # 10% warmup
-                "div_factor":      25.0,          # initial_lr = max_lr/25
-                "final_div_factor": 1e4,          # final_lr = max_lr/1e4
-            },
-            clip_args={"clip_norm": 10.0},  # gradient clipping
-        )
-
-        svi = pyro.infer.SVI(self._model_ntc, ntc_guide, optimizer, loss=elbo)
-        if hasattr(ntc_guide, 'to'):
-            ntc_guide.to(self.model.device)
-    
-        # ---------------------------
-        # Optimize
-        # ---------------------------
-        import math
-        losses = []
-        smoothed_loss = None
-        for step in range(niters):
-            loss = svi.step(
-                N, T_fit, C,
-                groups_ntc_tensor,
-                y_obs_ntc_tensor,
-                sum_factor_ntc_tensor,
-                beta_o_alpha_tensor,
-                beta_o_beta_tensor,
-                mu_x_mean_tensor,
-                mu_x_sd_tensor,
-                epsilon_tensor,
-                distribution,
-                denominator_ntc_tensor,
-                K,
-                sigma_hat_tensor,
-                **_model_precomp,
-            )
-            losses.append(loss)
-            if step % 1000 == 0:
-                print(f"Step {step} : loss = {loss:.5e}, device: {mu_x_mean_tensor.device}")
-            # Detect NaN/Inf loss early and give an actionable message
-            if not math.isfinite(loss):
-                raise RuntimeError(
-                    f"fit_ntc: loss became {loss} at step {step}. "
-                    "This usually indicates numerical instability. Try: "
-                    "(1) lower learning rate (e.g. lr=1e-4), "
-                    "(2) check for extreme values in sum_factor, "
-                    "(3) reduce OneCycleLR peak (pass lr=3e-4 to use a smaller cycle)."
-                )
-            if smoothed_loss is None:
-                smoothed_loss = loss
             else:
-                smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
+                # AutoNormal (mean-field) is the default guide for negbinom/other
+                # distributions, regardless of device or dataset size -- it's robust
+                # across dataset sizes and sparsity levels. AutoIAFNormal (a single
+                # jointly-coupled autoregressive flow over ALL T features) is opt-in via
+                # force_iaf=True: it can give a more expressive posterior for small,
+                # deeply-sequenced datasets, but its shared network means one sparse
+                # gene's exploding gradient (near-zero mu_final -> huge d/dx log(x+eps)
+                # as x->0) can corrupt every other feature's parameters in a single step.
+                # A prior memory-based auto-selection (IAF whenever estimated memory fit
+                # the budget, which is almost always true at realistic gene counts)
+                # silently exposed every user to this failure mode without them asking
+                # for IAF or knowing the risk -- see docs/SIMULATION_STUDY_PLAN.md's
+                # fit_ntc NaN diagnosis for the full trace.
+                if distribution == 'negbinom':
+                    # log2_alpha_y: (C-1) × T_fit
+                    # o_y: T_fit
+                    # mu_ntc: T_fit
+                    n_latent = (C - 1 + 2) * T_fit
+                else:
+                    # Conservative estimate for unknown distributions
+                    n_latent = C * T_fit
 
-        # ---------------------------
-        # Predictive (optionally on CPU)
-        # ---------------------------
-        _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
-        run_on_cpu = self.model.device.type != "cpu"
-        if run_on_cpu:
-            if hasattr(ntc_guide, 'to'):
-                ntc_guide.to("cpu")
-            self.model.device = torch.device("cpu")
-    
-            model_inputs = {
-                "N": N, "T": T_fit, "C": C,
-                "groups_ntc_tensor": self._to_cpu(groups_ntc_tensor),
-                "y_obs_ntc_tensor": self._to_cpu(y_obs_ntc_tensor),
-                "sum_factor_ntc_tensor": self._to_cpu(sum_factor_ntc_tensor),
-                "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
-                "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
-                "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
-                "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
-                "epsilon_tensor": self._to_cpu(epsilon_tensor),
-                "distribution": distribution,
-                "denominator_ntc_tensor": self._to_cpu(denominator_ntc_tensor),
-                "K": K,
-                "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor),
-                **{k: self._to_cpu(v) for k, v in _model_precomp.items()},
-            }
-        else:
-            model_inputs = {
-                "N": N, "T": T_fit, "C": C,
-                "groups_ntc_tensor": groups_ntc_tensor,
-                "y_obs_ntc_tensor": y_obs_ntc_tensor,
-                "sum_factor_ntc_tensor": sum_factor_ntc_tensor,
-                "beta_o_alpha_tensor": beta_o_alpha_tensor,
-                "beta_o_beta_tensor": beta_o_beta_tensor,
-                "mu_x_mean_tensor": mu_x_mean_tensor,
-                "mu_x_sd_tensor": mu_x_sd_tensor,
-                "epsilon_tensor": epsilon_tensor,
-                "distribution": distribution,
-                "denominator_ntc_tensor": denominator_ntc_tensor,
-                "K": K,
-                "sigma_hat_tensor": sigma_hat_tensor,
-                **_model_precomp,
-            }
-    
-        if self.model.device.type == "cuda":
-            torch.cuda.empty_cache()
-        import gc; gc.collect()
+                # IAF memory estimate (rough approximation), informational only now that
+                # the choice is explicit rather than memory-driven:
+                # - Transformation matrices: n_latent × n_latent × 4 bytes (float32)
+                # - Hidden states: ~2× the matrix size
+                # - Safety margin: 1.5×
+                iaf_memory_gb = (n_latent ** 2 * 4 * 3 * 1.5) / 1e9
 
-        # ========================================
-        # AUTO-DETECT MEMORY AND SET MINIBATCH
-        # ========================================
-        minibatch_size, use_parallel = estimate_predictive_memory_and_set_minibatch(
-            N=N, T=T_fit, C=C, nsamples=nsamples,
-            minibatch_size=minibatch_size,
-            distribution=distribution
-        )
+                use_iaf = force_iaf
+                if use_iaf:
+                    if self.model.device.type == 'cuda':
+                        try:
+                            # torch is already imported at module level
+                            total_memory_gb = torch.cuda.get_device_properties(self.model.device).total_memory / 1e9
+                            # Reserve 10 GB for data, gradients, and other operations
+                            available_for_guide_gb = total_memory_gb - 10.0
+                            oom_note = (" — OOM risk if estimate is accurate"
+                                        if iaf_memory_gb >= available_for_guide_gb else "")
+                            print(f"[INFO] force_iaf=True: using AutoIAFNormal (estimated {iaf_memory_gb:.1f} GB, "
+                                  f"{available_for_guide_gb:.1f} GB available{oom_note})")
+                        except Exception as e:
+                            print(f"[WARNING] force_iaf=True but could not check VRAM ({e})")
+                    else:
+                        print(f"[INFO] force_iaf=True: using AutoIAFNormal ({n_latent} latent variables, "
+                              f"estimated {iaf_memory_gb:.1f} GB) on CPU")
+                else:
+                    print(f"[INFO] Using AutoNormal (default; pass force_iaf=True for AutoIAFNormal) "
+                          f"for {n_latent} latent variables")
+                    # Increase niters for AutoNormal if using default (AutoNormal needs more iterations)
+                    if niters_was_default and niters < 100_000:
+                        old_niters = niters
+                        niters = 100_000
+                        print(f"[INFO] Increasing niters from {old_niters:,} to {niters:,} for AutoNormal convergence")
 
-        # CRITICAL MEMORY OPTIMIZATION: Exclude observation predictions from posterior
-        # These are enormous ([S, N, T]) and redundant since we already have the data
-        # Default filter excludes: y_obs_ntc, y_obs (for any distribution)
-        def default_keep_sites(name, site):
-            # Exclude all observation-level predictions (huge memory waste)
-            if name in ('y_obs_ntc', 'y_obs', 'obs'):
-                return False
-            # Keep all parameter posteriors (small: alpha, mu, phi, sigma, etc.)
-            return True
+                if use_iaf:
+                    ntc_guide = AutoIAFNormal(self._model_ntc, init_loc_fn=init_loc_fn)
+                    # Initialize the guide by calling it once with the model
+                    with torch.no_grad():
+                        ntc_guide(
+                            N, T_fit, C,
+                            groups_ntc_tensor,
+                            y_obs_ntc_tensor,
+                            sum_factor_ntc_tensor,
+                            beta_o_alpha_tensor,
+                            beta_o_beta_tensor,
+                            mu_x_mean_tensor,
+                            mu_x_sd_tensor,
+                            epsilon_tensor,
+                            distribution,
+                            denominator_ntc_tensor,
+                            K,
+                            sigma_hat_tensor,
+                            **_model_precomp,
+                        )
+                    ntc_guide.to(self.model.device)
+                else:
+                    # Fallback to memory-efficient AutoNormal
+                    ntc_guide = AutoNormalMessenger(self._model_ntc, init_loc_fn=init_loc_fn)
 
-        keep_sites = kwargs.get("keep_sites", default_keep_sites)
+            # Choose ELBO based on guide type
+            if isinstance(ntc_guide, (infer.autoguide.AutoNormal, infer.autoguide.AutoNormalMessenger)):
+                # lower-variance estimator for mean-field Normal
+                elbo = pyro.infer.TraceMeanField_ELBO(num_particles=1)
+            else:
+                elbo = pyro.infer.Trace_ELBO(num_particles=1)   # you can bump num_particles later if needed
 
-        # CRITICAL: Skip observation sampling during Predictive
-        # During Predictive, posterior samples of alpha_y can be extreme due to heavy-tailed priors
-        # This causes NaN/Inf in likelihood evaluation
-        # We only need parameter posteriors (alpha, mu, phi), not observations
-        model_inputs_with_skip = model_inputs.copy()
-        model_inputs_with_skip['skip_obs_sampling'] = True
+            # Use OneCycleLR scheduler for stable convergence
+            from torch.optim.lr_scheduler import OneCycleLR
+            base_lr = lr
 
-        if minibatch_size is not None:
-            predictive_technical = pyro.infer.Predictive(
-                self._model_ntc, guide=ntc_guide, num_samples=minibatch_size,
-                parallel=use_parallel
+            # OneCycleLR requires pct_start * total_steps > 1 to avoid ZeroDivisionError.
+            # With pct_start=0.1, minimum total_steps is 11 (0.1*11-1=0.1>0).
+            _pct_start = 0.1
+            _min_total_steps = int(1.0 / _pct_start) + 1  # = 11
+            _scheduler_total_steps = max(niters, _min_total_steps)
+
+            optimizer = pyro.optim.PyroLRScheduler(
+                scheduler_constructor=OneCycleLR,
+                optim_args={
+                    # underlying torch optimizer
+                    "optimizer": torch.optim.Adam,
+                    "optim_args": {
+                        "lr": base_lr,      # initial lr (OneCycle will move it)
+                        "betas": (0.9, 0.999),
+                    },
+                    # OneCycleLR hyperparameters
+                    "max_lr":          base_lr * 10,  # peak at 10x base_lr
+                    "total_steps":     _scheduler_total_steps,
+                    "pct_start":       _pct_start,    # 10% warmup
+                    "div_factor":      25.0,          # initial_lr = max_lr/25
+                    "final_div_factor": 1e4,          # final_lr = max_lr/1e4
+                },
+                clip_args={"clip_norm": 10.0},  # gradient clipping
             )
 
-            # Run first batch to get shapes, then preallocate full tensors
-            posterior_samples = {}
-            batch_idx = 0
-            with torch.no_grad():
-                for i in range(0, nsamples, minibatch_size):
-                    current_batch_size = min(minibatch_size, nsamples - i)
+            svi = pyro.infer.SVI(self._model_ntc, ntc_guide, optimizer, loss=elbo)
+            if hasattr(ntc_guide, 'to'):
+                ntc_guide.to(self.model.device)
+    
+            # ---------------------------
+            # Optimize
+            # ---------------------------
+            import math
+            losses = []
+            smoothed_loss = None
+            for step in range(niters):
+                loss = svi.step(
+                    N, T_fit, C,
+                    groups_ntc_tensor,
+                    y_obs_ntc_tensor,
+                    sum_factor_ntc_tensor,
+                    beta_o_alpha_tensor,
+                    beta_o_beta_tensor,
+                    mu_x_mean_tensor,
+                    mu_x_sd_tensor,
+                    epsilon_tensor,
+                    distribution,
+                    denominator_ntc_tensor,
+                    K,
+                    sigma_hat_tensor,
+                    **_model_precomp,
+                )
+                losses.append(loss)
+                if step % 1000 == 0:
+                    print(f"Step {step} : loss = {loss:.5e}, device: {mu_x_mean_tensor.device}")
+                # Detect NaN/Inf loss early and give an actionable message
+                if not math.isfinite(loss):
+                    raise RuntimeError(
+                        f"fit_ntc: loss became {loss} at step {step}. "
+                        "This usually indicates numerical instability. Try: "
+                        "(1) lower learning rate (e.g. lr=1e-4), "
+                        "(2) check for extreme values in sum_factor, "
+                        "(3) reduce OneCycleLR peak (pass lr=3e-4 to use a smaller cycle)."
+                    )
+                if smoothed_loss is None:
+                    smoothed_loss = loss
+                else:
+                    smoothed_loss = alpha_ewma * loss + (1 - alpha_ewma) * smoothed_loss
 
-                    # Generate batch
-                    if current_batch_size < minibatch_size:
-                        # Last batch might be smaller
-                        predictive_batch = pyro.infer.Predictive(
-                            self._model_ntc, guide=ntc_guide, num_samples=current_batch_size,
-                            parallel=use_parallel
-                        )
-                        samples = predictive_batch(**model_inputs_with_skip)
-                    else:
-                        samples = predictive_technical(**model_inputs_with_skip)
+            # ---------------------------
+            # Predictive (optionally on CPU)
+            # ---------------------------
+            _original_device = self.model.device  # Save exact device (e.g. cuda:6) before any switch
+            run_on_cpu = self.model.device.type != "cpu"
+            if run_on_cpu:
+                if hasattr(ntc_guide, 'to'):
+                    ntc_guide.to("cpu")
+                self.model.device = torch.device("cpu")
+    
+                model_inputs = {
+                    "N": N, "T": T_fit, "C": C,
+                    "groups_ntc_tensor": self._to_cpu(groups_ntc_tensor),
+                    "y_obs_ntc_tensor": self._to_cpu(y_obs_ntc_tensor),
+                    "sum_factor_ntc_tensor": self._to_cpu(sum_factor_ntc_tensor),
+                    "beta_o_alpha_tensor": self._to_cpu(beta_o_alpha_tensor),
+                    "beta_o_beta_tensor": self._to_cpu(beta_o_beta_tensor),
+                    "mu_x_mean_tensor": self._to_cpu(mu_x_mean_tensor),
+                    "mu_x_sd_tensor": self._to_cpu(mu_x_sd_tensor),
+                    "epsilon_tensor": self._to_cpu(epsilon_tensor),
+                    "distribution": distribution,
+                    "denominator_ntc_tensor": self._to_cpu(denominator_ntc_tensor),
+                    "K": K,
+                    "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor),
+                    **{k: self._to_cpu(v) for k, v in _model_precomp.items()},
+                }
+            else:
+                model_inputs = {
+                    "N": N, "T": T_fit, "C": C,
+                    "groups_ntc_tensor": groups_ntc_tensor,
+                    "y_obs_ntc_tensor": y_obs_ntc_tensor,
+                    "sum_factor_ntc_tensor": sum_factor_ntc_tensor,
+                    "beta_o_alpha_tensor": beta_o_alpha_tensor,
+                    "beta_o_beta_tensor": beta_o_beta_tensor,
+                    "mu_x_mean_tensor": mu_x_mean_tensor,
+                    "mu_x_sd_tensor": mu_x_sd_tensor,
+                    "epsilon_tensor": epsilon_tensor,
+                    "distribution": distribution,
+                    "denominator_ntc_tensor": denominator_ntc_tensor,
+                    "K": K,
+                    "sigma_hat_tensor": sigma_hat_tensor,
+                    **_model_precomp,
+                }
+    
+            if self.model.device.type == "cuda":
+                torch.cuda.empty_cache()
+            import gc; gc.collect()
 
-                    # First batch: preallocate full tensors
-                    if batch_idx == 0:
-                        for k, v in samples.items():
-                            if keep_sites(k, {"value": v}):
-                                v_cpu = self._to_cpu(v)
-                                # Preallocate: [nsamples, ...] with same dtype/shape as v
-                                full_shape = (nsamples,) + v_cpu.shape[1:]
-                                posterior_samples[k] = torch.empty(full_shape, dtype=v_cpu.dtype)
-                                # Fill first batch
-                                posterior_samples[k][:current_batch_size] = v_cpu
-                    else:
-                        # Subsequent batches: fill in-place
-                        start_idx = i
-                        end_idx = i + current_batch_size
-                        for k, v in samples.items():
-                            if k in posterior_samples:
-                                posterior_samples[k][start_idx:end_idx] = self._to_cpu(v)
+            # ========================================
+            # AUTO-DETECT MEMORY AND SET MINIBATCH
+            # ========================================
+            minibatch_size, use_parallel = estimate_predictive_memory_and_set_minibatch(
+                N=N, T=T_fit, C=C, nsamples=nsamples,
+                minibatch_size=minibatch_size,
+                distribution=distribution
+            )
 
-                    batch_idx += 1
+            # CRITICAL MEMORY OPTIMIZATION: Exclude observation predictions from posterior
+            # These are enormous ([S, N, T]) and redundant since we already have the data
+            # Default filter excludes: y_obs_ntc, y_obs (for any distribution)
+            def default_keep_sites(name, site):
+                # Exclude all observation-level predictions (huge memory waste)
+                if name in ('y_obs_ntc', 'y_obs', 'obs'):
+                    return False
+                # Keep all parameter posteriors (small: alpha, mu, phi, sigma, etc.)
+                return True
 
-                    # Clean up after each batch
-                    del samples
+            keep_sites = kwargs.get("keep_sites", default_keep_sites)
+
+            # CRITICAL: Skip observation sampling during Predictive
+            # During Predictive, posterior samples of alpha_y can be extreme due to heavy-tailed priors
+            # This causes NaN/Inf in likelihood evaluation
+            # We only need parameter posteriors (alpha, mu, phi), not observations
+            model_inputs_with_skip = model_inputs.copy()
+            model_inputs_with_skip['skip_obs_sampling'] = True
+
+            if minibatch_size is not None:
+                predictive_technical = pyro.infer.Predictive(
+                    self._model_ntc, guide=ntc_guide, num_samples=minibatch_size,
+                    parallel=use_parallel
+                )
+
+                # Run first batch to get shapes, then preallocate full tensors
+                posterior_samples = {}
+                batch_idx = 0
+                with torch.no_grad():
+                    for i in range(0, nsamples, minibatch_size):
+                        current_batch_size = min(minibatch_size, nsamples - i)
+
+                        # Generate batch
+                        if current_batch_size < minibatch_size:
+                            # Last batch might be smaller
+                            predictive_batch = pyro.infer.Predictive(
+                                self._model_ntc, guide=ntc_guide, num_samples=current_batch_size,
+                                parallel=use_parallel
+                            )
+                            samples = predictive_batch(**model_inputs_with_skip)
+                        else:
+                            samples = predictive_technical(**model_inputs_with_skip)
+
+                        # First batch: preallocate full tensors
+                        if batch_idx == 0:
+                            for k, v in samples.items():
+                                if keep_sites(k, {"value": v}):
+                                    v_cpu = self._to_cpu(v)
+                                    # Preallocate: [nsamples, ...] with same dtype/shape as v
+                                    full_shape = (nsamples,) + v_cpu.shape[1:]
+                                    posterior_samples[k] = torch.empty(full_shape, dtype=v_cpu.dtype)
+                                    # Fill first batch
+                                    posterior_samples[k][:current_batch_size] = v_cpu
+                        else:
+                            # Subsequent batches: fill in-place
+                            start_idx = i
+                            end_idx = i + current_batch_size
+                            for k, v in samples.items():
+                                if k in posterior_samples:
+                                    posterior_samples[k][start_idx:end_idx] = self._to_cpu(v)
+
+                        batch_idx += 1
+
+                        # Clean up after each batch
+                        del samples
+                        if self.model.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        gc.collect()
+            else:
+                predictive_technical = pyro.infer.Predictive(
+                    self._model_ntc, guide=ntc_guide, num_samples=nsamples,
+                    parallel=use_parallel
+                )
+                with torch.no_grad():
+                    posterior_samples = predictive_technical(**model_inputs_with_skip)
                     if self.model.device.type == "cuda":
                         torch.cuda.empty_cache()
                     gc.collect()
-        else:
-            predictive_technical = pyro.infer.Predictive(
-                self._model_ntc, guide=ntc_guide, num_samples=nsamples,
-                parallel=use_parallel
-            )
-            with torch.no_grad():
-                posterior_samples = predictive_technical(**model_inputs_with_skip)
-                if self.model.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
     
-        if run_on_cpu:
-            self.model.device = _original_device  # Restore exact original device (not generic "cuda")
+            if run_on_cpu:
+                self.model.device = _original_device  # Restore exact original device (not generic "cuda")
     
         for k, v in posterior_samples.items():
             posterior_samples[k] = v.cpu()
