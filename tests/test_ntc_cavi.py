@@ -65,3 +65,57 @@ def test_cavi_recovers_parameters():
     # intervals roughly calibrated (loose bound for a small simulation)
     z = np.abs(err_a) / r["log2_alpha_sd"]
     assert 0.75 < np.mean(z < 1.6449) <= 1.0
+
+
+def test_fit_ntc_method_cavi_end_to_end(tmp_path):
+    """fit_ntc(method='cavi') stores SVI-shaped results that fit_cis and fit_trans can use."""
+    import pandas as pd
+    from bayesDREAM import bayesDREAM
+
+    rng = np.random.default_rng(3)
+    n_cells, n_genes = 120, 12
+    target = np.where(np.arange(n_cells) < 60, "ntc", "GFI1B")
+    meta = pd.DataFrame({
+        "cell": [f"c{i}" for i in range(n_cells)],
+        "guide": np.where(target == "ntc", "ntc_1", np.where(np.arange(n_cells) % 2, "g1", "g2")),
+        "target": target,
+        "cell_line": np.tile(["A", "B"], n_cells // 2),
+        "sum_factor": rng.uniform(0.8, 1.2, n_cells),
+    })
+    genes = ["GFI1B"] + [f"gene_{i}" for i in range(n_genes - 1)]
+    counts = pd.DataFrame(rng.poisson(30, (n_genes, n_cells)), index=genes, columns=meta["cell"])
+    model = bayesDREAM(meta=meta, counts=counts, cis_gene="GFI1B", output_dir=str(tmp_path),
+                       label="cavi_e2e", device="cpu")
+    model.set_technical_groups(["cell_line"])
+    model.fit_ntc(sum_factor_col="sum_factor", nsamples=50, method="cavi")
+
+    gene_mod = model.get_modality("gene")
+    ps = gene_mod.posterior_samples_ntc
+    T = gene_mod.dims["n_features"]
+    assert ps["log2_alpha_y"].shape == (50, 1, T)
+    assert ps["mu_ntc"].shape == (50, 1, T)
+    assert ps["o_y"].shape == (50, 1, T)
+    assert gene_mod.alpha_y_prefit_mult.shape == (2, T)
+    assert model.alpha_x_prefit is not None
+    assert torch.isfinite(gene_mod.alpha_y_prefit_mult).all()
+
+    model.fit_cis(sum_factor_col="sum_factor", niters=50, nsamples=10)
+    model.fit_trans(sum_factor_col="sum_factor", function_type="single_hill", niters=20, nsamples=10)
+    assert gene_mod.posterior_samples_trans is not None
+
+
+def test_fit_ntc_method_cavi_rejects_other_distributions(tmp_path):
+    import pandas as pd
+    from bayesDREAM import bayesDREAM
+
+    meta = pd.DataFrame({"cell": ["a", "b", "c", "d"], "guide": ["n", "n", "g", "g"],
+                         "target": ["ntc", "ntc", "X", "X"], "cell_line": ["A"] * 4,
+                         "sum_factor": [1.0] * 4})
+    counts = pd.DataFrame([[1, 2, 3, 4], [5, 1, 2, 7]], index=["X", "Y"], columns=meta["cell"])
+    model = bayesDREAM(meta=meta, counts=counts, cis_gene="X", output_dir=str(tmp_path),
+                       label="cavi_reject", device="cpu")
+    model.set_technical_groups(["cell_line"])
+    with pytest.raises((NotImplementedError, ValueError)):
+        model.fit_ntc(distribution="normal", method="cavi")
+    with pytest.raises(ValueError):
+        model.fit_ntc(method="nuts")

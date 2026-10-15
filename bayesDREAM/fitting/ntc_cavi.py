@@ -105,6 +105,119 @@ def _exact_newton_terms(y, groups, Xg, G, log_s, m, log_phi, prior_diag, m0, bet
     return grad, H
 
 
+def _cavi_chunk(y, groups, log_s, C, beta_o, m0, prior_prec_mu, s_alpha, nu,
+                max_iter, tol, phi_every, phi_newton_steps, gh, newton_polish_steps,
+                init=None):
+    """CAVI + Newton polish + Laplace for one chunk of features, with beta_o held fixed."""
+    device, dtype = y.device, y.dtype
+    N, T = y.shape
+    gh_x, gh_w = gh
+    Xg = torch.eye(C, device=device, dtype=dtype)
+    Xg[:, 0] = 1.0
+    G = torch.nn.functional.one_hot(groups, C).to(dtype)  # [N, C]
+    X = Xg[groups]                                          # [N, C]
+
+    if init is None:
+        m = m0.clone()
+        ybar, var = y.mean(0), y.var(0)
+        log_phi = torch.log((ybar ** 2 / (var - ybar).clamp_min(1e-3 * ybar.clamp_min(1e-3))).clamp(0.05, 1e3))
+    else:
+        m, log_phi = init[0].clone(), init[1].clone()
+    V = torch.diag_embed(torch.full((T, C), 0.01, device=device, dtype=dtype))
+    E_tau = torch.ones(T, max(C - 1, 1), device=device, dtype=dtype)
+    prior_diag = torch.empty(T, C, device=device, dtype=dtype)
+    prior_diag[:, 0] = prior_prec_mu
+
+    def psi_var():
+        # x_c' V_t x_c per group, then per cell: [N, T]
+        return torch.einsum('cd,tde,ce->ct', Xg, V, Xg).clamp_min(0.0)[groups]
+
+    def expected_loglik(log_phi_, mean_wo_phi, var_):
+        """E_q[log NB(y | psi, phi)] summed over cells, as a function of log phi [T]."""
+        phi = torch.exp(log_phi_)
+        psi_mean = mean_wo_phi - log_phi_.unsqueeze(0)
+        nodes = psi_mean.unsqueeze(-1) + torch.sqrt(var_).unsqueeze(-1) * gh_x  # [N, T, Q]
+        e_softplus = (torch.nn.functional.softplus(nodes) * gh_w).sum(-1)
+        ll = (torch.lgamma(y + phi) - torch.lgamma(phi) + y * psi_mean - (y + phi) * e_softplus)
+        return ll.sum(0)  # [T]
+
+    def log_prior_logphi(log_phi_):
+        o = torch.exp(-0.5 * log_phi_)
+        return -beta_o * o + torch.log(o)
+
+    converged = False
+    for it in range(1, max_iter + 1):
+        m_old = m.clone()
+        phi = torch.exp(log_phi)
+
+        # ---- q(omega): E[omega] = (y + phi) / (2c) tanh(c / 2) ----
+        mean_wo_phi = X @ m.T + log_s                                  # [N, T]
+        psi_mean = mean_wo_phi - log_phi.unsqueeze(0)
+        c = torch.sqrt(psi_mean ** 2 + psi_var())
+        b = y + phi.unsqueeze(0)
+        E_omega = torch.where(c < 1e-4, b / 4.0, b / (2.0 * c.clamp_min(1e-12)) * torch.tanh(c / 2.0))
+
+        # ---- q(theta): Gaussian, batched over features ----
+        kappa = (y - phi.unsqueeze(0)) / 2.0
+        offset = log_s - log_phi.unsqueeze(0)                          # [N, T]
+        P = torch.einsum('cd,ct,ce->tde', Xg, G.T @ E_omega, Xg)        # [T, C, C]
+        if C > 1:
+            prior_diag[:, 1:] = E_tau / s_alpha ** 2
+        P = P + torch.diag_embed(prior_diag)
+        rhs = (X.T @ (kappa - E_omega * offset)).T + prior_diag * m0   # [T, C]
+        L = torch.linalg.cholesky(P)
+        m = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)
+        V = torch.cholesky_inverse(L)
+
+        # ---- q(tau): Student-t scale mixture ----
+        if C > 1:
+            E_beta2 = m[:, 1:] ** 2 + torch.diagonal(V, dim1=-2, dim2=-1)[:, 1:]
+            E_tau = (nu + 1.0) / (nu + E_beta2 / s_alpha ** 2)
+
+        # ---- phi: Newton steps on log phi, separable across features ----
+        if it % phi_every == 1 or phi_every == 1:
+            mean_wo_phi = X @ m.T + log_s
+            var_now = psi_var()
+            for _ in range(phi_newton_steps):
+                lp = log_phi.detach().clone().requires_grad_(True)
+                f = expected_loglik(lp, mean_wo_phi, var_now) + log_prior_logphi(lp)
+                g, = torch.autograd.grad(f.sum(), lp, create_graph=True)
+                h, = torch.autograd.grad(g.sum(), lp)
+                g = g.detach()
+                step = torch.where(h < 0, -g / h, 0.1 * torch.sign(g))
+                log_phi = (log_phi + step.clamp(-1.0, 1.0)).clamp(-8.0, 12.0).detach()
+
+        if (m - m_old).abs().max().item() < tol:
+            converged = True
+            break
+
+    # ---- Newton polish to the exact mode, then Laplace covariance ----
+    # The PG bound at convergence is the Jaakkola-Jordan tangent bound, whose curvature
+    # (y + phi) tanh(psi/2) / (2 psi) exceeds the true (y + phi) sigma(psi)(1 - sigma(psi))
+    # away from psi = 0. The CAVI means are good, but V is too narrow. Replace it by the
+    # inverse negative Hessian of the exact log posterior in (theta, log phi) at the mode.
+    for _ in range(newton_polish_steps):
+        grad, H = _exact_newton_terms(y, groups, Xg, G, log_s, m, log_phi, prior_diag, m0, beta_o, C)
+        step = torch.linalg.solve(H, grad.unsqueeze(-1)).squeeze(-1)
+        step = step * (1.0 / step.abs().amax(-1, keepdim=True).clamp_min(1.0))  # cap at 1 per feature
+        m = m + step[:, :C]
+        log_phi = (log_phi + step[:, C]).clamp(-8.0, 12.0)
+    grad, H = _exact_newton_terms(y, groups, Xg, G, log_s, m, log_phi, prior_diag, m0, beta_o, C)
+    # Features whose joint Hessian is not positive definite are those where log phi runs to
+    # its upper bound (no detectable overdispersion, Poisson-like). For them, decouple log phi
+    # and give it a fixed SD of 1; the theta block (always positive definite) is kept.
+    _, info = torch.linalg.cholesky_ex(H)
+    bad = info > 0
+    if bad.any():
+        H[bad, C, :C] = 0.0
+        H[bad, :C, C] = 0.0
+        H[bad, C, C] = 1.0
+    cov_full = torch.cholesky_inverse(torch.linalg.cholesky(H))
+    return dict(m=m, log_phi=log_phi, cov_full=cov_full, n_iter=it, converged=converged,
+                max_abs_grad=float(grad[~bad].abs().max()) if (~bad).any() else 0.0,
+                n_phi_boundary=int(bad.sum()))
+
+
 def fit_ntc_negbinom_cavi(
     y,
     groups,
@@ -121,6 +234,8 @@ def fit_ntc_negbinom_cavi(
     phi_newton_steps=2,
     n_quadrature=10,
     newton_polish_steps=5,
+    beta_o_passes=2,
+    max_chunk_bytes=1e9,
     device=None,
     dtype=torch.float64,
     verbose=True,
@@ -128,9 +243,14 @@ def fit_ntc_negbinom_cavi(
     """
     Fit the negative binomial NTC model by Polya-Gamma CAVI.
 
+    Features are independent given beta_o, so they are fitted in chunks that keep the
+    largest working array ([N, chunk, n_quadrature] in dtype) below max_chunk_bytes.
+    beta_o is held fixed within a pass and updated to its conditional mode between passes;
+    later passes are warm-started.
+
     Parameters
     ----------
-    y : array-like, shape [N, T]
+    y : array-like or tensor, shape [N, T]
         Counts for NTC cells.
     groups : array-like of int, shape [N]
         Technical group code per cell, 0 .. C-1; group 0 is the reference.
@@ -145,13 +265,17 @@ def fit_ntc_negbinom_cavi(
     beta_o_alpha, beta_o_beta : float
         Gamma hyperprior on beta_o (same defaults as fit_ntc).
     max_iter, tol : int, float
-        Stop when the largest change in m (natural-log units) falls below tol.
+        Stop a chunk when the largest change in m (natural-log units) falls below tol.
     phi_every, phi_newton_steps, n_quadrature : int
         Update log phi every phi_every iterations with this many Newton steps, using
         Gauss-Hermite quadrature with n_quadrature nodes for E_q[log(1 + exp(psi))].
     newton_polish_steps : int
         Newton steps on the exact log posterior from the CAVI solution before the Laplace
         covariance is computed (0 keeps the CAVI means).
+    beta_o_passes : int
+        Number of passes over all features; beta_o is updated between passes.
+    max_chunk_bytes : float
+        Memory budget for the largest working array per chunk.
 
     Returns
     -------
@@ -159,171 +283,86 @@ def fit_ntc_negbinom_cavi(
         log_mu_mean, log_mu_sd               [T]      natural log of mu_t
         log2_alpha_mean, log2_alpha_sd       [C-1, T] log2 a_ct for c >= 1
         theta_mean [T, C], theta_cov [T, C, C]        natural-log scale
-        log_phi_mean, log_phi_sd             [T]      Laplace approximation on log phi_t
-        phi, o_y                             [T]      point values at the mode
-        beta_o, n_iter, converged, time_s
+        z_mean [T, C+1], z_cov [T, C+1, C+1]          joint (theta, log phi) Laplace approximation
+        log_phi_mean, log_phi_sd             [T]
+        phi, o_y                             [T]      values at the mode
+        beta_o, n_iter (max over chunks), converged (all chunks), time_s
+        n_phi_boundary: features with log phi at its upper bound (no detectable
+            overdispersion); their log phi is decoupled in the Laplace step with SD 1
     """
     t0 = time.time()
     if device is None:
         device = torch.device("cpu")
-    y = torch.as_tensor(np.asarray(y), device=device, dtype=dtype)
-    groups = torch.as_tensor(np.asarray(groups), device=device, dtype=torch.long)
-    s = torch.as_tensor(np.asarray(sum_factor), device=device, dtype=dtype)
-    N, T = y.shape
+    y_all = torch.as_tensor(y).to(device=device, dtype=dtype) if torch.is_tensor(y) \
+        else torch.as_tensor(np.asarray(y), device=device, dtype=dtype)
+    groups = torch.as_tensor(np.asarray(groups.cpu() if torch.is_tensor(groups) else groups),
+                             device=device, dtype=torch.long)
+    s = torch.as_tensor(np.asarray(sum_factor.cpu() if torch.is_tensor(sum_factor) else sum_factor),
+                        device=device, dtype=dtype)
+    N, T = y_all.shape
     C = int(groups.max().item()) + 1 if n_groups is None else int(n_groups)
-
-    # Design: intercept + one indicator per non-reference group, X [N, C]
-    X = torch.zeros(N, C, device=device, dtype=dtype)
-    X[:, 0] = 1.0
-    if C > 1:
-        X[torch.arange(N, device=device), groups] = 1.0  # column 0 doubles as group 0
-    # Design row of each group, Xg [C, C]: a cell's row depends only on its group,
-    # so every per-cell quadratic form is computed per group and then indexed.
-    Xg = torch.eye(C, device=device, dtype=dtype)
-    Xg[:, 0] = 1.0
-    G = torch.nn.functional.one_hot(groups, C).to(dtype)  # [N, C]
-
     log_s = torch.log(s).unsqueeze(-1)  # [N, 1]
 
-    # ---------------- priors ----------------
-    y_norm_mean = (y / s.unsqueeze(-1)).mean(0).clamp_min(1e-3)
-    m0 = torch.zeros(T, C, device=device, dtype=dtype)
-    m0[:, 0] = torch.log(y_norm_mean)
     s_alpha = alpha_prior_scale_log2 * math.log(2.0)  # natural-log scale of the t prior
-    nu = alpha_prior_df
     prior_prec_mu = 1.0 / log_mu_prior_scale ** 2
+    gh = _gauss_hermite(n_quadrature, device, dtype)
+    bytes_per = torch.finfo(dtype).bits // 8
+    chunk = int(max(1, min(T, max_chunk_bytes // (N * n_quadrature * bytes_per))))
+    starts = list(range(0, T, chunk))
 
-    # ---------------- initial values ----------------
-    m = m0.clone()
-    V = torch.diag_embed(torch.full((T, C), 0.01, device=device, dtype=dtype))
-    E_tau = torch.ones(T, max(C - 1, 1), device=device, dtype=dtype)
-    ybar = y.mean(0)
-    var = y.var(0)
-    log_phi = torch.log((ybar ** 2 / (var - ybar).clamp_min(1e-3 * ybar.clamp_min(1e-3))).clamp(0.05, 1e3))
+    m_all = torch.zeros(T, C, device=device, dtype=dtype)
+    log_phi_all = torch.zeros(T, device=device, dtype=dtype)
+    cov_all = torch.zeros(T, C + 1, C + 1, device=device, dtype=dtype)
     beta_o = torch.tensor(beta_o_alpha / beta_o_beta, device=device, dtype=dtype)
-    gh_x, gh_w = _gauss_hermite(n_quadrature, device, dtype)
+    n_iter, converged, max_grad, n_phi_boundary = 0, True, 0.0, 0
 
-    def psi_var():
-        # x_c' V_t x_c per group, then per cell: [N, T]
-        v = torch.einsum('cd,tde,ce->ct', Xg, V, Xg).clamp_min(0.0)
-        return v[groups]
-
-    def expected_loglik(log_phi_, mean_wo_phi, var_):
-        """E_q[log NB(y | psi, phi)] summed over cells, as a function of log phi [T]."""
-        phi = torch.exp(log_phi_)
-        psi_mean = mean_wo_phi - log_phi_.unsqueeze(0)
-        sd = torch.sqrt(var_)
-        nodes = psi_mean.unsqueeze(-1) + sd.unsqueeze(-1) * gh_x  # [N, T, Q]
-        e_softplus = (torch.nn.functional.softplus(nodes) * gh_w).sum(-1)
-        ll = (torch.lgamma(y + phi) - torch.lgamma(phi) - torch.lgamma(y + 1.0)
-              + y * psi_mean - (y + phi) * e_softplus)
-        return ll.sum(0)  # [T]
-
-    def log_prior_logphi(log_phi_, beta_o_):
-        o = torch.exp(-0.5 * log_phi_)
-        return torch.log(beta_o_) - beta_o_ * o + torch.log(o) - math.log(2.0)
-
-    converged = False
-    for it in range(1, max_iter + 1):
-        m_old = m.clone()
-        phi = torch.exp(log_phi)
-
-        # ---- q(omega): E[omega] = (y + phi) / (2c) tanh(c / 2) ----
-        mean_wo_phi = X @ m.T + log_s                                  # [N, T]
-        var_now = psi_var()
-        psi_mean = mean_wo_phi - log_phi.unsqueeze(0)
-        c = torch.sqrt(psi_mean ** 2 + var_now)
-        b = y + phi.unsqueeze(0)
-        small = c < 1e-4
-        E_omega = torch.where(small, b / 4.0, b / (2.0 * c.clamp_min(1e-12)) * torch.tanh(c / 2.0))
-
-        # ---- q(theta): Gaussian, batched over features ----
-        kappa = (y - phi.unsqueeze(0)) / 2.0
-        offset = log_s - log_phi.unsqueeze(0)                          # [N, T]
-        W = G.T @ E_omega                                               # [C, T]
-        P = torch.einsum('cd,ct,ce->tde', Xg, W, Xg)                     # [T, C, C]
-        prior_diag = torch.empty(T, C, device=device, dtype=dtype)
-        prior_diag[:, 0] = prior_prec_mu
-        if C > 1:
-            prior_diag[:, 1:] = E_tau / s_alpha ** 2
-        P = P + torch.diag_embed(prior_diag)
-        rhs = X.T @ (kappa - E_omega * offset)                          # [C, T]
-        rhs = rhs.T + prior_diag * m0                                   # [T, C]
-        L = torch.linalg.cholesky(P)
-        m = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)
-        V = torch.cholesky_inverse(L)
-
-        # ---- q(tau): Student-t scale mixture ----
-        if C > 1:
-            E_beta2 = m[:, 1:] ** 2 + torch.diagonal(V, dim1=-2, dim2=-1)[:, 1:]
-            E_tau = (nu + 1.0) / (nu + E_beta2 / s_alpha ** 2)
-
-        # ---- phi: Newton steps on log phi, separable across features ----
-        mean_wo_phi = X @ m.T + log_s
-        var_now = psi_var()
-        for _ in range(phi_newton_steps if (it % phi_every == 1 or phi_every == 1) else 0):
-            lp = log_phi.detach().clone().requires_grad_(True)
-            f = expected_loglik(lp, mean_wo_phi, var_now) + log_prior_logphi(lp, beta_o)
-            g, = torch.autograd.grad(f.sum(), lp, create_graph=True)
-            h, = torch.autograd.grad(g.sum(), lp)
-            g = g.detach()
-            step = torch.where(h < 0, -g / h, 0.1 * torch.sign(g))
-            log_phi = (log_phi + step.clamp(-1.0, 1.0)).clamp(-8.0, 12.0).detach()
-
-        # ---- beta_o: conditional mode under Gamma(beta_o_alpha, beta_o_beta) ----
-        o = torch.exp(-0.5 * log_phi)
-        beta_o = (beta_o_alpha - 1.0 + T) / (beta_o_beta + o.sum())
-
-        delta = (m - m_old).abs().max().item()
-        if verbose and (it == 1 or it % 25 == 0):
-            print(f"[CAVI] iter {it}: max |delta m| = {delta:.2e}")
-        if delta < tol:
-            converged = True
-            break
-
-    # ---- Laplace correction of the covariance ----
-    # The PG bound at convergence is the Jaakkola-Jordan tangent bound, whose curvature
-    # (y + phi) tanh(psi/2) / (2 psi) exceeds the true (y + phi) sigma(psi)(1 - sigma(psi))
-    # away from psi = 0. The CAVI means are good, but V is too narrow. Replace it by the
-    # inverse negative Hessian of the exact log posterior in (theta, log phi) at the mode.
-    V_cavi = V
-    m_cavi = m.clone()
-    # A few Newton steps from the CAVI solution to the exact posterior mode, then Laplace there.
-    for _ in range(newton_polish_steps):
-        grad, H = _exact_newton_terms(y, groups, Xg, G, log_s, m, log_phi, prior_diag, m0, beta_o, C)
-        step = torch.linalg.solve(H, grad.unsqueeze(-1)).squeeze(-1)
-        step = step * (1.0 / step.abs().amax(-1, keepdim=True).clamp_min(1.0))  # cap at 1 per feature
-        m = m + step[:, :C]
-        log_phi = (log_phi + step[:, C]).clamp(-8.0, 12.0)
-    grad, H = _exact_newton_terms(y, groups, Xg, G, log_s, m, log_phi, prior_diag, m0, beta_o, C)
-    try:
-        cov_full = torch.cholesky_inverse(torch.linalg.cholesky(H))
-    except RuntimeError:
-        cov_full = torch.linalg.inv(H)
-    V = cov_full[:, :C, :C]
-    log_phi_sd = torch.sqrt(cov_full[:, C, C].clamp_min(1e-12))
+    for p in range(max(1, beta_o_passes)):
+        for a in starts:
+            b = min(T, a + chunk)
+            y_c = y_all[:, a:b]
+            m0 = torch.zeros(b - a, C, device=device, dtype=dtype)
+            m0[:, 0] = torch.log((y_c / s.unsqueeze(-1)).mean(0).clamp_min(1e-3))
+            init = None if p == 0 else (m_all[a:b], log_phi_all[a:b])
+            r = _cavi_chunk(y_c, groups, log_s, C, beta_o, m0, prior_prec_mu, s_alpha,
+                            alpha_prior_df, max_iter, tol, phi_every, phi_newton_steps, gh,
+                            newton_polish_steps, init=init)
+            m_all[a:b], log_phi_all[a:b], cov_all[a:b] = r["m"], r["log_phi"], r["cov_full"]
+            if p == max(1, beta_o_passes) - 1:
+                n_iter = max(n_iter, r["n_iter"])
+                converged = converged and r["converged"]
+                max_grad = max(max_grad, r["max_abs_grad"])
+                n_phi_boundary += r["n_phi_boundary"]
+        # beta_o: conditional mode under Gamma(beta_o_alpha, beta_o_beta)
+        if p < max(1, beta_o_passes) - 1:
+            o = torch.exp(-0.5 * log_phi_all)
+            beta_o = (beta_o_alpha - 1.0 + T) / (beta_o_beta + o.sum())
+        if verbose:
+            print(f"[CAVI] pass {p + 1}: {len(starts)} chunk(s) of up to {chunk} features, "
+                  f"beta_o = {float(beta_o):.3f}")
 
     ln2 = math.log(2.0)
+    V = cov_all[:, :C, :C]
     sd = torch.sqrt(torch.diagonal(V, dim1=-2, dim2=-1))
     out = {
-        "theta_mean": m.cpu().numpy(),
+        "theta_mean": m_all.cpu().numpy(),
         "theta_cov": V.cpu().numpy(),
-        "theta_mean_cavi": m_cavi.cpu().numpy(),
-        "theta_cov_cavi": V_cavi.cpu().numpy(),
-        "max_abs_grad": float(grad.abs().max()),
-        "log_mu_mean": m[:, 0].cpu().numpy(),
+        "z_mean": torch.cat([m_all, log_phi_all.unsqueeze(-1)], -1).cpu().numpy(),
+        "z_cov": cov_all.cpu().numpy(),
+        "max_abs_grad": max_grad,
+        "log_mu_mean": m_all[:, 0].cpu().numpy(),
         "log_mu_sd": sd[:, 0].cpu().numpy(),
-        "log2_alpha_mean": (m[:, 1:].T / ln2).cpu().numpy(),
+        "log2_alpha_mean": (m_all[:, 1:].T / ln2).cpu().numpy(),
         "log2_alpha_sd": (sd[:, 1:].T / ln2).cpu().numpy(),
-        "log_phi_mean": log_phi.cpu().numpy(),
-        "log_phi_sd": log_phi_sd.detach().cpu().numpy(),
-        "phi": torch.exp(log_phi).cpu().numpy(),
-        "o_y": torch.exp(-0.5 * log_phi).cpu().numpy(),
+        "log_phi_mean": log_phi_all.cpu().numpy(),
+        "log_phi_sd": torch.sqrt(cov_all[:, C, C].clamp_min(1e-12)).cpu().numpy(),
+        "phi": torch.exp(log_phi_all).cpu().numpy(),
+        "o_y": torch.exp(-0.5 * log_phi_all).cpu().numpy(),
         "beta_o": float(beta_o),
-        "n_iter": it,
+        "n_phi_boundary": n_phi_boundary,
+        "n_iter": n_iter,
         "converged": converged,
         "time_s": time.time() - t0,
     }
     if verbose:
-        print(f"[CAVI] {'converged' if converged else 'stopped'} after {it} iterations, {out['time_s']:.1f} s")
+        print(f"[CAVI] {'converged' if converged else 'stopped'}; {out['time_s']:.1f} s")
     return out

@@ -1,7 +1,17 @@
-# Pólya-Gamma CAVI for the negative binomial NTC model (prototype)
+# Pólya-Gamma CAVI for the negative binomial NTC model
 
-`bayesDREAM/fitting/ntc_cavi.py` fits the negbinom NTC model without SVI. It is standalone
-for now and is not called by `fit_ntc`.
+`bayesDREAM/fitting/ntc_cavi.py` fits the negbinom NTC model without SVI. Use it through
+
+```python
+model.fit_ntc(sum_factor_col='sum_factor', method='cavi')
+```
+
+The fit draws posterior samples from the Gaussian approximation in (log mu, log a, log phi)
+and stores them with the same keys and shapes as the SVI path (`log2_alpha_y`,
+`alpha_y_mul`, `delta_y_add`, `mu_ntc`, `o_y`, `beta_o`). Feature reconstruction, cis-gene
+extraction, `alpha_y_prefit_*`, saving and the later fits are therefore unchanged.
+`lr`, `niters`, `minibatch_size` and `force_iaf` are ignored. Extra options go in
+`cavi_options` (for example `tol`, `max_chunk_bytes`, `log_mu_prior_scale`).
 
 ## Model
 
@@ -26,6 +36,20 @@ For feature t and NTC cell i in technical group c(i), with c = 0 as the referenc
    whose curvature exceeds the true curvature away from psi = 0, so the CAVI covariance
    alone is too narrow. Without the correction, 90 % intervals covered about 75 %.
 
+## Memory and chunking
+
+Features are independent given beta_o. They are fitted in chunks that keep the largest
+working array ([cells, chunk, quadrature nodes] in float64) below `max_chunk_bytes`
+(default 1 GB). beta_o is held fixed within a pass and updated between passes
+(`beta_o_passes`, default 2); later passes are warm-started.
+
+## Features without detectable overdispersion
+
+For Poisson-like features, log phi runs to its upper bound (12), and the joint Hessian is
+not positive definite there. For those features log phi is decoupled in the Laplace step
+and given SD 1; the (log mu, log a) block is unaffected. `fit_ntc` reports how many such
+features there are.
+
 ## Benchmark
 
 `examples/diagnostics/benchmark_ntc_cavi.py` simulates 2000 NTC cells, 200 genes and
@@ -48,4 +72,5 @@ log mu and 0.91 for log phi, with RMSE 0.105, 0.050 and 0.43.
 
 - negbinom only; the other distributions still use SVI.
 - phi has a point estimate plus a Laplace interval, not a full variational factor.
-- Not yet wired into `fit_ntc`, and the output is not in the `posterior_samples_ntc` format.
+- The prior on log mu differs from the SVI model: Normal(log normalised mean, 2^2) rather
+  than the data-driven LogNormal.
