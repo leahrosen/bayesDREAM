@@ -142,3 +142,40 @@ def test_independent_targets_run():
     assert r["mu_log2_mean"].shape == (2,)
     assert r["mu_log2_mean"][0] > r["mu_log2_mean"][1]
     assert np.sqrt(np.mean((r["log2_x_eff_mean"] - l2eff) ** 2)) < 0.25
+
+
+def test_fit_cis_method_cavi_end_to_end(tmp_path):
+    """fit_cis(method='cavi') stores SVI-shaped results that fit_trans can use."""
+    import pandas as pd
+    from bayesDREAM import bayesDREAM
+
+    rng = np.random.default_rng(3)
+    n_cells, n_genes = 160, 10
+    target = np.where(np.arange(n_cells) < 80, "ntc", "GFI1B")
+    guide = np.where(target == "ntc", np.where(np.arange(n_cells) % 2, "n1", "n2"),
+                     np.where(np.arange(n_cells) % 2, "g1", "g2"))
+    meta = pd.DataFrame({"cell": [f"c{i}" for i in range(n_cells)], "guide": guide, "target": target,
+                         "cell_line": np.tile(["A", "B"], n_cells // 2),
+                         "sum_factor": rng.uniform(0.8, 1.2, n_cells)})
+    cis = rng.poisson(np.where(target == "ntc", 40, 10))
+    counts = pd.DataFrame(np.vstack([cis, rng.poisson(30, (n_genes - 1, n_cells))]),
+                          index=["GFI1B"] + [f"gene_{i}" for i in range(n_genes - 1)], columns=meta["cell"])
+    model = bayesDREAM(meta=meta, counts=counts, cis_gene="GFI1B", output_dir=str(tmp_path),
+                       label="cis_cavi_e2e", device="cpu")
+    model.set_technical_groups(["cell_line"])
+    model.fit_ntc(sum_factor_col="sum_factor", nsamples=20, method="cavi")
+    model.fit_cis(sum_factor_col="sum_factor", nsamples=30, method="cavi")
+
+    ps = model.posterior_samples_cis
+    G = model.meta["guide_code"].nunique()
+    assert ps["x_true"].shape == (30, n_cells)
+    assert ps["log_x_true"].shape == (30, n_cells)
+    assert ps["x_eff_g"].shape == (30, G)
+    assert torch.isfinite(model.x_true).all() and model.x_true.shape == (n_cells,)
+    # knocked-down guides sit below the NTC guides
+    codes = dict(model.meta[["guide", "guide_code"]].drop_duplicates().values)
+    xg = ps["x_eff_g"].median(0).values
+    assert max(xg[codes["g1"]], xg[codes["g2"]]) < min(xg[codes["n1"]], xg[codes["n2"]])
+
+    model.fit_trans(sum_factor_col="sum_factor", function_type="logistic_hill", niters=50, nsamples=10)
+    assert model.get_modality("gene").posterior_samples_trans is not None

@@ -4,6 +4,20 @@
 It is standalone for now and is not called by `fit_cis`. It follows the NTC prototype
 (`docs/NTC_CAVI.md`).
 
+## Usage
+
+```python
+model.fit_cis(sum_factor_col='sum_factor', method='cavi')
+```
+
+Single-guide mode only. `alpha_x` and `phi_x` come from `fit_ntc` as for SVI. Results are
+stored under the same keys as SVI (`x_true`, `log_x_true`, `x_eff_g`, `eps_x_eff_g`,
+`sigma_eff`, `mu`/`sigma` or `mu_target_k`/`sigma_target_k`). Samples are drawn
+independently from the per-cell and per-guide Gaussian marginals on the log2 scale, so
+quantiles of each quantity are right, but the correlation between cells of the same guide
+is not represented. `model.x_true` is the posterior median (2 to the power of the log2
+mean). Extra options go in `cavi_options`.
+
 ## Model
 
 For cell i with guide g(i), technical group c(i), and target k of its guide:

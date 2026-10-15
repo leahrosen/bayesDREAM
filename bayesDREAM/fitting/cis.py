@@ -199,6 +199,67 @@ class CisFitter:
                 obs=x_obs_tensor
             )
 
+    def _fit_cis_cavi(self, x_obs, guides, sum_factor, alpha_x_cells, phi_x, G,
+                      targets_per_guide, mu_mean_log2, mu_sd_log2, sigma_eff_log2,
+                      nsamples, cavi_options):
+        """
+        Fit the cis model by PG-CAVI + Laplace and store results in the SVI format.
+
+        Posterior samples are drawn independently from the Gaussian marginals (log2 scale) of
+        each cell's x_true and each guide's x_eff_g, so per-quantity quantiles are right but
+        the posterior correlation between cells of the same guide is not represented.
+        """
+        from .cis_cavi import fit_cis_negbinom_cavi
+
+        opts = dict(mu_prior_mean_log2=mu_mean_log2, mu_prior_sd_log2=max(mu_sd_log2, 1e-3),
+                    sigma_eff_prior_log2=sigma_eff_log2)
+        opts.update(cavi_options)
+        res = fit_cis_negbinom_cavi(
+            x_obs.cpu().numpy(), guides.cpu().numpy(), sum_factor.cpu().numpy(),
+            None if alpha_x_cells is None else alpha_x_cells.cpu().numpy(), float(phi_x),
+            n_guides=G,
+            targets_per_guide=None if targets_per_guide is None else targets_per_guide.cpu().numpy(),
+            **opts,
+        )
+        self.cavi_result = res
+        print(f"[INFO] fit_cis (cavi): converged={res['converged']}, "
+              f"laplace_converged={res['laplace_converged']}, {res['time_s']:.1f} s")
+
+        def draw(mean, sd):
+            mean = torch.as_tensor(np.asarray(mean), dtype=torch.float32)
+            sd = torch.as_tensor(np.asarray(sd), dtype=torch.float32)
+            return mean + sd * torch.randn((nsamples,) + tuple(mean.shape))
+
+        log2_x = draw(res['log2_x_true_mean'], res['log2_x_true_sd'])          # [S, N]
+        log2_xg = draw(res['log2_x_eff_mean'], res['log2_x_eff_sd'])           # [S, G]
+        mu = draw(res['mu_log2_mean'], res['mu_log2_sd'])                      # [S, K]
+        sigma = torch.as_tensor(np.asarray(res['sigma_log2']), dtype=torch.float32)  # [K]
+        tgt = (torch.zeros(G, dtype=torch.long) if targets_per_guide is None
+               else targets_per_guide.cpu().long())
+        posterior = {
+            'log_x_true': log2_x,
+            'x_true': 2.0 ** log2_x,
+            'x_eff_g': 2.0 ** log2_xg,
+            'eps_x_eff_g': (log2_xg - mu[:, tgt]) / sigma[tgt],
+            'sigma_eff': torch.as_tensor(np.asarray(res['sigma_eff_log2']), dtype=torch.float32)
+                         .expand(nsamples, G).clone(),
+        }
+        if targets_per_guide is None:
+            posterior['mu'] = mu[:, :1]
+            posterior['sigma'] = sigma[:1].expand(nsamples, 1).clone()
+        else:
+            for k in range(mu.shape[1]):
+                posterior[f'mu_target_{k}'] = mu[:, k]
+                posterior[f'sigma_target_{k}'] = sigma[k].expand(nsamples).clone()
+
+        self.model.loss_x = []
+        self.model.posterior_samples_cis = posterior
+        # Point estimates at the posterior median (= mean on the log2 scale)
+        l2m = torch.as_tensor(np.asarray(res['log2_x_true_mean']), dtype=torch.float32)
+        self.model.log2_x_true = l2m
+        self.model.x_true = 2.0 ** l2m
+        print("Finished fit_cis.")
+
     def fit_cis(
         self,
         technical_covariates: list[str] = None,
@@ -214,6 +275,8 @@ class CisFitter:
         minibatch_size: int = None,
         predictive_on_cpu: bool = True,
         independent_mu_sigma: bool = False,
+        method: str = 'svi',
+        cavi_options: dict = None,
         **kwargs
     ):
         """
@@ -252,6 +315,16 @@ class CisFitter:
             Exponential weight for smoothing the ELBO
         independent_mu_sigma : bool
             Whether to use independent mu/sigma per target type
+        method : {'svi', 'cavi'}, default 'svi'
+            'cavi' (single-guide mode) fits the cis model by Polya-Gamma CAVI with a
+            Laplace correction (``bayesDREAM.fitting.cis_cavi``): no learning rate or
+            iteration count, and calibrated guide-level intervals; see docs/CIS_CAVI.md.
+            ``lr``, ``niters`` and ``minibatch_size`` are ignored. The prior on the
+            per-guide cell spread is an inverse-gamma on its variance (instead of a Gamma
+            on the SD). Posterior samples are drawn from per-cell and per-guide Gaussian
+            marginals on the log2 scale and stored under the same keys as SVI.
+        cavi_options : dict, optional
+            Extra keyword arguments for ``fit_cis_negbinom_cavi``.
         kwargs :
             Additional arguments controlling priors, etc.
         """
@@ -388,6 +461,11 @@ class CisFitter:
         # as tensors that can be used as priors in the Pyro model.
         manual_guide_log2fc_tensor = None
         manual_guide_mask_tensor = None
+
+        if method not in ('svi', 'cavi'):
+            raise ValueError(f"method must be 'svi' or 'cavi', got {method!r}")
+        if method == 'cavi' and self.model.is_high_moi:
+            raise NotImplementedError("fit_cis(method='cavi') supports single-guide mode only")
 
         if manual_guide_effects is not None:
             raise NotImplementedError(
@@ -590,6 +668,17 @@ class CisFitter:
         else:
             rate_alpha_precomputed = None
             rate_beta_precomputed = None
+
+        if method == 'cavi':
+            alpha_x_cells = (self.model.alpha_x_prefit.flatten()[groups_tensor]
+                             if self.model.alpha_x_prefit is not None and groups_tensor is not None else None)
+            self._fit_cis_cavi(
+                x_obs_tensor, guides_tensor, sum_factor_tensor, alpha_x_cells,
+                1.0 / o_x_ntc ** 2, G, target_per_guide_tensor,
+                float(mu_x_mean_tensor), float(mu_x_sd_tensor), float(_seff_mean),
+                nsamples, cavi_options or {},
+            )
+            return
 
         guide_x = pyro.infer.autoguide.AutoNormalMessenger(self._model_x, init_loc_fn=init_loc_fn)
         guide_x.to(self.model.device)
