@@ -122,6 +122,33 @@ as wide as the CAVI intervals and covered 60 %. Its per-cell intervals were slig
 wide, covering 94 %. CAVI + Laplace was about 4000 times faster on this problem. SVI was
 run on one seed only, because each default run takes about 15 minutes.
 
+## Replogle et al. 2022, K562 essential screen
+
+`examples/diagnostics/compare_cis_svi_cavi_realdata.py`, with data from
+`replogle_prepare.py cis`. There are six random targets (GNL2, RSL24D1, PPP1CA, CLTC, PDCD5,
+PFDN5), each fitted with its own cells and 1500 random non-targeting cells. Gem groups
+are coarsened to 4 technical groups, and the NTC step uses CAVI for both methods. Each
+fit uses two random halves of the cells. The quantity compared is the knockdown: the
+log2 level of the targeting guide (the one with the most cells) minus the mean of the
+NTC guides.
+
+| target | half | CAVI knockdown | SVI knockdown |
+|---|---|---|---|
+| CLTC | A / B | -2.03 / -2.26 (SD 0.21) | -2.06 / -2.26 (SD 0.17) |
+| GNL2 | A / B | -3.10 / -3.28 (SD 0.24) | -2.98 / -3.34 (SD 0.13 to 0.15) |
+| PDCD5 | A / B | -3.69 / -3.32 (SD 0.28) | -3.12 / -2.95 (SD 0.10 to 0.15) |
+| PFDN5 | A / B | -3.43 / -3.63 (SD 0.31) | -2.80 / **0.00** (SD 0.09 / 0.01) |
+| PPP1CA | A / B | 0.01 / -0.03 (SD 0.08) | 0.00 / -0.00 (SD 0.01 to 0.03) |
+| RSL24D1 | A / B | -2.20 / -1.68 (SD 0.20 to 0.26) | -2.40 / -1.75 (SD 0.19 to 0.25) |
+
+Results:
+- **Calibration:** |z| < 1.645 between halves held for 6 of 6 targets with CAVI and 3 of 6
+  with SVI.
+- **SVI failure:** on half B of PFDN5, SVI stayed at no knockdown (z = -29.7 between its halves).
+- **PPP1CA:** its most frequent guide construct shows no knockdown with either method.
+- **Speed:** median time per fit was 0.7 s for CAVI and 1447 s for SVI.
+- **Caveat:** with six targets this is indicative only.
+
 ## Limitations
 
 - Single-guide mode only. The high-MOI model (additive log2 effects with NTC centering)

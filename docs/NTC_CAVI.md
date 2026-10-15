@@ -99,6 +99,32 @@ Both methods under-cover the group effect and log phi on these data. That points
 misspecification rather than to the inference. Perturbed cells are mixed in, and sum
 factors from 92 genes are crude, so model-based SEs are too small for both methods.
 
+## Replogle et al. 2022, K562 essential screen
+
+Data: `K562_essential_raw_singlecell_01.h5ad` (figshare+ 10.25452/figshare.plus.20029387),
+prepared with `examples/diagnostics/replogle_prepare.py ntc`. The subset is:
+- 1752 non-targeting cells from gem groups 1 to 8 (the technical groups);
+- 300 random genes with mean of at least 0.1 UMI;
+- sum factors equal to UMI count over its median.
+
+Split-half check as above (|z| < 1.645 should hold for about 90 %):
+
+| | SVI (default, 100,000 steps) | PG-CAVI + Laplace |
+|---|---|---|
+| log2 a (2100 gene x group pairs) | 0.71 (sd(z) 1.57) | 0.88 (sd(z) 1.03) |
+| log mu (300 genes) | 0.34 (sd(z) 3.8) | 0.89 (sd(z) 1.02) |
+| log phi | 0.86 (sd(z) 0.97) | 0.98 (sd(z) 0.75) |
+| mean abs. error, zero fraction per gene | 0.0039 | 0.0034 |
+| time, one half | about 5500 s | about 80 s |
+| time, all cells | 8759 s | 160 s |
+
+The fits ran in parallel, so the times are inflated.
+
+On all cells the two methods agree on the group effects (r = 0.987, median difference
+0.017) and on log mu (r = 0.9997). They differ on log phi (r = 0.85, median difference 0.94).
+On these genuine control cells CAVI intervals are close to nominal, while SVI intervals for
+log mu and the group effects are clearly too narrow.
+
 ## Limitations
 
 - negbinom only; the other distributions still use SVI.
