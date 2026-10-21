@@ -144,11 +144,29 @@ def select_morris_genes(model, summary_path, domingo_genes, n_total=200, modalit
     Steepness uses only active components (which_active a/b/both); per gene the
     signed n of its steepest active component.
     """
-    available = list(model.get_modality(modality_name).feature_ids)
+    mod = model.get_modality(modality_name)
+    available = list(mod.feature_ids)
     avail_set = set(available)
-    domingo_keep = [g for g in dict.fromkeys(domingo_genes) if g in avail_set]
+    to_id = _feature_id_lookup(mod)
+
+    domingo_ids = {}
+    for g in dict.fromkeys(domingo_genes):
+        fid = to_id.get(str(g))
+        if fid is not None and fid not in domingo_ids.values():
+            domingo_ids[g] = fid
+    domingo_keep = list(domingo_ids.values())
 
     df = pd.read_csv(summary_path)
+    df["feature"] = df["feature"].astype(str).map(lambda f: to_id.get(f, f))
+    n_summary_matched = df["feature"].isin(avail_set).sum()
+    print(f"modality feature_ids look like: {available[:3]}")
+    print(f"Domingo genes matched: {len(domingo_keep)}/{len(set(domingo_genes))}; "
+          f"summary features matched: {n_summary_matched}/{len(df)}")
+    if n_summary_matched == 0:
+        raise ValueError(
+            f"No feature in {summary_path} maps to this modality's feature_ids "
+            f"(summary examples: {df['feature'].head(3).tolist()}). Check the summary is "
+            "from this cis gene's production trans run.")
     rows = []
     for comp, active in (("a", ("a", "both")), ("b", ("b", "both"))):
         sub = df[df["which_active"].isin(active)]
@@ -177,10 +195,30 @@ def select_morris_genes(model, summary_path, domingo_genes, n_total=200, modalit
     print(f"{len(domingo_keep)} Domingo genes + {len(picked)} steep genes "
           f"({sum(p['n'] > 0 for p in picked)} pos, {sum(p['n'] < 0 for p in picked)} neg) "
           f"= {len(selection)} / {n_total} requested")
-    missing = [g for g in dict.fromkeys(domingo_genes) if g not in avail_set]
+    missing = [g for g in dict.fromkeys(domingo_genes) if g not in domingo_ids]
     if missing:
         print(f"Domingo genes not in this modality (cis gene / filtered / absent): {missing}")
+    if "gene_name" in mod.feature_meta.columns:   # readable names alongside the ids
+        id_to_name = dict(zip(available, mod.feature_meta["gene_name"].astype(str)))
+        selection.insert(1, "gene_name", selection["feature"].map(id_to_name))
     return selection
+
+
+def _feature_id_lookup(mod):
+    """
+    Map any identifier in the modality's feature_meta (gene_name / gene /
+    gene_id, plus the feature_ids themselves) to its feature_id, so gene
+    symbols and Ensembl IDs both resolve whichever one the model uses.
+    """
+    ids = [str(f) for f in mod.feature_ids]
+    lookup = {}
+    fm = mod.feature_meta.reset_index(drop=True)
+    for col in ("gene_id", "gene", "gene_name"):   # later columns don't overwrite earlier ones
+        if col in fm.columns:
+            for val, fid in zip(fm[col].astype(str), ids):
+                lookup.setdefault(val, fid)
+    lookup.update({fid: fid for fid in ids})
+    return lookup
 
 
 def fit_conditions(base_model, fit_kwargs, test_output_dir, base_label, conditions=None,
