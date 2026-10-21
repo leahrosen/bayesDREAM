@@ -23,7 +23,7 @@ import pyro.optim as optim
 import pyro.infer as infer
 import pyro.poutine as poutine
 
-from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor
+from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor, is_lean_posterior
 
 
 def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
@@ -1295,6 +1295,150 @@ class TransFitter:
         else:
             raise ValueError(f"Unknown distribution: {distribution}")
 
+    def _build_x_input(self, cell_idx_tensor, x_level='cell', x_uncertainty='median'):
+        """
+        Build the cis-expression input that _model_y conditions on.
+
+        x is never a latent in _model_y: it enters as fixed data, so trans
+        observations can never pull it ("cut" posterior). With
+        ``x_uncertainty='sample'`` the training loop feeds a fresh posterior draw
+        each SVI step, so the objective becomes E_{x ~ p(x | cis data)}[ELBO(theta; x)]
+        and dose-response curves are penalised wherever x is uncertain.
+
+        Parameters
+        ----------
+        cell_idx_tensor : torch.LongTensor
+            Positions (into self.model.meta) of the cells being fitted.
+        x_level : {'cell', 'guide'}
+            'cell'  : per-cell x_true (cis posterior site ``x_true``).
+            'guide' : per-cell guide-level expectation x_mean, i.e. x_eff_g of the
+                      cell's guide (low-MOI) or the log2-additive combination of the
+                      cell's guides (high-MOI, as in _model_x). Discards the
+                      within-guide spread, which is informed only by one cis count
+                      and the sum factor.
+        x_uncertainty : {'median', 'sample'}
+            'median' : point estimate only (x_draws is None).
+            'sample' : also return the [S, N] posterior draws.
+
+        Returns
+        -------
+        x_point : torch.Tensor [N] on self.model.device
+            Posterior median; used for prior construction and Predictive.
+        x_draws : torch.Tensor [S, N] on CPU, or None
+        """
+        if x_level not in ('cell', 'guide'):
+            raise ValueError(f"x_level must be 'cell' or 'guide', got {x_level!r}")
+        if x_uncertainty not in ('median', 'sample'):
+            raise ValueError(f"x_uncertainty must be 'median' or 'sample', got {x_uncertainty!r}")
+
+        if x_level == 'cell' and x_uncertainty == 'median':
+            return self.model.x_true[cell_idx_tensor], None
+
+        ps = getattr(self.model, 'posterior_samples_cis', None)
+        _how = f"x_level={x_level!r}, x_uncertainty={x_uncertainty!r}"
+        if ps is None:
+            raise ValueError(
+                f"fit_trans({_how}) needs the fit_cis posterior draws "
+                "(model.posterior_samples_cis), but none are set. Run fit_cis() or "
+                "load_cis_fit() first, or use x_level='cell', x_uncertainty='median'."
+            )
+        if is_lean_posterior(ps):
+            raise ValueError(
+                f"fit_trans({_how}) needs raw fit_cis posterior draws, but "
+                "posterior_samples_cis was lean-loaded (point estimates only). "
+                "Reload with load_cis_fit(lean=False)."
+            )
+
+        N_model = len(self.model.meta)
+        if x_level == 'cell':
+            if 'x_true' in ps:
+                draws = ps['x_true']
+            elif 'log_x_true' in ps:
+                draws = 2.0 ** ps['log_x_true']
+            else:
+                raise ValueError("posterior_samples_cis has neither 'x_true' nor 'log_x_true'.")
+            draws = draws.detach().float().cpu()
+            draws = draws.reshape(draws.shape[0], -1)  # [S, N_model]
+            if draws.shape[1] != N_model:
+                raise ValueError(
+                    f"posterior_samples_cis['x_true'] has {draws.shape[1]} cells, "
+                    f"model.meta has {N_model}."
+                )
+            # Guard against stale draws: model.x_true is the median of these draws
+            # unless it was replaced (set_x_true) or comes from a pre-median fit.
+            x_true_cpu = self.model.x_true.detach().float().cpu()
+            if not torch.allclose(draws.median(dim=0).values, x_true_cpu, rtol=1e-4, atol=1e-8):
+                raise ValueError(
+                    "posterior_samples_cis['x_true'] is out of sync with model.x_true "
+                    "(the per-cell posterior median of the draws != x_true). x_true was "
+                    "probably replaced via set_x_true() or loaded from a fit saved before "
+                    "the mean->median switch. Re-run fit_cis(), or use "
+                    "x_uncertainty='median'."
+                )
+        else:
+            if getattr(self.model, 'x_true_permuted', False):
+                raise ValueError(
+                    "x_level='guide' derives x from guide identity, so it would silently "
+                    "ignore the NTC resampling done by permute_x_true(). Use x_level='cell'."
+                )
+            if 'x_eff_g' not in ps:
+                raise ValueError("posterior_samples_cis has no 'x_eff_g' (needed for x_level='guide').")
+            x_eff_g = ps['x_eff_g'].detach().float().cpu()
+            x_eff_g = x_eff_g.reshape(x_eff_g.shape[0], -1)  # [S, G]
+            S, G = x_eff_g.shape
+            if self.model.is_high_moi:
+                # Same aggregation as _model_x: log2-additive guide effects relative to NTC
+                assign = self.model.guide_assignment_tensor.detach().float().cpu()  # [N_model, G]
+                if assign.shape[1] != G:
+                    raise ValueError(
+                        f"guide_assignment has {assign.shape[1]} guides but posterior "
+                        f"x_eff_g has {G}."
+                    )
+                if 'weighted_mean_NTC' not in ps:
+                    raise ValueError("posterior_samples_cis has no 'weighted_mean_NTC' (high-MOI x_level='guide').")
+                log2_ntc = torch.log2(ps['weighted_mean_NTC'].detach().float().cpu()
+                                      .reshape(S).clamp_min(1e-12))                      # [S]
+                log2_g = torch.log2(x_eff_g.clamp_min(1e-12))                            # [S, G]
+                guides_per_cell = assign.sum(dim=1).clamp_min(1)                         # [N_model]
+                log2_x = log2_g @ assign.T - (guides_per_cell - 1)[None, :] * log2_ntc[:, None]
+                draws = 2.0 ** log2_x                                                    # [S, N_model]
+            else:
+                codes = torch.as_tensor(self.model.meta['guide_code'].values, dtype=torch.long)
+                n_codes = int(self.model.meta['guide_code'].nunique())
+                if codes.min() < 0 or codes.max() >= G or n_codes != G:
+                    raise ValueError(
+                        f"meta['guide_code'] ({n_codes} codes, max {int(codes.max())}) does not "
+                        f"index posterior x_eff_g ({G} guides). The cells were likely subset "
+                        "after fit_cis(); re-run fit_cis() on this cell set."
+                    )
+                draws = x_eff_g[:, codes]                                                # [S, N_model]
+
+        draws = draws[:, cell_idx_tensor.cpu()].contiguous()
+        if x_level == 'cell':
+            x_point = self.model.x_true[cell_idx_tensor]
+        else:
+            x_point = draws.median(dim=0).values.to(self.model.device)
+        return x_point, (draws if x_uncertainty == 'sample' else None)
+
+    def _svi_step_x_draws(self, svi, x_draws_step, args, kwargs):
+        """
+        One SVI update averaging the ELBO over several x draws (a Python loop of
+        particles). Each draw gets its own guide sample; model and guide are scaled
+        by 1/P so the accumulated loss and gradients are the average over draws.
+        """
+        P = x_draws_step.shape[0]
+        model_s = poutine.scale(svi.model, scale=1.0 / P)
+        guide_s = poutine.scale(svi.guide, scale=1.0 / P)
+        loss = 0.0
+        with poutine.trace(param_only=True) as param_capture:
+            for p in range(P):
+                loss += svi.loss_and_grads(model_s, guide_s, *args,
+                                           **{**kwargs, 'x_true_sample': x_draws_step[p]})
+        params = set(site["value"].unconstrained() for site in param_capture.trace.nodes.values())
+        svi.optim(params)
+        pyro.infer.util.zero_grads(params)
+        return loss
+
     ########################################################
     # Step 3: Fit trans effects (model_y)
     ########################################################
@@ -1333,6 +1477,9 @@ class TransFitter:
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
+        x_level: str = 'cell',
+        x_uncertainty: str = 'median',
+        x_draws_per_step: int = 1,
         debug: bool = False,
         **kwargs
     ):
@@ -1432,6 +1579,23 @@ class TransFitter:
             mismatches produce a warning.
         function_type : str
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
+        x_level : {'cell', 'guide'}, optional
+            Which cis-expression quantity the dose-response is a function of.
+            'cell' (default): per-cell x_true from fit_cis. 'guide': the cell's
+            guide-level expectation (x_eff_g, or the log2-additive guide combination in
+            high-MOI mode), which removes the within-guide ordering of cells -- that
+            ordering is informed only by one cis count and the sum factor.
+        x_uncertainty : {'median', 'sample'}, optional
+            'median' (default, previous behaviour): condition on the posterior median of
+            x. 'sample': each SVI step conditions on a fresh joint draw from the fit_cis
+            posterior. x stays fixed data (never a latent of _model_y, so y cannot pull
+            it), and the objective becomes the ELBO averaged over the cis posterior, which
+            penalises dose-response curves that are steep where x is uncertain. Requires
+            full (non-lean) posterior_samples_cis consistent with model.x_true. Priors and
+            the final Predictive always use the posterior median.
+        x_draws_per_step : int, optional
+            Number of x draws averaged per SVI step when x_uncertainty='sample' (each with
+            its own guide sample). Reduces gradient noise at ~linear extra cost. Default 1.
         debug : bool, optional
             If True, run the slow debug SVI step that checks all parameters for
             non-finite values at every iteration and prints detailed diagnostics
@@ -1654,7 +1818,17 @@ class TransFitter:
         _cell_index_map = {c: i for i, c in enumerate(_all_model_cells)}
         _cell_indices = [_cell_index_map[c] for c in modality_cells]
         _cell_idx_tensor = torch.tensor(_cell_indices, dtype=torch.long, device=self.model.device)
-        x_true_subset = self.model.x_true[_cell_idx_tensor]
+        if x_draws_per_step < 1:
+            raise ValueError(f"x_draws_per_step must be >= 1, got {x_draws_per_step}")
+        # x_true_subset: posterior-median x (priors, Predictive); x_true_draws: [S, N]
+        # cis posterior draws fed to the training loop when x_uncertainty='sample'.
+        x_true_subset, x_true_draws = self._build_x_input(
+            _cell_idx_tensor, x_level=x_level, x_uncertainty=x_uncertainty)
+        if x_true_draws is not None:
+            print(f"[INFO] x input: x_level={x_level!r}, sampling from {x_true_draws.shape[0]} "
+                  f"fit_cis posterior draws ({x_draws_per_step} per SVI step)")
+        elif x_level != 'cell':
+            print(f"[INFO] x input: x_level={x_level!r}, posterior median")
 
         N = len(modality_cells)
 
@@ -2572,6 +2746,8 @@ class TransFitter:
             modality_name=modality_name,
             function_type=function_type,
             distribution=distribution,
+            x_level=x_level,
+            x_uncertainty=x_uncertainty,
         )
 
         def _load_and_validate_ckpt(path, context="loading checkpoint"):
@@ -2606,6 +2782,13 @@ class TransFitter:
                     f"[{context}] function_type mismatch: checkpoint effective={_stored_ft!r}, "
                     f"current call={function_type!r}. Ensure model and guide are compatible."
                 )
+            for _key, _cur in [('x_level', x_level), ('x_uncertainty', x_uncertainty)]:
+                _stored = ckpt.get(_key)
+                if _stored is not None and _stored != _cur:
+                    warnings.warn(
+                        f"[{context}] {_key} mismatch: checkpoint={_stored!r}, "
+                        f"current call={_cur!r}."
+                    )
             _stored_dist = ckpt.get('distribution')
             if _stored_dist is not None and _stored_dist != distribution:
                 warnings.warn(
@@ -2734,8 +2917,15 @@ class TransFitter:
             _coupling_frac = min(1.0, 2.0 * step / total_steps) if total_steps > 0 else 1.0
             current_coupling = alpha_n_coupling * _coupling_frac
 
-            # x_true and alpha_y_prefit are always point estimates (means)
-            x_true_sample = x_true_subset
+            # x: posterior median, or fresh fit_cis posterior draw(s) (fixed data, no
+            # gradient) when x_uncertainty='sample'. alpha_y_prefit is a point estimate.
+            x_draws_step = None
+            if x_true_draws is None:
+                x_true_sample = x_true_subset
+            else:
+                _draw_idx = torch.randint(x_true_draws.shape[0], (x_draws_per_step,))
+                x_draws_step = x_true_draws[_draw_idx].to(self.model.device)  # [P, N]
+                x_true_sample = x_draws_step[0]
             alpha_y_sample = alpha_y_prefit  # [C, T] point estimate or None
 
             use_straight_through = False
@@ -2780,6 +2970,14 @@ class TransFitter:
                 except FloatingPointError as e:
                     print(f"[STOP] {e} at step {step}")
                     break
+            elif x_draws_step is not None and x_draws_step.shape[0] > 1:
+                loss = self._svi_step_x_draws(
+                    svi, x_draws_step,
+                    (N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
+                     K_max_tensor, K_alpha_tensor, Vmax_mean_tensor, Vmax_alpha_tensor,
+                     n_mu_tensor, Amean_tensor, p_n_logits_tensor, epsilon_tensor),
+                    _svi_kwargs,
+                )
             else:
                 loss = svi.step(
                     N, T, y_obs_tensor, sum_factor_tensor, beta_o_alpha_tensor, beta_o_beta_tensor,
@@ -3222,8 +3420,14 @@ class TransFitter:
 
         # Store results
         # Store in modality
+        trans_x_input = {
+            'x_level': x_level,
+            'x_uncertainty': x_uncertainty,
+            'x_draws_per_step': x_draws_per_step if x_uncertainty == 'sample' else None,
+        }
         modality.posterior_samples_trans = posterior_samples_y
         modality.trans_prior_params = trans_prior_params
+        modality.trans_x_input = trans_x_input
         modality.losses_trans = self.losses_trans  # Store loss history
 
         # For primary modality, also store at model level for direct access via model.posterior_samples_trans
@@ -3231,6 +3435,7 @@ class TransFitter:
             self.model.posterior_samples_trans = posterior_samples_y
             self.model.losses_trans = self.losses_trans
             self.model.trans_prior_params = trans_prior_params
+            self.model.trans_x_input = trans_x_input
             # NOTE: alpha_y_prefit is stored per-modality (already done above), not at model level
             print(f"[INFO] Stored results in modality '{modality_name}' and at model level (primary modality)")
         else:
