@@ -50,14 +50,22 @@ def production_config(dataset, label, stage="trans"):
     return path
 
 
-def build_trans_model(cfg_path, device):
+def build_trans_model(cfg_path, device, model_overrides=None):
     """
     Rebuild the production trans-stage model up to (not including)
     exclude_trans_genes/fit_trans: build -> load_ntc_fit -> load_cis_fit ->
     technical groups -> sum-factor adjustments. Returns (model, cfg).
+
+    model_overrides: keys replaced in the config's `model:` block before
+    building (e.g. guide_covariates=[] so the guide panel matches a cis fit
+    made when high-MOI guide_covariates were still ignored).
     """
     cfg = load_bayesdream_yaml(Path(cfg_path))
     apply_device_override(cfg, str(device))
+    if model_overrides:
+        for k, v in model_overrides.items():
+            print(f"[override] model.{k}: {cfg['model'].get(k)!r} -> {v!r}")
+        cfg["model"].update(model_overrides)
     model = build_model_from_config(cfg)
 
     trans_cfg = cfg.get("trans") or {}
