@@ -678,9 +678,9 @@ class TransFitter:
                     alpha = pyro.sample("alpha", alpha_dist(temperature=temperature, logits=p_n_logits_tensor))  # [T]
             else:
                 if distribution == 'multinomial' and K is not None:
-                    alpha = torch.ones((T, K - 1), device=self.model.device)
+                    alpha = pyro.deterministic("alpha", torch.ones((T, K - 1), device=self.model.device), event_dim=1)
                 else:
-                    alpha = torch.ones((T,), device=self.model.device)
+                    alpha = pyro.deterministic("alpha", torch.ones((T,), device=self.model.device))
             
             if function_type in ['single_hill', 'additive_hill', 'nested_hill']:
 
@@ -840,7 +840,13 @@ class TransFitter:
                 # Sample all required parameters (additive_hill and nested_hill need second set)
                 if function_type in ['additive_hill', 'nested_hill']:
                     sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
-                    if distribution == 'multinomial' and K is not None:
+                    if not use_alpha:
+                        # No sparsity gate (regularise=False): beta fixed at 1, like alpha.
+                        if distribution == 'multinomial' and K is not None:
+                            beta = pyro.deterministic("beta", torch.ones((T, K - 1), device=self.model.device), event_dim=1)
+                        else:
+                            beta = pyro.deterministic("beta", torch.ones((T,), device=self.model.device))
+                    elif distribution == 'multinomial' and K is not None:
                         # Use .to_event(1) instead of nested plate to avoid dim=-1 collision with trans_plate
                         beta = pyro.sample("beta", alpha_dist(temperature=temperature, logits=p_n_logits_tensor).expand([K - 1]).to_event(1))  # [T, K-1]
                     else:
@@ -1477,6 +1483,7 @@ class TransFitter:
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
+        regularise: bool = True,
         x_level: str = 'cell',
         x_uncertainty: str = 'median',
         x_draws_per_step: int = 1,
@@ -1596,6 +1603,14 @@ class TransFitter:
         x_draws_per_step : int, optional
             Number of x draws averaged per SVI step when x_uncertainty='sample' (each with
             its own guide sample). Reduces gradient noise at ~linear extra cost. Default 1.
+        regularise : bool, optional
+            If True (default), each Hill term is gated by a relaxed-Bernoulli sparsity
+            variable (alpha, and beta for additive/nested hill) with prior p_n, coupled to
+            |n| via alpha_n_coupling. If False, the gates are removed (alpha = beta = 1,
+            recorded as deterministic sites) and the alpha_n_coupling penalty is dropped,
+            so every feature is fitted with an active Hill curve. p_n, init_temp,
+            final_temp and alpha_n_coupling then have no effect. All other priors
+            (including the n prior) are unchanged.
         debug : bool, optional
             If True, run the slow debug SVI step that checks all parameters for
             non-finite values at every iteration and prints detailed diagnostics
@@ -1663,6 +1678,11 @@ class TransFitter:
         # specify it.  This must happen before _do_warmup and guide initialisation,
         # both of which depend on function_type.
         # ---------------------------
+        if not regularise:
+            # No sparsity gates → nothing for the alpha/n coupling penalty to act on.
+            alpha_n_coupling = 0.0
+            print("[INFO] regularise=False: alpha/beta gates and alpha_n_coupling disabled")
+
         if predictive_checkpoint is not None:
             try:
                 _peek = torch.load(predictive_checkpoint, map_location='cpu', weights_only=False)
@@ -2664,7 +2684,7 @@ class TransFitter:
                 use_straight_through=False,
                 function_type=function_type,
                 polynomial_degree=polynomial_degree,
-                use_alpha=True,
+                use_alpha=regularise,
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
@@ -2748,6 +2768,7 @@ class TransFitter:
             distribution=distribution,
             x_level=x_level,
             x_uncertainty=x_uncertainty,
+            regularise=regularise,
         )
 
         def _load_and_validate_ckpt(path, context="loading checkpoint"):
@@ -2768,6 +2789,11 @@ class TransFitter:
                 stored = ckpt.get(key)
                 if stored is not None and stored != expected:
                     _bad.append(f"  {label}: checkpoint={stored}, current call={expected}")
+            # regularise toggles the alpha/beta guide sites; checkpoints predating
+            # the flag were always regularised.
+            _stored_reg = ckpt.get('regularise', True)
+            if _stored_reg != regularise:
+                _bad.append(f"  regularise: checkpoint={_stored_reg}, current call={regularise}")
             if _bad:
                 raise ValueError(
                     f"[{context}] Checkpoint metadata mismatch — cannot resume "
@@ -2941,7 +2967,7 @@ class TransFitter:
                 use_straight_through=use_straight_through,
                 function_type=effective_function_type,
                 polynomial_degree=polynomial_degree,
-                use_alpha=True if effective_function_type != 'polynomial' else True if phase_fraction>=0.5 else False,
+                use_alpha=regularise and (effective_function_type != 'polynomial' or phase_fraction >= 0.5),
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
@@ -3085,7 +3111,7 @@ class TransFitter:
                 "use_straight_through": True,
                 "function_type": function_type,
                 "polynomial_degree": polynomial_degree,
-                "use_alpha": True,
+                "use_alpha": regularise,
                 "distribution": distribution,
                 "denominator_tensor": self._to_cpu(denominator_tensor) if denominator_tensor is not None else None,
                 "K": K,
@@ -3126,7 +3152,7 @@ class TransFitter:
                 "use_straight_through": True,
                 "function_type": function_type,
                 "polynomial_degree": polynomial_degree,
-                "use_alpha": True,
+                "use_alpha": regularise,
                 "distribution": distribution,
                 "denominator_tensor": denominator_tensor if denominator_tensor is not None else None,
                 "K": K,
@@ -3303,6 +3329,7 @@ class TransFitter:
             trans_prior_params = {
                 'function_type':    function_type,
                 'distribution':     distribution,
+                'regularise':       regularise,
                 # n_a / n_b
                 'nmin':             float(nmin.item()),
                 'nmax':             float(nmax.item()),
