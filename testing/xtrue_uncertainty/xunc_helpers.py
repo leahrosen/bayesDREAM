@@ -18,6 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "publication_runs" / "common"))
@@ -309,6 +310,15 @@ def plot_condition_overlays(models, summaries, features, modality_name=None, pdf
     """
     trans_fn_kwargs.setdefault("show_ci", True)
     features = list(features)
+    first = next(iter(models.values()))
+    mod_name = modality_name or first.primary_modality
+    # Binomial: plot Δp on a log2FC x-axis, then label y as absolute p (p_ntc + Δp),
+    # so the dashed line plot_trans_functions draws at Δp = 0 sits at y_ntc.
+    absolute_p = (first.get_modality(mod_name).distribution == "binomial"
+                  and not trans_fn_kwargs.get("use_log2fc", False))
+    if absolute_p:
+        trans_fn_kwargs = {**trans_fn_kwargs, "use_log2fc": False, "use_delta_p": True}
+        p_ntc = _ntc_reference(first, mod_name)
     handles = [Line2D([], [], color=COND_COLORS.get(n, "k"), label=n) for n in models]
     pdf = PdfPages(pdf_path) if pdf_path else None
     try:
@@ -325,6 +335,10 @@ def plot_condition_overlays(models, summaries, features, modality_name=None, pdf
                         ax.text(0.02, 0.02, f"{name}: {type(e).__name__}", transform=ax.transAxes,
                                 fontsize=6, color="red")
                 ax.set_title(f"{feat}\n{_dep_marks(summaries, feat)}", fontsize=8)
+                if absolute_p and feat in p_ntc:
+                    ref = p_ntc[feat]
+                    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos, r=ref: f"{v + r:.2f}"))
+                    ax.set_ylabel(f"p   (dashed: NTC = {ref:.2f})")
             for ax in list(axes.flat)[len(page):]:
                 ax.axis("off")
             fig.suptitle("")  # plot_trans_functions sets its own figure title
@@ -340,6 +354,24 @@ def plot_condition_overlays(models, summaries, features, modality_name=None, pdf
         if pdf:
             pdf.close()
             print(f"Saved {pdf_path}")
+
+
+def _ntc_reference(model, modality_name):
+    """
+    Per-feature NTC level of a trans modality, {feature_id: value}: the
+    posterior median of mu_ntc, as plot_trans_functions' delta-p/log2FC
+    modes use for their reference.
+    """
+    mod = model.get_modality(modality_name)
+    mu_ntc = (getattr(mod, "posterior_samples_ntc", None) or {}).get("mu_ntc")
+    if mu_ntc is None:
+        return {}
+    if hasattr(mu_ntc, "float"):   # torch tensor [S, ...]
+        vals = mu_ntc.float().quantile(0.5, dim=0).squeeze().cpu().numpy()
+    else:
+        vals = np.median(np.asarray(mu_ntc), axis=0).squeeze()
+    vals = np.atleast_1d(vals)
+    return {f: float(vals[i]) for i, f in enumerate(mod.feature_ids) if i < len(vals)}
 
 
 def save_xy_plots(models, features, plot_dir, modality_name=None, **xy_kwargs):
