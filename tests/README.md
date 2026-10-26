@@ -35,10 +35,9 @@ This directory contains test scripts for bayesDREAM functionality.
 
 - **`test_imports.py`** - Quick smoke test for package imports
 
-### CLI and full pipeline tests
+### Full pipeline tests
 
-- **`test_cli_system.py`** - test the CLI
-- **`test_system_quick_pipeline.py`** - run a full pipeline
+- **`test_system_quick_pipeline.py`** - run a full Python-library pipeline
 
 ## Running Tests
 
