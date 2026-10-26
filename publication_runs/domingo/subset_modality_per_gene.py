@@ -26,7 +26,7 @@ Usage
         --modality-name sj --modality-spec config_modalities.yaml \\
         --data-dir <modalities.data_dir> --outdir <per-(gene,modality) output dir>
 
-Config: the SAME gene-scoped bayesdream-CLI-schema config
+Config: the SAME gene-scoped publication-stage config
 generate_slurm.py already renders for that gene's real 07_modality_<gene>_<mod>.sh
 job (cis_gene set directly, data: pointing at that gene's `full` primary-
 modality subset -- see common/subset_per_gene.py).

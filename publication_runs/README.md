@@ -6,13 +6,9 @@ subdirectory per dataset (`domingo/`, `morris/`, ...), each with its own
 of them.
 
 This directory is orchestration code, not part of the installable `bayesDREAM`
-package — it drives `bayesDREAM` (via `python -m bayesDREAM <stage> --config
-...`, the existing Typer CLI in `bayesDREAM/cli.py`, for stages it fully
-supports) and a growing set of `common/run_*.py` scripts for stages the CLI
-doesn't cover yet (compensation, permutation null, recapitulation
-simulation) or gets subtly wrong for this pipeline's needs (`run_trans.py`
-adds `adjust_ntc_sum_factor()`/`refit_sumfactor()`, which the CLI's
-`fit-trans` never calls).
+package. It drives the Python library through standalone `common/run_*.py`
+stage scripts, including workflow-specific compensation, permutation-null,
+and recapitulation-simulation stages.
 
 **Before your first real submission for a dataset, read `VERIFICATION.md`**
 — a staged checklist (static checks → dry run → dataset-specific risk
@@ -83,23 +79,18 @@ precomputes a per-(gene, modality) subset of its splicing/velocity data
    paths, which cis genes to run, per-step core counts, permutation/
    simulation replicate counts, cluster account. Consumed by
    `<dataset>/generate_slurm.py`. Not understood by `bayesDREAM` itself.
-2. **Per-gene/per-stage `bayesdream_config` YAML** — close to (but a
-   superset of) the schema `bayesDREAM/cli.py` expects (`data:`/`model:`/
-   `ntc:`/`cis:`/`trans:`/`report:` keys, as in
-   `examples/gfi1b_cli_config.yaml`, plus `sum_factor:`/
+2. **Per-gene/per-stage model YAML** — a schema consumed by the relevant
+  `common/run_*.py` script (`data:`/`model:`/`ntc:`/`cis:`/`trans:` keys,
+  plus `sum_factor:`/
    `exclude_trans_genes:`/`compensation:`/`permutation:`/`simulation:`
    blocks the `common/run_*.py` scripts read). These are *generated* by
    `generate_slurm.py` from `config.yaml` (one per gene per stage, written
    to `<outdir>/configs/`) rather than hand-written, so a dataset's
    4-or-500 genes don't need 4-or-500 hand-maintained files.
 
-**`build_model_from_config` is not `bayesDREAM.cli._build_model`.**
-`config_utils.py` duplicates that function's data-loading logic with an
-*extended* model-kwarg allow-list (adds `exclude_guides`, `min_count` — both
-accepted by `bayesDREAM.__init__` but not forwarded by the CLI's own
-allow-list) and support for sparse `.npz` counts (the CLI only reads counts
-via `pd.read_csv`; Morris's counts matrix is far too large to be dense CSV).
-See `config_utils.py`'s module docstring.
+`config_utils.py` builds library models from stage configs, including options
+such as `exclude_guides`, `min_count`, explicit feature identities, and sparse
+`.npz` counts used by the publication workflows.
 
 **Dynamic dataset-module hooks (`attach_modality`, `exclude_cells`).**
 `run_compensation.py`, `run_permutation_null.py`, and `run_recapitulation_sim.py`
@@ -236,7 +227,7 @@ above):
 
 **GPU node packing.** When a step only needs a fraction of a Dardel GPU node,
 don't request one node per task. Instead write a plain-text task list (one
-CLI invocation per line) and submit a single `sbatch` that requests one node
+command invocation per line) and submit a single `sbatch` that requests one node
 and runs `common/slurm/run_node_queue.sh <tasklist> <concurrency>`, which
 runs up to `<concurrency>` tasks at a time via a bash job-pool (`wait -n`,
 requires bash >=4.3). `common/slurm/sbatch_blocks.py`'s `SbatchGpuNodeQueue`

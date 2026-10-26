@@ -1,6 +1,6 @@
 # Domingo dataset -- orchestration config, consumed by generate_slurm.py.
-# NOT the bayesdream-CLI-schema config (see publication_runs/README.md);
-# generate_slurm.py renders that per gene/stage from this file.
+# This is the dataset orchestration config; generate_slurm.py renders a
+# per-gene/stage config consumed by the direct Python stage scripts.
 
 dataset: domingo
 label_prefix: domingo_20260806   # -> bayesdream label = <label_prefix>_<gene>

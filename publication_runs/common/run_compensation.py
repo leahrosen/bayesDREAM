@@ -1,11 +1,9 @@
 """
 Standalone "compensation" stage: model.check_systematic_shift().
 
-Not a bayesDREAM CLI subcommand (see publication_runs/README.md), so this
-script builds the model itself, loads the ntc + cis fits, and calls
-check_systematic_shift() directly. Mirrors the load/fit/save structure of
-bayesDREAM.cli._run_fit_cis so it slots into the same config file the cis/
-trans stages use.
+This script builds the model, loads the ntc + cis fits, and calls
+check_systematic_shift() directly using the same stage config as the other
+publication runners.
 
 Deliberately does NOT call adjust_ntc_sum_factor()/refit_sumfactor() --
 check_systematic_shift() always uses the raw 'sum_factor' column (its own
@@ -138,7 +136,7 @@ def run_compensation(cfg: dict) -> "object":
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", "-c", required=True, help="Path to bayesdream-CLI-schema YAML config.")
+    parser.add_argument("--config", "-c", required=True, help="Path to publication stage YAML config.")
     args = parser.parse_args()
 
     cfg = load_bayesdream_yaml(Path(args.config))
