@@ -6,28 +6,14 @@ Two layers of YAML, deliberately kept separate (see publication_runs/README.md):
 1. Dataset orchestration config (``<dataset>/config.yaml``) -- read directly
    with ``load_yaml`` by each dataset's ``generate_slurm.py``. No fixed
    schema; each dataset defines its own.
-2. Per-gene/per-stage "bayesdream config" -- the exact schema
-   ``bayesDREAM/cli.py`` expects (``data:``/``model:``/``ntc:``/``cis:``/
-   ``trans:``/``report:``). ``render_bayesdream_config`` builds these by
+2. Per-gene/per-stage model config -- the schema consumed by the
+    ``publication_runs/common/run_*.py`` stage scripts (``data:``/``model:``/
+    ``ntc:``/``cis:``/``trans:``). ``render_bayesdream_config`` builds these by
    deep-merging a dataset-wide base dict with per-gene overrides, and
    ``write_yaml`` writes the result to ``<output_dir>/<label>/configs/``.
 
-``load_bayesdream_yaml``/``normalize_stage_args``/``is_enabled``/
-``read_table``/``load_guide_assignment`` reuse ``bayesDREAM.cli``'s private
-helpers of the same name (underscore-prefixed there) rather than
-reimplementing them -- straightforward, config-shape-agnostic logic that's
-already correct in cli.py.
-
-``build_model_from_config`` is NOT a re-export of ``cli.py``'s
-``_build_model``, though -- it duplicates that function's data-loading logic
-but with an EXTENDED ``allowed_model_keys`` set. ``_build_model`` filters
-``model:`` config keys through an allow-list that's missing ``exclude_guides``
-and ``min_count`` (both needed by Morris on essentially every model
-construction) -- see the ``_EXTENDED_MODEL_KEYS`` comment below. Editing
-``bayesDREAM/cli.py`` itself would be a core-code change needing sign-off
-(see CLAUDE.md); duplicating ~30 lines here instead keeps every dataset's
-scripts working without one. If ``cli.py``'s own allow-list is ever extended
-upstream, ``_EXTENDED_MODEL_KEYS`` should be reconciled with it.
+The config loaders live here rather than in the installable package so the
+publication runners own their orchestration/config behavior.
 """
 
 import copy
@@ -35,21 +21,66 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
+import pandas as pd
 import yaml
 
 from bayesDREAM import bayesDREAM
-from bayesDREAM.cli import (
-    _load_yaml as load_bayesdream_yaml,
-    _normalize_stage_args as normalize_stage_args,
-    _is_enabled as is_enabled,
-    _read_table as read_table,
-    _load_guide_assignment as load_guide_assignment,
-)
 
-# Superset of bayesDREAM.cli._build_model's allowed_model_keys (as of this
-# writing) -- adds 'exclude_guides' and 'min_count', both accepted by
-# bayesDREAM.__init__ but not forwarded by the CLI's own allow-list. Also
-# adds 'feature_name_col'/'feature_names' (bayesDREAM commit 24bc2f5, "Unify
+
+def load_bayesdream_yaml(config_path: Path) -> Dict[str, Any]:
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a YAML mapping/object")
+    return config
+
+
+def normalize_stage_args(obj: Any) -> Dict[str, Any]:
+    if obj is None or isinstance(obj, bool):
+        return {}
+    if not isinstance(obj, dict):
+        raise ValueError(f"Stage config must be a dict/bool, got {type(obj).__name__}")
+    if "args" in obj:
+        args = obj.get("args")
+        if args is None:
+            return {}
+        if not isinstance(args, dict):
+            raise ValueError("Stage 'args' must be a dict")
+        return dict(args)
+    return {key: value for key, value in obj.items() if key != "enabled"}
+
+
+def is_enabled(obj: Any, default: bool = True) -> bool:
+    if obj is None:
+        return default
+    if isinstance(obj, bool):
+        return obj
+    return bool(obj.get("enabled", default)) if isinstance(obj, dict) else default
+
+
+def read_table(path: str, kwargs: Dict[str, Any] | None = None) -> pd.DataFrame:
+    return pd.read_csv(path, **dict(kwargs or {}))
+
+
+def load_guide_assignment(path: str) -> np.ndarray:
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix == ".npy":
+        return np.load(source)
+    if suffix == ".npz":
+        arrays = np.load(source)
+        if len(arrays.files) != 1:
+            raise ValueError(f"guide_assignment .npz should contain exactly one array, found {arrays.files}")
+        return arrays[arrays.files[0]]
+    if suffix in {".csv", ".tsv", ".txt"}:
+        return pd.read_csv(source, header=None, sep="\t" if suffix in {".tsv", ".txt"} else ",").to_numpy()
+    raise ValueError(f"Unsupported guide_assignment format: {path}. Use .npy, .npz, .csv, .tsv, or .txt")
+
+# Constructor options accepted by bayesDREAM.__init__. This includes
+# 'feature_name_col'/'feature_names' (bayesDREAM commit 24bc2f5, "Unify
 # feature identity resolution") -- pin the primary/cis-gene modality's
 # feature_id explicitly rather than relying on resolve_feature_ids' column-
 # priority cascade, which reordered 'gene_id' ABOVE 'gene_name' relative to
@@ -57,7 +88,7 @@ from bayesDREAM.cli import (
 # publication_runs/domingo/README.md's "Feature identity" sections for what
 # this means for a dataset with a sparse/`.npz` primary counts matrix, where
 # the cascade — not an explicit override — decides identity).
-_EXTENDED_MODEL_KEYS = {
+_MODEL_KEYS = {
     "modality_name", "cis_gene", "cis_feature", "guide_covariates", "guide_covariates_ntc",
     "sum_factor_col", "output_dir", "label", "device", "random_seed", "cores",
     "exclude_targets", "require_ntc",
@@ -67,7 +98,7 @@ _EXTENDED_MODEL_KEYS = {
 
 
 def _read_counts(path, read_csv_kwargs):
-    """Like bayesDREAM.cli's own counts loading, but also accepts a `.npz`
+    """Read CSV counts or a `.npz`
     sparse matrix (`scipy.sparse.load_npz`) -- needed for Morris, where a
     dense CSV of ~31k genes x ~94k cells is infeasible. Sparse `.npz` counts
     have NO row/column labels; bayesDREAM aligns them to `meta` PURELY BY
@@ -99,12 +130,7 @@ def _read_counts(path, read_csv_kwargs):
 
 
 def build_model_from_config(cfg: Dict[str, Any]) -> "bayesDREAM":
-    """Construct a bayesDREAM model from a bayesdream-CLI-schema config dict.
-
-    See module docstring: duplicates bayesDREAM.cli._build_model's
-    data-loading logic with an extended model-kwarg allow-list
-    (_EXTENDED_MODEL_KEYS) rather than reusing it directly.
-    """
+    """Construct a bayesDREAM model from a publication stage config."""
     data_cfg = cfg.get("data") or {}
     model_cfg = cfg.get("model") or {}
 
@@ -147,7 +173,7 @@ def build_model_from_config(cfg: Dict[str, Any]) -> "bayesDREAM":
     if data_cfg.get("guide_target"):
         guide_target = read_table(data_cfg["guide_target"], data_cfg.get("guide_target_read_csv_kwargs"))
 
-    model_kwargs = {k: v for k, v in model_cfg.items() if k in _EXTENDED_MODEL_KEYS}
+    model_kwargs = {k: v for k, v in model_cfg.items() if k in _MODEL_KEYS}
     if feature_meta is not None:
         model_kwargs["feature_meta"] = feature_meta
 

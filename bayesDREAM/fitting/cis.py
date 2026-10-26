@@ -16,9 +16,10 @@ from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
 
+from . import FitterBase
 
 
-class CisFitter:
+class CisFitter(FitterBase):
     """Handles cis gene expression fitting."""
 
     def __init__(self, model):
@@ -31,14 +32,6 @@ class CisFitter:
             The parent model instance
         """
         self.model = model
-
-    def _t(self, x, dtype=torch.float32):
-        return torch.as_tensor(x, dtype=dtype, device=self.model.device)
-
-    def _to_cpu(self, x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu()
-        return x
 
     ########################################################
     # Step 2: Fit cis effects (model_x)

@@ -1,5 +1,5 @@
 """
-Measure real peak memory for a bayesdream-CLI-schema config's model
+Measure real peak memory for a publication-stage config's model
 construction, and (optionally) a cheap fit_ntc()/fit_cis()/fit_trans() call
 -- to pick --cpus-per-task on Dardel's `shared` partition, where RAM is a
 FIXED 888MB per core (confirmed via `scontrol show partition shared` -- see

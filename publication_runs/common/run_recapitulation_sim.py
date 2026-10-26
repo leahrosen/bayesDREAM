@@ -7,8 +7,8 @@ from examples/simulation_study, which simulates from scratch (unknown ground
 truth priors) to test recovery under controlled conditions; this stage
 starts FROM an already-completed real fit.
 
-Not a bayesDREAM CLI subcommand. Requires ntc + cis + trans already fit and
-saved for this gene/modality (needs x_true, sum_factors, alpha_y_prefit, and
+Requires ntc + cis + trans already fit and saved for this gene/modality
+(needs x_true, sum_factors, alpha_y_prefit, and
 the saved trans_feature_summary.csv as ground truth). Deep-copies the loaded
 model and swaps in simulated counts for the TARGET modality, so x_true,
 sum_factors, technical_group_code and alpha_y_prefit are IDENTICAL to the
@@ -298,7 +298,7 @@ def run_recapitulation_sim(cfg: dict, rep: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", "-c", required=True, help="Path to bayesdream-CLI-schema YAML config.")
+    parser.add_argument("--config", "-c", required=True, help="Path to publication stage YAML config.")
     parser.add_argument("--rep", type=int, required=True, help="Replicate index (also seeds RNG).")
     parser.add_argument("--device", default=None, help="Explicit device override, e.g. 'cuda:2' (see config_utils.apply_device_override).")
     args = parser.parse_args()

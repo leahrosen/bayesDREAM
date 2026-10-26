@@ -3,18 +3,14 @@ From: python:3.11-slim
 
 %labels
     Author bayesDREAM Development Team
-    Description bayesDREAM CPU container for CLI and Snakemake workflows
+    Description bayesDREAM CPU container for Python workflows
 
 %help
     Build:
       apptainer build bayesdream_cpu.sif apptainer/bayesdream_cpu.def
 
-    Run CLI:
-      apptainer exec bayesdream_cpu.sif bayesdream --help
-      apptainer exec bayesdream_cpu.sif bayesdream run --config /work/config.yaml
-
-    Snakemake usage example:
-      snakemake --use-singularity --singularity-args "--bind $PWD:/work"
+        Python library:
+            apptainer exec bayesdream_cpu.sif python -c "from bayesDREAM import bayesDREAM"
 
 %environment
     export LC_ALL=C.UTF-8
@@ -45,7 +41,7 @@ From: python:3.11-slim
         --index-url https://download.pytorch.org/whl/cpu \
         torch torchvision torchaudio
 
-    # Install bayesDREAM dependencies and Typer CLI deps
+    # Install bayesDREAM dependencies
     python -m pip install --no-cache-dir \
         numpy \
         scipy \
@@ -56,16 +52,14 @@ From: python:3.11-slim
         seaborn \
         h5py \
         psutil \
-        pyyaml \
-        typer
+        pyyaml
 
     cd /opt/bayesDREAM
     python -m pip install --no-cache-dir -e .
 
 %runscript
     cd /opt/bayesDREAM
-    exec bayesdream "$@"
+    exec "$@"
 
 %test
     python -c "from bayesDREAM import bayesDREAM; print('bayesDREAM import ok')"
-    bayesdream --help >/dev/null

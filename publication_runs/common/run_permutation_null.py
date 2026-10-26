@@ -2,7 +2,7 @@
 Permutation-null stage: break cis-trans correlation, refit trans, save the
 result as one replicate of the expected-false-positive-rate distribution.
 
-Not a bayesDREAM CLI subcommand. Loads ntc + cis fits like the trans stage,
+Loads ntc + cis fits like the trans stage,
 then permutes ALL of one modality's features' NTC expression into perturbed
 cells (``permute_from_ntc``) and resamples ``x_true`` among NTC cells
 (``model.permute_x_true``) before calling ``fit_trans()`` -- so any
