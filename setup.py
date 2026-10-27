@@ -33,7 +33,7 @@ setup(
     description='Bayesian framework for modeling CRISPR perturbation effects across multiple molecular modalities',
     long_description=get_long_description(),
     long_description_content_type='text/markdown',
-    packages=find_packages(),
+    packages=find_packages(include=['bayesDREAM*']),
     python_requires='>=3.10',
     install_requires=[
         'numpy>=1.24.0',
