@@ -31,7 +31,9 @@ from config_utils import (  # noqa: E402
     is_enabled,
     load_bayesdream_yaml,
     normalize_stage_args,
+    read_table,
 )
+from bayesDREAM.utils import make_names_unique  # noqa: E402
 
 # condition name -> fit_trans x-input kwargs
 CONDITIONS = {
@@ -51,7 +53,7 @@ def production_config(dataset, label, stage="trans"):
     return path
 
 
-def build_trans_model(cfg_path, device, model_overrides=None):
+def build_trans_model(cfg_path, device, model_overrides=None, legacy_feature_names_col=None):
     """
     Rebuild the production trans-stage model up to (not including)
     exclude_trans_genes/fit_trans: build -> load_ntc_fit -> load_cis_fit ->
@@ -60,6 +62,12 @@ def build_trans_model(cfg_path, device, model_overrides=None):
     model_overrides: keys replaced in the config's `model:` block before
     building (e.g. guide_covariates=[] so the guide panel matches a cis fit
     made when high-MOI guide_covariates were still ignored).
+
+    legacy_feature_names_col: name features as pre-2026-09-09 bayesDREAM did --
+    this feature_meta column with repeats disambiguated scanpy-style
+    (X, X-1, ...) -- so they match fits saved by that code. Current code
+    rejects duplicates in feature_name_col, so the list is passed explicitly
+    as feature_names.
     """
     cfg = load_bayesdream_yaml(Path(cfg_path))
     apply_device_override(cfg, str(device))
@@ -67,6 +75,16 @@ def build_trans_model(cfg_path, device, model_overrides=None):
         for k, v in model_overrides.items():
             print(f"[override] model.{k}: {cfg['model'].get(k)!r} -> {v!r}")
         cfg["model"].update(model_overrides)
+    if legacy_feature_names_col:
+        data_cfg = cfg["data"]
+        fm = read_table(data_cfg["feature_meta"],
+                        data_cfg.get("feature_meta_read_csv_kwargs", {"index_col": 0}))
+        names = make_names_unique(fm[legacy_feature_names_col].tolist())
+        n_dup = sum(a != b for a, b in zip(names, fm[legacy_feature_names_col].astype(str)))
+        print(f"[override] model.feature_names: {legacy_feature_names_col!r} with "
+              f"{n_dup} duplicate(s) suffixed -1, -2, ... (pre-2026-09-09 naming)")
+        cfg["model"].pop("feature_name_col", None)
+        cfg["model"]["feature_names"] = names
     model = build_model_from_config(cfg)
 
     trans_cfg = cfg.get("trans") or {}
