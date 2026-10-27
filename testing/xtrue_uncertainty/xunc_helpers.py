@@ -73,6 +73,7 @@ def build_trans_model(cfg_path, device, model_overrides=None):
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     if is_enabled(trans_cfg.get("load_ntc"), default=True):
         model.load_ntc_fit(**normalize_stage_args(trans_cfg.get("load_ntc")))
+        _check_ntc_alignment(model)
     # full (non-lean) cis posterior: x_uncertainty='sample' needs the raw draws
     model.load_cis_fit(**normalize_stage_args(trans_cfg.get("load_cis")))
     if "technical_group_code" not in model.meta.columns:
@@ -81,6 +82,28 @@ def build_trans_model(cfg_path, device, model_overrides=None):
             model.set_technical_groups(covariates)
     apply_sum_factor_adjustments(model, cfg.get("sum_factor") or {})
     return model, cfg
+
+
+def _check_ntc_alignment(model, min_matched=0.9):
+    """
+    load_ntc_fit aligns the saved NTC posterior to the model's features by name
+    and, with mask_features=True, silently fills unmatched features with the
+    baseline (1.0 -- for every key, mu_ntc included). If the model's feature_ids
+    use a different identifier than the fit (e.g. Ensembl vs gene symbol), almost
+    nothing matches; stop instead of fitting with alpha_y = mu_ntc = 1.
+    """
+    mod = model.get_modality(model.primary_modality)
+    mask = getattr(mod, "fitted_feature_mask", None)
+    if mask is None:
+        return
+    mask = np.asarray(mask, dtype=bool)
+    frac = mask.mean()
+    print(f"NTC fit matched {mask.sum()}/{mask.size} features by name ({frac:.1%})")
+    if frac < min_matched:
+        raise ValueError(
+            f"Only {frac:.1%} of the model's features match the saved NTC fit by name -- "
+            f"feature_ids look like {list(mod.feature_ids[:3])}. The model is probably using a "
+            "different identifier than the fit (set model_overrides={'feature_name_col': ...}).")
 
 
 def build_modality_model(cfg_path, device):
