@@ -6,6 +6,12 @@ Within-dataset comparison of the three Replogle publication-run fit variants
     bm_noindmu  batch-matched NTC subset, independent_mu_sigma=False
     all_indmu   all-NTC subset,           independent_mu_sigma=True
 
+plus, as a fourth fit, ``previous``: the earlier Replogle fit used throughout
+the rest of comparative/ (the papermill fit_cis/fit_trans notebooks, exported
+by comparative/reconstruct_export_replogle.py into
+REPLOGLE.save_for_plotting_dir_fn(gene) -- see comparative/datasets.py).
+Its NTC cells are the NTC cells in the target cells' own batches.
+
 Unlike the rest of comparative/ (Domingo vs Morris vs Replogle), this
 compares the SAME dataset/cis gene across fit configurations, so every
 variant here is treated as its own "dataset" by trans_param_compare.py's
@@ -66,7 +72,9 @@ from config_utils import (  # noqa: E402
     apply_device_override,
 )
 
-from .datasets import DatasetSpec, PALETTE_B, REPLOGLE_GENE_TO_ID  # noqa: E402
+from dataclasses import replace as _replace_spec  # noqa: E402
+
+from .datasets import DatasetSpec, PALETTE_B, REPLOGLE, REPLOGLE_GENE_TO_ID  # noqa: E402
 from .hill_eval import add_log2fc_at_columns, get_x_ntc, tag_for_log2fc, HILL_LOG2FC_TARGETS  # noqa: E402
 
 
@@ -83,8 +91,12 @@ CACHE_DIR = (
 )
 
 VARIANTS = ['bm_indmu', 'bm_noindmu', 'all_indmu']
+# The earlier fit used by the rest of comparative/ (REPLOGLE in datasets.py).
+PREVIOUS = 'previous'
+COMPARED = VARIANTS + [PREVIOUS]
 VARIANT_DATA = {'bm_indmu': 'bm', 'bm_noindmu': 'bm', 'all_indmu': 'all'}
-VARIANT_COLORS = {'bm_indmu': '#1b9e77', 'bm_noindmu': '#d95f02', 'all_indmu': '#7570b3'}
+VARIANT_COLORS = {'bm_indmu': '#1b9e77', 'bm_noindmu': '#d95f02', 'all_indmu': '#7570b3',
+                  PREVIOUS: '#a6761d'}
 CIS_GENES = sorted(REPLOGLE_GENE_TO_ID)
 
 
@@ -101,6 +113,17 @@ def cache_dir(gene: str, variant: str) -> str:
     return os.path.join(CACHE_DIR, gene, variant)
 
 
+def previous_dir(gene: str) -> str:
+    """save_model_for_plotting() export of the previous fit (meta_plot.csv,
+    posterior_samples_cis.pt, backfilled trans_feature_summary_gene.csv)."""
+    return REPLOGLE.save_for_plotting_dir_fn(gene)
+
+
+def _ordered(names) -> List[str]:
+    names = set(names)
+    return [v for v in COMPARED if v in names]
+
+
 # ── cis: per-cell x_true posterior ───────────────────────────────────────────
 
 def _as_samples_by_cells(v, n_cells: int) -> np.ndarray:
@@ -115,8 +138,43 @@ def _as_samples_by_cells(v, n_cells: int) -> np.ndarray:
 
 def load_cis_posterior(gene: str, variant: str) -> dict:
     """Raw posterior_samples_cis.pt dict (full samples, not the lean file)."""
-    path = os.path.join(run_dir(gene, variant), 'posterior_samples_cis.pt')
-    return torch.load(path, map_location='cpu', weights_only=False)
+    d = previous_dir(gene) if variant == PREVIOUS else run_dir(gene, variant)
+    return torch.load(os.path.join(d, 'posterior_samples_cis.pt'), map_location='cpu', weights_only=False)
+
+
+def load_cis_meta(gene: str, variant: str) -> pd.DataFrame:
+    """Cell metadata of the fit: the cis_only subset's meta.csv for the
+    production variants, meta_plot.csv (the model's own meta, same row order
+    as its x_true) for the previous fit."""
+    if variant == PREVIOUS:
+        return pd.read_csv(os.path.join(previous_dir(gene), 'meta_plot.csv'), low_memory=False)
+    return pd.read_csv(os.path.join(subset_dir(gene, variant), 'meta.csv'), low_memory=False)
+
+
+def _cis_cell_names(post: dict, meta: pd.DataFrame, n_cells: int, tag: str) -> list:
+    """posterior_samples_cis.pt's cell_names; older files (the previous fit)
+    may lack them, in which case meta_plot.csv's row order is the cell order."""
+    cells = post.get('cell_names')
+    if cells is not None:
+        return list(cells)
+    if len(meta) != n_cells:
+        raise ValueError(f"[{tag}] no cell_names in posterior_samples_cis.pt and meta has "
+                         f"{len(meta)} rows vs {n_cells} cells -- can't align by position")
+    return meta['cell'].tolist()
+
+
+def _guide_labels(post: dict, meta: pd.DataFrame, n_guides: int, tag: str) -> list:
+    """x_eff_g's guide-axis labels (guide_used values). Older files lack
+    guide_axis_labels; then x_eff_g is indexed by meta's guide_code."""
+    labels = post.get('guide_axis_labels')
+    if labels is not None:
+        return list(labels)
+    if not {'guide_code', 'guide_used'}.issubset(meta.columns):
+        raise KeyError(f"[{tag}] no guide_axis_labels and no guide_code/guide_used in meta")
+    m = meta.drop_duplicates('guide_code').set_index('guide_code')['guide_used'].sort_index()
+    if list(m.index) != list(range(n_guides)):
+        raise ValueError(f"[{tag}] meta's guide_code doesn't cover 0..{n_guides - 1}")
+    return m.tolist()
 
 
 def cis_cell_summary(gene: str, variant: str) -> pd.DataFrame:
@@ -130,10 +188,10 @@ def cis_cell_summary(gene: str, variant: str) -> pd.DataFrame:
     comparable across variants even if the absolute x scale shifts.
     """
     post = load_cis_posterior(gene, variant)
-    cells = post.get('cell_names')
-    if cells is None:
-        raise KeyError(f"[{gene}/{variant}] posterior_samples_cis.pt has no cell_names")
     ps = post['posterior_samples']
+    meta = load_cis_meta(gene, variant)
+    n_cells = int(np.prod(ps['x_true'].shape[1:]))
+    cells = _cis_cell_names(post, meta, n_cells, f'{gene}/{variant}')
     x = _as_samples_by_cells(ps['x_true'], len(cells))
     lx = np.log2(np.clip(x, 1e-12, None))
 
@@ -146,12 +204,10 @@ def cis_cell_summary(gene: str, variant: str) -> pd.DataFrame:
     })
     df['ci_width'] = df['log2_x_true_upper'] - df['log2_x_true_lower']
 
-    meta = pd.read_csv(os.path.join(subset_dir(gene, variant), 'meta.csv'),
-                       usecols=lambda c: c in {'cell', 'guide', 'target'})
-    df = df.merge(meta, on='cell', how='left')
+    df = df.merge(meta[['cell', 'guide', 'target']].drop_duplicates('cell'), on='cell', how='left')
     if df['target'].isna().any():
         raise ValueError(f"[{gene}/{variant}] {int(df['target'].isna().sum())} cell(s) in the cis "
-                         f"posterior not found in {subset_dir(gene, variant)}/meta.csv")
+                         f"posterior not found in the fit's meta")
     df['is_ntc'] = df['target'].astype(str).str.lower().eq('ntc')
 
     log2_x_ntc = float(np.log2(np.median(np.median(x[:, df['is_ntc'].values], axis=0))))
@@ -161,7 +217,7 @@ def cis_cell_summary(gene: str, variant: str) -> pd.DataFrame:
     return df
 
 
-def load_cis_cells(gene: str, variants: List[str] = VARIANTS) -> pd.DataFrame:
+def load_cis_cells(gene: str, variants: List[str] = COMPARED) -> pd.DataFrame:
     """Long table: cis_cell_summary() for every variant, stacked."""
     return pd.concat([cis_cell_summary(gene, v) for v in variants], ignore_index=True)
 
@@ -176,10 +232,10 @@ def cis_cells_wide(cells: pd.DataFrame, value: str) -> pd.DataFrame:
 
 
 def cis_guide_summary(cells: pd.DataFrame) -> pd.DataFrame:
-    """Per (variant, guide): n cells, median of per-cell log2 x_true
+    """Per (variant, guide): is_ntc, n cells, median of per-cell log2 x_true
     medians, median per-cell log2FC vs own NTC, and median per-cell CI
     width / SD."""
-    return (cells.groupby(['variant', 'target', 'guide'], observed=True)
+    return (cells.groupby(['variant', 'is_ntc', 'target', 'guide'], observed=True)
                  .agg(n_cells=('cell', 'size'),
                       log2_x_true_median=('log2_x_true_median', 'median'),
                       log2fc_x_true=('log2fc_x_true', 'median'),
@@ -189,9 +245,11 @@ def cis_guide_summary(cells: pd.DataFrame) -> pd.DataFrame:
 
 
 def cis_guide_posterior(gene: str, variant: str) -> Optional[pd.DataFrame]:
-    """Guide-level x_eff_g posterior (log2 median + 95% CI) per guide, using
-    the guide_axis_labels saved with the fit. None if the fit has no
-    x_eff_g or no labels (legacy files).
+    """Guide-level x_eff_g posterior per guide: log2 median + 95% CI, and
+    the same as log2FC relative to the median x_eff_g over this fit's own
+    NTC guides (bayesDREAM's cis_guide_summary.csv log2fc_x_eff_g_*
+    definition, so it compares directly with Domingo/Morris). None if the
+    fit has no x_eff_g (legacy files).
 
     The saved labels are bayesDREAM's guide_used values,
     f"{guide}_{'_'.join(covariate values)}" (core.py). Replogle has no
@@ -199,18 +257,28 @@ def cis_guide_posterior(gene: str, variant: str) -> Optional[pd.DataFrame]:
     'guide' strips it so this joins against meta['guide'], and
     'guide_used' keeps the raw label."""
     post = load_cis_posterior(gene, variant)
-    labels = post.get('guide_axis_labels')
     ps = post['posterior_samples']
-    if labels is None or 'x_eff_g' not in ps:
+    if 'x_eff_g' not in ps:
         return None
+    meta = load_cis_meta(gene, variant)
+    n_guides = int(np.prod(ps['x_eff_g'].shape[1:]))
+    labels = _guide_labels(post, meta, n_guides, f'{gene}/{variant}')
     lx = np.log2(np.clip(_as_samples_by_cells(ps['x_eff_g'], len(labels)), 1e-12, None))
-    return pd.DataFrame({
+    df = pd.DataFrame({
         'variant': variant, 'guide_used': labels,
         'guide': [lab[:-1] if lab.endswith('_') else lab for lab in labels],
         'log2_x_eff_median': np.median(lx, axis=0),
         'log2_x_eff_lower': np.quantile(lx, 0.025, axis=0),
         'log2_x_eff_upper': np.quantile(lx, 0.975, axis=0),
     })
+    per_guide = meta.groupby('guide').agg(target=('target', 'first'), n_cells=('cell', 'size'))
+    df = df.join(per_guide, on='guide')
+    df['is_ntc'] = df['target'].astype(str).str.lower().eq('ntc')
+    if df['is_ntc'].any():
+        ref = float(np.log2(np.median(2.0 ** df.loc[df['is_ntc'], 'log2_x_eff_median'])))
+        for q in ('median', 'lower', 'upper'):
+            df[f'log2fc_x_eff_{q}'] = df[f'log2_x_eff_{q}'] - ref
+    return df
 
 
 def cis_variant_overview(cells: pd.DataFrame) -> pd.DataFrame:
@@ -225,21 +293,22 @@ def cis_variant_overview(cells: pd.DataFrame) -> pd.DataFrame:
              .unstack('group'))
     out.columns = [f'{a}_{b}' for a, b in out.columns]
     out['log2_x_ntc'] = cells.groupby('variant')['log2_x_ntc'].first()
-    return out.loc[[v for v in VARIANTS if v in out.index]]
+    return out.loc[_ordered(out.index)]
 
 
 def plot_cis_pairwise(cells: pd.DataFrame, value: str = 'log2_x_true_median', *,
-                      title: str = '', target_only: bool = False):
+                      title: str = '', target_only: bool = False, ncols: int = 3):
     """One scatter per variant pair of a per-cell column (default: log2
     x_true posterior median), on cells present in both. Target cells are
-    coloured by guide; NTC cells grey underneath. Identity line dashed."""
+    coloured by guide; NTC cells grey underneath. Identity line dashed.
+    The legend (guide names wrapped) sits outside, right of the last row."""
     import matplotlib.pyplot as plt
     from itertools import combinations
 
     wide = cis_cells_wide(cells, value)
     if target_only:
         wide = wide[~wide['is_ntc']]
-    variants = [v for v in VARIANTS if v in wide.columns]
+    variants = _ordered(c for c in wide.columns if c in COMPARED)
     pairs = list(combinations(variants, 2))
     vals = wide[variants].to_numpy(dtype=float)
     lo, hi = np.nanmin(vals), np.nanmax(vals)
@@ -248,9 +317,14 @@ def plot_cis_pairwise(cells: pd.DataFrame, value: str = 'log2_x_true_median', *,
 
     guides = sorted(wide.loc[~wide['is_ntc'], 'guide'].dropna().unique())
     cmap = plt.get_cmap('tab10' if len(guides) <= 10 else 'tab20')
-    fig, axes = plt.subplots(1, len(pairs), figsize=(4.2 * len(pairs), 4.2), constrained_layout=True,
-                             squeeze=False)
-    for ax, (a, b) in zip(axes[0], pairs):
+    ncols = min(ncols, len(pairs))
+    nrows = int(np.ceil(len(pairs) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols + 2.5, 4.2 * nrows),
+                             constrained_layout=True, squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[len(pairs):]:
+        ax.axis('off')
+    for ax, (a, b) in zip(axes, pairs):
         sub = wide.dropna(subset=[a, b])
         ntc = sub[sub['is_ntc']]
         if len(ntc):
@@ -259,13 +333,22 @@ def plot_cis_pairwise(cells: pd.DataFrame, value: str = 'log2_x_true_median', *,
         for i, gd in enumerate(guides):
             s = sub[(~sub['is_ntc']) & (sub['guide'] == gd)]
             if len(s):
-                ax.scatter(s[a], s[b], s=8, color=cmap(i % cmap.N), alpha=0.8, label=f'{gd} (n={len(s)})')
+                ax.scatter(s[a], s[b], s=8, color=cmap(i % cmap.N), alpha=0.8,
+                           label=f'{_wrap_guide_label(gd)}\n(n={len(s)})')
         ax.plot(lims, lims, ls='--', c='k', lw=0.8)
         ax.set_xlim(lims); ax.set_ylim(lims)
         ax.set_xlabel(a); ax.set_ylabel(b)
         r = sub[[a, b]].corr().iloc[0, 1]
         ax.set_title(f'{a} vs {b}  (r={r:.3f}, n={len(sub)})', fontsize=9)
-    axes[0][0].legend(fontsize=6, markerscale=2, loc='upper left')
+    # one entry per label across panels (a guide can be missing from a pair)
+    handles = {}
+    for ax in axes[:len(pairs)]:
+        for h, lab in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(lab.split('\n(n=')[0], (h, lab))
+    if handles:
+        hs, labs = zip(*handles.values())
+        axes[ncols - 1].legend(hs, labs, fontsize=6, markerscale=2, loc='upper left',
+                               bbox_to_anchor=(1.02, 1), borderaxespad=0)
     fig.suptitle(f'{title}{value}' + (' (targeting cells only)' if target_only else ''), fontsize=11)
     return fig
 
@@ -275,8 +358,8 @@ def plot_cis_tightness(cells: pd.DataFrame, *, title: str = ''):
     of log2 x_true) per variant, split target vs NTC."""
     import matplotlib.pyplot as plt
 
-    variants = [v for v in VARIANTS if v in set(cells['variant'])]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+    variants = _ordered(cells['variant'])
+    fig, axes = plt.subplots(1, 2, figsize=(5 + 1.6 * len(variants), 4), constrained_layout=True)
     for ax, col, lab in zip(axes, ['ci_width', 'log2_x_true_sd'],
                             ['95% CI width of log2 x_true', 'posterior SD of log2 x_true']):
         data, labels, colors = [], [], []
@@ -308,14 +391,16 @@ def _wrap_guide_label(label: str, width: int = 30) -> str:
     return '\n'.join(lines)
 
 
-def plot_guide_posteriors(guide_post: pd.DataFrame, *, title: str = ''):
+def plot_guide_posteriors(guide_post: pd.DataFrame, *, title: str = '', value: str = 'log2_x_eff'):
     """Point-range plot of guide-level log2 x_eff_g (median + 95% CI) per
     variant, guides on the y axis. Only guides present in EVERY variant are
     shown (the cis gene's own guides + bm's curated NTC guides) --
-    all_indmu's full NTC guide panel would otherwise swamp the plot."""
+    all_indmu's full NTC guide panel would otherwise swamp the plot.
+    `value` picks log2 x_eff ('log2_x_eff') or log2FC vs own NTC guides
+    ('log2fc_x_eff')."""
     import matplotlib.pyplot as plt
 
-    variants = [v for v in VARIANTS if v in set(guide_post['variant'])]
+    variants = _ordered(guide_post['variant'])
     per_variant = [set(guide_post.loc[guide_post['variant'] == v, 'guide']) for v in variants]
     guides = sorted(set.intersection(*per_variant))
     labels = [_wrap_guide_label(g) for g in guides]
@@ -328,13 +413,14 @@ def plot_guide_posteriors(guide_post: pd.DataFrame, *, title: str = ''):
     for off, v in zip(offs, variants):
         s = guide_post[guide_post['variant'] == v].set_index('guide').reindex(guides)
         y = ypos + off
-        ax.errorbar(s['log2_x_eff_median'], y,
-                    xerr=[s['log2_x_eff_median'] - s['log2_x_eff_lower'],
-                          s['log2_x_eff_upper'] - s['log2_x_eff_median']],
+        ax.errorbar(s[f'{value}_median'], y,
+                    xerr=[s[f'{value}_median'] - s[f'{value}_lower'],
+                          s[f'{value}_upper'] - s[f'{value}_median']],
                     fmt='o', ms=3, lw=1, color=VARIANT_COLORS[v], label=v)
     ax.set_yticks(ypos); ax.set_yticklabels(labels, fontsize=7)
     ax.set_ylim(heights.sum(), 0)
-    ax.set_xlabel('log2 x_eff_g (median, 95% CI)')
+    ax.set_xlabel(('log2FC x_eff_g vs own NTC guides' if value == 'log2fc_x_eff' else 'log2 x_eff_g')
+                  + ' (median, 95% CI)')
     ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1))
     ax.set_title(f'{title}guide-level cis expression', fontsize=11)
     return fig
@@ -392,6 +478,9 @@ def backfill_variant(gene: str, variant: str, *, targets=HILL_LOG2FC_TARGETS,
     'feature'. Skips if the cached file already has those columns, unless
     force=True. Needs a full model reload (minutes, several GB).
     """
+    if variant == PREVIOUS:
+        raise ValueError("the previous fit is backfilled by comparative/reconstruct_export_replogle.py, "
+                         "not here")
     out_path = _backfilled_path(gene, variant)
     needed = {f'y_at_{tag_for_log2fc(t)}_log2fc_median_allgenes' for t in targets}
     if not force and os.path.exists(out_path) and needed.issubset(pd.read_csv(out_path, nrows=0).columns):
@@ -428,12 +517,14 @@ def backfill_variant(gene: str, variant: str, *, targets=HILL_LOG2FC_TARGETS,
     return out_path
 
 
-def variant_specs(variants: List[str] = VARIANTS) -> List[DatasetSpec]:
+def variant_specs(variants: List[str] = COMPARED) -> List[DatasetSpec]:
     """One DatasetSpec per variant, reading the backfilled cache summaries,
     so trans_param_compare.load_all()/plot_pairwise_grid() treat each
     variant as a dataset. 'feature' is the Ensembl ID (feature_name_col:
-    gene_id); 'gene_name' is the symbol."""
+    gene_id); 'gene_name' is the symbol. PREVIOUS is comparative/'s own
+    REPLOGLE spec under this module's name and colour."""
     return [
+        _replace_spec(REPLOGLE, name=PREVIOUS, color=VARIANT_COLORS[PREVIOUS]) if v == PREVIOUS else
         DatasetSpec(
             name=v, color=VARIANT_COLORS[v], cell_line_palette=PALETTE_B, cis_genes=CIS_GENES,
             symbol_col='gene_name', run_dir_fn=(lambda g, v=v: cache_dir(g, v)),
