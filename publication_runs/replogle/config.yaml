@@ -285,7 +285,11 @@ trans:
   #   python common/profile_memory.py \
   #     --config slurm/configs/<label_prefix>_<gene>_bm_indmu_trans.yaml \
   #     --stage trans --niters 10
-  resources: {cores: 8, time_hours: 24}   # cores: NOT profiled -- placeholder, see comment above
+  # 2026-10-25 full rerun: never profiled, but all 14 real bm_* trans jobs
+  # completed at 8 cores with no OOM, in 2:19-15:02 wall-clock (slowest:
+  # HHEX bm_indmu) -- 24h limit keeps ~1.6x margin. Peak RSS still
+  # unrecorded (see STRATEGY.md §19).
+  resources: {cores: 8, time_hours: 24}
   # `gpu_resources` applies ONLY to the "all" (full-NTC) data variant's
   # fit_trans (all_indmu) -- one GPU node per gene, fixed at 24h, no
   # profiling (every all_indmu run has the identical full-8195-gene panel
