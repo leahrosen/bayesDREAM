@@ -37,9 +37,9 @@ from bayesDREAM.utils import make_names_unique  # noqa: E402
 
 # condition name -> fit_trans x-input kwargs
 CONDITIONS = {
-    "cell_median": dict(x_level="cell", x_uncertainty="median"),   # previous behaviour
-    "cell_sample": dict(x_level="cell", x_uncertainty="sample"),
-    "guide_sample": dict(x_level="guide", x_uncertainty="sample"),
+    "cell_median": dict(x_level="cell", x_uncertainty="median"),   # old behaviour; not recommended
+    "cell_sample": dict(x_level="cell", x_uncertainty="sample"),   # fit_trans default; recommended
+    "guide_sample": dict(x_level="guide", x_uncertainty="sample"), # not recommended
 }
 COND_COLORS = {"cell_median": "#7f7f7f", "cell_sample": "#1f77b4", "guide_sample": "#d62728",
                "guide_median": "#ff7f0e"}

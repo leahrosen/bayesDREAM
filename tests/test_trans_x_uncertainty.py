@@ -118,3 +118,21 @@ def test_trans_x_input_roundtrip(cis_fitted):
     m2.load_trans_fit()
     assert m2.trans_x_input == {"x_level": "cell", "x_uncertainty": "sample",
                                 "x_draws_per_step": 1}
+
+
+def test_fit_trans_default_is_cell_sample(cis_fitted):
+    import copy
+    m = copy.deepcopy(cis_fitted)
+    m.fit_trans(sum_factor_col="sum_factor", function_type="single_hill",
+                niters=40, nsamples=5, checkpoint_interval=None)
+    assert m.trans_x_input == {"x_level": "cell", "x_uncertainty": "sample",
+                               "x_draws_per_step": 1}
+
+
+def test_fit_trans_default_raises_without_cis_posterior(cis_fitted):
+    import copy
+    m = copy.deepcopy(cis_fitted)
+    m.posterior_samples_cis = None   # e.g. x_true set by hand
+    with pytest.raises(ValueError, match="x_uncertainty='median'"):
+        m.fit_trans(sum_factor_col="sum_factor", function_type="single_hill",
+                    niters=40, nsamples=5, checkpoint_interval=None)

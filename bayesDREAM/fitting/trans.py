@@ -1340,13 +1340,15 @@ class TransFitter:
             raise ValueError(
                 f"fit_trans({_how}) needs the fit_cis posterior draws "
                 "(model.posterior_samples_cis), but none are set. Run fit_cis() or "
-                "load_cis_fit() first, or use x_level='cell', x_uncertainty='median'."
+                "load_cis_fit() first. If x_true was set by hand (no cis posterior), pass "
+                "x_uncertainty='median' explicitly (not recommended: treats x as exact)."
             )
         if is_lean_posterior(ps):
             raise ValueError(
                 f"fit_trans({_how}) needs raw fit_cis posterior draws, but "
                 "posterior_samples_cis was lean-loaded (point estimates only). "
-                "Reload with load_cis_fit(lean=False)."
+                "Reload with load_cis_fit(lean=False), or pass x_uncertainty='median' "
+                "(not recommended: treats x as exact)."
             )
 
         N_model = len(self.model.meta)
@@ -1372,8 +1374,8 @@ class TransFitter:
                     "posterior_samples_cis['x_true'] is out of sync with model.x_true "
                     "(the per-cell posterior median of the draws != x_true). x_true was "
                     "probably replaced via set_x_true() or loaded from a fit saved before "
-                    "the mean->median switch. Re-run fit_cis(), or use "
-                    "x_uncertainty='median'."
+                    "the mean->median switch. Re-run fit_cis() (recommended), or pass "
+                    "x_uncertainty='median' (not recommended: treats x as exact)."
                 )
         else:
             if getattr(self.model, 'x_true_permuted', False):
@@ -1478,7 +1480,7 @@ class TransFitter:
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
         x_level: str = 'cell',
-        x_uncertainty: str = 'median',
+        x_uncertainty: str = 'sample',
         x_draws_per_step: int = 1,
         debug: bool = False,
         **kwargs
@@ -1581,18 +1583,22 @@ class TransFitter:
             Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
         x_level : {'cell', 'guide'}, optional
             Which cis-expression quantity the dose-response is a function of.
-            'cell' (default): per-cell x_true from fit_cis. 'guide': the cell's
-            guide-level expectation (x_eff_g, or the log2-additive guide combination in
-            high-MOI mode), which removes the within-guide ordering of cells -- that
-            ordering is informed only by one cis count and the sum factor.
-        x_uncertainty : {'median', 'sample'}, optional
-            'median' (default, previous behaviour): condition on the posterior median of
-            x. 'sample': each SVI step conditions on a fresh joint draw from the fit_cis
-            posterior. x stays fixed data (never a latent of _model_y, so y cannot pull
-            it), and the objective becomes the ELBO averaged over the cis posterior, which
-            penalises dose-response curves that are steep where x is uncertain. Requires
-            full (non-lean) posterior_samples_cis consistent with model.x_true. Priors and
-            the final Predictive always use the posterior median.
+            'cell' (default, recommended): per-cell x_true from fit_cis. 'guide' (not
+            recommended): the cell's guide-level expectation (x_eff_g, or the
+            log2-additive guide combination in high-MOI mode); it discards real
+            cell-to-cell variation in the cis effect along with the noise.
+        x_uncertainty : {'sample', 'median'}, optional
+            'sample' (default, recommended): each SVI step conditions on a fresh joint
+            draw from the fit_cis posterior. x stays fixed data (never a latent of
+            _model_y, so y cannot pull it), and the objective becomes the ELBO averaged
+            over the cis posterior, which penalises dose-response curves that are steep
+            where x is uncertain. Requires full (non-lean) posterior_samples_cis
+            consistent with model.x_true; raises otherwise. 'median' (not recommended;
+            the pre-2026-10 behaviour): condition on the posterior median of x as if it
+            were exact, which lets curves overfit within-guide ordering driven by cis
+            count noise and sum-factor error. Use it only when no cis posterior exists
+            (e.g. x_true set by hand via set_x_true()). Priors and the final Predictive
+            always use the posterior median.
         x_draws_per_step : int, optional
             Number of x draws averaged per SVI step when x_uncertainty='sample' (each with
             its own guide sample). Reduces gradient noise at ~linear extra cost. Default 1.
