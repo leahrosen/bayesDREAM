@@ -40,6 +40,7 @@ Usage
 
 import gc
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -291,6 +292,22 @@ def plot_cis_tightness(cells: pd.DataFrame, *, title: str = ''):
     return fig
 
 
+def _wrap_guide_label(label: str, width: int = 30) -> str:
+    """Multi-line a guide label: one line per '|'-joined guide, and any part
+    longer than `width` broken after '-' / '_' / '.' so long Replogle guide
+    IDs don't push the axes off the figure."""
+    lines = []
+    for part in label.split('|'):
+        cur = ''
+        for tok in re.split(r'(?<=[-_.])', part):
+            if cur and len(cur) + len(tok) > width:
+                lines.append(cur)
+                cur = ''
+            cur += tok
+        lines.append(cur)
+    return '\n'.join(lines)
+
+
 def plot_guide_posteriors(guide_post: pd.DataFrame, *, title: str = ''):
     """Point-range plot of guide-level log2 x_eff_g (median + 95% CI) per
     variant, guides on the y axis. Only guides present in EVERY variant are
@@ -301,18 +318,24 @@ def plot_guide_posteriors(guide_post: pd.DataFrame, *, title: str = ''):
     variants = [v for v in VARIANTS if v in set(guide_post['variant'])]
     per_variant = [set(guide_post.loc[guide_post['variant'] == v, 'guide']) for v in variants]
     guides = sorted(set.intersection(*per_variant))
-    fig, ax = plt.subplots(figsize=(7, 0.35 * len(guides) + 1.5), constrained_layout=True)
-    offs = np.linspace(-0.25, 0.25, len(variants))
+    labels = [_wrap_guide_label(g) for g in guides]
+    n_lines = [lab.count('\n') + 1 for lab in labels]
+    # row height grows with the number of label lines
+    heights = np.maximum(n_lines, 2) * 0.22
+    ypos = np.cumsum(heights) - heights / 2
+    fig, ax = plt.subplots(figsize=(7, heights.sum() + 1.5), constrained_layout=True)
+    offs = np.linspace(-0.25, 0.25, len(variants)) * heights.min()
     for off, v in zip(offs, variants):
         s = guide_post[guide_post['variant'] == v].set_index('guide').reindex(guides)
-        y = np.arange(len(guides)) + off
+        y = ypos + off
         ax.errorbar(s['log2_x_eff_median'], y,
                     xerr=[s['log2_x_eff_median'] - s['log2_x_eff_lower'],
                           s['log2_x_eff_upper'] - s['log2_x_eff_median']],
                     fmt='o', ms=3, lw=1, color=VARIANT_COLORS[v], label=v)
-    ax.set_yticks(np.arange(len(guides))); ax.set_yticklabels(guides, fontsize=7)
+    ax.set_yticks(ypos); ax.set_yticklabels(labels, fontsize=7)
+    ax.set_ylim(heights.sum(), 0)
     ax.set_xlabel('log2 x_eff_g (median, 95% CI)')
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1))
     ax.set_title(f'{title}guide-level cis expression', fontsize=11)
     return fig
 
