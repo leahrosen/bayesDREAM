@@ -190,7 +190,13 @@ def cis_guide_summary(cells: pd.DataFrame) -> pd.DataFrame:
 def cis_guide_posterior(gene: str, variant: str) -> Optional[pd.DataFrame]:
     """Guide-level x_eff_g posterior (log2 median + 95% CI) per guide, using
     the guide_axis_labels saved with the fit. None if the fit has no
-    x_eff_g or no labels (legacy files)."""
+    x_eff_g or no labels (legacy files).
+
+    The saved labels are bayesDREAM's guide_used values,
+    f"{guide}_{'_'.join(covariate values)}" (core.py). Replogle has no
+    guide covariates, so each is the guide name plus a trailing '_';
+    'guide' strips it so this joins against meta['guide'], and
+    'guide_used' keeps the raw label."""
     post = load_cis_posterior(gene, variant)
     labels = post.get('guide_axis_labels')
     ps = post['posterior_samples']
@@ -198,7 +204,8 @@ def cis_guide_posterior(gene: str, variant: str) -> Optional[pd.DataFrame]:
         return None
     lx = np.log2(np.clip(_as_samples_by_cells(ps['x_eff_g'], len(labels)), 1e-12, None))
     return pd.DataFrame({
-        'variant': variant, 'guide': labels,
+        'variant': variant, 'guide_used': labels,
+        'guide': [lab[:-1] if lab.endswith('_') else lab for lab in labels],
         'log2_x_eff_median': np.median(lx, axis=0),
         'log2_x_eff_lower': np.quantile(lx, 0.025, axis=0),
         'log2_x_eff_upper': np.quantile(lx, 0.975, axis=0),
@@ -245,7 +252,9 @@ def plot_cis_pairwise(cells: pd.DataFrame, value: str = 'log2_x_true_median', *,
     for ax, (a, b) in zip(axes[0], pairs):
         sub = wide.dropna(subset=[a, b])
         ntc = sub[sub['is_ntc']]
-        ax.scatter(ntc[a], ntc[b], s=4, c='lightgrey', alpha=0.5, label=f'NTC (n={len(ntc)})', rasterized=True)
+        if len(ntc):
+            ax.scatter(ntc[a], ntc[b], s=4, c='lightgrey', alpha=0.5, label=f'NTC (n={len(ntc)})',
+                       rasterized=True)
         for i, gd in enumerate(guides):
             s = sub[(~sub['is_ntc']) & (sub['guide'] == gd)]
             if len(s):
@@ -256,7 +265,7 @@ def plot_cis_pairwise(cells: pd.DataFrame, value: str = 'log2_x_true_median', *,
         r = sub[[a, b]].corr().iloc[0, 1]
         ax.set_title(f'{a} vs {b}  (r={r:.3f}, n={len(sub)})', fontsize=9)
     axes[0][0].legend(fontsize=6, markerscale=2, loc='upper left')
-    fig.suptitle(f'{title}{value}', fontsize=11)
+    fig.suptitle(f'{title}{value}' + (' (targeting cells only)' if target_only else ''), fontsize=11)
     return fig
 
 
