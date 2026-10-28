@@ -64,6 +64,8 @@ class CisFitter:
         rate_alpha_precomputed=None,
         rate_beta_precomputed=None,
         scale_2_tensor=None,
+        mu_target_mean_tensor=None,
+        mu_target_sd_tensor=None,
     ):
 
         ###################################
@@ -93,7 +95,14 @@ class CisFitter:
             sigma_targets = {}
             _hc_scale = scale_2_tensor if scale_2_tensor is not None else self._t(2.0)
             for t in unique_targets:
-                mu_targets[int(t.item())] = pyro.sample(f"mu_target_{int(t.item())}", dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor))
+                ti = int(t.item())
+                # Per-group prior (see _group_mu_prior); falls back to the pooled
+                # all-guide prior only if none was supplied.
+                if mu_target_mean_tensor is not None:
+                    loc, scale = mu_target_mean_tensor[ti], mu_target_sd_tensor[ti]
+                else:
+                    loc, scale = mu_x_mean_tensor, mu_x_sd_tensor
+                mu_targets[ti] = pyro.sample(f"mu_target_{ti}", dist.Normal(loc, scale))
                 sigma_targets[int(t.item())] = pyro.sample(f"sigma_target_{int(t.item())}", dist.HalfCauchy(scale=_hc_scale))
             # gather mu and sigma for each guide
             mu_target_tensor = torch.stack([mu_targets[int(t.item())] for t in unique_targets], dim=0)
@@ -302,6 +311,47 @@ class CisFitter:
         m.mu_sigma_guide_groups = labels  # group label per guide-axis position
         print(f"[INFO] independent_mu_sigma: {len(uniques)} mu/sigma groups: {m.mu_sigma_group_labels}")
         return torch.tensor(codes, dtype=torch.long, device=m.device)
+
+    @staticmethod
+    def _group_mu_prior(guide_sum, guide_n, guide_means, group_per_guide, fallback_center):
+        """Per-group Normal prior (loc, scale) for mu_target_t under
+        independent_mu_sigma=True: centred on each group's OWN data, with the
+        width of the shared (all-guide) prior.
+
+        Before this, every mu_target_t got the same prior, centred on the mean
+        of ALL guides' empirical log2 means. With many NTC guides and a cis
+        group of one or two guides, that centre is ~ the NTC level, so the
+        prior pulls the cis group's mu toward NTC (e.g. Replogle GFI1B: ~500
+        NTC guides + 1 targeting guide pair).
+
+        loc_t: log2 of the group's cell-pooled mean (sum of x_obs/(sum_factor*alpha_x)
+               over the group's cells / its cell count). Pooling cells rather than
+               averaging per-guide log2 means keeps a single all-zero guide from
+               dragging the centre to log2(epsilon). A group with no counts at all
+               falls back to `fallback_center`.
+        scale: SD of ALL guides' log2 means -- the same width the shared prior
+               always had, identical for every group. Taken over all guides rather
+               than per group so it is defined for a group with one guide (no SD)
+               and stable for a group with two (an SD from two values is noise and
+               can be ~0). Clamped at 1e-3 only so a degenerate input can't give a
+               zero-width Normal.
+
+        All inputs are per guide-axis position (numpy, length G); group_per_guide
+        holds group codes 0..T-1. Returns two float32 numpy arrays of length T.
+        """
+        guide_sum = np.asarray(guide_sum, dtype=np.float64)
+        guide_n = np.asarray(guide_n, dtype=np.float64)
+        guide_means = np.asarray(guide_means, dtype=np.float64)
+        group_per_guide = np.asarray(group_per_guide)
+        T = int(group_per_guide.max()) + 1
+        loc = np.empty(T)
+        for t in range(T):
+            mask = group_per_guide == t
+            total, n = guide_sum[mask].sum(), guide_n[mask].sum()
+            loc[t] = np.log2(total / n) if (total > 0 and n > 0) else float(fallback_center)
+        sd = np.std(guide_means, ddof=1) if len(guide_means) > 1 else np.nan
+        scale = np.full(T, max(float(sd), 1e-3) if np.isfinite(sd) else 1e-3)
+        return loc.astype(np.float32), scale.astype(np.float32)
 
     def fit_cis(
         self,
@@ -585,6 +635,7 @@ class CisFitter:
 
             guide_means = torch.from_numpy(guide_means_np).to(self.model.device)
             guide_mads_tensor = torch.from_numpy(guide_mads_np).to(self.model.device)
+            _guide_sum_np, _guide_n_np = guide_sums_np, cell_counts_np
         else:
             # Single-guide mode: vectorized means via bincount, MADs via sorted numpy slices
             guides_np = guides_tensor.cpu().numpy()
@@ -608,9 +659,25 @@ class CisFitter:
 
             guide_means = torch.from_numpy(guide_means_np).to(self.model.device)
             guide_mads_tensor = torch.from_numpy(guide_mads_np).to(self.model.device)
+            _guide_sum_np, _guide_n_np = sum_per_guide_np, n_per_guide_np
 
         mu_x_mean_tensor = torch.mean(guide_means)
         mu_x_sd_tensor = torch.std(guide_means)
+
+        mu_target_mean_tensor = None
+        mu_target_sd_tensor = None
+        if independent_mu_sigma:
+            _loc, _scale = self._group_mu_prior(
+                _guide_sum_np, _guide_n_np, guide_means_np,
+                target_per_guide_tensor.cpu().numpy(),
+                fallback_center=float(mu_x_mean_tensor),
+            )
+            mu_target_mean_tensor = torch.from_numpy(_loc).to(self.model.device)
+            mu_target_sd_tensor = torch.from_numpy(_scale).to(self.model.device)
+            _n_guides = np.bincount(target_per_guide_tensor.cpu().numpy(), minlength=len(_loc))
+            for _t, _lab in enumerate(self.model.mu_sigma_group_labels):
+                print(f"[INFO] mu_target_{_t} ({_lab}, {_n_guides[_t]} guide(s)) prior: "
+                      f"Normal({_loc[_t]:.3f}, {_scale[_t]:.3f})")
 
         guide_mads_tensor = guide_mads_tensor * 1.4826  # Gaussian-equivalent spread
         sigma_eff_mean_tensor = torch.mean(guide_mads_tensor)#.to(self.model.device)
@@ -703,6 +770,8 @@ class CisFitter:
                 rate_alpha_precomputed=rate_alpha_precomputed,
                 rate_beta_precomputed=rate_beta_precomputed,
                 scale_2_tensor=scale_2_tensor,
+                mu_target_mean_tensor=mu_target_mean_tensor,
+                mu_target_sd_tensor=mu_target_sd_tensor,
             )
             losses.append(loss)
             if step % 1000 == 0:
@@ -743,6 +812,8 @@ class CisFitter:
                 "rate_alpha_precomputed": self._to_cpu(rate_alpha_precomputed),
                 "rate_beta_precomputed": self._to_cpu(rate_beta_precomputed),
                 "scale_2_tensor": self._to_cpu(scale_2_tensor),
+                "mu_target_mean_tensor": self._to_cpu(mu_target_mean_tensor),
+                "mu_target_sd_tensor": self._to_cpu(mu_target_sd_tensor),
             }
         else:
             model_inputs = {
@@ -764,6 +835,8 @@ class CisFitter:
                 "rate_alpha_precomputed": rate_alpha_precomputed,
                 "rate_beta_precomputed": rate_beta_precomputed,
                 "scale_2_tensor": scale_2_tensor,
+                "mu_target_mean_tensor": mu_target_mean_tensor,
+                "mu_target_sd_tensor": mu_target_sd_tensor,
             }
 
         if self.model.device.type == "cuda":
