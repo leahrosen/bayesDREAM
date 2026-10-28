@@ -324,11 +324,16 @@ trans gene's `y/sf` in the same direction, producing spurious trends.
 
 | Argument | Values | Meaning |
 |---|---|---|
-| `x_level` | `'cell'` (default) | per-cell `x_true` |
-| | `'guide'` | guide-level expectation (`x_eff_g` of the cell's guide; log2-additive combination in high-MOI), removes within-guide ordering entirely |
-| `x_uncertainty` | `'median'` (default, previous behaviour) | condition on the posterior median |
-| | `'sample'` | each SVI step conditions on a fresh joint draw from `posterior_samples_cis` |
+| `x_level` | `'cell'` (default, **recommended**) | per-cell `x_true` |
+| | `'guide'` (not recommended) | guide-level expectation (`x_eff_g` of the cell's guide; log2-additive combination in high-MOI); removes within-guide ordering entirely, but also discards real cell-to-cell variation in the cis effect |
+| `x_uncertainty` | `'sample'` (default, **recommended**) | each SVI step conditions on a fresh joint draw from `posterior_samples_cis` |
+| | `'median'` (not recommended; pre-2026-10 behaviour) | condition on the posterior median as if it were exact; lets curves overfit within-guide noise. Only for models with no cis posterior (e.g. `x_true` set by hand) |
 | `x_draws_per_step` | int, default 1 | draws averaged per step with `'sample'` (lower gradient noise, ~linear cost) |
+
+The default is therefore `x_level='cell', x_uncertainty='sample'`. It needs the full
+(non-lean) `posterior_samples_cis` from `fit_cis()`/`load_cis_fit()` and raises if it is
+missing, lean-loaded or out of sync with `model.x_true`. It does not fall back silently;
+pass `x_uncertainty='median'` explicitly if no cis posterior exists.
 
 With `'sample'`, x remains **fixed data** in `_model_y` (never a latent), so trans
 observations cannot pull it toward a better fit ("cut" posterior). The objective is
@@ -345,8 +350,9 @@ together with `x_true`. The settings are stored in `trans_x_input` and saved/loa
 the trans fit.
 
 ```python
+model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')   # cell + sample
 model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill',
-                x_uncertainty='sample', x_draws_per_step=4)
+                x_draws_per_step=4)                                                 # less gradient noise
 ```
 
 ## Excluding Genes Before Fitting

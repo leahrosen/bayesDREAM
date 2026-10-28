@@ -37,6 +37,7 @@ def negbinom_fitted_model(shared_test_data):
         sum_factor_col='sum_factor',
         distribution='negbinom',
         function_type='single_hill',
+        x_uncertainty='median',  # dummy x_true, no cis posterior
         niters=NITERS,
         lr=1e-2,
         p0=0.01,
