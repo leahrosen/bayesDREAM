@@ -58,6 +58,7 @@ def set_max_threads(cores: int):
     os.environ["MKL_NUM_THREADS"] = str(cores)
     os.environ["VECLIB_MAXIMUM_THREADS"] = str(cores)
     os.environ["NUMEXPR_NUM_THREADS"] = str(cores)
+    torch.set_num_threads(cores)
 
 
 ########################################
