@@ -300,7 +300,13 @@ class ModelSaver:
                 'modality_name': 'cis',  # Cis always uses 'cis' modality
                 'feature_meta': cis_mod.feature_meta.to_dict('records') if hasattr(cis_mod, 'feature_meta') and cis_mod.feature_meta is not None else None,
                 'cell_names': self.model.meta['cell'].tolist() if 'cell' in self.model.meta.columns else None,
-                'loss_x': self.model.loss_x if hasattr(self.model, 'loss_x') else None
+                'loss_x': self.model.loss_x if hasattr(self.model, 'loss_x') else None,
+                # guide-axis latents (x_eff_g, sigma_eff, ...) are positional; these names
+                # let load_cis_fit() align them (and the mu_target_i/sigma_target_i groups)
+                # by name. None for a fit that itself came from a legacy file.
+                'guide_axis_labels': getattr(self.model, 'cis_guide_labels', None),
+                'mu_sigma_group_labels': getattr(self.model, 'mu_sigma_group_labels', None),
+                'mu_sigma_guide_groups': getattr(self.model, 'mu_sigma_guide_groups', None),
             }
 
             path = os.path.join(output_dir, 'posterior_samples_cis.pt')

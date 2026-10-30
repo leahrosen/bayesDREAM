@@ -95,23 +95,37 @@ def is_already_backfilled(output_dir: str, modality_name: str, save_dir: str,
 
 
 def get_x_ntc(model) -> float:
-    """The cis gene's NTC reference expression (linear space).
+    """The cis gene's NTC reference expression (linear space), on the SAME
+    scale as model.x_true / the fitted Hill curve's own x-axis.
 
-    Prefers the cis modality's own fit_ntc-derived mu_ntc (requires
-    add_cis_gene() to have extracted it from the shared panel); falls back
-    to the median *fitted* x_true among this model's own NTC cells if that
-    extraction never happened (e.g. cis_gene was set eagerly instead) --
-    less precise but keeps this usable either way.
+    Uses the median of the model's own fitted x_true among NTC cells --
+    NOT the cis modality's fit_ntc-derived mu_ntc (previously preferred
+    here, backwards from what's correct). mu_ntc is the direct mean
+    parameter of a single-layer NegBinomial (fit_ntc has no per-cell latent
+    layer), whereas fit_cis() defines x_true as the MEDIAN of an extra
+    log-normal layer on top of x_eff_g (log2(x_true) ~
+    Normal(log2(x_eff_g), sigma_eff)). Using mu_ntc here as `x_target =
+    x_ntc * 2**x_log2fc` mixes a mean-type reference into a median-type
+    x-axis (the same Hill curve whose K was fit against x_true), biasing
+    every hill_value_at_log2fc() result by ~0.5*ln(2)*sigma_eff**2 log2
+    units -- confirmed empirically (2026-09-21, IKZF1/Panten; see
+    bayesDREAM.io.summary.ModelSummarizer.save_cis_summary()'s
+    x_ntc_matched docstring for the full derivation). Falls back to
+    fit_ntc's mu_ntc only if there are no NTC cells to take a median over
+    (shouldn't normally happen) -- less precise, but keeps this usable
+    either way.
     """
+    x_true = model.x_true
+    x_true = x_true.detach().cpu().numpy() if isinstance(x_true, torch.Tensor) else np.asarray(x_true)
+    ntc_mask = (model.meta["target"].values == "ntc")
+    if ntc_mask.any():
+        return float(np.median(x_true[ntc_mask]))
     cis_mod = model.get_modality("cis")
     ps_ntc = cis_mod.posterior_samples_ntc
     if ps_ntc is not None and "mu_ntc" in ps_ntc:
         mu_ntc_cis = ps_ntc["mu_ntc"]
         return float(mu_ntc_cis.mean().item() if isinstance(mu_ntc_cis, torch.Tensor) else np.mean(mu_ntc_cis))
-    x_true = model.x_true
-    x_true = x_true.detach().cpu().numpy() if isinstance(x_true, torch.Tensor) else np.asarray(x_true)
-    ntc_mask = (model.meta["target"].values == "ntc")
-    return float(np.median(x_true[ntc_mask]))
+    raise ValueError("get_x_ntc: no NTC cells in model.meta and no fit_ntc mu_ntc available.")
 
 
 def hill_value_at_log2fc(model, modality_name: str, x_log2fc: float,

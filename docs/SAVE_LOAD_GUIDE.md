@@ -135,7 +135,11 @@ model.save_cis_fit(output_dir='./my_results/cis/')
 
 **What Gets Saved**:
 - `x_true.pt`: True cis gene expression (posterior samples)
-- `posterior_samples_cis.pt`: Full posterior samples from cis fit
+- `posterior_samples_cis.pt`: Full posterior samples from cis fit, plus metadata: cell names,
+  loss history, `guide_axis_labels` (name of each position of the guide-level latents
+  `x_eff_g`/`sigma_eff`/`eps_x_eff_g`) and, for `independent_mu_sigma=True` fits,
+  `mu_sigma_group_labels` / `mu_sigma_guide_groups` (what `mu_target_i`/`sigma_target_i` mean)
+- `posterior_samples_cis_lean.pt`: small point-estimate companion used by `load_cis_fit(lean=True)`
 
 ### 4. Load Cis Fit
 
@@ -158,6 +162,14 @@ model.load_cis_fit(lean=True)
 - Sets `self.x_true` and `self.log2_x_true` (`[N_cells]` point estimates — the
   posterior median, taken at fit time regardless of `lean`)
 - Loads `self.posterior_samples_cis` (full multi-sample, or lean-reduced if `lean=True`)
+- Aligns guide-level latents (`x_eff_g`, `sigma_eff`, `eps_x_eff_g`) to the current model's
+  guides **by name** (the guide axis is otherwise positional): reordered if the same guides,
+  extra saved guides dropped, and a `ValueError` if the current model has a guide that is not
+  in the fit (e.g. different `guide_covariates`)
+- Restores `self.mu_sigma_group_labels` (group `i` <-> `mu_target_i`/`sigma_target_i`),
+  `self.mu_sigma_guide_groups` and `self.cis_guide_labels`
+- Fits saved before these labels existed load positionally with a warning; re-save from the
+  fitting session to add them
 
 ### 5. Save Trans Fit
 

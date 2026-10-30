@@ -64,8 +64,8 @@ bayesDREAM(
   - For `'atac'`: region ID (e.g., `'chr9:132283881-132284881'`)
   - For custom modalities: feature identifier
   - Note: Cannot specify both `cis_gene` and `cis_feature`
-- `guide_covariates` (list, optional): Covariates for guide grouping (e.g., `['cell_line', 'batch']`)
-- `guide_covariates_ntc` (list, optional): Covariates for NTC guide grouping (if different from `guide_covariates`)
+- `guide_covariates` (list, optional): Covariates that split **non-NTC** guides into separate guide effects (e.g., `['cell_line', 'batch']`; `cell_line` = CRISPRi vs CRISPRa)
+- `guide_covariates_ntc` (list, optional): Covariates that split **NTC** guides into separate guide effects. Used *instead of* `guide_covariates` for NTC guides; the two lists are never combined (NTC guides are split only by `guide_covariates_ntc`, all other guides only by `guide_covariates`). Default: `[]` (NTC guides not split). Also the default NTC grouping for `fit_cis(independent_mu_sigma=True)`
 - `sum_factor_col` (str): Column name in meta containing size factors. Default: `'sum_factor'`
 - `output_dir` (str): Output directory. Default: `'./model_out'`
 - `label` (str, optional): Run label for organizing outputs
@@ -515,7 +515,9 @@ model.fit_cis(
     epsilon=1e-6,
     alpha_dirichlet=0.1,
     minibatch_size=None,
-    independent_mu_sigma=False
+    independent_mu_sigma=False,
+    mu_sigma_covariates=None,
+    mu_sigma_covariates_ntc=None
 )
 ```
 
@@ -548,8 +550,13 @@ Fit cis model to estimate direct effects on the targeted feature.
 - `epsilon` (float): Small constant for numerical stability. Default: 1e-6
 - `alpha_dirichlet` (float): Dirichlet concentration. Default: 0.1
 - `minibatch_size` (int, optional): Minibatch size for predictive sampling
-- `independent_mu_sigma` (bool): Whether to use independent mu/sigma per target type. Default: False
-  - Requires `target` column in meta with >1 unique values
+- `independent_mu_sigma` (bool): Fit `mu`/`sigma` (the hyperparameters of the guide effects `x_eff_g`) independently per group instead of sharing one pair across all guides. Default: False (one shared `mu`/`sigma`; NTC and cis guides pooled)
+  - If True, a group is *NTC vs. cis target* crossed with a covariate combination. By default, cis (non-NTC) guides are grouped by the model's `guide_covariates` (e.g. CRISPRi and CRISPRa get separate `mu`/`sigma`) and NTC guides by `guide_covariates_ntc` (one NTC group if empty)
+  - Group labels (e.g. `'GFI1B|cell_line=CRISPRi'`, `'ntc'`) are stored in `model.mu_sigma_group_labels`; entry `i` corresponds to the posterior sites `mu_target_i` / `sigma_target_i`. `None` when `independent_mu_sigma=False`
+  - Raises if fewer than 2 groups result
+- `mu_sigma_covariates` (list, optional): Only with `independent_mu_sigma=True`. meta columns defining separate `mu`/`sigma` groups among non-NTC (cis) guides. `None` (default) = the model's `guide_covariates`; `[]` = one group for all cis guides
+- `mu_sigma_covariates_ntc` (list, optional): Same, for NTC guides. `None` (default) = the model's `guide_covariates_ntc`; `[]` = all NTC guides fit as one group
+  - Each covariate used for grouping must take a single value within every guide effect (i.e. be one of the covariates guides are split by at init, or otherwise constant within a guide); otherwise a `ValueError` is raised
 
 **Side Effects:**
 - Sets `self.x_true` (posterior cis expression per cell)
@@ -569,10 +576,22 @@ model.fit_cis(
     sum_factor_col='sum_factor'
 )
 
-# With independent mu/sigma per target type
+# With independent mu/sigma per group. Model created with
+# guide_covariates=['cell_line'] (CRISPRi/CRISPRa) -> groups:
+#   'GFI1B|cell_line=CRISPRi', 'GFI1B|cell_line=CRISPRa', 'ntc'
 model.fit_cis(
     sum_factor_col='sum_factor',
     independent_mu_sigma=True
+)
+print(model.mu_sigma_group_labels)
+
+# Override the grouping: one mu/sigma for all cis guides, NTC split by lane
+# (guide_covariates_ntc=['lane'] at init)
+model.fit_cis(
+    sum_factor_col='sum_factor',
+    independent_mu_sigma=True,
+    mu_sigma_covariates=[],
+    mu_sigma_covariates_ntc=['lane']
 )
 ```
 
@@ -757,21 +776,21 @@ model.load_ntc_fit()
 
 ```python
 model.save_cis_fit(
-    file_path=None,
-    metadata=None
+    output_dir=None,
+    verbose=False
 )
 ```
 
-Save cis fitting results to HDF5 file.
+Save cis fitting results as `.pt` files.
 
 **Parameters:**
-- `file_path` (str, optional): Custom save path. Defaults to `{output_dir}/{label}/cis_fit.h5`
-- `metadata` (dict, optional): Additional metadata
+- `output_dir` (str, optional): Directory to save to. Defaults to `{model.output_dir}/{model.label}`
+- `verbose` (bool): Print each saved file
 
 **Saves:**
-- Posterior samples for x_true (cis expression per guide)
-- Posterior samples for cis model parameters
-- Loss history
+- `x_true.pt`, `log2_x_true.pt` (point estimates per cell)
+- `posterior_samples_cis.pt`: full posterior samples plus metadata: cell names, loss history, and the **guide-axis labels** (`guide_axis_labels`: name of each position of the guide-level latents `x_eff_g`/`sigma_eff`/`eps_x_eff_g`; single-guide mode: the `guide_used` value per `guide_code`, high-MOI: `guide_meta['guide']` + `|<covariate key>`) and, if `independent_mu_sigma=True` was used, `mu_sigma_group_labels` (group `i` <-> `mu_target_i`/`sigma_target_i`) and `mu_sigma_guide_groups` (group label per guide)
+- `posterior_samples_cis_lean.pt`: small point-estimate companion (same metadata)
 
 **Example:**
 ```python
@@ -784,19 +803,28 @@ model.save_cis_fit()
 
 ```python
 model.load_cis_fit(
-    file_path=None
+    input_dir=None,
+    verbose=False,
+    subset_cells=False,
+    lean=False
 )
 ```
 
-Load cis fitting results from HDF5 file.
+Load cis fitting results saved by `save_cis_fit()`.
 
 **Parameters:**
-- `file_path` (str, optional): Path to load from
+- `input_dir` (str, optional): Directory to load from. Defaults to `{model.output_dir}/{model.label}`
+- `verbose` (bool): Print each loaded file
+- `subset_cells` (bool): Reduce the model to the cells present in the saved fit instead of raising when some are missing
+- `lean` (bool): Load point estimates (median + 95% CI sibling keys) instead of full posterior draws
 
 **Restores:**
-- `self.x_true`
+- `self.x_true`, `self.log2_x_true`
 - `self.posterior_samples_cis`
-- `self.loss_cis`
+- `self.loss_x`
+- `self.cis_guide_labels`, `self.mu_sigma_group_labels`, `self.mu_sigma_guide_groups`
+
+**Guide-axis alignment:** guide-level latents (`x_eff_g`, `sigma_eff`, `eps_x_eff_g`) are matched to the current model's guides **by name** using the saved `guide_axis_labels`, like per-cell tensors are matched by cell name. Same guides in a different order are reordered; guides in the fit but not in the current model are dropped (single-guide `guide_code` is re-compacted); a current guide that is not in the fit raises a `ValueError` (the model must be built with the same `guide_covariates`/`guide_covariates_ntc`). `mu_target_i`/`sigma_target_i` are group hyperparameters and are not re-indexed; interpret them through `model.mu_sigma_group_labels`. Fits saved before these labels existed load positionally with a warning (nothing is checked).
 
 **Example:**
 ```python
