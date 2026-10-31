@@ -308,6 +308,12 @@ def fit_trans(
   - Lower values encourage stronger sparsity (more genes at baseline)
   - Higher values allow more genes to respond
 
+- **regularise** (bool, default=True):
+  - `True`: each Hill term is gated by a relaxed-Bernoulli sparsity variable (`alpha`, plus `beta` for additive/nested hill) with prior `p_n`, coupled to |n| via `alpha_n_coupling`
+  - `False`: no gates (`alpha = beta = 1`, stored as deterministic sites so summaries/plots still work) and no `alpha_n_coupling` penalty, so every feature gets an active Hill curve. `p_n`, `init_temp`, `final_temp` and `alpha_n_coupling` have no effect. All other priors, including the n prior (`Normal(n_mu, sigma_n)`, `sigma_n ~ Exp(1)`), are unchanged
+  - `save_trans_summary` skips the gate-based FDR when `regularise=False`: `fdr_alpha`, `fdr_beta`, `is_dependent`, `fit_type` and `which_active` are all NaN
+  - Checkpoints record the setting; resuming with a different value raises an error
+
 ## Propagating x_true Uncertainty (`x_level`, `x_uncertainty`)
 
 Per-cell `x_true` from `fit_cis` is informed only by that cell's cis count and its

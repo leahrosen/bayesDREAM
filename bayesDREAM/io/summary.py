@@ -1849,7 +1849,9 @@ class ModelSummarizer:
         - observed_delta_p: y_max - y_min over observed x range (probability difference)
         - full_delta_p_median/lower/upper: y_max - y_min over theoretical x range
 
-        FDR columns (all function types):
+        FDR columns (all function types; fdr_alpha, fdr_beta, is_dependent, fit_type
+        and which_active are all NaN for fits run with fit_trans(regularise=False),
+        which have no alpha/beta gates to test):
         - fdr_alpha: Bayesian q-value for component A (positive Hill, or the single Hill
                      component in single_hill).  The minimum expected FDR among all called
                      sets that include this feature's component A.  Analogous to a
@@ -2312,10 +2314,19 @@ class ModelSummarizer:
         if verbose:
             print(f"  _add_{function_type}_params: {time.time() - _t0:.1f}s")
 
-        # Compute Bayesian q-values (FDR columns) for Hill components
+        # Compute Bayesian q-values (FDR columns) for Hill components.
+        # Skipped for fit_trans(regularise=False): alpha/beta are fixed at 1, so the
+        # gate-based FDR (and everything derived from it) is undefined.
         _t0 = time.time()
-        fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features,
-                                              n_cats_per_feature=n_cats_per_feature)
+        _trans_priors = getattr(modality, 'trans_prior_params', None) or {}
+        fdr_applicable = (function_type != 'polynomial'
+                          and _trans_priors.get('regularise', True))
+        if fdr_applicable:
+            fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features,
+                                                  n_cats_per_feature=n_cats_per_feature)
+        else:
+            fdr_cols = {'fdr_alpha': np.full(n_features, np.nan),
+                        'fdr_beta': np.full(n_features, np.nan)}
         data.update(fdr_cols)
         if verbose:
             print(f"  _compute_bayesian_fdr:      {time.time() - _t0:.1f}s")
@@ -2323,7 +2334,7 @@ class ModelSummarizer:
         # is_dependent: FDR-significant AND the corresponding Hill exponent's CI
         # excludes 0, guarding against alpha/beta being "significant" purely from a
         # constant offset while n_a/n_b ≈ 0 (flat Hill, unidentified K).
-        if function_type == 'polynomial':
+        if not fdr_applicable:
             data['is_dependent'] = np.full(n_features, np.nan)
         else:
             fdr_alpha_arr = np.asarray(data['fdr_alpha'], dtype=float)
@@ -2346,8 +2357,8 @@ class ModelSummarizer:
         #   - 'additive_hill': both component A and component B are active
         #   - 'single_hill':   exactly one of component A / component B is active
         #   - 'not_dependent': neither component is active
-        # NaN for polynomial (no Hill components to test).
-        if function_type == 'polynomial':
+        # NaN for polynomial (no Hill components to test) and for regularise=False.
+        if not fdr_applicable:
             data['fit_type'] = np.full(n_features, np.nan, dtype=object)
             data['which_active'] = np.full(n_features, np.nan, dtype=object)
         else:
