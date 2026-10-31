@@ -1238,6 +1238,8 @@ class ModelLoader:
                         self.model.losses_trans = loaded_data['losses_trans']
                     if loaded_data.get('trans_prior_params') is not None:
                         self.model.trans_prior_params = loaded_data['trans_prior_params']
+                    if loaded_data.get('trans_x_input') is not None:
+                        self.model.trans_x_input = loaded_data['trans_x_input']
                     if verbose:
                         print(f"[LOAD] posterior_samples_trans (modality: {extra.get('modality_name')}, "
                               f"{extra.get('n_features')} features) ← {posterior_path}")
@@ -1266,6 +1268,8 @@ class ModelLoader:
                         mod_loaded.append(f"loss({len(self.model.modalities[mod_name].losses_trans)})")
                     if loaded_data.get('trans_prior_params') is not None:
                         self.model.modalities[mod_name].trans_prior_params = loaded_data['trans_prior_params']
+                    if loaded_data.get('trans_x_input') is not None:
+                        self.model.modalities[mod_name].trans_x_input = loaded_data['trans_x_input']
 
                     if verbose:
                         print(f"[LOAD] {mod_name}.posterior_samples_trans "

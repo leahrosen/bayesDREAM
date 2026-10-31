@@ -308,6 +308,47 @@ def fit_trans(
   - Lower values encourage stronger sparsity (more genes at baseline)
   - Higher values allow more genes to respond
 
+## Propagating x_true Uncertainty (`x_level`, `x_uncertainty`)
+
+Per-cell `x_true` from `fit_cis` is informed only by that cell's cis count and its
+sum factor (shrunk toward the guide mean), so the ordering of cells *within* a guide
+is mostly count noise plus sum-factor error. Conditioning `_model_y` on the posterior
+median treats that ordering as exact, and sum-factor errors then push x and every
+trans gene's `y/sf` in the same direction, producing spurious trends.
+
+| Argument | Values | Meaning |
+|---|---|---|
+| `x_level` | `'cell'` (default, **recommended**) | per-cell `x_true` |
+| | `'guide'` (not recommended) | guide-level expectation (`x_eff_g` of the cell's guide; log2-additive combination in high-MOI); removes within-guide ordering entirely, but also discards real cell-to-cell variation in the cis effect |
+| `x_uncertainty` | `'sample'` (default, **recommended**) | each SVI step conditions on a fresh joint draw from `posterior_samples_cis` |
+| | `'median'` (not recommended; pre-2026-10 behaviour) | condition on the posterior median as if it were exact; lets curves overfit within-guide noise. Only for models with no cis posterior (e.g. `x_true` set by hand) |
+| `x_draws_per_step` | int, default 1 | draws averaged per step with `'sample'` (lower gradient noise, ~linear cost) |
+
+The default is therefore `x_level='cell', x_uncertainty='sample'`. It needs the full
+(non-lean) `posterior_samples_cis` from `fit_cis()`/`load_cis_fit()` and raises if it is
+missing, lean-loaded or out of sync with `model.x_true`. It does not fall back silently;
+pass `x_uncertainty='median'` explicitly if no cis posterior exists.
+
+With `'sample'`, x remains **fixed data** in `_model_y` (never a latent), so trans
+observations cannot pull it toward a better fit ("cut" posterior). The objective is
+the ELBO averaged over the cis posterior, `E_x[log p(y | x, θ)]`, which penalises curves
+that are steep where x is uncertain (≈ `−½·curvature·Var_x[f(x)]`). Note this is
+deliberately *not* the marginal likelihood `log E_x[p(y | x, θ)]`, which would let each
+cell choose the x draw that best fits its y.
+
+Priors (K, Vmax centring) and the final Predictive always use the posterior median of
+the chosen `x_level`. Requirements: full (non-lean) `posterior_samples_cis` whose median
+matches `model.x_true` (`set_x_true()` with external values raises); `x_level='guide'`
+is incompatible with `permute_x_true()`. `permute_x_true()` resamples the cis draws
+together with `x_true`. The settings are stored in `trans_x_input` and saved/loaded with
+the trans fit.
+
+```python
+model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill')   # cell + sample
+model.fit_trans(sum_factor_col='sum_factor_adj', function_type='additive_hill',
+                x_draws_per_step=4)                                                 # less gradient noise
+```
+
 ## Excluding Genes Before Fitting
 
 Call `model.exclude_trans_genes()` before `fit_trans()` to permanently drop

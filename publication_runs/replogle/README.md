@@ -198,14 +198,21 @@ unrestricted coverage).
 
 ## Resources
 
-| stage | data variant | partition | time | cores | status |
-|---|---|---|---|---|---|
-| `ntc_shared` | (all NTC) | GPU (1 gpu) | 24h | 8 | fixed -- GPU jobs don't need profiling (see below) |
-| `subset` (both variants) | full combined panel + `add_cis_gene()` | CPU (`shared`) | 4h | 16 | **REAL sacct measurement, 2026-09-13** |
-| `cis` (`bm_indmu`/`bm_noindmu`) | `cis_only`, 165 cells | CPU (`shared`) | 24h | 4 | **profiled post-`lean=True`, 2026-09-13: 610 MB** |
-| `cis` (`all_indmu`) | `cis_only`, 85,753 cells (all NTC) | CPU (`shared`) | 24h | 10 | **profiled post-`lean=True`, 2026-09-13: 5,489 MB** |
-| `trans` (`bm_indmu`/`bm_noindmu`) | `full`, batch-matched | CPU (`shared`) | 24h | 8 | **placeholder -- see profiling below** |
-| `trans` (`all_indmu`) | `full`, all NTC | GPU (1 gpu) | 24h | 8 | fixed, not profiled (see rationale below) |
+| stage | data variant | partition | time | cores | status | real run 2026-10-25 (wall-clock) |
+|---|---|---|---|---|---|---|
+| `ntc_shared` | (all NTC) | GPU (1 gpu) | 24h | 8 | fixed -- GPU jobs don't need profiling (see below) | 10:23 (sacct AllocCPUS 128) |
+| `subset` (both variants) | full combined panel + `add_cis_gene()` | CPU (`shared`) | 4h | 32 | **REAL sacct measurement, 2026-09-13** (16 → 32 cores after OOM, see `STRATEGY.md` §16) | `bm` 2:28–3:03 min, `all` 5:08–6:38 min |
+| `cis` (`bm_indmu`/`bm_noindmu`) | `cis_only`, 165 cells | CPU (`shared`) | 24h | 4 | **profiled post-`lean=True`, 2026-09-13: 610 MB** | 18–37 min |
+| `cis` (`all_indmu`) | `cis_only`, 85,753 cells (all NTC) | CPU (`shared`) | 24h | 10 | **profiled post-`lean=True`, 2026-09-13: 5,489 MB** | 37–54 min |
+| `trans` (`bm_indmu`/`bm_noindmu`) | `full`, batch-matched | CPU (`shared`) | 24h | 8 | never profiled, but **no OOM on all 14 real jobs (2026-10-25)** -- peak RSS still unrecorded | **2:19–15:02** (longest: HHEX `bm_indmu`, ~63% of the 24h limit) |
+| `trans` (`all_indmu`) | `full`, all NTC | GPU (1 gpu) | 24h | 8 | fixed, not profiled (see rationale below) | 2:33–2:40 (sacct AllocCPUS 128) |
+
+All 57 jobs of the 2026-10-25 full rerun (job IDs 26888856–26888912) COMPLETED
+on the first attempt -- see `STRATEGY.md` §19. `sacct -X` returned an empty
+`MaxRSS` for every job (memory is only recorded on the `.batch` step, which
+`-X` hides), so real peak memory for `trans` is still unmeasured; get it from
+`sacct -j <ids> --format=JobName%50,MaxRSS` (no `-X`, read the `.batch` rows)
+or from each output dir's `trans_stats.json` (`peak_rss_mb`).
 
 ## A profiling-methodology lesson: prefer real `sacct` over `profile_memory.py` proxies when you can
 

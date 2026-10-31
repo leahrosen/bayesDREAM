@@ -554,6 +554,7 @@ Fit cis model to estimate direct effects on the targeted feature.
   - If True, a group is *NTC vs. cis target* crossed with a covariate combination. By default, cis (non-NTC) guides are grouped by the model's `guide_covariates` (e.g. CRISPRi and CRISPRa get separate `mu`/`sigma`) and NTC guides by `guide_covariates_ntc` (one NTC group if empty)
   - Group labels (e.g. `'GFI1B|cell_line=CRISPRi'`, `'ntc'`) are stored in `model.mu_sigma_group_labels`; entry `i` corresponds to the posterior sites `mu_target_i` / `sigma_target_i`. `None` when `independent_mu_sigma=False`
   - Raises if fewer than 2 groups result
+  - Each group's `mu_target_i` prior is centred on that group's own cell-pooled log2 mean (not the all-guide mean), with the shared prior's width (SD over all guides' log2 means)
 - `mu_sigma_covariates` (list, optional): Only with `independent_mu_sigma=True`. meta columns defining separate `mu`/`sigma` groups among non-NTC (cis) guides. `None` (default) = the model's `guide_covariates`; `[]` = one group for all cis guides
 - `mu_sigma_covariates_ntc` (list, optional): Same, for NTC guides. `None` (default) = the model's `guide_covariates_ntc`; `[]` = all NTC guides fit as one group
   - Each covariate used for grouping must take a single value within every guide effect (i.e. be one of the covariates guides are split by at init, or otherwise constant within a guide); otherwise a `ValueError` is raised

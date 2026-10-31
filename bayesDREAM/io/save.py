@@ -414,6 +414,7 @@ class ModelSaver:
                     'cis_gene': self.model.cis_gene,
                     'losses_trans': self.model.losses_trans if hasattr(self.model, 'losses_trans') else None,
                     'trans_prior_params': self.model.trans_prior_params if hasattr(self.model, 'trans_prior_params') else None,
+                    'trans_x_input': getattr(self.model, 'trans_x_input', None),
                 }
 
                 # Include modality name in filename to prevent overwrites
@@ -448,6 +449,7 @@ class ModelSaver:
                     'cis_gene': self.model.cis_gene,
                     'losses_trans': mod.losses_trans if hasattr(mod, 'losses_trans') else None,
                     'trans_prior_params': mod.trans_prior_params if hasattr(mod, 'trans_prior_params') else None,
+                    'trans_x_input': getattr(mod, 'trans_x_input', None),
                 }
 
                 path = os.path.join(output_dir, f'posterior_samples_trans_{mod_name}.pt')

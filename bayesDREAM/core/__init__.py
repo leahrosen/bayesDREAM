@@ -1014,6 +1014,17 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         else:
             x_true_np = np.array(self.x_true)
 
+        # Cell-indexed fit_cis posterior draws are resampled with the same indices so
+        # fit_trans(x_uncertainty='sample') stays consistent with the permuted x_true.
+        ps_cis = getattr(self, 'posterior_samples_cis', None)
+        n_meta = len(self.meta)
+        cis_draw_keys = []
+        if isinstance(ps_cis, dict) and not is_lean_posterior(ps_cis):
+            cis_draw_keys = [k for k in ('x_true', 'log_x_true')
+                             if isinstance(ps_cis.get(k), torch.Tensor) and ps_cis[k].shape[-1] == n_meta]
+            for k in cis_draw_keys:
+                ps_cis[k] = ps_cis[k].clone()
+
         groups = self.meta.groupby(covariates) if covariates else [(None, self.meta)]
         for _key, group in groups:
             ntc_cells = group.loc[group['target'] == 'ntc', 'cell'].values
@@ -1053,9 +1064,16 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
             # of labels, correct regardless of what self.meta.index holds.
             meta_ntc_idx = np.where(self.meta['cell'].isin(ntc_cells).values)[0]
             x_true_np[meta_ntc_idx] = x_true_np[meta_ntc_idx][perm_idx]
+            for k in cis_draw_keys:
+                src = torch.as_tensor(meta_ntc_idx[perm_idx], device=ps_cis[k].device)
+                dst = torch.as_tensor(meta_ntc_idx, device=ps_cis[k].device)
+                ps_cis[k][..., dst] = ps_cis[k][..., src]
 
         cis_mod.counts = cis_counts_work
         self.x_true = torch.tensor(x_true_np, dtype=self.x_true.dtype, device=self.x_true.device)
+        if getattr(self, 'log2_x_true', None) is not None:
+            self.log2_x_true = torch.log2(self.x_true)
+        self.x_true_permuted = True
 
     def subset_cells(
         self,
@@ -1277,6 +1295,7 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
                 # x_true is always shape [N] - subset to new cells
                 if isinstance(self.x_true, torch.Tensor):
                     model_new.x_true = self.x_true[cell_indices_torch].clone()
+                model_new.x_true_permuted = getattr(self, 'x_true_permuted', False)
 
             # Copy log2_x_true (also needs subsetting)
             if hasattr(self, 'log2_x_true') and self.log2_x_true is not None:

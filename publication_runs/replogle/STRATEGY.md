@@ -682,7 +682,7 @@ sacct -j <jobids...> --format=JobID,JobName%25,Elapsed,MaxRSS,ReqMem,State -p
 tail -30 logs/replogle_subset_<gene>_<variant>_<jobid>.err   # "Detected 1 oom_kill event..."
 ```
 
-## 17. GFI1B's `bm` cis jobs (`bm_indmu`/`bm_noindmu`) fail with NaN priors (2026-09-13, open)
+## 17. GFI1B's `bm` cis jobs (`bm_indmu`/`bm_noindmu`) fail with NaN priors (2026-09-13, RESOLVED 2026-10-25 by §18 -- see §19)
 
 Both real (non-profiling) `02_cis_GFI1B_bm_indmu.sh`/`_bm_noindmu.sh` jobs
 failed in ~2:34 with `ValueError: ... Normal(loc: nan, scale: nan)`, raised
@@ -747,7 +747,7 @@ back: cis should keep using `sum_factor_adj` (more signal, deliberately
 NTC-normalized) -- the real problem is WHERE it gets computed, not WHETHER
 it should be used. See §18 for the actual fix.
 
-## 18. Real fix for §17: compute `sum_factor_adj` ONCE upstream, not per-gene (2026-09-13)
+## 18. Real fix for §17: compute `sum_factor_adj` ONCE upstream, not per-gene (2026-09-13, confirmed on real jobs 2026-10-25 -- see §19)
 
 User's question, verbatim: "for cis stage sum_factor_adj should be used.
 Can we solve this issue in some better way? Ideally using as many cells as
@@ -821,3 +821,37 @@ in §16, if they complete before this lands. `meta_ntc.csv` is untouched
 
 Not yet re-tested against a real job -- do that before trusting this
 closes the issue.
+
+## 19. Full rerun after §18 -- all 57 jobs COMPLETED (2026-10-25)
+
+Everything from the 2026-09-12/13 attempt was stale: the last `preprocess.py`
+run (the first to write `sum_factor_adj`, job 25082156) finished AFTER all 14
+subset jobs and GFI1B's one completed cis fit, so none of them carried the
+new column (checked: subset `meta.csv` mtimes 00:03-01:24 vs. `meta.csv`
+02:16, and `sum_factor_adj` absent from every `cis_only/meta.csv`). The old
+outputs were moved to `BayesianModel_outs/_stale_20260913/` before
+rerunning -- necessary, not just tidy: `run_ntc.py`/`run_cis_deferred.py`
+skip the fit and load instead when a prior `*_stats.json` records the step
+as completed, so leaving them in place would have silently reused the stale
+fits.
+
+- `preprocess.py` rerun (job 26755994): 25:27 wall-clock, 27.43 GB peak
+  (`main`, full node) -- answers §18's open sizing question.
+- `sum_factor` reproducibility: max abs diff 0.0 between the old and new
+  `meta_ntc.csv`, so scran (`set.seed(42)`) is deterministic here and the
+  2026-09-12 `ntc_shared` fit had in fact seen identical inputs.
+  `ntc_shared` was refit anyway (full rerun from one code version).
+- Full chain submitted by hand (not `submit_all.sh`, which doesn't record
+  job IDs for Replogle) with a loop that writes a real
+  `slurm/submitted_jobs.tsv` -- see `Run Replogle publication run.md` in the
+  parent `bayesDREAM code/` directory.
+- **Result: all 57 jobs (26888856-26888912) COMPLETED first time**, no OOM,
+  no timeouts, no requeues. In particular, GFI1B `bm_indmu`/`bm_noindmu`
+  cis (the §17 failure) completed in 25:10 / 22:30, confirming §18's fix.
+- Wall-clock: `ntc_shared` 10:23; subset 2.5-6.5 min; cis `bm_*` 18-37
+  min, `all_indmu` 37-54 min; trans `all_indmu` (GPU) 2:33-2:40; trans
+  `bm_*` (CPU, 8 cores) 2:19-15:02, gene-dependent (GFI1B ~2.3h; HHEX/TET2
+  `bm_indmu` 15:02/13:27). The 24h limit has ~1.6x margin over the slowest.
+- Still open: real peak memory for trans `bm_*` (8 cores was enough, but
+  how much headroom is unknown). `sacct -X` returned empty MaxRSS; use the
+  `.batch` rows or `trans_stats.json`'s `peak_rss_mb`.
