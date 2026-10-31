@@ -79,6 +79,8 @@ def summary_model(tmp_path_factory):
     return {
         'model': model,
         'outdir': os.path.join(tmpdir, 'summary_test_simple'),
+        # NTC reference levels; log2FC columns need these, and the mock has no fit_ntc posteriors
+        'ntc_levels': {'x_ntc': 5.0, 'y_ntc': np.full(n_features_trans, 10.0)},
     }
 
 
@@ -94,7 +96,7 @@ def test_technical_summary_csv_created(summary_model):
     model = summary_model['model']
     outdir = summary_model['outdir']
     model.save_ntc_summary()
-    csv_path = os.path.join(outdir, 'technical_feature_summary_gene.csv')
+    csv_path = os.path.join(outdir, 'ntc_feature_summary_gene.csv')
     assert os.path.exists(csv_path)
 
 
@@ -115,16 +117,16 @@ def test_cis_summary_csvs_created(summary_model):
 
 def test_trans_summary_additive_hill_columns(summary_model):
     model = summary_model['model']
-    trans_df = model.save_trans_summary(compute_inflection=True, compute_full_log2fc=True)
-    for col in ('feature', 'function_type', 'observed_log2fc', 'Vmax_a_mean',
-                'EC50_a_mean', 'inflection_a_mean', 'full_log2fc_mean'):
+    trans_df = model.save_trans_summary(compute_inflection=True, **summary_model['ntc_levels'])
+    for col in ('feature', 'function_type', 'observed_log2fc', 'Vmax_a_median',
+                'EC50_a_median', 'inflection_a_median', 'full_log2fc_median'):
         assert col in trans_df.columns
 
 
 def test_trans_summary_csv_created(summary_model):
     model = summary_model['model']
     outdir = summary_model['outdir']
-    model.save_trans_summary(compute_inflection=True, compute_full_log2fc=True)
+    model.save_trans_summary(compute_inflection=True, **summary_model['ntc_levels'])
     assert os.path.exists(os.path.join(outdir, 'trans_feature_summary_gene.csv'))
 
 
@@ -139,6 +141,6 @@ def test_trans_summary_polynomial_columns(summary_model):
     model.posterior_samples_trans = {
         'poly_coefs': torch.randn((n_samples, n_features_trans, degree), device=model.device)
     }
-    poly_df = model.save_trans_summary(compute_inflection=False, compute_full_log2fc=True)
-    assert 'coef_0_mean' in poly_df.columns
-    assert 'full_log2fc_mean' in poly_df.columns
+    poly_df = model.save_trans_summary(compute_inflection=False, **summary_model['ntc_levels'])
+    assert 'coef_0_median' in poly_df.columns
+    assert 'full_log2fc_median' in poly_df.columns
