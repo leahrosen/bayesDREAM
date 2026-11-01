@@ -231,11 +231,11 @@ def test_lean_cis_matches_full_summary(fitted_and_saved):
     assert np.all(np.isfinite(lean_guide_df["x_true_lower"]))
     assert np.all(np.isfinite(lean_guide_df["x_true_upper"]))
     assert np.all(lean_guide_df["x_true_lower"] <= lean_guide_df["x_true_upper"] + 1e-6)
-    # Guide-level mean is "mean of per-cell posterior medians" under lean
-    # loading (not the exact mean of per-cell posterior means) — close but
+    # Guide-level median is "median of per-cell posterior medians" under lean
+    # loading (not the exact median of per-cell posterior medians) — close but
     # not bit-identical to the full-load value.
     np.testing.assert_allclose(
-        full_guide_df["x_true_mean"], lean_guide_df["x_true_mean"], rtol=0.05)
+        full_guide_df["x_true_median"], lean_guide_df["x_true_median"], rtol=0.05)
 
     assert lean_model.is_cis_lean is True
     assert full_model.is_cis_lean is False

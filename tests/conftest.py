@@ -48,8 +48,9 @@ def _create_shared_test_data(
         columns=[f"cell_{i}" for i in range(n_cells)],
         index=[f"exon_{i}" for i in range(n_features)],
     )
+    # total >= inclusion, as binomial modalities require
     total_counts = pd.DataFrame(
-        np.random.poisson(lam=60, size=(n_features, n_cells)),
+        inclusion_counts.values + np.random.poisson(lam=30, size=(n_features, n_cells)),
         columns=[f"cell_{i}" for i in range(n_cells)],
         index=[f"exon_{i}" for i in range(n_features)],
     )
@@ -72,7 +73,7 @@ def _create_shared_test_data(
         }
     )
     splicing_counts = np.random.poisson(20, (3, n_cells))
-    splicing_denom = np.random.poisson(100, (3, n_cells))
+    splicing_denom = splicing_counts + np.random.poisson(80, (3, n_cells))
     splicing_meta = pd.DataFrame(
         {
             "junction": [f"junction_{i}" for i in range(3)],

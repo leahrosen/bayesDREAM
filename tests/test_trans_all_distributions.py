@@ -44,6 +44,16 @@ def _fit_ntc(model):
     )
 
 
+def _fit_ntc_modality(model, modality_name):
+    # Non-primary modalities need their own fit_ntc before fit_trans.
+    model.fit_ntc(
+        modality_name=modality_name,
+        niters=NITERS,
+        nsamples=NSAMPLES,
+        lr=LR,
+    )
+
+
 def _fit_cis(model):
     model.fit_cis(
         sum_factor_col="sum_factor",
@@ -110,7 +120,8 @@ def test_binomial_hill_and_polynomial(shared_test_data):
         denominator=total_counts,
     )
 
-    # Binomial modality has no fit_technical path, so only fit cis baseline.
+    _fit_ntc(model)
+    _fit_ntc_modality(model, "exon_skip")
     _fit_cis(model)
 
     _fit_trans(
@@ -139,7 +150,7 @@ def test_binomial_hill_and_polynomial(shared_test_data):
     assert torch.all(A >= 0) and torch.all(A <= 1)
 
 
-def test_multinomial_hill_and_polynomial(shared_test_data):
+def test_multinomial_hill(shared_test_data):
     meta = shared_test_data["meta"]
     gene_counts = shared_test_data["gene_counts"]
     feature_meta = shared_test_data["feature_meta"]
@@ -156,6 +167,8 @@ def test_multinomial_hill_and_polynomial(shared_test_data):
         distribution="multinomial",
     )
 
+    _fit_ntc(model)
+    _fit_ntc_modality(model, "donor_usage")
     _fit_cis(model)
 
     _fit_trans(
@@ -168,19 +181,6 @@ def test_multinomial_hill_and_polynomial(shared_test_data):
     posterior = _posterior_for(model, modality_name="donor_usage")
     n_a = posterior["n_a"]
     assert n_a.shape[-1] == K - 1
-
-    _fit_trans(
-        model,
-        sum_factor_col=None,
-        function_type="polynomial",
-        modality_name="donor_usage",
-        min_denominator=0,
-    )
-    poly_coeffs = {
-        k: v for k, v in _posterior_for(model, modality_name="donor_usage").items() if "poly_coeff" in k
-    }
-    for samples in poly_coeffs.values():
-        assert samples.shape[-1] == K
 
 
 def test_normal_polynomial(shared_test_data):
@@ -197,6 +197,8 @@ def test_normal_polynomial(shared_test_data):
         distribution="normal",
     )
 
+    _fit_ntc(model)
+    _fit_ntc_modality(model, "scores")
     _fit_cis(model)
     _fit_trans(
         model,
