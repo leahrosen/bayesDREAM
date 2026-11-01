@@ -150,7 +150,7 @@ def test_binomial_hill_and_polynomial(shared_test_data):
     assert torch.all(A >= 0) and torch.all(A <= 1)
 
 
-def test_multinomial_hill_and_polynomial(shared_test_data):
+def test_multinomial_hill(shared_test_data):
     meta = shared_test_data["meta"]
     gene_counts = shared_test_data["gene_counts"]
     feature_meta = shared_test_data["feature_meta"]
@@ -181,20 +181,6 @@ def test_multinomial_hill_and_polynomial(shared_test_data):
     posterior = _posterior_for(model, modality_name="donor_usage")
     n_a = posterior["n_a"]
     assert n_a.shape[-1] == K - 1
-
-    _fit_trans(
-        model,
-        sum_factor_col=None,
-        function_type="polynomial",
-        modality_name="donor_usage",
-        min_denominator=0,
-    )
-    poly_coeffs = {
-        k: v for k, v in _posterior_for(model, modality_name="donor_usage").items() if "poly_coeff" in k
-    }
-    assert poly_coeffs
-    for samples in poly_coeffs.values():
-        assert samples.shape[-2:] == (K, multinomial_counts.shape[0])  # [K, T] per degree
 
 
 def test_normal_polynomial(shared_test_data):

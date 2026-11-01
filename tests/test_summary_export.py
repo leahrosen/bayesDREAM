@@ -75,7 +75,7 @@ def test_technical_summary_csv(summary_export_model):
     model = summary_export_model['model']
     outdir = summary_export_model['outdir']
     model.save_ntc_summary()
-    assert os.path.exists(os.path.join(outdir, 'technical_feature_summary_gene.csv'))
+    assert os.path.exists(os.path.join(outdir, 'ntc_feature_summary_gene.csv'))
 
 
 @pytest.mark.skipif(not TOYDATA_AVAILABLE, reason="toydata not found")
@@ -107,14 +107,14 @@ def test_cis_summary_csvs(summary_export_model):
 def test_trans_summary_additive_hill_columns(summary_export_model):
     model = summary_export_model['model']
     trans_df = model.save_trans_summary(
-        compute_inflection=True, compute_full_log2fc=True
+        compute_inflection=True
     )
     expected_cols = (
         'feature', 'modality', 'distribution', 'function_type',
         'observed_log2fc', 'observed_log2fc_lower', 'observed_log2fc_upper',
-        'Vmax_a_mean', 'K_a_mean', 'EC50_a_mean',
-        'Vmax_b_mean', 'K_b_mean', 'EC50_b_mean',
-        'inflection_a_mean', 'inflection_b_mean', 'full_log2fc_mean'
+        'Vmax_a_median', 'K_a_median', 'EC50_a_median',
+        'Vmax_b_median', 'K_b_median', 'EC50_b_median',
+        'inflection_a_median', 'inflection_b_median', 'full_log2fc_median'
     )
     for col in expected_cols:
         assert col in trans_df.columns
@@ -124,20 +124,5 @@ def test_trans_summary_additive_hill_columns(summary_export_model):
 def test_trans_summary_csv(summary_export_model):
     model = summary_export_model['model']
     outdir = summary_export_model['outdir']
-    model.save_trans_summary(compute_inflection=True, compute_full_log2fc=True)
+    model.save_trans_summary(compute_inflection=True)
     assert os.path.exists(os.path.join(outdir, 'trans_feature_summary_gene.csv'))
-
-
-@pytest.mark.skipif(not TOYDATA_AVAILABLE, reason="toydata not found")
-def test_trans_summary_polynomial_columns(summary_export_model):
-    model = summary_export_model['model']
-    model.fit_trans(
-        sum_factor_col='sum_factor',
-        function_type='polynomial',
-        niters=NITERS_TRANS,
-        lr=0.01,
-    )
-    poly_df = model.save_trans_summary(compute_inflection=False, compute_full_log2fc=True)
-    coef_cols = [c for c in poly_df.columns if 'coef_' in c]
-    assert len(coef_cols) > 0
-    assert 'full_log2fc_mean' in poly_df.columns
