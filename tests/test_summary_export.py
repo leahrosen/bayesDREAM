@@ -82,7 +82,7 @@ def test_technical_summary_csv(summary_export_model):
 def test_cis_summary_guide_level_columns(summary_export_model):
     model = summary_export_model['model']
     guide_df, _ = model.save_cis_summary(include_cell_level=True)
-    for col in ('guide', 'target', 'n_cells', 'x_true_mean', 'x_true_lower', 'x_true_upper'):
+    for col in ('guide', 'target', 'n_cells', 'x_true_median', 'x_true_lower', 'x_true_upper'):
         assert col in guide_df.columns
 
 
@@ -90,7 +90,7 @@ def test_cis_summary_guide_level_columns(summary_export_model):
 def test_cis_summary_cell_level_columns(summary_export_model):
     model = summary_export_model['model']
     _, cell_df = model.save_cis_summary(include_cell_level=True)
-    for col in ('cell', 'guide', 'x_true_mean'):
+    for col in ('cell', 'guide', 'x_true_median'):
         assert col in cell_df.columns
 
 

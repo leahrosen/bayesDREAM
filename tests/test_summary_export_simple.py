@@ -103,7 +103,7 @@ def test_technical_summary_csv_created(summary_model):
 def test_cis_summary_columns(summary_model):
     model = summary_model['model']
     guide_df, _ = model.save_cis_summary()
-    for col in ('guide', 'target', 'x_true_mean', 'x_true_lower', 'x_true_upper'):
+    for col in ('guide', 'target', 'x_true_median', 'x_true_lower', 'x_true_upper'):
         assert col in guide_df.columns
 
 
