@@ -55,7 +55,7 @@ class ModelSaver:
 
         Saves model-level (automatically when primary modality is included):
         - alpha_x_prefit.pt: Cis gene overdispersion (if set)
-        - technical_group_labels.csv: technical_group_code -> covariate values
+        - alpha_y_prefit.pt: Trans gene overdispersion (from primary modality)
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
