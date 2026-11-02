@@ -24,6 +24,7 @@ import pyro.infer as infer
 import pyro.poutine as poutine
 
 from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor, is_lean_posterior
+from . import FitterBase
 
 
 def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
