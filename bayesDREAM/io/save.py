@@ -300,7 +300,13 @@ class ModelSaver:
                 'modality_name': 'cis',  # Cis always uses 'cis' modality
                 'feature_meta': cis_mod.feature_meta.to_dict('records') if hasattr(cis_mod, 'feature_meta') and cis_mod.feature_meta is not None else None,
                 'cell_names': self.model.meta['cell'].tolist() if 'cell' in self.model.meta.columns else None,
-                'loss_x': self.model.loss_x if hasattr(self.model, 'loss_x') else None
+                'loss_x': self.model.loss_x if hasattr(self.model, 'loss_x') else None,
+                # guide-axis latents (x_eff_g, sigma_eff, ...) are positional; these names
+                # let load_cis_fit() align them (and the mu_target_i/sigma_target_i groups)
+                # by name. None for a fit that itself came from a legacy file.
+                'guide_axis_labels': getattr(self.model, 'cis_guide_labels', None),
+                'mu_sigma_group_labels': getattr(self.model, 'mu_sigma_group_labels', None),
+                'mu_sigma_guide_groups': getattr(self.model, 'mu_sigma_guide_groups', None),
             }
 
             path = os.path.join(output_dir, 'posterior_samples_cis.pt')
@@ -408,6 +414,7 @@ class ModelSaver:
                     'cis_gene': self.model.cis_gene,
                     'losses_trans': self.model.losses_trans if hasattr(self.model, 'losses_trans') else None,
                     'trans_prior_params': self.model.trans_prior_params if hasattr(self.model, 'trans_prior_params') else None,
+                    'trans_x_input': getattr(self.model, 'trans_x_input', None),
                 }
 
                 # Include modality name in filename to prevent overwrites
@@ -442,6 +449,7 @@ class ModelSaver:
                     'cis_gene': self.model.cis_gene,
                     'losses_trans': mod.losses_trans if hasattr(mod, 'losses_trans') else None,
                     'trans_prior_params': mod.trans_prior_params if hasattr(mod, 'trans_prior_params') else None,
+                    'trans_x_input': getattr(mod, 'trans_x_input', None),
                 }
 
                 path = os.path.join(output_dir, f'posterior_samples_trans_{mod_name}.pt')

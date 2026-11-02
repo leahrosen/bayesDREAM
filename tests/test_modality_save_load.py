@@ -37,6 +37,10 @@ def _build_model(meta, gene_counts, atac_counts, atac_meta, splicing_counts, spl
         cell_names=meta["cell"].values,
         distribution="negbinom",
     )
+    # Negbinom modalities need cell-indexed sum factors before fit_ntc/fit_trans.
+    model.modalities["atac"].sum_factors = pd.DataFrame(
+        {"sum_factor": meta["sum_factor"].values}, index=meta["cell"].values
+    )
 
     model.modalities["splicing"] = Modality(
         name="splicing",
@@ -127,7 +131,9 @@ def test_save_primary_explicitly(fitted_model):
 
     assert (outdir / "alpha_y_prefit_gene.pt").exists()
     assert not (outdir / "alpha_y_prefit_atac.pt").exists()
-    assert (outdir / "alpha_y_prefit.pt").exists()
+    # Model level: alpha_x (cis gene) and the technical group labels; alpha_y is per modality only.
+    assert (outdir / "alpha_x_prefit.pt").exists()
+    assert (outdir / "technical_group_labels.csv").exists()
 
 
 def test_load_specific_modalities(fitted_model):
@@ -160,7 +166,7 @@ def test_load_specific_modalities(fitted_model):
         splicing_meta,
         output_dir=outdir,
     )
-    model2.load_ntc_fit(modalities=["atac", "splicing"], load_model_level=False)
+    model2.load_ntc_fit(input_dir=str(outdir), modalities=["atac", "splicing"], load_model_level=False)
 
     gene_mod = model2.modalities["gene"]
     atac_mod = model2.modalities["atac"]

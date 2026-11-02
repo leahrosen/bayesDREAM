@@ -64,6 +64,7 @@ def fitted_multimodal_model(shared_test_data):
         function_type='additive_hill',
         modality_name='gene',
         p0=0.01, gamma_threshold=0.01,
+        x_uncertainty='median',  # dummy x_true, no cis posterior
         niters=NITERS, nsamples=NSAMPLES,
     )
 
@@ -72,6 +73,7 @@ def fitted_multimodal_model(shared_test_data):
         function_type='additive_hill',
         modality_name='splicing_test',
         p0=0.01, gamma_threshold=0.01,
+        x_uncertainty='median',  # dummy x_true, no cis posterior
         niters=NITERS, nsamples=NSAMPLES,
         min_denominator=0,
     )
@@ -135,7 +137,8 @@ def test_trans_without_technical_fit_raises(fitted_multimodal_model):
     fitted_multimodal_model.add_modality('untrained', third_modality)
     
     with pytest.raises(ValueError):
-        fitted_multimodal_model.fit_trans(modality_name='untrained', niters=10, nsamples=5)
+        fitted_multimodal_model.fit_trans(modality_name='untrained', niters=10, nsamples=5,
+                                          x_uncertainty='median')
 
 
 # --- Default behaviour ---

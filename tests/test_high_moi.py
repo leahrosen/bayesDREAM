@@ -183,6 +183,7 @@ def high_moi_fitted_model():
         label='test_high_moi_cis',
         device='cpu',
     )
+    model.fit_ntc(sum_factor_col='sum_factor', niters=NITERS_CIS, nsamples=10)
     model.fit_cis(
         sum_factor_col='sum_factor',
         lr=1e-2,
@@ -217,10 +218,8 @@ def test_x_eff_g_guide_count(high_moi_fitted_model):
 
 # ----------------------------------------------------------------------
 # High MOI deferred cis_gene tests (cis_gene omitted at init, committed
-# later via add_cis_gene()). Stops short of fit_cis()/fit_trans(): those
-# hit a pre-existing dtype bug in fit_cis (guide_assignment_tensor vs.
-# log2_x_eff_g dtype mismatch) that reproduces identically in eager
-# high-MOI mode too, so it's out of scope here.
+# later via add_cis_gene()). Stops short of fit_cis()/fit_trans(); the
+# eager high-MOI fit_cis is covered by high_moi_fitted_model above.
 # ----------------------------------------------------------------------
 @pytest.fixture(scope='module')
 def high_moi_deferred_model():

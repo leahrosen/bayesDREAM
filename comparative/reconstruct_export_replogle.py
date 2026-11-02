@@ -131,7 +131,7 @@ def _write_ntc_lean_companion(model, save_dir: str) -> None:
         'posterior_samples': posterior,
         'modality_name': 'gene',
         'distribution': mod.distribution,
-        'feature_names': mod.feature_names,
+        'feature_names': mod.feature_ids,
         'n_features': mod.dims.get('n_features'),
         'feature_meta': mod.feature_meta.to_dict('records') if mod.feature_meta is not None else None,
         'loss_ntc': getattr(mod, 'loss_ntc', None),

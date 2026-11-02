@@ -41,8 +41,29 @@ log2(x_eff_g) ~ Normal(mu, sigma) * eps,  where eps ~ StudentT(df=3)
 x_eff_g = 2^(log2(x_eff_g))
 ```
 
-Where `mu` and `sigma` are shared hyperparameters across all guides (or per-target if
-`independent_mu_sigma=True`).
+Where `mu` and `sigma` are shared hyperparameters across all guides by default. With
+`independent_mu_sigma=True` they are fit independently per group (sites `mu_target_i`/
+`sigma_target_i`), where a group is NTC-vs-cis crossed with a covariate combination: cis
+guides by `mu_sigma_covariates` (default: the model's `guide_covariates`, e.g. CRISPRi vs
+CRISPRa) and NTC guides by `mu_sigma_covariates_ntc` (default: `guide_covariates_ntc`; one
+NTC group if empty). Group labels are in `model.mu_sigma_group_labels`. See
+`API_REFERENCE.md` (`fit_cis`).
+
+**Prior on `mu` / `mu_target_i`:** empirical. With shared `mu`, its prior is
+`Normal(mean, SD)` of every guide's empirical log2 mean (counts / sum_factor / alpha_x).
+With `independent_mu_sigma=True`, each group's `mu_target_i` prior is centred on **that
+group's own** cell-pooled log2 mean, with the same width as the shared prior (SD over all
+guides' log2 means). The width is taken over all guides rather than per group so it is
+defined for a group with one guide and stable for a group with two (an SD from two values
+can be ~0). A group with no counts at all falls back to the all-guide centre. Before
+2026-10-28 every group was also centred on the all-guide mean, which pulled a cis group
+with few guides toward NTC whenever there were many NTC guides (e.g. Replogle's all-NTC
+variant: ~500 NTC guides + 1 targeting guide pair).
+
+With one guide in a group, `mu_target_i` and `sigma_target_i` are not separately
+identifiable (`log2 x_eff_g = mu + sigma * eps` with one `eps`); `x_eff_g` itself is
+still determined by that guide's cells, but read the group's `mu`/`sigma` posteriors
+with that in mind.
 
 **Interpretation:**
 - Higher `x_eff_g` = stronger knockdown/activation effect (depending on perturbation type)

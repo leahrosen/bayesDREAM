@@ -99,7 +99,10 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
             among cells carrying that guide (see _expand_guide_assignment_by_covariates).
         guide_covariates_ntc : list of str or None
             Same as guide_covariates, but for NTC guides (used instead of guide_covariates
-            when a guide's target is an NTC variant).
+            when a guide's target is an NTC variant). The two lists are never combined:
+            NTC guides are split only by guide_covariates_ntc, all other guides only by
+            guide_covariates. Default (None/[]) leaves NTC guides unsplit (one effect per
+            guide). Also the default grouping for NTC in fit_cis(independent_mu_sigma=True).
         output_dir : str
             Where to save results
         label : str
@@ -285,8 +288,11 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
 
         # Construct guide_used column (single-guide mode only)
         if not self.is_high_moi:
+            # NTC guides are split only by guide_covariates_ntc; all other guides only by
+            # guide_covariates (the two lists are never combined). Order follows the
+            # user-supplied list, so labels are deterministic.
             self.meta["guide_used"] = self.meta.apply(
-                lambda row: f"{row['guide']}_{'_'.join(str(row[cov]) for cov in (guide_covariates_ntc if row['target'] == 'ntc' else set(guide_covariates_ntc + guide_covariates)))}",
+                lambda row: f"{row['guide']}_{'_'.join(str(row[cov]) for cov in (guide_covariates_ntc if row['target'] == 'ntc' else guide_covariates))}",
                 axis=1
             )
             # one-hot encode guides
@@ -330,6 +336,10 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         # Bookkeeping for results
         self.alpha_x_prefit = None    # from step1: shape [C], always a mean point estimate
         # NOTE: alpha_y_prefit is stored per-modality as a mean point estimate [C, T]
+        # fit_cis bookkeeping for guide-axis latents (x_eff_g, sigma_eff, mu_target_i, ...)
+        self.cis_guide_labels = None          # name of each guide-axis position (see utils.get_guide_axis_labels)
+        self.mu_sigma_group_labels = None     # independent_mu_sigma: label of group i <-> mu_target_i/sigma_target_i
+        self.mu_sigma_guide_groups = None     # independent_mu_sigma: group label per guide-axis position
         self.trace_cellline = None    # from step1
         self.trace_x = None          # from step2
         self.trace_y = None          # from step3
@@ -1004,6 +1014,17 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         else:
             x_true_np = np.array(self.x_true)
 
+        # Cell-indexed fit_cis posterior draws are resampled with the same indices so
+        # fit_trans(x_uncertainty='sample') stays consistent with the permuted x_true.
+        ps_cis = getattr(self, 'posterior_samples_cis', None)
+        n_meta = len(self.meta)
+        cis_draw_keys = []
+        if isinstance(ps_cis, dict) and not is_lean_posterior(ps_cis):
+            cis_draw_keys = [k for k in ('x_true', 'log_x_true')
+                             if isinstance(ps_cis.get(k), torch.Tensor) and ps_cis[k].shape[-1] == n_meta]
+            for k in cis_draw_keys:
+                ps_cis[k] = ps_cis[k].clone()
+
         groups = self.meta.groupby(covariates) if covariates else [(None, self.meta)]
         for _key, group in groups:
             ntc_cells = group.loc[group['target'] == 'ntc', 'cell'].values
@@ -1043,9 +1064,16 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
             # of labels, correct regardless of what self.meta.index holds.
             meta_ntc_idx = np.where(self.meta['cell'].isin(ntc_cells).values)[0]
             x_true_np[meta_ntc_idx] = x_true_np[meta_ntc_idx][perm_idx]
+            for k in cis_draw_keys:
+                src = torch.as_tensor(meta_ntc_idx[perm_idx], device=ps_cis[k].device)
+                dst = torch.as_tensor(meta_ntc_idx, device=ps_cis[k].device)
+                ps_cis[k][..., dst] = ps_cis[k][..., src]
 
         cis_mod.counts = cis_counts_work
         self.x_true = torch.tensor(x_true_np, dtype=self.x_true.dtype, device=self.x_true.device)
+        if getattr(self, 'log2_x_true', None) is not None:
+            self.log2_x_true = torch.log2(self.x_true)
+        self.x_true_permuted = True
 
     def subset_cells(
         self,
@@ -1267,6 +1295,7 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
                 # x_true is always shape [N] - subset to new cells
                 if isinstance(self.x_true, torch.Tensor):
                     model_new.x_true = self.x_true[cell_indices_torch].clone()
+                model_new.x_true_permuted = getattr(self, 'x_true_permuted', False)
 
             # Copy log2_x_true (also needs subsetting)
             if hasattr(self, 'log2_x_true') and self.log2_x_true is not None:
@@ -1288,6 +1317,8 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
                 model_new.posterior_samples_cis = subsetted_cis
             if hasattr(self, 'loss_x') and self.loss_x is not None:
                 model_new.loss_x = self.loss_x
+            # group labels index the mu_target_i/sigma_target_i sites, which cell subsetting leaves intact
+            model_new.mu_sigma_group_labels = getattr(self, 'mu_sigma_group_labels', None)
             if hasattr(self, 'posterior_samples_trans') and self.posterior_samples_trans is not None:
                 model_new.posterior_samples_trans = self.posterior_samples_trans
             if hasattr(self, 'losses_trans') and self.losses_trans is not None:

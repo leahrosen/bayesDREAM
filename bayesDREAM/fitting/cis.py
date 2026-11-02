@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import pyro
 import pyro.distributions as dist
+from ..utils import get_guide_axis_labels
 from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
@@ -56,6 +57,8 @@ class CisFitter(FitterBase):
         rate_alpha_precomputed=None,
         rate_beta_precomputed=None,
         scale_2_tensor=None,
+        mu_target_mean_tensor=None,
+        mu_target_sd_tensor=None,
     ):
 
         ###################################
@@ -85,7 +88,14 @@ class CisFitter(FitterBase):
             sigma_targets = {}
             _hc_scale = scale_2_tensor if scale_2_tensor is not None else self._t(2.0)
             for t in unique_targets:
-                mu_targets[int(t.item())] = pyro.sample(f"mu_target_{int(t.item())}", dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor))
+                ti = int(t.item())
+                # Per-group prior (see _group_mu_prior); falls back to the pooled
+                # all-guide prior only if none was supplied.
+                if mu_target_mean_tensor is not None:
+                    loc, scale = mu_target_mean_tensor[ti], mu_target_sd_tensor[ti]
+                else:
+                    loc, scale = mu_x_mean_tensor, mu_x_sd_tensor
+                mu_targets[ti] = pyro.sample(f"mu_target_{ti}", dist.Normal(loc, scale))
                 sigma_targets[int(t.item())] = pyro.sample(f"sigma_target_{int(t.item())}", dist.HalfCauchy(scale=_hc_scale))
             # gather mu and sigma for each guide
             mu_target_tensor = torch.stack([mu_targets[int(t.item())] for t in unique_targets], dim=0)
@@ -192,6 +202,150 @@ class CisFitter(FitterBase):
                 obs=x_obs_tensor
             )
 
+    def _build_mu_sigma_groups(self, G, guides_tensor, mu_sigma_covariates, mu_sigma_covariates_ntc):
+        """
+        Assign each guide effect (guide_code / guide_assignment column) to a mu/sigma group
+        for ``independent_mu_sigma=True``.
+
+        A group is (NTC vs. cis target) x (covariate combination), where NTC guides are
+        crossed with ``mu_sigma_covariates_ntc`` and all other guides with
+        ``mu_sigma_covariates`` (None -> model.guide_covariates / guide_covariates_ntc).
+
+        Returns a LongTensor [G] of group indices (0..K-1); the group labels are stored in
+        ``self.model.mu_sigma_group_labels`` (list of K strings, index-aligned).
+        Raises ValueError if a guide effect spans several groups (e.g. a covariate that
+        varies within a guide) or if fewer than 2 groups result.
+        """
+        m = self.model
+        if 'target' not in m.meta.columns and not m.is_high_moi:
+            raise ValueError("independent_mu_sigma is True, self.model.meta['target'] column not found.")
+
+        covs_cis = list(m.guide_covariates if mu_sigma_covariates is None else mu_sigma_covariates)
+        covs_ntc = list(m.guide_covariates_ntc if mu_sigma_covariates_ntc is None else mu_sigma_covariates_ntc)
+        missing = [c for c in dict.fromkeys(covs_cis + covs_ntc) if c not in m.meta.columns]
+        if missing:
+            raise ValueError(f"independent_mu_sigma covariate(s) {missing} not found in model.meta columns.")
+        all_covs = list(dict.fromkeys(covs_cis + covs_ntc))
+
+        # Per-guide target label + NTC flag; covariate values are read lazily by _cov_value
+        # (only the covariates that apply to each guide's NTC/cis class are checked).
+        if m.is_high_moi:
+            # High MOI: one target label per guide column. Two sources: guide_meta['target']
+            # (simple) or guide_targets_dict (many-to-many).
+            _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
+            if 'target' in m.guide_meta.columns:
+                target_labels = m.guide_meta['target'].tolist()
+            elif hasattr(m, 'guide_targets_dict') and m.guide_targets_dict:
+                # Priority: cis_gene > any NTC variant > first target.
+                def _primary_target(targets):
+                    if m.cis_gene and m.cis_gene in targets:
+                        return m.cis_gene
+                    for t in targets:
+                        if t in _ntc_variants:
+                            return 'ntc'
+                    return targets[0] if targets else 'ntc'
+
+                target_labels = [
+                    _primary_target(m.guide_targets_dict.get(row['guide'], ['ntc']))
+                    for _, row in m.guide_meta.iterrows()
+                ]
+            else:
+                raise ValueError(
+                    "independent_mu_sigma=True in high MOI mode requires either "
+                    "guide_meta['target'] or guide_targets_dict."
+                )
+            is_ntc = [t in _ntc_variants for t in target_labels]
+            target_labels = ['ntc' if f else t for f, t in zip(is_ntc, target_labels)]
+
+            assign = m.guide_assignment.astype(bool)  # [N, G]
+            factorized = {c: pd.factorize(m.meta[c].astype(str)) for c in all_covs}
+
+            def _cov_value(c, g):
+                codes, uniques = factorized[c]
+                u = np.unique(codes[assign[:, g]])
+                if len(u) > 1:
+                    raise ValueError(
+                        f"independent_mu_sigma covariate '{c}' takes {len(u)} values within guide "
+                        f"effect {g} (guide '{m.guide_meta.iloc[g]['guide']}'). Split guides by it "
+                        f"via guide_covariates/guide_covariates_ntc at init, or drop it from "
+                        f"mu_sigma_covariates/mu_sigma_covariates_ntc."
+                    )
+                return str(uniques[u[0]]) if len(u) == 1 else 'NA'
+        else:
+            df = m.meta[['guide_code', 'target'] + all_covs].copy()
+            grp = df.groupby('guide_code', sort=True)
+            n_unique = grp.nunique(dropna=False).reindex(range(G))
+            first = grp.first().reindex(range(G))
+            if (n_unique['target'] > 1).any():
+                g_bad = int(n_unique.index[(n_unique['target'] > 1).values][0])
+                raise ValueError(f"Guide {g_bad} maps to multiple targets. independent_mu_sigma=True "
+                                 f"requires unambiguous target assignment per guide.")
+            target_labels = first['target'].astype(str).tolist()
+            is_ntc = [t == 'ntc' for t in target_labels]
+
+            def _cov_value(c, g):
+                if n_unique[c].iloc[g] > 1:
+                    raise ValueError(
+                        f"independent_mu_sigma covariate '{c}' takes multiple values within guide "
+                        f"effect {g}. Split guides by it via guide_covariates/guide_covariates_ntc "
+                        f"at init, or drop it from mu_sigma_covariates/mu_sigma_covariates_ntc."
+                    )
+                return str(first[c].iloc[g])
+
+        labels = []
+        for g in range(G):
+            covs = covs_ntc if is_ntc[g] else covs_cis
+            labels.append("|".join([target_labels[g]] + [f"{c}={_cov_value(c, g)}" for c in covs]))
+
+        codes, uniques = pd.factorize(pd.Series(labels))
+        if len(uniques) < 2:
+            raise ValueError("independent_mu_sigma is True, but only 1 mu/sigma group results.")
+        m.mu_sigma_group_labels = [str(u) for u in uniques]
+        m.mu_sigma_guide_groups = labels  # group label per guide-axis position
+        print(f"[INFO] independent_mu_sigma: {len(uniques)} mu/sigma groups: {m.mu_sigma_group_labels}")
+        return torch.tensor(codes, dtype=torch.long, device=m.device)
+
+    @staticmethod
+    def _group_mu_prior(guide_sum, guide_n, guide_means, group_per_guide, fallback_center):
+        """Per-group Normal prior (loc, scale) for mu_target_t under
+        independent_mu_sigma=True: centred on each group's OWN data, with the
+        width of the shared (all-guide) prior.
+
+        Before this, every mu_target_t got the same prior, centred on the mean
+        of ALL guides' empirical log2 means. With many NTC guides and a cis
+        group of one or two guides, that centre is ~ the NTC level, so the
+        prior pulls the cis group's mu toward NTC (e.g. Replogle GFI1B: ~500
+        NTC guides + 1 targeting guide pair).
+
+        loc_t: log2 of the group's cell-pooled mean (sum of x_obs/(sum_factor*alpha_x)
+               over the group's cells / its cell count). Pooling cells rather than
+               averaging per-guide log2 means keeps a single all-zero guide from
+               dragging the centre to log2(epsilon). A group with no counts at all
+               falls back to `fallback_center`.
+        scale: SD of ALL guides' log2 means -- the same width the shared prior
+               always had, identical for every group. Taken over all guides rather
+               than per group so it is defined for a group with one guide (no SD)
+               and stable for a group with two (an SD from two values is noise and
+               can be ~0). Clamped at 1e-3 only so a degenerate input can't give a
+               zero-width Normal.
+
+        All inputs are per guide-axis position (numpy, length G); group_per_guide
+        holds group codes 0..T-1. Returns two float32 numpy arrays of length T.
+        """
+        guide_sum = np.asarray(guide_sum, dtype=np.float64)
+        guide_n = np.asarray(guide_n, dtype=np.float64)
+        guide_means = np.asarray(guide_means, dtype=np.float64)
+        group_per_guide = np.asarray(group_per_guide)
+        T = int(group_per_guide.max()) + 1
+        loc = np.empty(T)
+        for t in range(T):
+            mask = group_per_guide == t
+            total, n = guide_sum[mask].sum(), guide_n[mask].sum()
+            loc[t] = np.log2(total / n) if (total > 0 and n > 0) else float(fallback_center)
+        sd = np.std(guide_means, ddof=1) if len(guide_means) > 1 else np.nan
+        scale = np.full(T, max(float(sd), 1e-3) if np.isfinite(sd) else 1e-3)
+        return loc.astype(np.float32), scale.astype(np.float32)
+
     def fit_cis(
         self,
         technical_covariates: list[str] = None,
@@ -207,6 +361,8 @@ class CisFitter(FitterBase):
         minibatch_size: int = None,
         predictive_on_cpu: bool = True,
         independent_mu_sigma: bool = False,
+        mu_sigma_covariates: list = None,
+        mu_sigma_covariates_ntc: list = None,
         **kwargs
     ):
         """
@@ -244,7 +400,27 @@ class CisFitter(FitterBase):
         alpha_ewma : float
             Exponential weight for smoothing the ELBO
         independent_mu_sigma : bool
-            Whether to use independent mu/sigma per target type
+            If False (default), all guides share one mu/sigma (NTC and cis guides alike).
+            If True, mu/sigma are fit independently per group, where a group is
+            NTC-vs-cis crossed with the covariate combination chosen by
+            ``mu_sigma_covariates`` (cis/non-NTC guides) and
+            ``mu_sigma_covariates_ntc`` (NTC guides). With the defaults this means
+            e.g. CRISPRi and CRISPRa guides (``guide_covariates=['cell_line']``) each get
+            their own mu/sigma, and NTC guides are split by ``guide_covariates_ntc``
+            (one group if that is empty). The group labels are stored in
+            ``self.model.mu_sigma_group_labels`` (entry i <-> sites
+            ``mu_target_i``/``sigma_target_i``) and are saved/restored by
+            ``save_cis_fit``/``load_cis_fit``.
+        mu_sigma_covariates : list of str or None
+            Only used if ``independent_mu_sigma=True``. meta columns that define separate
+            mu/sigma groups among non-NTC (cis) guides. None (default) uses the model's
+            ``guide_covariates``; ``[]`` puts all cis guides in one group. Each covariate
+            must take a single value within every guide effect (i.e. be one of the
+            covariates guides are split by, or otherwise constant within a guide),
+            otherwise a ValueError is raised.
+        mu_sigma_covariates_ntc : list of str or None
+            Same as ``mu_sigma_covariates`` but for NTC guides. None (default) uses the
+            model's ``guide_covariates_ntc``; ``[]`` fits all NTC guides as one group.
         kwargs :
             Additional arguments controlling priors, etc.
         """
@@ -389,57 +565,13 @@ class CisFitter(FitterBase):
             )
         # ========================================================================
         if independent_mu_sigma:
-            if ('target' not in self.model.meta.columns):
-                raise ValueError("independent_mu_sigma is True, self.model.meta['target'] column not found.")
-            elif self.model.meta['target'].nunique() < 2:
-                raise ValueError("independent_mu_sigma is True, but only 1 target type found in self.model.meta['target'] column.")
-
-            ### BUILD target_per_guide_tensor [G] based on guide → target
-            if self.model.is_high_moi:
-                # High MOI: derive one target label per guide for grouping mu/sigma.
-                # Two sources: guide_meta['target'] (simple) or guide_targets_dict (many-to-many).
-                _ntc_variants = {'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting'}
-
-                if 'target' in self.model.guide_meta.columns:
-                    guide_target_labels = self.model.guide_meta['target'].tolist()
-                elif hasattr(self.model, 'guide_targets_dict') and self.model.guide_targets_dict:
-                    # Derive a single representative target per guide.
-                    # Priority: cis_gene > any NTC variant > first target.
-                    def _primary_target(targets):
-                        if self.model.cis_gene and self.model.cis_gene in targets:
-                            return self.model.cis_gene
-                        for t in targets:
-                            if t in _ntc_variants:
-                                return 'ntc'
-                        return targets[0] if targets else 'ntc'
-
-                    guide_target_labels = [
-                        _primary_target(self.model.guide_targets_dict.get(row['guide'], ['ntc']))
-                        for _, row in self.model.guide_meta.iterrows()
-                    ]
-                else:
-                    raise ValueError(
-                        "independent_mu_sigma=True in high MOI mode requires either "
-                        "guide_meta['target'] or guide_targets_dict."
-                    )
-
-                target_factorized, target_unique = pd.factorize(guide_target_labels)
-                target_per_guide_tensor = torch.tensor(target_factorized, dtype=torch.long, device=self.model.device)
-                print(f"[INFO] independent_mu_sigma (high MOI): {len(target_unique)} unique targets")
-            else:
-                # Single-guide mode: one target code per guide (raises if a guide has multiple targets)
-                self.model.meta['target_code'] = pd.factorize(self.model.meta['target'])[0]
-                target_codes_tensor = torch.tensor(self.model.meta['target_code'].values, dtype=torch.long, device=self.model.device)
-
-                target_per_guide_tensor = torch.empty(G, dtype=torch.long, device=self.model.device)
-                for g in range(G):
-                    idx = (guides_tensor == g)
-                    guide_targets = torch.unique(target_codes_tensor[idx])
-                    if guide_targets.shape[0] != 1:
-                        raise ValueError(f"Guide {g} maps to multiple targets: {guide_targets}. independent_mu_sigma=True requires unambiguous target assignment per guide.")
-                    target_per_guide_tensor[g] = guide_targets[0]
+            target_per_guide_tensor = self._build_mu_sigma_groups(
+                G, guides_tensor, mu_sigma_covariates, mu_sigma_covariates_ntc
+            )
         else:
             target_per_guide_tensor = None
+            self.model.mu_sigma_group_labels = None
+            self.model.mu_sigma_guide_groups = None
         primary_mod = self.model.get_modality(self.model.primary_modality)
         sum_factor_tensor = torch.tensor(
             primary_mod.sum_factors.loc[self.model.meta['cell'].values, sum_factor_col].values,
@@ -483,7 +615,8 @@ class CisFitter(FitterBase):
             assign_np = self.model.guide_assignment  # [N, G] numpy array
             cell_counts_np = assign_np.sum(axis=0).clip(min=1)  # [G]
             guide_sums_np = x_np @ assign_np  # [G]
-            guide_means_np = np.log2(np.clip(guide_sums_np / cell_counts_np, epsilon, None))
+            # float32: assign_np is float64, and a double mu breaks the matmul in _model_x
+            guide_means_np = np.log2(np.clip(guide_sums_np / cell_counts_np, epsilon, None)).astype(np.float32)
 
             log2_x_np = np.log2(np.clip(x_np, epsilon, None))
             guide_mads_np = np.zeros(G, dtype=np.float32)
@@ -496,6 +629,7 @@ class CisFitter(FitterBase):
 
             guide_means = torch.from_numpy(guide_means_np).to(self.model.device)
             guide_mads_tensor = torch.from_numpy(guide_mads_np).to(self.model.device)
+            _guide_sum_np, _guide_n_np = guide_sums_np, cell_counts_np
         else:
             # Single-guide mode: vectorized means via bincount, MADs via sorted numpy slices
             guides_np = guides_tensor.cpu().numpy()
@@ -519,9 +653,25 @@ class CisFitter(FitterBase):
 
             guide_means = torch.from_numpy(guide_means_np).to(self.model.device)
             guide_mads_tensor = torch.from_numpy(guide_mads_np).to(self.model.device)
+            _guide_sum_np, _guide_n_np = sum_per_guide_np, n_per_guide_np
 
         mu_x_mean_tensor = torch.mean(guide_means)
         mu_x_sd_tensor = torch.std(guide_means)
+
+        mu_target_mean_tensor = None
+        mu_target_sd_tensor = None
+        if independent_mu_sigma:
+            _loc, _scale = self._group_mu_prior(
+                _guide_sum_np, _guide_n_np, guide_means_np,
+                target_per_guide_tensor.cpu().numpy(),
+                fallback_center=float(mu_x_mean_tensor),
+            )
+            mu_target_mean_tensor = torch.from_numpy(_loc).to(self.model.device)
+            mu_target_sd_tensor = torch.from_numpy(_scale).to(self.model.device)
+            _n_guides = np.bincount(target_per_guide_tensor.cpu().numpy(), minlength=len(_loc))
+            for _t, _lab in enumerate(self.model.mu_sigma_group_labels):
+                print(f"[INFO] mu_target_{_t} ({_lab}, {_n_guides[_t]} guide(s)) prior: "
+                      f"Normal({_loc[_t]:.3f}, {_scale[_t]:.3f})")
 
         guide_mads_tensor = guide_mads_tensor * 1.4826  # Gaussian-equivalent spread
         sigma_eff_mean_tensor = torch.mean(guide_mads_tensor)#.to(self.model.device)
@@ -614,6 +764,8 @@ class CisFitter(FitterBase):
                 rate_alpha_precomputed=rate_alpha_precomputed,
                 rate_beta_precomputed=rate_beta_precomputed,
                 scale_2_tensor=scale_2_tensor,
+                mu_target_mean_tensor=mu_target_mean_tensor,
+                mu_target_sd_tensor=mu_target_sd_tensor,
             )
             losses.append(loss)
             if step % 1000 == 0:
@@ -654,6 +806,8 @@ class CisFitter(FitterBase):
                 "rate_alpha_precomputed": self._to_cpu(rate_alpha_precomputed),
                 "rate_beta_precomputed": self._to_cpu(rate_beta_precomputed),
                 "scale_2_tensor": self._to_cpu(scale_2_tensor),
+                "mu_target_mean_tensor": self._to_cpu(mu_target_mean_tensor),
+                "mu_target_sd_tensor": self._to_cpu(mu_target_sd_tensor),
             }
         else:
             model_inputs = {
@@ -675,6 +829,8 @@ class CisFitter(FitterBase):
                 "rate_alpha_precomputed": rate_alpha_precomputed,
                 "rate_beta_precomputed": rate_beta_precomputed,
                 "scale_2_tensor": scale_2_tensor,
+                "mu_target_mean_tensor": mu_target_mean_tensor,
+                "mu_target_sd_tensor": mu_target_sd_tensor,
             }
 
         if self.model.device.type == "cuda":
@@ -727,6 +883,9 @@ class CisFitter(FitterBase):
             posterior_samples_x[k] = self._to_cpu(v)
 
         self.model.loss_x = losses
+        # Names of the guide-axis positions the guide-level latents were fit with; saved by
+        # save_cis_fit() and used by load_cis_fit() to align by name, not by position.
+        self.model.cis_guide_labels = get_guide_axis_labels(self.model)
         # Store full posterior on model (not just on CisFitter)
         self.model.posterior_samples_cis = posterior_samples_x
         self.model.x_true = posterior_samples_x['x_true'].median(dim=0).values

@@ -195,9 +195,12 @@ class bayesDREAM(
             (dropped). Because resolution depends on cis_gene, the same guide_target
             mapping can be reused across separate cis-gene fits without editing meta.
         guide_covariates : list, optional
-            Covariates for guide grouping (e.g., ['cell_line', 'batch'])
+            Covariates that split non-NTC guides into separate guide effects
+            (e.g., ['cell_line', 'batch'])
         guide_covariates_ntc : list, optional
-            Covariates for NTC guide grouping (if different from guide_covariates)
+            Covariates that split NTC guides into separate guide effects. Used instead
+            of guide_covariates for NTC guides (the two lists are never combined).
+            Default: [] (NTC guides not split).
         sum_factor_col : str, default='sum_factor'
             Column name in meta containing size factors
         output_dir : str, default="./model_out"

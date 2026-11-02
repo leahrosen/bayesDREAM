@@ -95,11 +95,11 @@ The main class in `bayesDREAM/model.py` implements multi-modal Bayesian modeling
 - `set_alpha_x(alpha_x, covariates)`: Sets cis gene overdispersion parameters
 - `set_alpha_y(alpha_y, covariates)`: Sets trans gene overdispersion parameters
 - `adjust_ntc_sum_factor(covariates, ...)`: Adjusts NTC sum factors for covariates
-- `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`
+- `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`. `independent_mu_sigma=True` fits `mu`/`sigma` per group = (NTC | cis) x covariates: cis guides by `mu_sigma_covariates` (default `guide_covariates`), NTC by `mu_sigma_covariates_ntc` (default `guide_covariates_ntc`). `guide_covariates` splits only non-NTC guides and `guide_covariates_ntc` only NTC guides (never combined)
 - `set_x_true(x_true)`: Sets true cis expression for trans modeling
 - `permute_genes(genes2permute, ...)`: Permutes guide-gene associations for null testing
 - `refit_sumfactor(covariates, ...)`: Re-estimates sum factors based on posterior cis expression
-- `fit_trans(sum_factor_col, function_type, modality_name, ...)`: Fits trans effects using `_model_y`
+- `fit_trans(sum_factor_col, function_type, modality_name, ...)`: Fits trans effects using `_model_y`. Default `x_level='cell', x_uncertainty='sample'`: each SVI step conditions on a fresh fit_cis posterior draw of x_true (fixed data, never a latent of `_model_y`); needs full `posterior_samples_cis` and raises otherwise. `x_uncertainty='median'` and `x_level='guide'` exist but are not recommended (see docs/FIT_TRANS_GUIDE.md)
 
 **Function Types for Trans Modeling:**
 
@@ -228,7 +228,7 @@ for gene in ['GFI1B', 'MYB', 'TET2']:
 - At init: cells are classified as `'excluded'` / `'ntc'` / `'other'` (cis identity unknown yet); excluded cells are dropped immediately; the full guide panel is kept (no pruning) since which guides are "cis" isn't known until `add_cis_gene()`.
 - `fit_ntc(use_all_cells=...)` defaults to `True` when `cis_gene` is still unset in high-MOI mode (cell classification into NTC/cis/other isn't possible yet, so a per-gene NTC-only fit isn't well-defined). Pass `use_all_cells=False` explicitly to force NTC-only fitting instead (still correct, since 'ntc' cells are already properly classified at this point).
 - `add_cis_gene(gene)` additionally: reclassifies any cell carrying a guide targeting `gene` from `'ntc'`/`'other'` to `gene` (excluded cells are never reclassified — same `excluded > cis > ntc > other` priority used in eager high-MOI init), then prunes `guide_assignment`/`guide_meta`/`guide_targets_dict` down to NTC + cis-gene guides only and rebuilds `guide_assignment_tensor`.
-- Known pre-existing issue (not introduced by deferred-cis-gene support): `fit_cis()` in high-MOI mode currently raises `RuntimeError: expected scalar type Float but found Double` from a dtype mismatch between `guide_assignment_tensor` and `log2_x_eff_g` in `_model_x` — reproduces identically in eager high-MOI mode (`cis_gene` set at init), so it's an existing bug in `fitting/cis.py`, not specific to the deferred workflow.
+- Fixed: `fit_cis()` in high-MOI mode used to raise a Float/Double dtype mismatch in `_model_x`, because the high-MOI guide means were computed in float64 from the numpy `guide_assignment`; they are now cast to float32 in `fitting/cis.py`.
 
 ### Single-Guide Mode with `guide_target` (Ambiguous/Multi-Target Guides)
 

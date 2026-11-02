@@ -71,7 +71,7 @@ def save_model_for_plotting(model, save_dir=None, verbose=True, save_ntc=True):
     import pandas as pd
     mod = model.get_modality(model.primary_modality)
     arr_primary = mod.counts.toarray() if sparse.issparse(mod.counts) else np.asarray(mod.counts)
-    names_primary = list(mod.feature_names)
+    names_primary = list(mod.feature_ids)
     meta_primary = mod.feature_meta.copy()
 
     if 'cis' in model.modalities:
@@ -79,7 +79,7 @@ def save_model_for_plotting(model, save_dir=None, verbose=True, save_ntc=True):
         arr_cis = cis_mod.counts.toarray() if sparse.issparse(cis_mod.counts) else np.asarray(cis_mod.counts)
         if arr_cis.ndim == 1:
             arr_cis = arr_cis[np.newaxis, :]
-        names_cis = list(cis_mod.feature_names) if cis_mod.feature_names else [model.cis_gene]
+        names_cis = list(cis_mod.feature_ids) if cis_mod.feature_ids else [model.cis_gene]
         meta_cis = cis_mod.feature_meta.copy()
 
         arr = np.vstack([arr_cis, arr_primary])
