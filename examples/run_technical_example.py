@@ -18,15 +18,7 @@ import torch
 import pyro
 import numpy as np
 from bayesDREAM import bayesDREAM
-
-def set_max_threads(cores: int):
-    """Set maximum threads for various libraries."""
-    os.environ["OMP_NUM_THREADS"] = str(cores)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(cores)
-    os.environ["MKL_NUM_THREADS"] = str(cores)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(cores)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(cores)
-    torch.set_num_threads(cores)
+from bayesDREAM.utils import set_max_threads
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run bayesDREAM technical fit')
