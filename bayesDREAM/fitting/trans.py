@@ -48,7 +48,7 @@ def _soft_clamp(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Te
     return center + half * torch.tanh(x / half)
 
 
-class TransFitter:
+class TransFitter(FitterBase):
     """Handles trans effects fitting."""
 
     def _save_checkpoint_atomic(self, checkpoint_path: str, data: dict) -> None:
@@ -84,14 +84,6 @@ class TransFitter:
             The parent model instance
         """
         self.model = model
-
-    def _t(self, x, dtype=torch.float32):
-        return torch.as_tensor(x, dtype=dtype, device=self.model.device)
-
-    def _to_cpu(self, x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu()
-        return x
 
     # ----------------------------
     # Debug helpers (Option 1)

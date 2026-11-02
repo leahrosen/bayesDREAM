@@ -501,8 +501,8 @@ splicing.py (Pure Python - no R dependencies)
   └── modality.py
 
 fitting/
-  ├── helpers.py (helper functions)
-  ├── technical.py (NTCFitter)
+  ├── __init__.py (FitterBase: shared tensor conversion helpers)
+  ├── ntc.py (NTCFitter)
   ├── cis.py (CisFitter)
   └── trans.py (TransFitter)
 

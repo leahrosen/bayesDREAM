@@ -33,9 +33,8 @@ model_defaults:
 
 cis_genes: [GENE1, GENE2]
 
-# Delete this block (and use per-gene fit_ntc via the plain `bayesDREAM
-# fit-ntc` CLI stage instead) if your dataset DOESN'T share one fit_ntc
-# across genes.
+# Delete this block and configure per-gene NTC runner jobs instead if your
+# dataset DOESN'T share one fit_ntc across genes.
 ntc_shared:
   set_technical_groups: [cell_line]
   resources: {cores: 8, time_hours: 4}

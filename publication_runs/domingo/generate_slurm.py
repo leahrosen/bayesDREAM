@@ -1,5 +1,5 @@
 """
-Generate SLURM scripts + per-gene bayesdream-CLI configs for the Domingo
+Generate SLURM scripts + per-gene stage configs for the Domingo
 dataset: one shared fit_ntc, then per cis-gene (GFI1B/MYB/NFE2/TET2)
 fit_cis -> compensation -> fit_trans -> permutation reps -> recapitulation
 reps, plus the extra (splicing/velocity/efficiency) modalities per gene
@@ -76,7 +76,7 @@ Usage
     python generate_slurm.py [--config config.yaml] [--outdir slurm]
 
 Writes:
-    <outdir>/configs/*.yaml         one bayesdream-CLI config per gene/stage
+    <outdir>/configs/*.yaml         one Python stage config per gene/stage
     <outdir>/logs/                  sbatch log directory
     <outdir>/01_ntc_shared.sh
     <outdir>/02_cis_<gene>.sh
@@ -221,10 +221,7 @@ def main() -> None:
     }
 
     def bd_cmd(kind: str, config_path: Path, extra_args: str = "") -> str:
-        """kind: 'fit-ntc'/'fit-cis'/'fit-trans'/'report' -> bayesDREAM CLI;
-        otherwise a common/run_<kind>.py script."""
-        if kind in {"fit-ntc", "fit-cis", "fit-trans", "report"}:
-            return f'cd "{repo_dir}" && "{python_env}" -m bayesDREAM {kind} --config "{config_path}"{extra_args}'
+        """Run a standalone publication stage script."""
         script = f"{repo_dir}/publication_runs/common/run_{kind}.py"
         return f'"{python_env}" "{script}" --config "{config_path}"{extra_args}'
 

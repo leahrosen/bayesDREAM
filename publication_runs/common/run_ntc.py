@@ -1,11 +1,8 @@
 """
-Standalone fit_ntc stage, using config_utils.build_model_from_config (the
-extended builder -- supports exclude_guides/min_count/sparse .npz counts,
-none of which bayesDREAM.cli's own `fit-ntc` subcommand forwards, see
-config_utils.py's module docstring). Used for every dataset's SHARED
-fit_ntc build (cis_gene omitted -- deferred) so every dataset goes through
-the same model-construction code path, rather than some datasets using the
-plain CLI and others needing a bespoke script.
+Standalone fit_ntc stage using config_utils.build_model_from_config, which
+supports exclude_guides/min_count/sparse .npz counts. Used for every dataset's
+SHARED fit_ntc build (cis_gene omitted -- deferred) so each dataset uses the
+same model-construction code path.
 
 As of bayesDREAM's "Support deferred cis_gene in high-MOI mode" change,
 this works identically for low-MOI and high-MOI datasets: cis_gene omitted,
@@ -18,7 +15,7 @@ Usage
 -----
     python run_ntc.py --config <ntc_shared_config.yaml>
 
-Config is the standard bayesdream-CLI-schema (data:/model:/ntc:), with
+Config uses the publication stage schema (data:/model:/ntc:), with
 model.cis_gene omitted::
 
     data:
@@ -69,8 +66,8 @@ def run_ntc(cfg: dict) -> None:
     if model_cfg.get("cis_gene"):
         raise ValueError(
             "run_ntc: config's model.cis_gene should be omitted for a shared/deferred "
-            "fit_ntc run -- found model.cis_gene={!r}. If cis_gene is meant to be fixed, "
-            "use the plain `bayesDREAM fit-ntc` CLI stage instead.".format(model_cfg["cis_gene"])
+            "fit_ntc run -- found model.cis_gene={!r}. This runner is for shared/deferred "
+            "NTC fits.".format(model_cfg["cis_gene"])
         )
 
     model = build_model_from_config(cfg)

@@ -298,8 +298,6 @@ def main() -> None:
     }
 
     def bd_cmd(kind: str, config_path, python_env: str, extra_args: str = "") -> str:
-        if kind in {"fit-ntc", "fit-cis", "fit-trans", "report"}:
-            return f'cd "{repo_dir}" && "{python_env}" -m bayesDREAM {kind} --config "{config_path}"{extra_args}'
         script = f"{repo_dir}/publication_runs/common/run_{kind}.py"
         return f'"{python_env}" "{script}" --config "{config_path}"{extra_args}'
 

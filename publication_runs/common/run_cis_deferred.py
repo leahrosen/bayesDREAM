@@ -18,15 +18,9 @@ excluded. See morris/generate_slurm.py for how a dataset-specific,
 per-cis-gene exclude_guides list gets computed and baked into each gene's
 own rendered config.
 
-Why this needs its own script rather than `python -m bayesDREAM fit-cis
---config ...`: the plain CLI's _build_model always passes `model.cis_gene`
-straight to the bayesDREAM constructor, which carves the cis gene out of the
-primary modality immediately -- there is no way to build a model with
-cis_gene deferred and then call add_cis_gene() through the existing CLI
-subcommands. This script does exactly that, as a separate process per gene,
-loading the ALREADY-FITTED shared ntc posteriors from disk (fit_ntc() itself
-only ever needs to run once, in a separate job -- see each dataset's
-ntc_shared stage, common/run_ntc.py).
+This runner builds a model with cis_gene deferred, loads the ALREADY-FITTED
+shared NTC posteriors, then calls add_cis_gene() before fitting. It runs as a
+separate process per gene; fit_ntc() only needs to run once in common/run_ntc.py.
 
 KNOWN PRE-EXISTING ISSUE for high-MOI (not introduced by, or specific to,
 the deferred workflow -- see CLAUDE.md / docs/HIGH_MOI_GUIDE.md): fit_cis()
@@ -95,8 +89,8 @@ def run_cis_deferred(cfg: dict) -> None:
     if model_cfg.get("cis_gene"):
         raise ValueError(
             "run_cis_deferred: config's model.cis_gene must be omitted (deferred) -- "
-            "found model.cis_gene={!r}. Use the plain `bayesDREAM fit-cis` CLI stage "
-            "instead if cis_gene is meant to be set at construction time.".format(model_cfg["cis_gene"])
+            "found model.cis_gene={!r}. This runner requires top-level cis_gene "
+            "and ntc_shared_dir settings.".format(model_cfg["cis_gene"])
         )
 
     cis_gene = cfg.get("cis_gene")

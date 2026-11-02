@@ -1,13 +1,9 @@
 """
-Standalone trans-fit stage, used instead of `python -m bayesDREAM fit-trans
---config ...` because the plain CLI's `_run_fit_trans` (bayesDREAM/cli.py)
-doesn't call `adjust_ntc_sum_factor()`/`refit_sumfactor()` -- every dataset
-here needs both (docs/FIT_TRANS_GUIDE.md's documented workflow is
+Standalone trans-fit stage. Every dataset here needs
+`adjust_ntc_sum_factor()`/`refit_sumfactor()` (docs/FIT_TRANS_GUIDE.md's documented workflow is
 adjust_ntc_sum_factor -> fit_cis -> refit_sumfactor -> fit_trans, and
 neither 'sum_factor_adj' nor 'sum_factor_refit' survives a save/load round
-trip -- see config_utils.apply_sum_factor_adjustments's docstring for why).
-This script adds that step and is otherwise identical to the CLI's trans
-stage (same load_ntc/load_cis/fit/save config shape).
+This script applies those steps along with loading and fitting trans.
 
 Usage
 -----

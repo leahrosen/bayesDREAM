@@ -1,5 +1,5 @@
 # Morris dataset -- orchestration config, consumed by generate_slurm.py.
-# High-MOI. NOT the bayesdream-CLI-schema config -- see
+# High-MOI dataset orchestration config -- see
 # publication_runs/README.md and morris/README.md (the latter explains the
 # shared-fit_ntc deferred-cis_gene pattern this dataset relies on -- now
 # built directly into bayesDREAM's add_cis_gene(), no workaround needed --

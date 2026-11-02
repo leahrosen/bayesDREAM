@@ -46,8 +46,6 @@ setup(
         'seaborn>=0.12',
         'adjustText>=1.0.0',  # Non-overlapping label placement for volcano plots
         'h5py>=3.8.0',
-        'typer>=0.12.0',
-        'pyyaml>=6.0.0',
     ],
     extras_require={
         'dev': [
@@ -71,9 +69,4 @@ setup(
         'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
     ],
-    entry_points={
-        'console_scripts': [
-            'bayesdream=bayesDREAM.cli:main',
-        ],
-    },
 )

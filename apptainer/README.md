@@ -16,26 +16,26 @@ If your cluster requires rootless builds, use your site's remote builder (if con
 apptainer build --remote bayesdream_cpu.sif apptainer/bayesdream_cpu.def
 ```
 
-## Run bayesDREAM CLI
+## Run Python Workflows
 
 ```bash
 # CPU
 apptainer exec --bind $PWD:/work bayesdream_cpu.sif \
-  bayesdream run --config /work/config.yaml
+  python /work/your_workflow.py
 
 # NVIDIA GPU
 apptainer exec --nv --bind $PWD:/work bayesdream_cuda.sif \
-  bayesdream run --config /work/config.yaml
+  python /work/your_workflow.py
 
 # AMD GPU
 apptainer exec --rocm --bind $PWD:/work bayesdream_rocm.sif \
-  bayesdream run --config /work/config.yaml
+  python /work/your_workflow.py
 ```
 
-You can also use run mode (runs `bayesdream` directly):
+Run mode forwards arguments to the container command:
 
 ```bash
-apptainer run --bind $PWD:/work bayesdream_cpu.sif --help
+apptainer run --bind $PWD:/work bayesdream_cpu.sif python /work/your_workflow.py
 ```
 
 ## Snakemake integration
@@ -51,10 +51,7 @@ rule bayesdream_pipeline:
     container:
         "bayesdream_cpu.sif"
     shell:
-        """
-        bayesdream run --config {input.cfg}
-        touch {output.done}
-        """
+        "python scripts/run_analysis.py --config {input.cfg} && touch {output.done}"
 ```
 
 Run with container support enabled:

@@ -1,5 +1,5 @@
 """
-Generate SLURM scripts + per-gene/per-cis-variant bayesdream-CLI configs for
+Generate SLURM scripts + per-gene/per-cis-variant stage configs for
 the Replogle dataset: one shared fit_ntc (all NTC cells), then per cis gene
 (GFI1B/MYB/NFE2/TET2/IKZF1/HHEX/RUNX1) x 2 NTC-subsetting data variants x 3
 fit_cis configurations -> matching fit_trans. See

@@ -341,7 +341,7 @@ def attach_modality_precomputed(model, spec: Dict, precomputed_dir: str) -> str:
 
 
 def main() -> None:
-    """CLI entry point for one (gene, modality) attach + fit_ntc + fit_trans task.
+    """Stage entry point for one (gene, modality) attach + fit_ntc + fit_trans task.
 
     Fits a SEPARATE fit_ntc() for this modality (not reused from the primary
     'gene' modality's ntc fit -- matches the reference notebook pattern of
@@ -399,8 +399,8 @@ def main() -> None:
     cis_cfg = cfg.get("cis") or {}
     ntc_cfg = cfg.get("ntc") or cfg.get("technical") or {}
     # NOTE: deliberately does NOT call model.load_ntc_fit() here for the
-    # primary 'gene' modality (earlier versions of this script did, cargo-
-    # culted from bayesDREAM.cli._run_fit_cis's load-then-fit_cis pattern).
+    # primary 'gene' modality (earlier versions of this script did, copied
+    # from a load-then-fit_cis stage pattern).
     # It has no `input_dir` in this script's config (only `load_cis` is
     # rendered -- see domingo/generate_slurm.py's mod_cfg), so it would
     # default to this gene's OWN output_dir/label, where no ntc fit is ever
