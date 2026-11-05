@@ -1,11 +1,10 @@
-"""Test fit_trans with all distributions and function types.
+"""Test fit_trans with all distributions.
 
 Verifies:
 1. Binomial Hill works in probability space with Beta priors
-2. Binomial polynomial works in logit space
-3. Multinomial has per-category parameters (K-1 for Hill, K for polynomial)
-4. Technical groups are applied correctly (no double-application)
-5. All distributions work with all function types
+2. Multinomial has per-category parameters (K-1 for Hill)
+3. Technical groups are applied correctly (no double-application)
+4. All distributions work with Hill function types
 """
 
 import numpy as np
@@ -104,7 +103,7 @@ def test_negbinom_hill_variants(shared_test_data):
         assert key in model.posterior_samples_trans
 
 
-def test_binomial_hill_and_polynomial(shared_test_data):
+def test_binomial_hill(shared_test_data):
     meta = shared_test_data["meta"]
     gene_counts = shared_test_data["gene_counts"]
     feature_meta = shared_test_data["feature_meta"]
@@ -136,18 +135,6 @@ def test_binomial_hill_and_polynomial(shared_test_data):
     Vmax_a = posterior["Vmax_a"]
     assert torch.all(A >= 0) and torch.all(A <= 1)
     assert torch.all(Vmax_a >= 0) and torch.all(Vmax_a <= 1)
-
-    _fit_trans(
-        model,
-        sum_factor_col=None,
-        function_type="polynomial",
-        modality_name="exon_skip",
-        min_denominator=0,
-    )
-    posterior = _posterior_for(model, modality_name="exon_skip")
-    assert any("poly_coeff" in k for k in posterior)
-    A = posterior["A"]
-    assert torch.all(A >= 0) and torch.all(A <= 1)
 
 
 def test_multinomial_hill(shared_test_data):
@@ -183,7 +170,7 @@ def test_multinomial_hill(shared_test_data):
     assert n_a.shape[-1] == K - 1
 
 
-def test_normal_polynomial(shared_test_data):
+def test_normal_hill(shared_test_data):
     meta = shared_test_data["meta"]
     gene_counts = shared_test_data["gene_counts"]
     feature_meta = shared_test_data["feature_meta"]
@@ -203,10 +190,12 @@ def test_normal_polynomial(shared_test_data):
     _fit_trans(
         model,
         sum_factor_col=None,
-        function_type="polynomial",
+        function_type="single_hill",
         modality_name="scores",
     )
     posterior = _posterior_for(model, modality_name="scores")
+    assert "A" in posterior
+    assert "Vmax_a" in posterior
     assert (
         "sigma_y" in posterior
         or "sigma" in posterior
