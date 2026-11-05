@@ -9,7 +9,7 @@ with bayesDREAM.
 Two parameterizations are supported:
 
 Direct parameterization (A_median column present):
-    Uses Hill/polynomial parameters from the trans summary directly.
+    Uses Hill parameters from the trans summary directly.
 
 Fold-change parameterization (y_ntc_median column present):
     Derives A and V from interpretable quantities — NTC expression (y_ntc),
@@ -249,8 +249,7 @@ def simulate_from_trans_summary(
         **Always required**
 
         - ``feature``: feature name.
-        - ``function_type``: one of ``'single_hill'``, ``'additive_hill'``,
-          ``'polynomial'``.
+        - ``function_type``: one of ``'single_hill'``, ``'additive_hill'``.
         - ``distribution`` *(optional)*: one of ``'negbinom'``, ``'normal'``,
           ``'studentt'``, ``'binomial'``.  Defaults to ``'negbinom'`` when absent.
 
@@ -266,7 +265,7 @@ def simulate_from_trans_summary(
         *Direct* — when ``A_median`` is a column.
         *Fold-change* — when ``y_ntc_median`` is a column.  Only for negbinom.
 
-        Hill / polynomial parameter columns follow the same conventions as
+        Hill parameter columns follow the same conventions as
         ``save_trans_summary`` output.  See existing docstring (inline below)
         for the full column listing by function_type and parameterization.
 
@@ -598,12 +597,6 @@ def simulate_from_trans_summary(
             if function_type == 'additive_hill':
                 hill_b = _hill(x_exp, 1.0, K_b[:, np.newaxis], n_b[:, np.newaxis])
                 y_pred = y_pred + V_b[:, np.newaxis] * hill_b
-
-        elif function_type == 'polynomial':
-            raise ValueError(
-                "Fold-change parameterization is not supported for function_type='polynomial'. "
-                "Use the direct parameterization (A_median column) instead."
-            )
         else:
             raise ValueError(f"Unsupported function_type: {function_type}")
 
@@ -700,12 +693,6 @@ def simulate_from_trans_summary(
                             y_k = y_k + beta_k[:, np.newaxis] * hill_b_k
 
                     y_pred_cats[:, :, k] = y_k
-
-                elif function_type == 'polynomial':
-                    raise NotImplementedError(
-                        "Polynomial multinomial simulation is not yet supported. "
-                        "Use single_hill or additive_hill."
-                    )
                 else:
                     raise ValueError(
                         f"Unsupported function_type for multinomial: {function_type!r}"
@@ -806,41 +793,6 @@ def simulate_from_trans_summary(
 
             hill_a = _hill(x_exp, Vmax_a[:, np.newaxis], K_a[:, np.newaxis], n_a[:, np.newaxis])
             y_pred = A[:, np.newaxis] + alpha[:, np.newaxis] * hill_a
-
-        elif function_type == 'polynomial':
-            coef_cols = sorted(
-                [c for c in df.columns if c.startswith('coef_') and c.endswith('_median')],
-                key=lambda c: int(c.split('_')[1])
-            )
-            if not coef_cols:
-                raise ValueError("No polynomial coefficient columns found (coef_N_median).")
-
-            if distribution == 'negbinom':
-                # Polynomial operates in log2(x) space: log2(y) = sum(coef_i * log2(x)^i)
-                # where coef_0 = log2(A) and coef_1..d are the polynomial terms.
-                log2_x_exp = np.log2(np.maximum(x_exp, 1e-12))
-                log2_y_pred = np.zeros((n_genes, n_cells))
-                for i, col in enumerate(coef_cols):
-                    log2_y_pred += df[col].values[:, np.newaxis] * np.power(log2_x_exp, i)
-                y_pred = np.power(2.0, log2_y_pred)
-
-            elif distribution in ('normal', 'studentt'):
-                # Polynomial in linear x space: y = sum(coef_i * x^i)
-                # where coef_0 = A
-                y_pred = np.zeros((n_genes, n_cells))
-                for i, col in enumerate(coef_cols):
-                    y_pred += df[col].values[:, np.newaxis] * np.power(x_exp, i)
-
-            elif distribution == 'binomial':
-                # Polynomial in linear x space on logit scale:
-                # logit(p) = sum(coef_i * x^i) where coef_0 = logit(A)
-                logit_p = np.zeros((n_genes, n_cells))
-                for i, col in enumerate(coef_cols):
-                    logit_p += df[col].values[:, np.newaxis] * np.power(x_exp, i)
-                y_pred = 1.0 / (1.0 + np.exp(-logit_p))  # sigmoid
-
-            else:
-                raise ValueError(f"Unsupported distribution for polynomial: {distribution}")
 
         else:
             raise ValueError(f"Unsupported function_type: {function_type}")

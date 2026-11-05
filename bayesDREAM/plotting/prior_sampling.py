@@ -397,7 +397,7 @@ def sample_trans_priors(
     modality_name : str, optional
         Modality name (default: primary modality)
     function_type : str
-        Function type used in trans fit ('additive_hill', 'single_hill', 'polynomial')
+        Function type used in trans fit ('additive_hill', 'single_hill')
     nsamples : int
         Number of prior samples to draw
     distribution : str, optional
@@ -477,22 +477,6 @@ def sample_trans_priors(
         prior_samples['n'] = n
 
         theta = torch.stack([A, Vmax, K, n], dim=-1)
-        prior_samples['theta'] = theta
-
-    elif function_type == 'polynomial':
-        # Polynomial coefficients
-        degree = 6  # default
-        coef_names = [f'coef_{i}' for i in range(degree + 1)]
-
-        coefs = []
-        for i in range(degree + 1):
-            # Decreasing variance for higher order terms
-            scale = 10.0 / (i + 1)
-            coef = dist.Normal(0.0, scale).sample((nsamples, T))
-            prior_samples[f'coef_{i}'] = coef
-            coefs.append(coef)
-
-        theta = torch.stack(coefs, dim=-1)
         prior_samples['theta'] = theta
 
     return prior_samples

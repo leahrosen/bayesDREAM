@@ -222,11 +222,9 @@ def plot_trans_hits_by_gene(
     Raises
     ------
     ValueError
-        If ``classification_col`` or ``gene_col`` is missing from ``fdr_df``
-        (e.g. ``fdr_df`` was exported with ``function_type='polynomial'``,
-        which has no Hill components to classify), if ``color_by`` is not one
-        of ``'direction'``/``'classification'``, or if no rows remain after
-        filtering.
+        If ``classification_col`` or ``gene_col`` is missing from ``fdr_df``,
+        if ``color_by`` is not one of ``'direction'``/``'classification'``,
+        or if no rows remain after filtering.
     """
     d, group, group_order, color_map, legend_title = _prepare_trans_group_data(
         fdr_df, gene_col, classification_col, dependent_col,
