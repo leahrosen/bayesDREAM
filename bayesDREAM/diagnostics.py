@@ -430,10 +430,8 @@ def _reconstruct_mu_y(
     Vmax_a, Vmax_b,
     log_K_a, log_K_b, K_b,
     n_a, n_b,
-    poly_coeffs, polynomial_degree,
     Hill_based_positive_logK,
     Hill_based_positive,
-    Polynomial_function,
     epsilon=1e-6,
 ):
     """
@@ -490,28 +488,6 @@ def _reconstruct_mu_y(
             mu = torch.clamp(mu, eps, None)
         return mu  # [N]
 
-    elif function_type == "polynomial":
-        if polynomial_degree is None or poly_coeffs is None:
-            raise ValueError("poly_coeffs not found in posterior_samples_trans.")
-
-        if distribution in ("normal", "studentt"):
-            poly_val = Polynomial_function(x, poly_coeffs.unsqueeze(-1)).squeeze(-1)
-            return A + alpha * poly_val
-
-        elif distribution == "negbinom":
-            log2_x = torch.log2(x.clamp_min(eps))
-            poly_val = Polynomial_function(log2_x, poly_coeffs.unsqueeze(-1)).squeeze(-1)
-            log2_mu = torch.log2(A.clamp_min(eps)) + alpha * poly_val
-            return (2.0 ** log2_mu).clamp_min(eps)
-
-        elif distribution == "binomial":
-            A_clamped = A.clamp(eps, 1.0 - eps)
-            logit_A = torch.log(A_clamped) - torch.log(1.0 - A_clamped)
-            poly_val = Polynomial_function(x, poly_coeffs.unsqueeze(-1)).squeeze(-1)
-            return torch.sigmoid(logit_A + alpha * poly_val)
-
-        else:
-            raise ValueError(f"Polynomial not implemented for distribution '{distribution}'.")
     else:
         raise ValueError(f"Unknown function_type: '{function_type}'.")
 
@@ -1574,7 +1550,7 @@ class DiagnosticsMixin:
 
             loss[g, i] = -log p(y_{g,i} | f(x_true_i; θ_g), technical_group_i)
 
-        where f is the fitted Hill or polynomial function.
+        where f is the fitted Hill function.
 
         Requires ``fit_trans()`` to have been called for the target modality.
 
@@ -1616,7 +1592,6 @@ class DiagnosticsMixin:
         from .utils import (
             Hill_based_positive_logK,
             Hill_based_positive,
-            Polynomial_function,
         )
 
         if modality_name is None:
@@ -1751,15 +1726,6 @@ class DiagnosticsMixin:
         nu_y      = _pm("nu_y")       # [T] or None
         alpha_y_raw = _pm("alpha_y")  # [C-1, T] or [C, T] or [C-1, T, K]
 
-        # Polynomial coefficients: collect by degree
-        poly_coeffs = []
-        for d in range(1, 20):
-            c = _pm(f"poly_coeff_{d}")
-            if c is None:
-                break
-            poly_coeffs.append(c)
-        polynomial_degree = len(poly_coeffs) if poly_coeffs else None
-
         # ---- Reconstruct full alpha_y [C, T] or [C, T, K] -------------------
         if alpha_y_raw is not None and has_groups:
             alpha_y_full = _reconstruct_full_alpha_y(alpha_y_raw, C, distribution)
@@ -1795,11 +1761,6 @@ class DiagnosticsMixin:
             nb_g    = _g(n_b)
             oy_g    = _g(o_y)        # scalar
             nuy_g   = _g(nu_y)       # scalar or None
-
-            if poly_coeffs:
-                coeffs_g = torch.stack([c[g_idx] for c in poly_coeffs], dim=0)  # [D]
-            else:
-                coeffs_g = None
 
             # alpha_y for this gene across technical groups: [C] or [C, K]
             if alpha_y_full is not None:
@@ -1846,11 +1807,8 @@ class DiagnosticsMixin:
                 Vmax_a=Va_g, Vmax_b=Vb_g,
                 log_K_a=lKa_g, log_K_b=lKb_g, K_b=Kb_g,
                 n_a=na_g, n_b=nb_g,
-                poly_coeffs=coeffs_g,
-                polynomial_degree=polynomial_degree,
                 Hill_based_positive_logK=Hill_based_positive_logK,
                 Hill_based_positive=Hill_based_positive,
-                Polynomial_function=Polynomial_function,
                 epsilon=1e-6,
             )  # [N_sub] or [N_sub, K]
 
