@@ -89,7 +89,7 @@ python run_trans_example.py \
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--function_type` | Function type: `single_hill`, `additive_hill`, `polynomial` | `additive_hill` |
+| `--function_type` | Function type: `single_hill`, `additive_hill` | `additive_hill` |
 | `--modality` | Modality to fit trans on | `gene` |
 | `--use_posterior` | Use full posterior samples | False |
 
