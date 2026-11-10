@@ -20,6 +20,101 @@ from .ntc_tuning import estimate_predictive_memory_and_set_minibatch
 from . import FitterBase
 
 
+def _compute_robust_sd(y_data, epsilon, use_nan=False):
+    """
+    Compute robust SD using MAD (median absolute deviation) with SD fallback.
+
+    MAD is more robust to outliers and heavy tails common in count data.
+    Falls back to SD when MAD is 0 (e.g., >50% of values equal the median).
+
+    Parameters
+    ----------
+    y_data : np.ndarray
+        Data array of shape [N, T]
+    epsilon : float
+        Small constant to avoid division by zero
+    use_nan : bool
+        If True, use nanmedian/nanstd for NaN-aware computation
+
+    Returns
+    -------
+    robust_sd : np.ndarray
+        Robust SD estimate of shape [T]
+    """
+    if use_nan:
+        median_vals = np.nanmedian(y_data, axis=0)
+        mad = np.nanmedian(np.abs(y_data - median_vals), axis=0)
+        cell_sd = np.nanstd(y_data, axis=0)
+    else:
+        median_vals = np.median(y_data, axis=0)
+        mad = np.median(np.abs(y_data - median_vals), axis=0)
+        cell_sd = np.std(y_data, axis=0)
+
+    # Convert MAD to SD (scaling factor for normal distribution)
+    robust_sd = 1.4826 * mad
+
+    # Fallback to regular SD when MAD is 0 (e.g., >50% zeros)
+    robust_sd = np.where(robust_sd > epsilon, robust_sd, cell_sd)
+
+    return robust_sd
+
+
+def compute_continuous_ntc_prior_params(y_obs_ntc, groups_ntc, epsilon=1e-6):
+    """
+    Data-driven prior parameters used by ``_model_ntc`` for normal/studentt.
+
+    Single source of truth shared by ``NTCFitter.fit_ntc`` and the prior
+    sampler used for prior/posterior plots (``plotting/prior_sampling.py``),
+    so the plotted priors are exactly the priors that were fit.
+
+    In ``_model_ntc`` these parameterise:
+
+    - ``mu_ntc      ~ Normal(mu_x_mean, mu_x_sd)``
+    - ``log2_alpha_y ~ StudentT(df=3, loc=0, scale=mu_x_sd)``  (additive shift)
+    - ``sigma_y     ~ HalfNormal(2 * sigma_hat)``
+
+    Parameters
+    ----------
+    y_obs_ntc : np.ndarray or scipy.sparse matrix
+        NTC observations, shape [N, T] (no size-factor scaling for normal/studentt).
+    groups_ntc : np.ndarray
+        Technical group code per NTC cell, shape [N]; group 0 is the reference.
+    epsilon : float
+        Small constant for numerical safety.
+
+    Returns
+    -------
+    mu_x_mean, mu_x_sd, sigma_hat : np.ndarray
+        Each of shape [T].
+    """
+    from scipy import sparse
+    if sparse.issparse(y_obs_ntc):
+        y_obs_ntc = y_obs_ntc.toarray()
+    y_obs_ntc = np.asarray(y_obs_ntc, dtype=float)
+    y_baseline = y_obs_ntc[np.asarray(groups_ntc) == 0, :]
+
+    # sigma_y prior scale: SD of the reference group
+    sigma_hat = np.nanstd(y_baseline, axis=0) + epsilon
+    sigma_hat = np.where(np.isfinite(sigma_hat), sigma_hat, 1.0)
+
+    # mu_ntc prior: NaN-aware reference-group mean
+    mu_x_mean = np.nanmean(y_baseline, axis=0)  # [T]
+
+    # Robust SD over all NTC cells (NaN-aware), converted to SE of the mean,
+    # floored at 10% of |mean| (or 0.1 if mean is ~0)
+    robust_sd = _compute_robust_sd(y_obs_ntc, epsilon, use_nan=True)
+    N_cells = y_obs_ntc.shape[0]
+    mu_x_sd = robust_sd / np.sqrt(N_cells) + epsilon
+    mean_floor = np.maximum(np.abs(mu_x_mean) * 0.1, 0.1)
+    mu_x_sd = np.maximum(mu_x_sd, mean_floor)
+
+    # Safety: replace any remaining non-finite with defaults
+    mu_x_mean = np.where(np.isfinite(mu_x_mean), mu_x_mean, 0.0)
+    mu_x_sd = np.where(np.isfinite(mu_x_sd), mu_x_sd, 1.0)
+
+    return mu_x_mean, mu_x_sd, sigma_hat
+
+
 class NTCFitter(FitterBase):
     """Handles NTC fitting: estimates gene-specific overdispersion and batch effects."""
 
@@ -1115,53 +1210,7 @@ class NTCFitter(FitterBase):
                 # Dense array: use boolean indexing directly
                 return matrix[mask, :]
 
-        if distribution in ('normal', 'studentt'):
-            baseline_mask = (groups_ntc == 0)
-            y_baseline = _extract_rows_sparse_safe(y_obs_ntc_factored, baseline_mask)
-            sigma_hat = np.nanstd(y_baseline, axis=0) + epsilon
-            sigma_hat = np.where(np.isfinite(sigma_hat), sigma_hat, 1.0)
-            sigma_hat_tensor = torch.tensor(sigma_hat, dtype=torch.float32, device=self.model.device)
-        else:
-            sigma_hat_tensor = None
-
-        # ---- Helper: compute robust SD using MAD with SD fallback ----
-        def _compute_robust_sd(y_data, epsilon, use_nan=False):
-            """
-            Compute robust SD using MAD (median absolute deviation) with SD fallback.
-
-            MAD is more robust to outliers and heavy tails common in count data.
-            Falls back to SD when MAD is 0 (e.g., >50% of values equal the median).
-
-            Parameters
-            ----------
-            y_data : np.ndarray
-                Data array of shape [N, T]
-            epsilon : float
-                Small constant to avoid division by zero
-            use_nan : bool
-                If True, use nanmedian/nanstd for NaN-aware computation
-
-            Returns
-            -------
-            robust_sd : np.ndarray
-                Robust SD estimate of shape [T]
-            """
-            if use_nan:
-                median_vals = np.nanmedian(y_data, axis=0)
-                mad = np.nanmedian(np.abs(y_data - median_vals), axis=0)
-                cell_sd = np.nanstd(y_data, axis=0)
-            else:
-                median_vals = np.median(y_data, axis=0)
-                mad = np.median(np.abs(y_data - median_vals), axis=0)
-                cell_sd = np.std(y_data, axis=0)
-
-            # Convert MAD to SD (scaling factor for normal distribution)
-            robust_sd = 1.4826 * mad
-
-            # Fallback to regular SD when MAD is 0 (e.g., >50% zeros)
-            robust_sd = np.where(robust_sd > epsilon, robust_sd, cell_sd)
-
-            return robust_sd
+        sigma_hat_tensor = None  # set below for normal/studentt
 
         # ---- mu_x priors per distribution ----
         if distribution == 'negbinom':
@@ -1180,25 +1229,12 @@ class NTCFitter(FitterBase):
             mu_x_mean = mu_x_mean + epsilon  # strictly positive for Gamma
 
         elif distribution in ('normal', 'studentt'):
-            baseline_mask = (groups_ntc == 0)
-            y_baseline = _extract_rows_sparse_safe(y_obs_ntc_factored, baseline_mask)
+            # Shared with plotting/prior_sampling.py so plotted priors match the fit
+            mu_x_mean, mu_x_sd, sigma_hat = compute_continuous_ntc_prior_params(
+                y_obs_ntc_factored, groups_ntc, epsilon
+            )
+            sigma_hat_tensor = torch.tensor(sigma_hat, dtype=torch.float32, device=self.model.device)
 
-            # NaN-aware baseline mean
-            mu_x_mean = np.nanmean(y_baseline, axis=0)  # [T_fit]
-
-            # Compute robust SD using MAD with SD fallback (NaN-aware)
-            robust_sd = _compute_robust_sd(y_obs_ntc_factored, epsilon, use_nan=True)
-
-            # Convert to SE of mean, with floor at 10% of |mean| (or 0.1 if mean is ~0)
-            N_cells = y_obs_ntc_factored.shape[0]
-            mu_x_sd = robust_sd / np.sqrt(N_cells) + epsilon
-            mean_floor = np.maximum(np.abs(mu_x_mean) * 0.1, 0.1)
-            mu_x_sd = np.maximum(mu_x_sd, mean_floor)
-
-            # Safety: replace any remaining non-finite with defaults
-            mu_x_mean = np.where(np.isfinite(mu_x_mean), mu_x_mean, 0.0)
-            mu_x_sd   = np.where(np.isfinite(mu_x_sd),   mu_x_sd,   1.0)
-    
         else:
             # binomial & multinomial: handled with Beta/Dirichlet in the model
             mu_x_mean = np.zeros((T_fit,), dtype=float)

@@ -16,7 +16,9 @@ def _compute_data_driven_priors(model, modality, distribution, epsilon=1e-6):
     """
     Compute data-driven prior parameters (mu_x_mean_tensor, mu_x_sd_tensor) from NTC data.
 
-    This replicates the logic from bayesDREAM/fitting/technical.py:469-494.
+    For normal/studentt this calls the same function fit_ntc uses
+    (``fitting.ntc.compute_continuous_ntc_prior_params``), so the plotted
+    priors match the fitted ones exactly.
 
     Parameters
     ----------
@@ -35,6 +37,8 @@ def _compute_data_driven_priors(model, modality, distribution, epsilon=1e-6):
         Feature-specific prior means [T] or [T, D]
     mu_x_sd_tensor : torch.Tensor
         Feature-specific prior standard deviations [T] or [T, D]
+    sigma_hat_tensor : torch.Tensor or None
+        Reference-group SD [T] for normal/studentt (sigma_y prior scale), else None
     """
     # Always use modality.counts for consistency
     # (model.counts might be subset to cis gene only, but modality has all features)
@@ -94,12 +98,12 @@ def _compute_data_driven_priors(model, modality, distribution, epsilon=1e-6):
         mu_x_sd = np.std(guide_means, axis=0) + epsilon
         mu_x_mean = mu_x_mean + epsilon  # strictly positive for Gamma
 
-    elif distribution == 'normal':
-        baseline_mask = (groups_ntc == 0)
-        mu_x_mean = np.mean(y_obs_ntc_factored[baseline_mask, :], axis=0)
-        guide_means = np.array([np.mean(y_obs_ntc_factored[guides_ntc == g], axis=0)
-                               for g in np.unique(guides_ntc)])
-        mu_x_sd = np.std(guide_means, axis=0) + epsilon
+    elif distribution in ('normal', 'studentt'):
+        # Exactly the computation fit_ntc uses (single shared implementation)
+        from ..fitting.ntc import compute_continuous_ntc_prior_params
+        mu_x_mean, mu_x_sd, sigma_hat = compute_continuous_ntc_prior_params(
+            y_obs_ntc_factored, groups_ntc, epsilon
+        )
 
     else:
         # binomial & multinomial: not used
@@ -110,8 +114,12 @@ def _compute_data_driven_priors(model, modality, distribution, epsilon=1e-6):
     # Convert to tensors
     mu_x_mean_tensor = torch.tensor(mu_x_mean, dtype=torch.float32)
     mu_x_sd_tensor = torch.tensor(mu_x_sd, dtype=torch.float32)
+    sigma_hat_tensor = (
+        torch.tensor(sigma_hat, dtype=torch.float32)
+        if distribution in ('normal', 'studentt') else None
+    )
 
-    return mu_x_mean_tensor, mu_x_sd_tensor
+    return mu_x_mean_tensor, mu_x_sd_tensor, sigma_hat_tensor
 
 
 def sample_technical_priors(
@@ -159,12 +167,33 @@ def sample_technical_priors(
     # Sample priors based on distribution
     prior_samples = {}
 
-    # Cell-line effects: log2_alpha_y ~ StudentT(df=3, loc=0, scale=20.0)
-    # This matches the actual prior used in fitting (bayesDREAM/fitting/technical.py:77)
-    # Wide prior allows data to constrain the posterior appropriately
-    log2_alpha_y = dist.StudentT(df=3, loc=0.0, scale=20.0).sample((nsamples, C - 1, T))
+    # Compute data-driven prior parameters from NTC data
+    mu_x_mean_tensor, mu_x_sd_tensor, sigma_hat_tensor = _compute_data_driven_priors(
+        model, modality, distribution
+    )
+
+    # Ensure T matches the actual computed prior parameters
+    # (handles edge cases where modality might have been modified after fitting)
+    if mu_x_mean_tensor.numel() > 0 and mu_x_mean_tensor.numel() != T:
+        print(f"[WARNING] Modality has {T} features but computed priors have {mu_x_mean_tensor.numel()} features. "
+              f"Using actual prior size ({mu_x_mean_tensor.numel()}).")
+        T = mu_x_mean_tensor.numel()
+
+    # Technical-group effects, as in fitting/ntc.py::_model_ntc:
+    # - normal/studentt: additive shift log2_alpha_y ~ StudentT(3, 0, mu_x_sd) per feature
+    #   (data-driven scale: robust SE of the NTC mean)
+    # - otherwise:       log2_alpha_y ~ StudentT(3, 0, 20)
+    if distribution in ('normal', 'studentt'):
+        alpha_scale = mu_x_sd_tensor.clamp_min(1e-6)  # [T]
+    else:
+        alpha_scale = torch.full((T,), 20.0)
+    log2_alpha_y = dist.StudentT(df=3, loc=0.0, scale=alpha_scale).sample((nsamples, C - 1))  # [S, C-1, T]
     prior_samples['log2_alpha_y'] = log2_alpha_y
-    prior_samples['alpha_y_mul'] = 2.0 ** log2_alpha_y  # multiplicative
+    if distribution in ('normal', 'studentt'):
+        # Multiplicative effects are not used for normal/studentt (fixed to 1)
+        prior_samples['alpha_y_mul'] = torch.ones_like(log2_alpha_y)
+    else:
+        prior_samples['alpha_y_mul'] = 2.0 ** log2_alpha_y  # multiplicative
     prior_samples['delta_y_add'] = log2_alpha_y  # additive/logit
 
     # Add baseline row (first technical group is always 1.0 or 0.0)
@@ -173,16 +202,6 @@ def sample_technical_priors(
     prior_samples['alpha_y'] = alpha_full_mul  # back-compat
     prior_samples['alpha_y_mult'] = alpha_full_mul
     prior_samples['alpha_y_add'] = alpha_full_add
-
-    # Compute data-driven prior parameters from NTC data
-    mu_x_mean_tensor, mu_x_sd_tensor = _compute_data_driven_priors(model, modality, distribution)
-
-    # Ensure T matches the actual computed prior parameters
-    # (handles edge cases where modality might have been modified after fitting)
-    if mu_x_mean_tensor.numel() > 0 and mu_x_mean_tensor.numel() != T:
-        print(f"[WARNING] Modality has {T} features but computed priors have {mu_x_mean_tensor.numel()} features. "
-              f"Using actual prior size ({mu_x_mean_tensor.numel()}).")
-        T = mu_x_mean_tensor.numel()
 
     # Distribution-specific parameters
     if distribution == 'negbinom':
@@ -211,9 +230,10 @@ def sample_technical_priors(
         mu_ntc = torch.stack(mu_ntc_list, dim=1)  # (nsamples, T)
         prior_samples['mu_ntc'] = mu_ntc
 
-    elif distribution == 'normal':
-        # sigma_y ~ HalfCauchy(10.0)
-        sigma_y = dist.HalfCauchy(10.0).sample((nsamples, T))
+    elif distribution in ('normal', 'studentt'):
+        # sigma_y ~ HalfNormal(2 * sigma_hat), sigma_hat = reference-group SD
+        # (studentt uses the same sigma_y prior; its nu_y is fixed at 3 in fit_ntc)
+        sigma_y = dist.HalfNormal(2.0 * sigma_hat_tensor).sample((nsamples,))  # (nsamples, T)
         prior_samples['sigma_y'] = sigma_y
 
         # mu_ntc ~ Normal(mu_x_mean, mu_x_sd) with data-driven parameters
