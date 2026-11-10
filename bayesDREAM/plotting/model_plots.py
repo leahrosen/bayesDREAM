@@ -474,8 +474,8 @@ class ModelPlottingMixin:
         plot_type : str, default 'auto'
             ``'auto'``, ``'violin'``, or ``'scatter'``.
         function_type : str, default 'additive_hill'
-            Function type used in the trans fit: ``'additive_hill'``,
-            ``'single_hill'``, or ``'polynomial'``.
+            Function type used in the trans fit: ``'additive_hill'``
+            or ``'single_hill'``.
         metric : str, default 'posterior_coverage'
             Prior/posterior comparison metric: ``'overlap'``, ``'kl_divergence'``,
             or ``'posterior_coverage'``.
@@ -568,7 +568,7 @@ class ModelPlottingMixin:
             Example: {'K562': 'crimson', 'TF1': 'dodgerblue'}
         show_hill_function : bool
             Overlay fitted trans function if trans model fitted (all distributions, default: True).
-            Works with all function types: additive_hill, single_hill, polynomial.
+            Works with all function types: additive_hill, single_hill.
             Automatically detects function type from posterior_samples_trans.
         show_ntc_gradient : bool
             Color lines by NTC proportion in k-NN window (default: False).
@@ -672,7 +672,6 @@ class ModelPlottingMixin:
             When True, extend the x-axis (and the Hill curve) beyond the data range
             so that all K/EC50 parameters are visible on the plot (default: False).
             Requires ``show_hill_function=True`` and a fitted trans model.
-            Ignored for polynomial function types (which have no K parameters).
         expand_y_to_params : bool
             When True, extend the y-axis to show the full range of the fitted Hill
             curve over the entire displayed x range (default: False). Normally the
@@ -847,7 +846,6 @@ class ModelPlottingMixin:
         Raises
         ------
         ValueError
-            If function type is polynomial (derivatives not supported)
             If no features could be plotted
             If use_log2fc=True but NTC means not available
             If use_delta_p=True but NTC means not available

@@ -7,10 +7,9 @@ Exports model results as R-friendly CSV files with:
 - Observed log2FC, predicted log2FC, inflection points for trans fits
 - Derivative roots and function classification
 
-Supports three function types:
+Supports two function types:
 - additive_hill: Two Hill components with independent weights
 - single_hill: Single Hill function with optional weight
-- polynomial: Polynomial in x with configurable degree
 """
 
 import os
@@ -127,88 +126,6 @@ class ModelSummarizer:
         if compute_third:
             def d3(x):
                 return alpha * self._hill_third_derivative(x, Vmax, K, n)
-            roots3 = self._find_roots_empirical(d3, x_range)
-    
-        return roots1, roots2, roots3
-
-    # ========================================================================
-    # Polynomial Derivative Helpers
-    # ========================================================================
-
-    def _poly_derivative_coefs(self, coefs_asc: np.ndarray, order: int) -> np.ndarray:
-        """
-        Given polynomial coefficients in ascending order:
-            p(x) = sum_{i=0}^d c[i] x^i
-        Return coefficients of the 'order'-th derivative, also ascending.
-        """
-        c = np.asarray(coefs_asc, dtype=float).copy()
-        for _ in range(order):
-            if c.size <= 1:
-                return np.array([0.0], dtype=float)
-            # derivative: new_c[i-1] = i * c[i] for i>=1
-            c = np.array([i * c[i] for i in range(1, c.size)], dtype=float)
-        return c
-    
-    
-    def _poly_eval(self, x: np.ndarray, coefs_asc: np.ndarray) -> np.ndarray:
-        """
-        Evaluate polynomial with ascending coefs at x (vectorized).
-        """
-        x = np.asarray(x, dtype=float)
-        c = np.asarray(coefs_asc, dtype=float)
-        # Horner's method (ascending -> reverse for Horner)
-        y = np.zeros_like(x, dtype=float)
-        for a in c[::-1]:
-            y = y * x + a
-        return y
-    
-    
-    def _poly_derivative_roots(
-        self,
-        coefs_asc: np.ndarray,
-        x_range: np.ndarray,
-        compute_third: bool = True
-    ) -> Tuple[List[float], List[float], List[float]]:
-        """
-        Find derivative roots for polynomial: p(x) = sum_{i=0}^d coef_i * x^i
-
-        Uses analytic derivative coefficients and empirical root finding.
-
-        Parameters
-        ----------
-        coefs_asc : np.ndarray
-            Coefficients in ascending order [c0, c1, ..., cd]
-        x_range : np.ndarray
-            Grid of x values to search for roots
-        compute_third : bool
-            Whether to compute third derivative roots
-
-        Returns
-        -------
-        roots_d1 : List[float]
-            First derivative roots (where p'(x) = 0, extrema)
-        roots_d2 : List[float]
-            Second derivative roots (where p''(x) = 0, inflection points)
-        roots_d3 : List[float]
-            Third derivative roots (where p'''(x) = 0)
-        """
-        c1 = self._poly_derivative_coefs(coefs_asc, 1)
-        c2 = self._poly_derivative_coefs(coefs_asc, 2)
-        c3 = self._poly_derivative_coefs(coefs_asc, 3) if compute_third else None
-    
-        def d1(x):
-            return self._poly_eval(x, c1)
-    
-        def d2(x):
-            return self._poly_eval(x, c2)
-    
-        roots1 = self._find_roots_empirical(d1, x_range)
-        roots2 = self._find_roots_empirical(d2, x_range)
-    
-        roots3 = []
-        if compute_third:
-            def d3(x):
-                return self._poly_eval(x, c3)
             roots3 = self._find_roots_empirical(d3, x_range)
     
         return roots1, roots2, roots3
@@ -1838,7 +1755,7 @@ class ModelSummarizer:
         - feature: Feature name
         - modality: Modality name
         - distribution: Distribution type
-        - function_type: Function type (additive_hill, single_hill, polynomial)
+        - function_type: Function type (additive_hill, single_hill)
         - x_obs_min, x_obs_max: Observed x range (min/max of guide-level x_true)
 
         For negbinom/normal/studentt distributions:
@@ -1861,7 +1778,7 @@ class ModelSummarizer:
                      tests (alpha + beta), which accounts for the increased multiple-testing
                      burden relative to single_hill.
         - fdr_beta:  Bayesian q-value for component B (negative Hill).  NaN for
-                     single_hill and polynomial.  Computed in the same pooled family as
+                     single_hill.  Computed in the same pooled family as
                      fdr_alpha for additive_hill.
         - is_dependent: True if the gene has a genuine (non-degenerate) dose-response:
                      (fdr_alpha < fdr_threshold AND n_a's 95% CI excludes 0) OR
@@ -1869,17 +1786,15 @@ class ModelSummarizer:
                      Guards against the case where a component is FDR-significant purely
                      because alpha/beta absorbed a constant offset while n_a/n_b ≈ 0
                      (flat Hill, unidentified K) — see FIT_TRANS_DESIGN_DECISIONS.md §12.
-                     NaN for polynomial (no sparsity indicator to threshold).
         - fit_type:  Per-feature functional form actually supported by the data, using
                      the same per-component (fdr < fdr_threshold) AND (n's 95% CI
                      excludes 0) criterion as is_dependent:
                      - 'additive_hill': both component A and component B are active
                      - 'single_hill':   exactly one of component A / component B is active
                      - 'not_dependent': neither component is active
-                     NaN for polynomial (no Hill components to test).
         - which_active: Which component(s) are active, using the same criterion as
-                     fit_type: 'a', 'b', 'both', or NaN if neither is active (or
-                     polynomial). Mainly informative when fit_type == 'single_hill',
+                     fit_type: 'a', 'b', 'both', or NaN if neither is active.
+                     Mainly informative when fit_type == 'single_hill',
                      to distinguish which of the two Hill components (A vs B) is the
                      one supported by the data.
 
@@ -1944,10 +1859,6 @@ class ModelSummarizer:
         - K_median, K_lower, K_upper: Hill coefficient
         - xc_median, xc_lower, xc_upper: Half-max point (EC50 or IC50)
         - inflection_median, inflection_lower, inflection_upper: Inflection x
-        - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
-
-        For polynomial:
-        - coef_{i}_median, coef_{i}_lower, coef_{i}_upper: Coefficient i
         - full_log2fc_median, full_log2fc_lower, full_log2fc_upper: Full dynamic range
 
         Overdispersion and technical group effects (for simulation):
@@ -2093,9 +2004,7 @@ class ModelSummarizer:
 
         # Determine function type from posterior keys
         keys = set(posterior.keys())
-        if {'poly_coefs'} <= keys:
-            function_type = 'polynomial'
-        elif {'Vmax_a','K_a','n_a','Vmax_b','K_b','n_b'} <= keys:
+        if {'Vmax_a','K_a','n_a','Vmax_b','K_b','n_b'} <= keys:
             # Could be additive or nested; decide by presence of an indicator you store,
             # OR fall back to model setting if available.
             function_type = getattr(self.model, 'function_type', 'additive_hill')
@@ -2301,16 +2210,6 @@ class ModelSummarizer:
                 y_ntc=_y_ntc,
                 verbose=verbose,
             )
-        elif function_type == 'polynomial':
-            data = self._add_polynomial_params(
-                data, posterior, n_features,
-                compute_derivative_roots=compute_derivative_roots,
-                compute_log2fc_params=compute_log2fc_params,
-                x_range=x_range,
-                x_obs_min=x_obs_min,
-                x_obs_max=x_obs_max,
-                verbose=verbose,
-            )
         if verbose:
             print(f"  _add_{function_type}_params: {time.time() - _t0:.1f}s")
 
@@ -2319,8 +2218,7 @@ class ModelSummarizer:
         # gate-based FDR (and everything derived from it) is undefined.
         _t0 = time.time()
         _trans_priors = getattr(modality, 'trans_prior_params', None) or {}
-        fdr_applicable = (function_type != 'polynomial'
-                          and _trans_priors.get('regularise', True))
+        fdr_applicable = _trans_priors.get('regularise', True)
         if fdr_applicable:
             fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features,
                                                   n_cats_per_feature=n_cats_per_feature)
@@ -2357,7 +2255,7 @@ class ModelSummarizer:
         #   - 'additive_hill': both component A and component B are active
         #   - 'single_hill':   exactly one of component A / component B is active
         #   - 'not_dependent': neither component is active
-        # NaN for polynomial (no Hill components to test) and for regularise=False.
+        # NaN for regularise=False.
         if not fdr_applicable:
             data['fit_type'] = np.full(n_features, np.nan, dtype=object)
             data['which_active'] = np.full(n_features, np.nan, dtype=object)
@@ -2578,7 +2476,7 @@ class ModelSummarizer:
         posterior : dict
             Posterior samples dict from fit_trans (keys include 'alpha', 'beta', etc.).
         function_type : str
-            'additive_hill', 'single_hill', or 'polynomial'.
+            'additive_hill' or 'single_hill'.
         n_features : int
             Number of trans features.
         activity_epsilon : float
@@ -2595,7 +2493,7 @@ class ModelSummarizer:
                 component would be included in a called set.
             fdr_beta : ndarray (n_features,)
                 Bayesian q-value for component B (negative Hill).
-                NaN for single_hill and polynomial.
+                NaN for single_hill.
 
         Notes
         -----
@@ -2684,10 +2582,6 @@ class ModelSummarizer:
             return qvals
 
         nan_col = np.full(n_features, np.nan)
-
-        if function_type == 'polynomial':
-            # Polynomial has no sparsity indicator; FDR not applicable
-            return {'fdr_alpha': nan_col.copy(), 'fdr_beta': nan_col.copy()}
 
         if function_type == 'single_hill':
             p_active_a = _p_active('alpha', 'Vmax_a')
@@ -4488,202 +4382,6 @@ class ModelSummarizer:
                 data['third_deriv_roots_log2fc_median'] = third_log
     
         return data
-
-    def _add_polynomial_params(
-        self,
-        data,
-        posterior,
-        n_features,
-        compute_derivative_roots: bool = True,
-        compute_log2fc_params: bool = False,
-        x_range: Optional[np.ndarray] = None,
-        x_obs_min: Optional[float] = None,
-        x_obs_max: Optional[float] = None,
-        verbose: bool = False,
-    ):
-        """
-        Add polynomial parameters to data dict.
-
-        IMPORTANT: The polynomial operates in different spaces depending on distribution:
-        - negbinom: log2(y) = log2(A) + alpha * poly(log2(x))  [log2 space for x]
-        - normal/studentt: y = A + alpha * poly(x)  [linear space]
-        - binomial: logit(p) = logit(A) + alpha * poly(x)  [linear x, logit y]
-
-        For negbinom, the polynomial coefficients multiply powers of log2(x), so:
-        - x_range should be in LINEAR x-space (this method converts internally)
-        - Derivative roots are found in log2(x) space, then converted back
-        - full_log2fc represents the range of log2(y) values
-
-        For normal/studentt/binomial, coefficients multiply powers of linear x.
-
-        Parameters stored (with _mean, _lower, _upper suffixes):
-        - coef_{i}: Coefficient for the i-th power term
-        - For negbinom: coef_i multiplies log2(x)^i
-        - For others: coef_i multiplies x^i
-
-        Also computes:
-        - full_log2fc: Dynamic range in appropriate space
-        - observed_log2fc: Same as full_log2fc for polynomial
-        - Derivative roots in the native polynomial space
-        - Log2FC transforms of roots if x_ntc is available
-        """
-        coefs = posterior['poly_coefs']  # [S, T, d+1] or [T, d+1]
-        if isinstance(coefs, torch.Tensor):
-            coefs = coefs.cpu().numpy()
-    
-        degree = coefs.shape[-1] - 1
-    
-        if coefs.ndim == 3:
-            # summary per coefficient
-            for i in range(degree + 1):
-                data[f'coef_{i}_median'] = np.median(coefs[:, :, i], axis=0)
-                data[f'coef_{i}_lower']  = np.quantile(coefs[:, :, i], 0.025, axis=0)
-                data[f'coef_{i}_upper']  = np.quantile(coefs[:, :, i], 0.975, axis=0)
-            coefs_mean = np.median(coefs, axis=0)  # [T, d+1] — used for function evaluation
-        else:
-            for i in range(degree + 1):
-                data[f'coef_{i}_median'] = coefs[:, i]
-                data[f'coef_{i}_lower']  = coefs[:, i]
-                data[f'coef_{i}_upper']  = coefs[:, i]
-            coefs_mean = coefs  # [T, d+1]
-    
-        # Determine if polynomial is in log2 space (negbinom) or linear space (others)
-        distribution = data.get('distribution', 'negbinom')
-        is_log2_space = (distribution == 'negbinom')
-
-        # full_log2fc and observed_log2fc: evaluate over observed x-range
-        # For negbinom: poly(log2(x)), evaluate on log2 grid
-        # For others: poly(x), evaluate on linear grid
-        if verbose:
-            print(f"  [polynomial] {n_features} features  "
-                  f"compute_derivative_roots={compute_derivative_roots}  "
-                  f"compute_log2fc_params={compute_log2fc_params}")
-        _t_poly = time.time()
-        if compute_log2fc_params:
-            if (x_obs_min is not None) and (x_obs_max is not None) and np.isfinite(x_obs_min) and np.isfinite(x_obs_max):
-                x_min = float(x_obs_min)
-                x_max = float(x_obs_max)
-            else:
-                # fallback: if no x info, pick a generic range
-                x_min, x_max = 1.0, 2.0
-
-            eps = 1e-10
-            n_eval = 1000
-
-            if is_log2_space:
-                # For negbinom: polynomial is poly(log2(x))
-                # Create grid in log2 space, evaluate polynomial there
-                log2_min = np.log2(max(x_min, eps))
-                log2_max = np.log2(max(x_max, eps))
-                u_eval = np.linspace(log2_min, log2_max, n_eval)  # u = log2(x)
-            else:
-                # For normal/studentt/binomial: polynomial is poly(x)
-                x_eval = np.linspace(x_min, x_max, n_eval)
-
-            full_mean = []
-            observed_log2fc = []
-            for t in range(n_features):
-                if is_log2_space:
-                    # poly(log2(x)) gives log2(y) - log2(A) (scaled by alpha)
-                    # The polynomial output IS the log2FC contribution
-                    poly_vals = self._poly_eval(u_eval, coefs_mean[t, :])
-                    # Dynamic range is max - min of poly values (already in log2 space)
-                    poly_range = np.nanmax(poly_vals) - np.nanmin(poly_vals)
-                    full_mean.append(abs(poly_range) if np.isfinite(poly_range) else np.nan)
-                    observed_log2fc.append(abs(poly_range) if np.isfinite(poly_range) else np.nan)
-                else:
-                    # poly(x) gives y directly (for normal/studentt) or logit contribution (binomial)
-                    y_eval = self._poly_eval(x_eval, coefs_mean[t, :])
-                    y_min_val = np.nanmin(y_eval)
-                    y_max_val = np.nanmax(y_eval)
-
-                    # Log2 ratio only valid if both values are positive
-                    if y_min_val > eps and y_max_val > eps:
-                        full_mean.append(np.log2(y_max_val / y_min_val))
-                        observed_log2fc.append(np.log2(y_max_val / y_min_val))
-                    else:
-                        # Fall back to NaN if y values are non-positive
-                        full_mean.append(np.nan)
-                        observed_log2fc.append(np.nan)
-
-            data['full_log2fc_median'] = full_mean
-            data['full_log2fc_lower'] = full_mean
-            data['full_log2fc_upper'] = full_mean
-            data['observed_log2fc'] = observed_log2fc
-            data['observed_log2fc_lower'] = observed_log2fc
-            data['observed_log2fc_upper'] = observed_log2fc
-
-        # derivative roots over x_range
-        # For negbinom: find roots in log2(x) space, convert back to linear x
-        # For others: find roots in linear x space directly
-        if compute_derivative_roots and (x_range is not None):
-            first_roots = []
-            second_roots = []
-            third_roots = []
-            n_first = []
-            n_second = []
-            n_third = []
-
-            eps = 1e-10
-
-            if is_log2_space:
-                # Convert x_range to log2 space for root finding
-                x_range_positive = x_range[x_range > eps]
-                if len(x_range_positive) > 0:
-                    u_range = np.log2(x_range_positive)
-                else:
-                    u_range = np.linspace(-5, 5, 1000)  # fallback
-
-            for t in range(n_features):
-                if is_log2_space:
-                    # Find roots in u = log2(x) space
-                    r1_u, r2_u, r3_u = self._poly_derivative_roots(coefs_mean[t, :], u_range, compute_third=True)
-                    # Convert roots back to linear x space: x = 2^u
-                    r1 = [2**u for u in r1_u] if r1_u else []
-                    r2 = [2**u for u in r2_u] if r2_u else []
-                    r3 = [2**u for u in r3_u] if r3_u else []
-                else:
-                    # Find roots directly in linear x space
-                    r1, r2, r3 = self._poly_derivative_roots(coefs_mean[t, :], x_range, compute_third=True)
-
-                first_roots.append(r1)
-                second_roots.append(r2)
-                third_roots.append(r3)
-                n_first.append(len(r1))
-                n_second.append(len(r2))
-                n_third.append(len(r3))
-
-            data['n_first_deriv_roots'] = n_first
-            data['n_second_deriv_roots'] = n_second
-            data['n_third_deriv_roots'] = n_third
-            # Roots are now in linear x space for all distributions
-            data['first_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in first_roots]
-            data['second_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in second_roots]
-            data['third_deriv_roots_median'] = [';'.join([f'{r:.4f}' for r in rr]) if rr else np.nan for rr in third_roots]
-
-            # u-space root conversion: only when compute_log2fc_params is also True
-            if compute_log2fc_params and 'x_ntc' in data and data['x_ntc'] is not None and np.isfinite(data['x_ntc']):
-                log2_x_ntc = np.log2(max(float(data['x_ntc']), eps))
-
-                def _to_log2fc_str(root_str):
-                    """Convert x-space root string to log2FC space (u = log2(x) - log2(x_ntc))."""
-                    if root_str is None or (isinstance(root_str, float) and np.isnan(root_str)):
-                        return np.nan
-                    if isinstance(root_str, str) and root_str.strip() == '':
-                        return np.nan
-                    roots = [float(r) for r in str(root_str).split(';')]
-                    u = [np.log2(max(r, eps)) - log2_x_ntc for r in roots]
-                    return ';'.join([f'{val:.4f}' for val in u]) if u else np.nan
-
-                data['first_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['first_deriv_roots_median']]
-                data['second_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['second_deriv_roots_median']]
-                data['third_deriv_roots_log2fc_median'] = [_to_log2fc_str(s) for s in data['third_deriv_roots_median']]
-
-        if verbose:
-            print(f"  [polynomial] total: {time.time() - _t_poly:.1f}s")
-
-        return data
-
 
     def _compute_hill_inflection(self, n, K, epsilon=1e-12):
         """

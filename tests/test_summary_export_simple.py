@@ -128,19 +128,3 @@ def test_trans_summary_csv_created(summary_model):
     outdir = summary_model['outdir']
     model.save_trans_summary(compute_inflection=True, **summary_model['ntc_levels'])
     assert os.path.exists(os.path.join(outdir, 'trans_feature_summary_gene.csv'))
-
-
-def test_trans_summary_polynomial_columns(summary_model):
-    import torch
-
-    model = summary_model['model']
-    n_features_trans = model.modalities['gene'].dims['n_features']
-    n_samples = 100
-    degree = 6
-    model.function_type = 'polynomial'
-    model.posterior_samples_trans = {
-        'poly_coefs': torch.randn((n_samples, n_features_trans, degree), device=model.device)
-    }
-    poly_df = model.save_trans_summary(compute_inflection=False, **summary_model['ntc_levels'])
-    assert 'coef_0_median' in poly_df.columns
-    assert 'full_log2fc_median' in poly_df.columns

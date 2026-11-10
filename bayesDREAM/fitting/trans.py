@@ -23,7 +23,7 @@ import pyro.optim as optim
 import pyro.infer as infer
 import pyro.poutine as poutine
 
-from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, Polynomial_function, check_tensor, is_lean_posterior
+from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, check_tensor, is_lean_posterior
 from . import FitterBase
 
 
@@ -409,7 +409,6 @@ class TransFitter(FitterBase):
         temperature=1.0,
         use_straight_through=False,
         function_type='single_hill',
-        polynomial_degree=6,
         use_alpha=True,
         distribution='negbinom',
         denominator_tensor=None,
@@ -483,13 +482,6 @@ class TransFitter(FitterBase):
         # Degrees of freedom: Student-t only, fixed at 3 to match fit_ntc
         nu_y = self._t(3.0) if distribution == 'studentt' else None
     
-        #################
-        ## Hill-based: ##
-        #################
-        if function_type in ['polynomial']:
-            #sigma_coeff = pyro.sample("sigma_coeff", dist.Exponential(100)) #   -> controls how variable n_a can be across genes
-            sigma_coeff = pyro.sample("sigma_coeff", dist.HalfCauchy(scale=self._t(1.0)))
-        
         # Now enter the trans_plate (T dimension)
         with trans_plate:
 
@@ -1023,88 +1015,6 @@ class TransFitter(FitterBase):
                             Hilla = Hill_based_positive_logK(x_true.unsqueeze(-1), Vmax=Vmax_a, A=0, logK=log_K_a, n=n_a)
                             Hillb = Hill_based_positive_logK(Hilla, Vmax=Vmax_b, A=0, logK=log_K_b, n=n_b)
                             y_dose_response = A + (alpha * Hillb)
-
-            elif function_type == 'polynomial':
-                assert polynomial_degree is not None and polynomial_degree >= 1, \
-                    "polynomial_degree must be ≥ 1 (no intercept, A is handled separately)"
-
-                if distribution == 'multinomial' and K is not None:
-                    # For multinomial: fit K independent polynomials (one per category) in logit space
-                    # Then apply softmax to get K probabilities that sum to 1
-                    # This is more standard than K-1 with residual for unbounded logit space
-
-                    # Sample per-category polynomial coefficients
-                    coeffs_per_category = []
-                    for d in range(1, polynomial_degree + 1):
-                        with pyro.plate(f"poly_category_plate_deg{d}", K, dim=-2):
-                            coeff = pyro.sample(f"poly_coeff_{d}", dist.Normal(0., sigma_coeff))  # [K, T]
-                            coeffs_per_category.append(coeff)
-                    coeffs = torch.stack(coeffs_per_category, dim=-3)  # [degree, K, T]
-
-                    if latents_only:
-                        return
-
-                    # Compute polynomial for each category
-                    # coeffs: [degree, K, T]
-                    # Need to permute to [degree, T, K] for Polynomial_function to work correctly
-                    coeffs_permuted = coeffs.permute(0, 2, 1)  # [degree, T, K]
-                    poly_val = Polynomial_function(x_true_sample, coeffs_permuted)  # [N, T, K]
-
-                    # A is baseline logit for each category (need K logits)
-                    # Sample K baseline logits (unbounded)
-                    with pyro.plate("category_plate_A", K, dim=-2):
-                        A_clamped = torch.clamp(A.unsqueeze(-2), min=epsilon_tensor, max=1.0 - epsilon_tensor)  # [1, T]
-                        logit_A_transpose = torch.log(A_clamped) - torch.log(1 - A_clamped)  # [K, T] logits
-                    logit_A = logit_A_transpose.transpose(-1, -2)  # [T, K]
-
-                    # Compute logits for each category
-                    logits_K = logit_A.unsqueeze(0) + alpha.unsqueeze(0).unsqueeze(-1) * poly_val  # [N, T, K]
-
-                    # Apply softmax to get probabilities that sum to 1
-                    y_dose_response = torch.softmax(logits_K, dim=-1)  # [N, T, K]
-
-                else:
-                    # For non-multinomial: single set of coefficients per feature
-                    # Stack polynomial coefficients
-                    coeffs = []
-                    for d in range(1, polynomial_degree + 1):  # start at degree 1, no intercept
-                        coeff = pyro.sample(f"poly_coeff_{d}", dist.Normal(0., sigma_coeff))
-                        coeffs.append(coeff)
-                    coeffs = torch.stack(coeffs, dim=-2)  # [degree, T]
-                    if (coeffs.shape[1] == 1) & (coeffs.ndim == 4):
-                        coeffs = coeffs.squeeze(1)        # [S, D, T]
-
-                    if latents_only:
-                        return
-
-                    # Distribution-specific polynomial computation:
-                    if distribution in ['normal', 'studentt']:
-                        # For continuous distributions: work in natural space (no logs!)
-                        # Polynomial is applied to x_true directly: y = A + alpha * poly(x)
-                        poly_val = Polynomial_function(x_true_sample, coeffs)  # [N, T]
-                        y_dose_response = A + alpha * poly_val  # [N, T] - can be negative!
-
-                    elif distribution in ['negbinom']:
-                        # For negbinom: work in log space
-                        # Polynomial is applied to log2(x): log2(y) = log2(A) + alpha * poly(log2(x))
-                        log2_x_true = torch.log2(x_true_sample)  # [N]
-                        poly_val = Polynomial_function(log2_x_true, coeffs)  # [N, T]
-                        log2_y_dose_response = torch.log2(A) + alpha * poly_val  # [N, T]
-                        y_dose_response = 2 ** log2_y_dose_response  # Convert back to count space
-
-                    elif distribution == 'binomial':
-                        # For binomial: work in LOGIT space (unbounded: -inf to +inf)
-                        # A is in [0,1] from Beta prior, convert to logit
-                        # Polynomial is applied to x_true: logit(p) = logit(A) + alpha * poly(x)
-                        A_clamped = torch.clamp(A, min=epsilon_tensor, max=1.0 - epsilon_tensor)
-                        logit_A = torch.log(A_clamped) - torch.log(1 - A_clamped)  # logit(A)
-                        poly_val = Polynomial_function(x_true_sample, coeffs)  # [N, T]
-                        logit_p = logit_A + alpha * poly_val  # [N, T] - logit space (unbounded)
-                        # Convert back to probability space for sampler
-                        y_dose_response = torch.sigmoid(logit_p)  # [N, T] in [0, 1]
-
-                    else:
-                        raise ValueError(f"Unknown distribution for polynomial: {distribution}")
             else:
                 raise ValueError(f"Unknown function_type: {function_type}")
             
@@ -1188,7 +1098,7 @@ class TransFitter(FitterBase):
 
         elif distribution == 'binomial':
             # Sampler expects: mu_y = probability in [0, 1]
-            # y_dose_response should already be a probability from Hill/polynomial
+            # y_dose_response should already be a probability from Hill
             # Sampler will apply technical groups on logit scale
             mu_y = y_dose_response  # [N, T] - already probability
 
@@ -1224,8 +1134,6 @@ class TransFitter(FitterBase):
                 check_tensor("n_b", n_b)
                 check_tensor("Vmax_b", Vmax_b)
                 check_tensor("K_b", K_b)
-            if function_type == 'polynomial':
-                check_tensor("coeffs", coeffs)
 
         # Call distribution-specific observation sampler
         from .distributions import get_observation_sampler
@@ -1447,7 +1355,6 @@ class TransFitter(FitterBase):
         self,
         sum_factor_col: str = None,
         function_type: str = 'single_hill',  # or 'additive', 'nested'
-        polynomial_degree: int = 6,
         lr: float = None,
         niters: int = None,
         nsamples: int = 1000,
@@ -1510,7 +1417,7 @@ class TransFitter(FitterBase):
         warmup : bool, optional
             For additive_hill/nested_hill: run a single_hill warmup phase before the main
             fit. Default True (warmup is on by default for additive/nested hill).
-            Ignored for single_hill and polynomial.
+            Ignored for single_hill.
         warmup_T_min : float, optional
             Temperature at which Phase 1 (single_hill warmup) ends. Phase 1 cools from
             init_temp down to warmup_T_min at the same rate as Phase 2, so the number of
@@ -1580,7 +1487,7 @@ class TransFitter(FitterBase):
             Structural mismatches (N, T, K, C) raise an error; ``distribution``
             mismatches produce a warning.
         function_type : str
-            Dose-response function: 'single_hill', 'additive_hill', 'polynomial'
+            Dose-response function: 'single_hill', 'additive_hill'
         x_level : {'cell', 'guide'}, optional
             Which cis-expression quantity the dose-response is a function of.
             'cell' (default, recommended): per-cell x_true from fit_cis. 'guide' (not
@@ -1656,16 +1563,12 @@ class TransFitter(FitterBase):
         # Set conditional default for niters
         # ---------------------------
         if niters is None:
-            # Default: 100,000 unless multinomial OR polynomial function, then 200,000
+            # Default: 100,000 unless multinomial distribution, then 200,000
             # niters always means Phase 2 (additive/nested hill) steps.
             if distribution == 'multinomial':
                 niters = 200_000
                 if predictive_checkpoint is None:
                     print(f"[INFO] Using default niters=200,000 for multivariate distribution '{distribution}'")
-            elif function_type == 'polynomial':
-                niters = 200_000
-                if predictive_checkpoint is None:
-                    print(f"[INFO] Using default niters=200,000 for polynomial function")
             else:
                 niters = 100_000
                 if predictive_checkpoint is None:
@@ -2648,102 +2551,16 @@ class TransFitter(FitterBase):
         if alpha_y_prefit is not None:
             alpha_y_prefit = alpha_y_prefit.to(self.model.device)
 
-        def init_loc_fn(site):
-            name = site["name"]
-            if "poly_coeff" in name:
-                return torch.zeros(T)
-            return pyro.infer.autoguide.initialization.init_to_median(site)
-        
-        from torch.optim.lr_scheduler import OneCycleLR
-        if function_type == "polynomial":
-            guide_y = pyro.infer.autoguide.AutoMultivariateNormal(self._model_y, init_loc_fn=init_loc_fn)
-
-            guide_y(
-                N,
-                T,
-                y_obs_tensor,
-                sum_factor_tensor,
-                beta_o_alpha_tensor,
-                beta_o_beta_tensor,
-                K_max_tensor,
-                K_alpha_tensor,
-                Vmax_mean_tensor,
-                Vmax_alpha_tensor,
-                n_mu_tensor,
-                Amean_tensor,
-                p_n_logits_tensor,
-                epsilon_tensor,
-                x_true_sample = x_true_subset,
-                nmin = nmin,
-                nmax = nmax,
-                alpha_y_sample = alpha_y_prefit,
-                C = C,
-                groups_tensor=groups_tensor,
-                temperature=torch.tensor(init_temp, dtype=torch.float32, device=self.model.device),
-                use_straight_through=False,
-                function_type=function_type,
-                polynomial_degree=polynomial_degree,
-                use_alpha=regularise,
-                distribution=distribution,
-                denominator_tensor=denominator_tensor,
-                K=K,
-                x_true_CV=x_true_CV,
-                x_ntc_mean=x_ntc_mean,
-
-                use_epsilon=use_epsilon,
-                vmax_log_sigma_floor_tensor=vmax_log_sigma_floor_tensor,
-                k_log_sigma_min_tensor=k_log_sigma_min_tensor,
-                k_center_tensor=k_center_tensor,
-                y_ntc_tensor=y_ntc_tensor,
-                mean_y_corrected_tensor=mean_y_corrected_tensor,
-                o_y_ntc_tensor=o_y_ntc_tensor,
-                sigma_hat_tensor=sigma_hat_tensor,
-                alpha_n_coupling=alpha_n_coupling,
-            )
-            # OneCycleLR for polynomial only
-            base_lr = 1e-3 if lr is None else lr
-
-            optimizer = pyro.optim.PyroLRScheduler(
-                scheduler_constructor=OneCycleLR,
-                optim_args={
-                    # underlying torch optimizer
-                    "optimizer": torch.optim.Adam,
-                    "optim_args": {
-                        "lr": base_lr,      # initial lr (OneCycle will move it)
-                        "betas": (0.9, 0.999),
-                    },
-                    # OneCycleLR hyperparameters
-                    "max_lr":          base_lr * 10,  # was 1e-2 when base_lr=1e-3
-                    "total_steps":     niters,
-                    "pct_start":       0.1,
-                    "div_factor":      25.0,
-                    "final_div_factor": 1e4,
-                },
-                clip_args={"clip_norm": 5},
-            )
-
-            svi = pyro.infer.SVI(
-                self._model_y,
-                guide_y,
-                optimizer,
-                loss=pyro.infer.Trace_ELBO()
-            )
-        else:
-            # Simple Adam for Hill-based function types (single_hill, additive_hill, nested_hill)
-            guide_y = pyro.infer.autoguide.AutoNormalMessenger(self._model_y)
-            hill_lr = 1e-3 if lr is None else lr
-            optimizer = pyro.optim.ClippedAdam({"lr": hill_lr, "clip_norm": 10.0})
-            svi = pyro.infer.SVI(
-                self._model_y,
-                guide_y,
-                optimizer,
-                loss=pyro.infer.Trace_ELBO()
-            )
-
-        
-        for name, value in pyro.get_param_store().items():
-            if "poly_coeff" in name and "loc" in name:
-                print(name, value.shape, value.min().item(), value.max().item())
+        # AutoNormalMessenger for Hill-based function types (single_hill, additive_hill, nested_hill)
+        guide_y = pyro.infer.autoguide.AutoNormalMessenger(self._model_y)
+        hill_lr = 1e-3 if lr is None else lr
+        optimizer = pyro.optim.ClippedAdam({"lr": hill_lr, "clip_norm": 10.0})
+        svi = pyro.infer.SVI(
+            self._model_y,
+            guide_y,
+            optimizer,
+            loss=pyro.infer.Trace_ELBO()
+        )
 
         self.losses_trans = []
         smoothed_loss = None
@@ -2931,8 +2748,6 @@ class TransFitter(FitterBase):
                 phase_fraction = phase_step / float(niters) if niters > 0 else 1.0
                 if effective_function_type in ['single_hill', 'additive_hill', 'nested_hill']:
                     current_temp = init_temp + (final_temp - init_temp) * phase_fraction
-                elif effective_function_type == 'polynomial':
-                    current_temp = init_temp + (final_temp - init_temp) * (2*phase_fraction-1)
                 else:
                     raise ValueError(f"Unknown function_type: {effective_function_type}")
                 
@@ -2965,8 +2780,7 @@ class TransFitter(FitterBase):
                 temperature=torch.tensor(current_temp, dtype=torch.float32, device=self.model.device),
                 use_straight_through=use_straight_through,
                 function_type=effective_function_type,
-                polynomial_degree=polynomial_degree,
-                use_alpha=regularise and (effective_function_type != 'polynomial' or phase_fraction >= 0.5),
+                use_alpha=regularise,
                 distribution=distribution,
                 denominator_tensor=denominator_tensor,
                 K=K,
@@ -3109,7 +2923,6 @@ class TransFitter(FitterBase):
                 "temperature": torch.tensor(final_temp, dtype=torch.float32, device=torch.device("cpu")),
                 "use_straight_through": True,
                 "function_type": function_type,
-                "polynomial_degree": polynomial_degree,
                 "use_alpha": regularise,
                 "distribution": distribution,
                 "denominator_tensor": self._to_cpu(denominator_tensor) if denominator_tensor is not None else None,
@@ -3150,7 +2963,6 @@ class TransFitter(FitterBase):
                 "temperature": torch.tensor(final_temp, dtype=torch.float32, device=self.model.device),
                 "use_straight_through": True,
                 "function_type": function_type,
-                "polynomial_degree": polynomial_degree,
                 "use_alpha": regularise,
                 "distribution": distribution,
                 "denominator_tensor": denominator_tensor if denominator_tensor is not None else None,
@@ -3174,7 +2986,7 @@ class TransFitter(FitterBase):
         max_samples = nsamples
         keep_sites = kwargs.get("keep_sites", lambda name, site: name != "y_obs")
 
-        # Add latents_only=True so _model_y exits before [N, T] Hill/polynomial computation.
+        # Add latents_only=True so _model_y exits before [N, T] Hill computation.
         # All downstream-used sites (A, o_y, alpha, beta, Vmax_a/b, K_a/b, n_a/b, etc.) are
         # [T]-shaped and sampled BEFORE the cell-level computation, so nothing is lost.
         # This avoids allocating multiple [N=cells, T=genes] tensors (~2.68 GB each) per

@@ -1245,13 +1245,6 @@ def predict_trans_derivatives(
         except (KeyError, IndexError, AttributeError):
             return None, None, None
 
-    elif 'theta' in posterior:
-        # ===== POLYNOMIAL - NOT SUPPORTED =====
-        raise ValueError(
-            "Derivative plotting not supported for polynomial function type. "
-            "Only single_hill and additive_hill are supported."
-        )
-
     else:
         # Unknown function type
         return None, None, None
@@ -1809,7 +1802,6 @@ def plot_trans_functions(
     Raises
     ------
     ValueError
-        If function type is polynomial (derivatives not supported)
         If no features could be plotted
         If use_log2fc=True but NTC means not available
         If use_delta_p=True but NTC means not available
@@ -1991,7 +1983,6 @@ def plot_trans_functions(
                 # X values for plotting (same for all features when not using log2fc/delta_p)
                 x_plot_feat = np.log2(x_range) if use_log2_x else x_range
         except ValueError as e:
-            # Polynomial not supported
             raise e
 
         if y_pred is None and first_deriv is None:
@@ -2300,7 +2291,7 @@ def predict_trans_function(
     """
     Predict trans effect function for a feature given x_true values.
 
-    Automatically detects function type (additive_hill, single_hill, polynomial)
+    Automatically detects function type (additive_hill, single_hill)
     from posterior_samples_trans and computes predictions.
 
     Parameters
@@ -2339,7 +2330,6 @@ def predict_trans_function(
     Works with all function types:
     - additive_hill: A + alpha*Hill_a + beta*Hill_b
     - single_hill: A + Vmax*Hill(x, K, n)
-    - polynomial: sum(coeffs[i] * x^i)
     """
     # Determine which modality to use
     if modality_name is None:
@@ -2504,47 +2494,6 @@ def predict_trans_function(
 
         except (KeyError, IndexError, AttributeError) as e:
             if debug: print(f"[predict_trans_function] returning None: single_hill extraction failed: {e}")
-            return None
-
-    elif 'theta' in posterior:
-        # ===== POLYNOMIAL OR THETA-BASED =====
-        try:
-            theta_samples = posterior['theta']
-            # theta shape for primary: (samples, features, n_params)
-            # theta shape for non-primary: (samples, cis_genes, features, n_params)
-
-            # Median over samples and squeeze cis gene dimension if present.
-            # torch.quantile(.., 0.5, dim=0) / np.median(.., axis=0) match the
-            # median point-estimate convention elsewhere, and are a no-op on a
-            # lean-loaded (1-sample) posterior — same value comes out either way.
-            if hasattr(theta_samples, 'mean'):
-                theta_median = torch.quantile(theta_samples.float(), 0.5, dim=0)
-                # Squeeze out cis gene dimension if present
-                if theta_median.ndim > 2:  # (cis_genes, features, n_params)
-                    theta_median = theta_median.squeeze(0)  # (features, n_params)
-                theta_median = theta_median[feature_idx, :]  # (n_params,)
-                theta_np = theta_median.cpu().numpy() if hasattr(theta_median, 'cpu') else np.array(theta_median)
-            else:
-                theta_median = np.median(theta_samples, axis=0)
-                if theta_median.ndim > 2:
-                    theta_median = theta_median.squeeze(0)
-                theta_median = theta_median[feature_idx, :]
-                theta_np = np.array(theta_median)
-
-            # Polynomial: y = coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + ...
-            # First coefficient is baseline (like A)
-            baseline = theta_np[0]
-            poly_coeffs = theta_np[1:]  # Remaining coefficients
-
-            # Compute polynomial
-            y_pred = np.full_like(x_range, baseline)
-            for i, coeff in enumerate(poly_coeffs, start=1):
-                y_pred += coeff * (x_range ** i)
-
-            return y_pred
-
-        except (KeyError, IndexError, AttributeError) as e:
-            if debug: print(f"[predict_trans_function] returning None: polynomial extraction failed: {e}")
             return None
 
     else:
@@ -2822,7 +2771,7 @@ def predict_trans_function_samples(
             return None
 
     else:
-        # Polynomial or unknown - not supported for samples
+        # Unknown - not supported for samples
         return None
 
 
@@ -3024,7 +2973,7 @@ def predict_trans_derivatives_samples(
             return None, None, None, None
 
     else:
-        # Polynomial or unknown - not supported
+        # Unknown - not supported
         return None, None, None, None
 
 
@@ -3436,7 +3385,7 @@ def _compute_hill_markers(model, feature, modality, log2_space=True, y_scale=1.0
 
     if feature not in feature_list:
         return []
-    if 'Vmax_a' not in posterior:   # polynomial or unknown
+    if 'Vmax_a' not in posterior:   # unknown function type
         return []
 
     feature_idx = feature_list.index(feature)
@@ -5590,7 +5539,7 @@ def plot_xy_data(
         Example: {'K562': 'crimson', 'TF1': 'dodgerblue'}
     show_hill_function : bool
         Overlay fitted trans function if trans model fitted (all distributions, default: True)
-        Works with all function types: additive_hill, single_hill, polynomial
+        Works with all function types: additive_hill, single_hill
         Automatically detects function type from posterior_samples_trans
     show_ntc_gradient : bool
         Color lines by NTC proportion in k-NN window (default: False)
@@ -5742,8 +5691,7 @@ def plot_xy_data(
         Requires ``show_hill_function=True`` and a fitted trans model.
         The x-axis minimum and maximum are widened to include the mean K_a and
         K_b values from the posterior, so any EC50 that falls outside the data
-        range will still appear on the curve.  Ignored for polynomial function
-        types (which have no K parameters).
+        range will still appear on the curve.
     expand_y_to_params : bool
         When True, extend the y-axis to show the full range of the fitted Hill
         curve over the entire displayed x range, including any x values added by

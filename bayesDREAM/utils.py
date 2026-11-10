@@ -4,7 +4,7 @@ Utility functions for bayesDREAM.
 This module contains helper functions used throughout the bayesDREAM package:
 - Thread configuration
 - Numerical solvers
-- Dose-response functions (Hill, polynomial)
+- Dose-response functions (Hill)
 - Tensor utilities
 """
 
@@ -722,42 +722,6 @@ def Hill_based_piecewise(x, Vmax, A, K, n, epsilon=1e-6):
     denominator = K_n + x_n
     fraction = torch.where(n < 0, K_n / denominator, x_n / denominator)
     return Vmax * fraction + A
-
-
-def Polynomial_function(x, coeffs):
-    """
-    Polynomial dose-response function.
-
-    Computes: sum_{i=1}^{degree} coeffs[i] * x^i
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        Input values, shape [N] or [N, 1]
-    coeffs : torch.Tensor
-        Polynomial coefficients, shape [degree, T] or [S, degree, T]
-        where T is number of features and S is number of samples
-
-    Returns
-    -------
-    torch.Tensor
-        Predicted response values
-        - Shape [N, T] if coeffs is [degree, T]
-        - Shape [S, N, T] if coeffs is [S, degree, T]
-    """
-    if x.dim() == 1:
-        x = x.unsqueeze(-1)
-
-    powers = torch.arange(1, coeffs.shape[-2] + 1, device=x.device).view(1, -1)  # [1, degree]
-    x_powers = x ** powers  # [N, degree]
-
-    if coeffs.dim() == 2:
-        return x_powers @ coeffs  # [N, T]
-    elif coeffs.dim() == 3:
-        x_powers = x_powers.unsqueeze(0)  # [1, N, degree]
-        return torch.matmul(x_powers, coeffs).squeeze(-2)  # [S, N, T]
-    else:
-        raise ValueError(f"Expected coeffs to have 2 or 3 dims, got shape {coeffs.shape}")
 
 
 ########################################
