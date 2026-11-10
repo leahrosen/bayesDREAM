@@ -9,6 +9,18 @@ import pandas as pd
 from ..utils import is_lean_posterior
 from .load import _reduce_posterior_samples
 
+
+def _prior_params_to_dict(df):
+    """Serialise a fit_ntc prior-params DataFrame (indexed by feature id) to a
+    plain dict of lists, or None. Reversed in io/load.py."""
+    if df is None:
+        return None
+    out = {'feature_id': [str(f) for f in df.index]}
+    for col in df.columns:
+        out[col] = df[col].astype(float).tolist()
+    return out
+
+
 class ModelSaver:
     """Handles saving fitted parameters."""
 
@@ -194,7 +206,12 @@ class ModelSaver:
                     'feature_ids': mod.feature_ids if hasattr(mod, 'feature_ids') else None,
                     'n_features': n_features,
                     'feature_meta': mod.feature_meta.to_dict('records') if hasattr(mod, 'feature_meta') and mod.feature_meta is not None else None,
-                    'loss_ntc': mod.loss_ntc if hasattr(mod, 'loss_ntc') else None
+                    'loss_ntc': mod.loss_ntc if hasattr(mod, 'loss_ntc') else None,
+                    # Data-driven prior parameters fit_ntc used (for exact
+                    # prior/posterior plots); plain dict-of-lists, keyed by feature id
+                    'prior_params': _prior_params_to_dict(
+                        (getattr(self.model, 'ntc_prior_params', None) or {}).get(mod_name)
+                    ),
                 }
 
                 path = os.path.join(output_dir, f'posterior_samples_ntc_{mod_name}.pt')

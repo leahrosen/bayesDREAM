@@ -862,6 +862,14 @@ class bayesDREAM(
         cis_modality.posterior_samples_ntc = cis_posterior
         print(f"[INFO] Extracted '{cis_gene}' posteriors from primary modality NTC fit")
 
+        # File the cis gene's recorded fit_ntc prior parameters under 'cis' too
+        # (the primary modality's table is keyed by feature id, so it needs no trimming)
+        _pp = (getattr(self, 'ntc_prior_params', None) or {}).get(self.primary_modality)
+        if _pp is not None:
+            _ids = (primary_mod.feature_ids if primary_mod.feature_ids is not None
+                    else list(primary_mod.feature_meta.index))
+            self.ntc_prior_params['cis'] = _pp.reindex([str(_ids[cis_feat_iloc])])
+
         # Trim cis gene row from primary modality posteriors in-place
         if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
             ps['alpha_y_mult'] = full_alpha_y_mult[..., trans_idx]

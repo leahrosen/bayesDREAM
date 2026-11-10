@@ -115,6 +115,69 @@ def compute_continuous_ntc_prior_params(y_obs_ntc, groups_ntc, epsilon=1e-6):
     return mu_x_mean, mu_x_sd, sigma_hat
 
 
+def compute_negbinom_ntc_prior_params(y_obs_ntc_factored, groups_ntc, epsilon=1e-6):
+    """
+    Data-driven mean/SD for the negbinom ``mu_ntc`` prior in ``_model_ntc``.
+
+    Single source of truth shared by ``NTCFitter.fit_ntc`` and the prior
+    sampler used for prior/posterior plots (``plotting/prior_sampling.py``).
+    Feed the result to :func:`negbinom_mu_ntc_lognormal_params` to get the
+    LogNormal parameters actually used in the model.
+
+    Parameters
+    ----------
+    y_obs_ntc_factored : np.ndarray or scipy.sparse matrix
+        NTC counts divided by size factors, shape [N, T].
+    groups_ntc : np.ndarray
+        Technical group code per NTC cell, shape [N]; group 0 is the reference.
+    epsilon : float
+        Small constant for numerical safety.
+
+    Returns
+    -------
+    mu_x_mean, mu_x_sd : np.ndarray
+        Each of shape [T]. ``mu_x_mean`` is the reference-group mean (+epsilon,
+        strictly positive); ``mu_x_sd`` is the robust SE of the NTC mean,
+        floored at 10% of the mean.
+    """
+    from scipy import sparse
+    if sparse.issparse(y_obs_ntc_factored):
+        y_obs_ntc_factored = y_obs_ntc_factored.toarray()
+    y_obs_ntc_factored = np.asarray(y_obs_ntc_factored)
+    y_baseline = y_obs_ntc_factored[np.asarray(groups_ntc) == 0, :]
+    mu_x_mean = np.mean(y_baseline, axis=0)  # [T]
+
+    # Robust SD over all NTC cells, converted to SE of the mean,
+    # floored at 10% of mean
+    robust_sd = _compute_robust_sd(y_obs_ntc_factored, epsilon, use_nan=False)
+    N_cells = y_obs_ntc_factored.shape[0]
+    mu_x_sd = robust_sd / np.sqrt(N_cells) + epsilon
+    mu_x_sd = np.maximum(mu_x_sd, (mu_x_mean + epsilon) * 0.1)
+
+    mu_x_mean = mu_x_mean + epsilon  # strictly positive
+    return mu_x_mean, mu_x_sd
+
+
+def negbinom_mu_ntc_lognormal_params(mu_x_mean_tensor, mu_x_sd_tensor):
+    """
+    LogNormal (loc, scale) for the negbinom ``mu_ntc`` prior in ``_model_ntc``.
+
+    Moment-matched to mean ``mu_x_mean`` and SD ``mu_x_sd``, with the log-scale
+    floored at 0.1 so the prior cannot collapse to a point mass for very
+    stably expressed genes.
+
+    Returns
+    -------
+    log_mu, log_sigma : torch.Tensor
+        ``mu_ntc ~ LogNormal(log_mu, log_sigma)``, each of shape [T].
+    """
+    log_sigma = torch.sqrt(
+        torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
+    ).clamp(min=0.1)
+    log_mu = torch.log(mu_x_mean_tensor) - 0.5 * log_sigma ** 2
+    return log_mu, log_sigma
+
+
 class NTCFitter(FitterBase):
     """Handles NTC fitting: estimates gene-specific overdispersion and batch effects."""
 
@@ -391,10 +454,9 @@ class NTCFitter(FitterBase):
                         _log_mu = log_mu_ntc
                         _log_sigma = log_sigma_ntc
                     else:
-                        _log_sigma = torch.sqrt(
-                            torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
-                        ).clamp(min=0.1)
-                        _log_mu = torch.log(mu_x_mean_tensor) - 0.5 * _log_sigma ** 2
+                        _log_mu, _log_sigma = negbinom_mu_ntc_lognormal_params(
+                            mu_x_mean_tensor, mu_x_sd_tensor
+                        )
                     mu_ntc = pyro.sample(
                         "mu_ntc",
                         dist.LogNormal(_log_mu, _log_sigma)
@@ -1213,33 +1275,57 @@ class NTCFitter(FitterBase):
         sigma_hat_tensor = None  # set below for normal/studentt
 
         # ---- mu_x priors per distribution ----
+        _prior_param_cols = None  # recorded below for prior/posterior plots
         if distribution == 'negbinom':
-            baseline_mask = (groups_ntc == 0)
-            y_baseline = _extract_rows_sparse_safe(y_obs_ntc_factored, baseline_mask)
-            mu_x_mean = np.mean(y_baseline, axis=0)  # [T_fit]
-
-            # Compute robust SD using MAD with SD fallback
-            robust_sd = _compute_robust_sd(y_obs_ntc_factored, epsilon, use_nan=False)
-
-            # Convert to SE of mean, with floor at 10% of mean
-            N_cells = y_obs_ntc_factored.shape[0]
-            mu_x_sd = robust_sd / np.sqrt(N_cells) + epsilon
-            mu_x_sd = np.maximum(mu_x_sd, (mu_x_mean + epsilon) * 0.1)  # floor at 10% of mean
-
-            mu_x_mean = mu_x_mean + epsilon  # strictly positive for Gamma
+            mu_x_mean, mu_x_sd = compute_negbinom_ntc_prior_params(
+                y_obs_ntc_factored, groups_ntc, epsilon
+            )
+            _prior_param_cols = {'mu_x_mean': mu_x_mean, 'mu_x_sd': mu_x_sd}
 
         elif distribution in ('normal', 'studentt'):
-            # Shared with plotting/prior_sampling.py so plotted priors match the fit
             mu_x_mean, mu_x_sd, sigma_hat = compute_continuous_ntc_prior_params(
                 y_obs_ntc_factored, groups_ntc, epsilon
             )
             sigma_hat_tensor = torch.tensor(sigma_hat, dtype=torch.float32, device=self.model.device)
+            _prior_param_cols = {'mu_x_mean': mu_x_mean, 'mu_x_sd': mu_x_sd, 'sigma_hat': sigma_hat}
 
         else:
             # binomial & multinomial: handled with Beta/Dirichlet in the model
             mu_x_mean = np.zeros((T_fit,), dtype=float)
             mu_x_sd   = np.ones((T_fit,), dtype=float)
-    
+
+        # Record the data-driven prior parameters actually used, keyed by feature
+        # id, so plotting/prior_sampling.py draws exactly these priors (no
+        # recomputation that could disagree on cells, size factors or features).
+        if _prior_param_cols is not None:
+            _all_feature_ids = list(modality.feature_ids if modality.feature_ids is not None
+                                    else modality.feature_meta.index)
+            _cis_feature_id = None
+            if cis_idx_in_counts is not None:
+                # The cis gene row was appended last (see above)
+                _cis_mod = self.model.get_modality('cis')
+                _cis_feature_id = str(_cis_mod.feature_ids[0] if _cis_mod.feature_ids is not None
+                                      else _cis_mod.feature_meta.index[0])
+                _all_feature_ids.append(_cis_feature_id)
+            if len(_all_feature_ids) != len(fit_mask):
+                raise RuntimeError(
+                    f"Internal error: modality '{modality_name}' has {len(_all_feature_ids)} "
+                    f"feature ids but the fit mask has {len(fit_mask)} entries."
+                )
+            _fit_feature_ids =[str(f) for f, keep in zip(_all_feature_ids, fit_mask) if keep]
+            if getattr(self.model, 'ntc_prior_params', None) is None:
+                self.model.ntc_prior_params = {}
+            self.model.ntc_prior_params[modality_name] = pd.DataFrame(
+                {k: np.asarray(v, dtype=float) for k, v in _prior_param_cols.items()},
+                index=pd.Index(_fit_feature_ids, name='feature_id'),
+            )
+            if _cis_feature_id is not None:
+                # Also file the cis gene's row under the 'cis' modality
+                # (reindexing to it gives an all-NaN row if it was filtered out)
+                self.model.ntc_prior_params['cis'] = (
+                    self.model.ntc_prior_params[modality_name].reindex([_cis_feature_id])
+                )
+
         # CRITICAL MEMORY OPTIMIZATION: Use torch.from_numpy() to avoid copies
         # torch.tensor() creates a NEW copy, torch.from_numpy() shares memory with numpy array
         # Then explicitly delete numpy arrays and move tensors to device
@@ -1280,11 +1366,9 @@ class NTCFitter(FitterBase):
         _model_precomp = {}
 
         if distribution == 'negbinom':
-            _log_sigma_pc = torch.sqrt(
-                torch.log1p((mu_x_sd_tensor / mu_x_mean_tensor) ** 2)
-            ).clamp(min=0.1)
-            _model_precomp['log_sigma_ntc'] = _log_sigma_pc
-            _model_precomp['log_mu_ntc'] = torch.log(mu_x_mean_tensor) - 0.5 * _log_sigma_pc ** 2
+            _model_precomp['log_mu_ntc'], _model_precomp['log_sigma_ntc'] = (
+                negbinom_mu_ntc_lognormal_params(mu_x_mean_tensor, mu_x_sd_tensor)
+            )
 
         denominator_ntc_tensor = None
         if denominator_ntc_for_fit is not None:

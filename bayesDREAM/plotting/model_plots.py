@@ -73,7 +73,7 @@ class ModelPlottingMixin:
         Parameters
         ----------
         param : str
-            Parameter to plot: 'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc', 'o_y'
+            Parameter to plot: 'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc'
         modality_name : str, optional
             Modality name (default: primary modality)
         technical_group_index : int, optional
@@ -219,6 +219,10 @@ class ModelPlottingMixin:
 
         elif param == 'alpha_y':
             # 1D or 2D parameter: (samples, genes) or (samples, cell_lines, genes)
+            if 'log2_alpha_y' not in prior_dict:
+                raise ValueError(
+                    f"Cannot plot the alpha_y prior: {prior_dict.get('_missing_reason', 'prior not available.')}"
+                )
 
             # Determine if we should plot in log2 space based on distribution
             # Multiplicative (negbinom): plot log2(alpha_y_mult) - baseline is 0 in log2 space
@@ -388,9 +392,55 @@ class ModelPlottingMixin:
                         plot_type=plot_type, metric=metric, is_additive=is_additive, **kwargs
                     )
 
+        elif param == 'mu_ntc':
+            # Per-feature baseline (reference-group) mean, [S, T]
+            if 'mu_ntc' not in posterior:
+                raise ValueError(f"mu_ntc not found in posterior_samples_ntc for modality '{modality.name}'.")
+            if 'mu_ntc' not in prior_dict:
+                raise ValueError(
+                    f"Cannot plot the mu_ntc prior: "
+                    f"{prior_dict.get('_missing_reason', f'no mu_ntc prior for distribution {modality.distribution!r}.')}"
+                )
+
+            post_samples = posterior['mu_ntc']
+            post_samples = post_samples.detach().cpu().numpy() if hasattr(post_samples, 'detach') else np.asarray(post_samples)
+            if post_samples.ndim == 3 and post_samples.shape[1] == 1:
+                post_samples = post_samples[:, 0, :]
+            prior_samples = prior_dict['mu_ntc'].numpy()
+
+            feature_names = list(modality_feature_names)
+            if post_samples.ndim != 2 or post_samples.shape[1] != len(feature_names) \
+                    or prior_samples.shape[1] != len(feature_names):
+                raise ValueError(
+                    f"Shape mismatch: mu_ntc posterior {post_samples.shape}, prior {prior_samples.shape}, "
+                    f"modality '{modality.name}' has {len(feature_names)} features."
+                )
+
+            # Features fit_ntc did not fit have no prior (NaN); drop them
+            fitted = np.isfinite(prior_samples).all(axis=0) & np.isfinite(post_samples).all(axis=0)
+            if not fitted.all():
+                print(f"Note: Excluding {(~fitted).sum()} feature(s) that fit_ntc did not fit")
+                prior_samples = prior_samples[:, fitted]
+                post_samples = post_samples[:, fitted]
+                feature_names = [f for f, keep in zip(feature_names, fitted) if keep]
+
+            if modality.distribution == 'negbinom':
+                # Positive and spanning orders of magnitude across genes: plot log2
+                prior_samples = np.log2(np.maximum(prior_samples, 1e-10))
+                post_samples = np.log2(np.maximum(post_samples, 1e-10))
+                param_label = 'log2(mu_ntc)'
+            else:
+                param_label = 'mu_ntc'
+
+            return plot_1d_parameter(
+                prior_samples, post_samples, feature_names, param_label,
+                order_by, subset_features=subset_features, plot_type=plot_type,
+                metric=metric, **kwargs
+            )
+
         else:
             raise ValueError(f"Unknown parameter: {param}. Must be one of: "
-                           "'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc', 'o_y'")
+                           "'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc'")
 
     def plot_cis_fit(
         self,

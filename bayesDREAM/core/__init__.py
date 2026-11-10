@@ -336,6 +336,13 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         # Bookkeeping for results
         self.alpha_x_prefit = None    # from step1: shape [C], always a mean point estimate
         # NOTE: alpha_y_prefit is stored per-modality as a mean point estimate [C, T]
+        # Data-driven prior parameters fit_ntc actually used, per modality:
+        # {modality_name: pd.DataFrame indexed by feature id, columns e.g.
+        # mu_x_mean, mu_x_sd (+ sigma_hat for normal/studentt)}. Used to draw the
+        # exact fitted priors for prior/posterior plots. Kept on the model (not the
+        # Modality) and keyed by feature id so it survives add_cis_gene()/feature
+        # subsetting, which rebuild Modality objects. Persisted by save_ntc_fit().
+        self.ntc_prior_params = {}
         # fit_cis bookkeeping for guide-axis latents (x_eff_g, sigma_eff, mu_target_i, ...)
         self.cis_guide_labels = None          # name of each guide-axis position (see utils.get_guide_axis_labels)
         self.mu_sigma_group_labels = None     # independent_mu_sigma: label of group i <-> mu_target_i/sigma_target_i

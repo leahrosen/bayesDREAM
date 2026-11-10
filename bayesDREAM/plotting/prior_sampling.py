@@ -12,114 +12,53 @@ import pyro
 import pyro.distributions as dist
 
 
-def _compute_data_driven_priors(model, modality, distribution, epsilon=1e-6):
+_DATA_DRIVEN_DISTS = ('negbinom', 'normal', 'studentt')
+
+
+def _get_ntc_prior_params(model, modality_name, modality):
     """
-    Compute data-driven prior parameters (mu_x_mean_tensor, mu_x_sd_tensor) from NTC data.
+    Data-driven prior parameters that fit_ntc actually used for this modality,
+    aligned to the modality's current features.
 
-    For normal/studentt this calls the same function fit_ntc uses
-    (``fitting.ntc.compute_continuous_ntc_prior_params``), so the plotted
-    priors match the fitted ones exactly.
-
-    Parameters
-    ----------
-    model : bayesDREAM
-        The model instance
-    modality : Modality
-        The modality to compute priors for
-    distribution : str
-        Distribution type
-    epsilon : float
-        Small value to ensure positivity
+    fit_ntc records them (``model.ntc_prior_params[modality_name]``, a DataFrame
+    indexed by feature id; persisted by save_ntc_fit/load_ntc_fit), so the
+    priors drawn here are exactly the fitted ones, independent of later cell
+    subsetting, size-factor columns or feature trimming. They are deliberately
+    not recomputed from the data.
 
     Returns
     -------
-    mu_x_mean_tensor : torch.Tensor
-        Feature-specific prior means [T] or [T, D]
-    mu_x_sd_tensor : torch.Tensor
-        Feature-specific prior standard deviations [T] or [T, D]
-    sigma_hat_tensor : torch.Tensor or None
-        Reference-group SD [T] for normal/studentt (sigma_y prior scale), else None
+    params : pd.DataFrame or None
+        Indexed by the modality's feature ids (same order). Rows are NaN for
+        features fit_ntc did not fit. None if nothing was recorded.
+    reason : str or None
+        Why params is None.
     """
-    # Always use modality.counts for consistency
-    # (model.counts might be subset to cis gene only, but modality has all features)
-    counts = modality.counts
-    cell_names = modality.cell_names if modality.cell_names is not None else \
-                 model.meta['cell'].values[:counts.shape[modality.cells_axis]]
-
-    # Subset to NTC cells
-    cell_set = set(cell_names)
-    meta_subset = model.meta[model.meta['cell'].isin(cell_set)].copy()
-    meta_ntc = meta_subset[meta_subset["target"] == "ntc"].copy()
-
-    ntc_cell_list = meta_ntc["cell"].tolist()
-    ntc_indices = [i for i, c in enumerate(cell_names) if c in ntc_cell_list]
-
-    if len(ntc_indices) == 0:
-        raise ValueError("No NTC cells found for computing data-driven priors")
-
-    # Extract NTC counts
-    if counts.ndim == 2:
-        counts_ntc = counts[:, ntc_indices] if modality.cells_axis == 1 else counts[ntc_indices, :]
-    elif counts.ndim == 3:
-        counts_ntc = counts[:, ntc_indices, :]
-    else:
-        raise ValueError(f"Unexpected dimensions: {counts.ndim}")
-
-    # Get technical groups and guides for NTC cells
-    groups_ntc = meta_ntc['technical_group_code'].values
-    guides_ntc = meta_ntc['guide_code'].values
-
-    # Prepare data for prior computation (handle 3D by summing/averaging last axis)
-    if counts_ntc.ndim == 3:
-        if distribution == 'multinomial':
-            y_obs_ntc_for_priors = counts_ntc.sum(axis=2)  # [T, N] or [N, T]
-        else:
-            y_obs_ntc_for_priors = counts_ntc.sum(axis=2)
-    else:
-        y_obs_ntc_for_priors = counts_ntc
-
-    # Transpose if needed to get [N, T]
-    if modality.cells_axis == 1:
-        y_obs_ntc_for_priors = y_obs_ntc_for_priors.T
-
-    # Apply size factors for negbinom — read from modality.sum_factors
-    if distribution == 'negbinom' and modality.sum_factors is not None and 'sum_factor' in modality.sum_factors.columns:
-        ntc_sf = modality.sum_factors.loc[meta_ntc['cell'].values, 'sum_factor'].values
-        y_obs_ntc_factored = y_obs_ntc_for_priors / ntc_sf.reshape(-1, 1)
-    else:
-        y_obs_ntc_factored = y_obs_ntc_for_priors
-
-    # Compute mu_x_mean and mu_x_sd based on distribution
-    if distribution == 'negbinom':
-        baseline_mask = (groups_ntc == 0)
-        mu_x_mean = np.mean(y_obs_ntc_factored[baseline_mask, :], axis=0)
-        guide_means = np.array([np.mean(y_obs_ntc_factored[guides_ntc == g], axis=0)
-                               for g in np.unique(guides_ntc)])
-        mu_x_sd = np.std(guide_means, axis=0) + epsilon
-        mu_x_mean = mu_x_mean + epsilon  # strictly positive for Gamma
-
-    elif distribution in ('normal', 'studentt'):
-        # Exactly the computation fit_ntc uses (single shared implementation)
-        from ..fitting.ntc import compute_continuous_ntc_prior_params
-        mu_x_mean, mu_x_sd, sigma_hat = compute_continuous_ntc_prior_params(
-            y_obs_ntc_factored, groups_ntc, epsilon
+    recorded = (getattr(model, 'ntc_prior_params', None) or {}).get(modality_name)
+    if recorded is None:
+        return None, (
+            f"fit_ntc's data-driven prior parameters were not recorded for modality "
+            f"'{modality_name}' (fit saved/run before they were recorded). Re-run "
+            f"fit_ntc() and save_ntc_fit() to plot these priors."
         )
+    feature_ids = (modality.feature_ids if modality.feature_ids is not None
+                   else list(modality.feature_meta.index))
+    return recorded.reindex([str(f) for f in feature_ids]), None
 
-    else:
-        # binomial & multinomial: not used
-        T = y_obs_ntc_for_priors.shape[1]
-        mu_x_mean = np.zeros(T, dtype=float)
-        mu_x_sd = np.ones(T, dtype=float)
 
-    # Convert to tensors
-    mu_x_mean_tensor = torch.tensor(mu_x_mean, dtype=torch.float32)
-    mu_x_sd_tensor = torch.tensor(mu_x_sd, dtype=torch.float32)
-    sigma_hat_tensor = (
-        torch.tensor(sigma_hat, dtype=torch.float32)
-        if distribution in ('normal', 'studentt') else None
-    )
-
-    return mu_x_mean_tensor, mu_x_sd_tensor, sigma_hat_tensor
+def _sample_where_valid(make_dist, params, cols, nsamples):
+    """
+    Draw ``nsamples`` per feature from ``make_dist(*param_tensors)`` for features
+    whose params are all finite; NaN for the rest (features fit_ntc did not fit).
+    Returns a tensor of shape [nsamples, T].
+    """
+    arrs = [params[c].to_numpy(dtype=float) for c in cols]
+    valid = np.all([np.isfinite(a) for a in arrs], axis=0)
+    out = torch.full((nsamples, len(valid)), float('nan'))
+    if valid.any():
+        tens = [torch.tensor(a[valid], dtype=torch.float32) for a in arrs]
+        out[:, torch.from_numpy(valid)] = make_dist(*tens).sample((nsamples,))
+    return out
 
 
 def sample_technical_priors(
@@ -129,7 +68,13 @@ def sample_technical_priors(
     distribution=None
 ):
     """
-    Sample from the prior distributions defined in _model_technical.
+    Sample from the prior distributions defined in fit_ntc's ``_model_ntc``.
+
+    Data-driven priors (negbinom/normal/studentt ``mu_ntc``, normal/studentt
+    ``sigma_y`` and ``log2_alpha_y``) use the exact parameters fit_ntc
+    recorded (see :func:`_get_ntc_prior_params`). If none were recorded, those
+    keys are omitted and ``'_missing_reason'`` explains why; the remaining
+    priors are still returned. Features fit_ntc did not fit get NaN.
 
     Parameters
     ----------
@@ -164,44 +109,44 @@ def sample_technical_priors(
 
     C = model.meta['technical_group_code'].nunique()
 
-    # Sample priors based on distribution
     prior_samples = {}
 
-    # Compute data-driven prior parameters from NTC data
-    mu_x_mean_tensor, mu_x_sd_tensor, sigma_hat_tensor = _compute_data_driven_priors(
-        model, modality, distribution
-    )
-
-    # Ensure T matches the actual computed prior parameters
-    # (handles edge cases where modality might have been modified after fitting)
-    if mu_x_mean_tensor.numel() > 0 and mu_x_mean_tensor.numel() != T:
-        print(f"[WARNING] Modality has {T} features but computed priors have {mu_x_mean_tensor.numel()} features. "
-              f"Using actual prior size ({mu_x_mean_tensor.numel()}).")
-        T = mu_x_mean_tensor.numel()
+    params, missing_reason = (None, None)
+    if distribution in _DATA_DRIVEN_DISTS:
+        params, missing_reason = _get_ntc_prior_params(model, modality_name, modality)
+        if missing_reason is not None:
+            prior_samples['_missing_reason'] = missing_reason
 
     # Technical-group effects, as in fitting/ntc.py::_model_ntc:
-    # - normal/studentt: additive shift log2_alpha_y ~ StudentT(3, 0, mu_x_sd) per feature
-    #   (data-driven scale: robust SE of the NTC mean)
+    # - normal/studentt: additive shift log2_alpha_y ~ StudentT(3, 0, mu_x_sd)
+    #   (data-driven per-feature scale)
     # - otherwise:       log2_alpha_y ~ StudentT(3, 0, 20)
+    log2_alpha_y = None
     if distribution in ('normal', 'studentt'):
-        alpha_scale = mu_x_sd_tensor.clamp_min(1e-6)  # [T]
+        if params is not None:
+            scale = _sample_where_valid(
+                lambda s: dist.StudentT(df=3, loc=0.0, scale=s.clamp_min(1e-6)),
+                params, ['mu_x_sd'], nsamples * max(C - 1, 1),
+            )
+            log2_alpha_y = scale.reshape(nsamples, max(C - 1, 1), T)[:, :C - 1, :]
     else:
-        alpha_scale = torch.full((T,), 20.0)
-    log2_alpha_y = dist.StudentT(df=3, loc=0.0, scale=alpha_scale).sample((nsamples, C - 1))  # [S, C-1, T]
-    prior_samples['log2_alpha_y'] = log2_alpha_y
-    if distribution in ('normal', 'studentt'):
-        # Multiplicative effects are not used for normal/studentt (fixed to 1)
-        prior_samples['alpha_y_mul'] = torch.ones_like(log2_alpha_y)
-    else:
-        prior_samples['alpha_y_mul'] = 2.0 ** log2_alpha_y  # multiplicative
-    prior_samples['delta_y_add'] = log2_alpha_y  # additive/logit
+        log2_alpha_y = dist.StudentT(df=3, loc=0.0, scale=torch.full((T,), 20.0)).sample((nsamples, C - 1))
 
-    # Add baseline row (first technical group is always 1.0 or 0.0)
-    alpha_full_mul = torch.cat([torch.ones(nsamples, 1, T), prior_samples['alpha_y_mul']], dim=1)
-    alpha_full_add = torch.cat([torch.zeros(nsamples, 1, T), prior_samples['delta_y_add']], dim=1)
-    prior_samples['alpha_y'] = alpha_full_mul  # back-compat
-    prior_samples['alpha_y_mult'] = alpha_full_mul
-    prior_samples['alpha_y_add'] = alpha_full_add
+    if log2_alpha_y is not None:  # [S, C-1, T]
+        prior_samples['log2_alpha_y'] = log2_alpha_y
+        if distribution in ('normal', 'studentt'):
+            # Multiplicative effects are not used for normal/studentt (fixed to 1)
+            prior_samples['alpha_y_mul'] = torch.ones_like(log2_alpha_y)
+        else:
+            prior_samples['alpha_y_mul'] = 2.0 ** log2_alpha_y  # multiplicative
+        prior_samples['delta_y_add'] = log2_alpha_y  # additive/logit
+
+        # Add baseline row (first technical group is always 1.0 or 0.0)
+        alpha_full_mul = torch.cat([torch.ones(nsamples, 1, T), prior_samples['alpha_y_mul']], dim=1)
+        alpha_full_add = torch.cat([torch.zeros(nsamples, 1, T), prior_samples['delta_y_add']], dim=1)
+        prior_samples['alpha_y'] = alpha_full_mul  # back-compat
+        prior_samples['alpha_y_mult'] = alpha_full_mul
+        prior_samples['alpha_y_add'] = alpha_full_add
 
     # Distribution-specific parameters
     if distribution == 'negbinom':
@@ -217,28 +162,27 @@ def sample_technical_priors(
         o_y = dist.Exponential(beta_o.unsqueeze(-1)).sample((T,)).squeeze()  # (nsamples, T)
         prior_samples['o_y'] = o_y
 
-        # mu_ntc ~ Gamma(alpha, beta) with data-driven parameters
-        # Shape-rate parameterization: alpha = mu^2/sigma^2, beta = mu/sigma^2
-        alpha_param = (mu_x_mean_tensor ** 2) / (mu_x_sd_tensor ** 2)
-        beta_param = mu_x_mean_tensor / (mu_x_sd_tensor ** 2)
+        # mu_ntc ~ LogNormal(log_mu, log_sigma), moment-matched to the recorded
+        # (mu_x_mean, mu_x_sd) exactly as in _model_ntc
+        if params is not None:
+            from ..fitting.ntc import negbinom_mu_ntc_lognormal_params
 
-        # Sample for each feature
-        mu_ntc_list = []
-        for i in range(T):
-            mu_ntc_feat = dist.Gamma(alpha_param[i], beta_param[i]).sample((nsamples,))
-            mu_ntc_list.append(mu_ntc_feat)
-        mu_ntc = torch.stack(mu_ntc_list, dim=1)  # (nsamples, T)
-        prior_samples['mu_ntc'] = mu_ntc
+            def _lognormal(mean, sd):
+                return dist.LogNormal(*negbinom_mu_ntc_lognormal_params(mean, sd))
+
+            prior_samples['mu_ntc'] = _sample_where_valid(
+                _lognormal, params, ['mu_x_mean', 'mu_x_sd'], nsamples)  # (nsamples, T)
 
     elif distribution in ('normal', 'studentt'):
-        # sigma_y ~ HalfNormal(2 * sigma_hat), sigma_hat = reference-group SD
-        # (studentt uses the same sigma_y prior; its nu_y is fixed at 3 in fit_ntc)
-        sigma_y = dist.HalfNormal(2.0 * sigma_hat_tensor).sample((nsamples,))  # (nsamples, T)
-        prior_samples['sigma_y'] = sigma_y
+        if params is not None:
+            # sigma_y ~ HalfNormal(2 * sigma_hat), sigma_hat = reference-group SD
+            # (studentt uses the same sigma_y prior; its nu_y is fixed at 3 in fit_ntc)
+            prior_samples['sigma_y'] = _sample_where_valid(
+                lambda s: dist.HalfNormal(2.0 * s), params, ['sigma_hat'], nsamples)
 
-        # mu_ntc ~ Normal(mu_x_mean, mu_x_sd) with data-driven parameters
-        mu_ntc = dist.Normal(mu_x_mean_tensor, mu_x_sd_tensor).sample((nsamples,))
-        prior_samples['mu_ntc'] = mu_ntc
+            # mu_ntc ~ Normal(mu_x_mean, mu_x_sd)
+            prior_samples['mu_ntc'] = _sample_where_valid(
+                lambda m, s: dist.Normal(m, s), params, ['mu_x_mean', 'mu_x_sd'], nsamples)
 
     elif distribution == 'binomial':
         # mu_ntc ~ Beta(a, b) with empirical Bayes parameters from NTC data

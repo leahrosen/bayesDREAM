@@ -701,6 +701,18 @@ class ModelLoader:
                         'n_features': n_features
                     }
 
+                    # Data-driven prior parameters fit_ntc used; absent in fits saved
+                    # before they were recorded (prior sampling then omits the
+                    # data-driven priors rather than approximating them).
+                    if loaded_data.get('prior_params') is not None:
+                        if getattr(self.model, 'ntc_prior_params', None) is None:
+                            self.model.ntc_prior_params = {}
+                        _pp = dict(loaded_data['prior_params'])
+                        self.model.ntc_prior_params[mod_name] = pd.DataFrame(
+                            {k: v for k, v in _pp.items() if k != 'feature_id'},
+                            index=pd.Index(_pp['feature_id'], name='feature_id'),
+                        )
+
                     if loaded_data.get('loss_ntc') is not None:
                         mod.loss_ntc = loaded_data['loss_ntc']
                         mod_loaded.append(f'loss({len(mod.loss_ntc)})')
