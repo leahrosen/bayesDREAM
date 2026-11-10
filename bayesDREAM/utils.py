@@ -864,6 +864,50 @@ def check_tensor(name, tensor):
     print(f"  has Inf: {torch.isinf(tensor).any().item()}")
 
 
+def check_technical_alpha_shape(alpha, C, trailing_shape=(), name="alpha"):
+    """
+    Validate a fit_ntc technical-group point estimate before it is used.
+
+    Technical-group effects (``alpha_x_prefit``, ``alpha_y_prefit_mult``,
+    ``alpha_y_prefit_add``) are always point estimates (posterior medians from
+    ``fit_ntc``) that already include the reference group at index 0.
+    The expected shape is therefore ``(C, *trailing_shape)``:
+
+    - alpha_x: ``(C,)``
+    - alpha_y: ``(C, T)``, or ``(C, T, K)`` for multinomial
+
+    Any other shape (a leading posterior-sample dimension, C-1 groups with
+    the reference row missing, or the wrong feature count) means the value
+    did not come from the current fit_ntc pipeline, so raise instead of
+    trying to reshape it.
+
+    Parameters
+    ----------
+    alpha : torch.Tensor
+        Technical-group effect tensor to validate.
+    C : int
+        Number of technical groups, including the reference group.
+    trailing_shape : tuple of int
+        Expected shape after the group axis (``()`` for alpha_x,
+        ``(T,)`` or ``(T, K)`` for alpha_y).
+    name : str
+        Name used in the error message.
+
+    Raises
+    ------
+    ValueError
+        If ``alpha.shape != (C, *trailing_shape)``.
+    """
+    expected = (int(C),) + tuple(int(d) for d in trailing_shape)
+    if tuple(alpha.shape) != expected:
+        raise ValueError(
+            f"{name} has shape {tuple(alpha.shape)}, expected {expected} "
+            f"(C={C} technical groups including the reference group at index 0). "
+            f"{name} must be the fit_ntc point estimate; re-run fit_ntc() "
+            f"(or load_ntc_fit()) with the current technical groups."
+        )
+
+
 ########################################
 # Lean-loaded posterior detection
 ########################################

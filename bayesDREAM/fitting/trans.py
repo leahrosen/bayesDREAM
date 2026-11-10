@@ -23,7 +23,7 @@ import pyro.optim as optim
 import pyro.infer as infer
 import pyro.poutine as poutine
 
-from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, check_tensor, is_lean_posterior
+from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, check_tensor, is_lean_posterior, check_technical_alpha_shape
 from . import FitterBase
 
 
@@ -1028,64 +1028,16 @@ class TransFitter(FitterBase):
         # IMPORTANT: Samplers in distributions.py handle technical group effects themselves!
         # Do NOT apply alpha_y here - pass it to the sampler via alpha_y_full.
 
-        # Prepare alpha_y_full (full C technical groups, including reference)
-        # This will be passed to samplers, which apply technical groups themselves
-        # Multinomial now supported (additive on logit scale, like binomial)
+        # alpha_y is the fit_ntc point estimate with the reference group already
+        # included: [C, T], or [C, T, K] for multinomial. It is passed to the
+        # samplers, which apply technical-group effects themselves.
         if alpha_y is not None and groups_tensor is not None:
-            # CRITICAL: Check if alpha_y already includes reference group
-            # If alpha_y.shape[0 or 1] == C, it already has reference, don't add it!
-
-            if alpha_y.dim() == 4:  # Predictive multinomial: Could be (S, C-1, T, K) or (S, C, T, K)
-                if alpha_y.shape[1] == C:
-                    # Already includes reference
-                    alpha_y_full = alpha_y
-                else:
-                    # Need to add reference (zeros for additive on logit scale)
-                    baseline_shape = (alpha_y.shape[0], 1, alpha_y.shape[2], alpha_y.shape[3])
-                    baseline = torch.zeros(baseline_shape, device=self.model.device)
-                    alpha_y_full = torch.cat([baseline, alpha_y], dim=1)
-
-            elif alpha_y.dim() == 3:
-                # Could be Predictive 2D (S, C-1, T) or Training multinomial (C-1, T, K) or (C, T, K)
-                # Check if last dimension matches K (multinomial) or T (2D predictive)
-                if distribution == 'multinomial' and K is not None and alpha_y.shape[-1] == K:
-                    # Training multinomial: (C-1, T, K) or (C, T, K)
-                    if alpha_y.shape[0] == C:
-                        # Already includes reference
-                        alpha_y_full = alpha_y
-                    else:
-                        # Need to add reference (zeros for additive on logit scale)
-                        baseline_shape = (1, alpha_y.shape[1], alpha_y.shape[2])
-                        baseline = torch.zeros(baseline_shape, device=self.model.device)
-                        alpha_y_full = torch.cat([baseline, alpha_y], dim=0)
-                else:
-                    # Predictive 2D: (S, C-1, T) or (S, C, T)
-                    if alpha_y.shape[1] == C:
-                        # Already includes reference
-                        alpha_y_full = alpha_y
-                    else:
-                        # Need to add reference (zeros for additive, ones for multiplicative)
-                        ones_shape = (alpha_y.shape[0], 1, T)
-                        if distribution == 'negbinom':
-                            baseline = torch.ones(ones_shape, device=self.model.device)
-                        else:
-                            baseline = torch.zeros(ones_shape, device=self.model.device)
-                        alpha_y_full = torch.cat([baseline, alpha_y], dim=1)
-
-            elif alpha_y.dim() == 2:  # Training 2D: Could be (C-1, T) or (C, T)
-                if alpha_y.shape[0] == C:
-                    # Already includes reference
-                    alpha_y_full = alpha_y
-                else:
-                    # Need to add reference (zeros for additive, ones for multiplicative)
-                    ones_shape = (1, T)
-                    if distribution == 'negbinom':
-                        baseline = torch.ones(ones_shape, device=self.model.device)
-                    else:
-                        baseline = torch.zeros(ones_shape, device=self.model.device)
-                    alpha_y_full = torch.cat([baseline, alpha_y], dim=0)
-            else:
-                raise ValueError(f"Unexpected alpha_y shape: {alpha_y.shape}")
+            check_technical_alpha_shape(
+                alpha_y, C,
+                trailing_shape=(T, K) if distribution == 'multinomial' else (T,),
+                name="alpha_y",
+            )
+            alpha_y_full = alpha_y
         else:
             alpha_y_full = None
 
@@ -2537,13 +2489,14 @@ class TransFitter(FitterBase):
         else:  # 'middle'
             k_center_tensor = (K_max_tensor / 2.0).clamp_min(epsilon_tensor)
 
-        # Diagnostic: Verify alpha_y_prefit is correctly structured
+        # Fail fast (before SVI setup) if alpha_y_prefit is not a [C, T] / [C, T, K]
+        # fit_ntc point estimate; _model_y re-checks on every call.
         if alpha_y_prefit is not None and groups_tensor is not None:
-            print(f"[INFO] Technical correction setup: alpha_y_prefit.shape={alpha_y_prefit.shape}, C={C}")
-            if alpha_y_prefit.shape[0] == C:
-                print(f"[INFO] alpha_y_prefit already includes reference group (correct!)")
-            else:
-                print(f"[WARNING] alpha_y_prefit shape mismatch - may need to add reference group")
+            check_technical_alpha_shape(
+                alpha_y_prefit, C,
+                trailing_shape=(T, K) if distribution == 'multinomial' else (T,),
+                name="alpha_y_prefit",
+            )
 
         # Ensure x_true is on the correct device (may have been loaded from CPU)
         # Always move to device to avoid device comparison issues (cuda vs cuda:0)

@@ -402,26 +402,6 @@ def _fit_shift_multinomial_gam(
 # Loss-matrix helpers  (module-level so they can be tested independently)
 # ---------------------------------------------------------------------------
 
-def _reconstruct_full_alpha_y(alpha_y_raw, C, distribution):
-    """
-    Ensure alpha_y has shape [C, T] (or [C, T, K]) by prepending the
-    reference-group row if only C-1 groups are stored.
-
-    negbinom reference = 1.0 (multiplicative); others = 0.0 (additive).
-    """
-    import torch
-    if alpha_y_raw.shape[0] == C:
-        return alpha_y_raw  # already includes reference
-
-    if distribution == "negbinom":
-        ref = torch.ones((1,) + alpha_y_raw.shape[1:],
-                         dtype=alpha_y_raw.dtype, device=alpha_y_raw.device)
-    else:
-        ref = torch.zeros((1,) + alpha_y_raw.shape[1:],
-                          dtype=alpha_y_raw.dtype, device=alpha_y_raw.device)
-    return torch.cat([ref, alpha_y_raw], dim=0)
-
-
 def _reconstruct_mu_y(
     x_subset,
     function_type,
@@ -1543,8 +1523,10 @@ class DiagnosticsMixin:
         Compute the per-cell, per-gene negative log-likelihood (loss) under the
         fitted trans model.
 
-        The model parameters used are the **posterior means** from
-        ``modality.posterior_samples_trans``.  The loss for each (gene, cell)
+        The dose-response parameters used are the **posterior medians** from
+        ``modality.posterior_samples_trans``; the technical-group effects are
+        ``modality.alpha_y_prefit`` (the fit_ntc point estimate that fit_trans
+        conditions on, since fit_trans does not estimate alpha_y).  The loss for each (gene, cell)
         pair is the negative log-probability of the observed count/measurement
         under the dose-response + technical-group model:
 
@@ -1592,6 +1574,7 @@ class DiagnosticsMixin:
         from .utils import (
             Hill_based_positive_logK,
             Hill_based_positive,
+            check_technical_alpha_shape,
         )
 
         if modality_name is None:
@@ -1724,12 +1707,28 @@ class DiagnosticsMixin:
         n_b       = _pm("n_b")
         o_y       = _pm("o_y")        # [T]
         nu_y      = _pm("nu_y")       # [T] or None
-        alpha_y_raw = _pm("alpha_y")  # [C-1, T] or [C, T] or [C-1, T, K]
 
-        # ---- Reconstruct full alpha_y [C, T] or [C, T, K] -------------------
-        if alpha_y_raw is not None and has_groups:
-            alpha_y_full = _reconstruct_full_alpha_y(alpha_y_raw, C, distribution)
-            alpha_y_full = alpha_y_full.to(dev)
+        # ---- Technical-group effects alpha_y [C, T] or [C, T, K] -------------
+        # fit_trans does not estimate alpha_y (it is never in
+        # posterior_samples_trans); it conditions on the fit_ntc point estimate
+        # stored on the modality, so use exactly that here.
+        if has_groups:
+            alpha_y_full = modality.alpha_y_prefit
+            if alpha_y_full is None:
+                raise RuntimeError(
+                    f"Modality '{modality_name}' has technical groups but no "
+                    "alpha_y_prefit. Run fit_ntc() (or load_ntc_fit()) for this "
+                    "modality so the loss uses the same technical correction as fit_trans()."
+                )
+            check_technical_alpha_shape(
+                alpha_y_full, C,
+                trailing_shape=(
+                    (len(feature_names), modality.counts.shape[2])
+                    if distribution == "multinomial" else (len(feature_names),)
+                ),
+                name="alpha_y_prefit",
+            )
+            alpha_y_full = alpha_y_full.detach().float().to(dev)
         else:
             alpha_y_full = None
 

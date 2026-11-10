@@ -161,63 +161,61 @@ class ModelPlottingMixin:
             return plot_scalar_parameter(prior_samples, post_samples, 'beta_o', metric=metric, **kwargs)
 
         elif param == 'alpha_x':
-            # 1D or 2D parameter (per technical group)
-            if not hasattr(self, 'alpha_x_prefit'):
-                raise ValueError("alpha_x not found. Check if cis gene was included in technical fit.")
+            # alpha_x is not estimated by fit_cis: it is fit_ntc's alpha_y for the
+            # cis gene. Its NTC posterior samples live on the 'cis' modality as
+            # posterior_samples_ntc['alpha_x_mult'] with shape [S, C, 1] (reference
+            # group included); self.alpha_x_prefit is only their [C] median.
+            cis_mod = self.modalities.get('cis')
+            cis_posterior = getattr(cis_mod, 'posterior_samples_ntc', None) if cis_mod is not None else None
+            if not cis_posterior or not any(k in cis_posterior for k in ('alpha_x_mult', 'alpha_x')):
+                raise ValueError(
+                    "alpha_x NTC posterior samples not found on the 'cis' modality. alpha_x is "
+                    "estimated by fit_ntc() (as the cis gene's alpha_y), so run fit_ntc() with "
+                    "the cis gene present, or call add_cis_gene() after fit_ntc()."
+                )
+            require_full_posterior(cis_posterior, "plot_technical_fit('alpha_x')")
 
-            post_samples = self.alpha_x_prefit
-            if hasattr(post_samples, 'numpy'):
-                post_samples = post_samples.numpy()
+            post_samples = cis_posterior.get('alpha_x_mult', cis_posterior.get('alpha_x'))
+            if hasattr(post_samples, 'detach'):
+                post_samples = post_samples.detach().cpu().numpy()
+            post_samples = np.asarray(post_samples)
+            if post_samples.ndim == 3 and post_samples.shape[-1] == 1:
+                post_samples = post_samples[..., 0]  # [S, C, 1] -> [S, C]
+            if post_samples.ndim != 2:
+                raise ValueError(
+                    f"Unexpected alpha_x posterior shape {post_samples.shape}; expected [S, C, 1] or [S, C]."
+                )
+            # Plot on log2 scale, as for alpha_y (reference group = 0)
+            post_samples = np.log2(post_samples + 1e-10)
 
-            # For alpha_x, we need cis priors (will implement below)
-            # For now use technical priors as approximation
-            if 'alpha_x' in prior_dict:
-                prior_samples = prior_dict['alpha_x'].numpy() if hasattr(prior_dict['alpha_x'], 'numpy') else prior_dict['alpha_x']
-            else:
-                # Fall back to alpha_y structure if alpha_x not in prior_dict
-                warnings.warn("alpha_x not in prior_dict - using alpha_y structure as approximation")
-                prior_samples = prior_dict['alpha_y'].numpy() if hasattr(prior_dict['alpha_y'], 'numpy') else prior_dict['alpha_y']
-                if prior_samples.ndim == 3:
-                    prior_samples = prior_samples[:, :, 0]  # Take first gene dimension
+            # Prior: the same fit_ntc prior as alpha_y (identical for every feature),
+            # so any one feature's draw is the alpha_x prior. Prepend the reference row.
+            prior_samples = prior_dict['log2_alpha_y']
+            prior_samples = prior_samples.numpy() if hasattr(prior_samples, 'numpy') else np.asarray(prior_samples)
+            prior_samples = prior_samples[:, :, 0]  # [S, C-1]
+            prior_samples = np.concatenate([np.zeros((prior_samples.shape[0], 1)), prior_samples], axis=1)
 
-            # Get informative technical group names
             group_names = self._get_technical_group_names()
 
-            # Handle different dimensionalities
-            if post_samples.ndim == 1:
-                # (samples,) - single value across all groups
-                return plot_scalar_parameter(prior_samples, post_samples, 'alpha_x', metric=metric, **kwargs)
-            elif post_samples.ndim == 2:
-                # (samples, technical_groups) - one value per group
-                if technical_group_index is not None:
-                    # Check if trying to plot baseline group
-                    if technical_group_index == 0:
-                        # Already caught by earlier check, but this makes it explicit
-                        raise ValueError("Cannot plot technical_group_index=0 (baseline group with no variation)")
+            if technical_group_index is not None:
+                prior_tg = prior_samples[:, technical_group_index]
+                post_tg = post_samples[:, technical_group_index]
+                group_name = group_names[technical_group_index]
+                return plot_scalar_parameter(
+                    prior_tg, post_tg, f'log2(alpha_x) ({group_name})', metric=metric, **kwargs
+                )
 
-                    # Plot single technical group
-                    prior_tg = prior_samples[:, technical_group_index]
-                    post_tg = post_samples[:, technical_group_index]
-                    group_name = group_names[technical_group_index]
+            # Plot all non-reference technical groups as separate "features"
+            if post_samples.shape[1] > 1:
+                prior_samples = prior_samples[:, 1:]
+                post_samples = post_samples[:, 1:]
+                group_names = group_names[1:]
+                print("Note: Excluding baseline technical group (index 0) which has no variation")
 
-                    return plot_scalar_parameter(
-                        prior_tg, post_tg, f'alpha_x ({group_name})', metric=metric, **kwargs
-                    )
-                else:
-                    # Plot all technical groups - treat as separate features
-                    # Exclude baseline group (TG_0) which is always constant
-                    if post_samples.shape[1] > 1:
-                        prior_samples = prior_samples[:, 1:]  # Skip first group
-                        post_samples = post_samples[:, 1:]
-                        group_names = group_names[1:]  # Skip first name
-                        print(f"Note: Excluding baseline technical group (index 0) which has no variation")
-
-                    return plot_1d_parameter(
-                        prior_samples, post_samples, group_names, 'alpha_x',
-                        order_by='input', plot_type='violin', metric=metric, **kwargs
-                    )
-            else:
-                raise ValueError(f"Unexpected alpha_x shape: {post_samples.shape}")
+            return plot_1d_parameter(
+                prior_samples, post_samples, group_names, 'log2(alpha_x)',
+                order_by='input', plot_type='violin', metric=metric, **kwargs
+            )
 
         elif param == 'alpha_y':
             # 1D or 2D parameter: (samples, genes) or (samples, cell_lines, genes)
