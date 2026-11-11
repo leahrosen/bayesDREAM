@@ -553,26 +553,26 @@ class bayesDREAM(
         Parameters
         ----------
         cis_gene : str
-            Name of the cis gene (must exist in the primary modality's feature_meta). If the
-            model was built with guide_target (high-MOI, or single-guide with a guide_target
-            mapping), at least one guide must target it per guide_targets_dict.
-            Otherwise its cells are found via ``meta['target']``: if no cell has
-            ``target == cis_gene``, the gene's other identifiers (feature id and the
-            values in its feature_meta row, e.g. gene_id vs gene_name) are tried, and
-            matching cells are relabelled to ``cis_gene``.
+            Name of the cis gene (must exist in the primary modality's feature_meta). Its
+            cells are found via the guide mapping (high-MOI, or single-guide with a
+            ``guide_target`` mapping), else via ``meta['target']``. In both cases, if
+            ``cis_gene`` itself does not appear, the gene's other identifiers (feature id
+            and the values in its feature_meta row, e.g. gene_id vs gene_name) are tried,
+            and the match is relabelled to ``cis_gene``.
         allow_ntc_only : bool, default False
             Allow committing to a cis gene that no cell targets (an NTC-only fit).
-            By default this raises, since it usually means ``meta['target']`` uses
-            a different naming convention than ``cis_gene``.
+            By default this raises, since it usually means the targets use a different
+            naming convention than ``cis_gene``. A guide mapping in which no guide
+            targets the gene always raises.
 
         Raises
         ------
         ValueError
             If cis_gene is already set, if the gene is not found, if no guide targets it
-            (when a guide_target mapping is in use), if no cell targets it (unless
-            ``allow_ntc_only=True``) or several of its identifiers appear in
-            ``meta['target']``, or if the gene has zero counts or zero variance across
-            NTC + cis cells.
+            (when a guide mapping is in use), if no cell targets it (unless
+            ``allow_ntc_only=True``), if several of its identifiers appear among the
+            targets, or if the gene has zero counts or zero variance across NTC + cis
+            cells. All of these except the last are checked before the model is modified.
         """
         if self.cis_gene is not None:
             raise ValueError(
@@ -608,9 +608,11 @@ class bayesDREAM(
             if isinstance(_v, str) and _v.strip() and _v not in cis_aliases:
                 cis_aliases.append(_v)
 
-        # Resolve cis_gene against meta['target'] (issue #22) BEFORE modifying
+        # Resolve cis_gene against the targets (issue #22) BEFORE modifying
         # anything, so a failure leaves the model untouched and add_cis_gene()
-        # can be retried.
+        # can be retried. Exactly one of these applies, depending on whether
+        # targets come from a guide mapping or from meta['target'].
+        self._resolve_cis_target_in_guide_map(cis_gene, cis_aliases, allow_ntc_only)
         self._resolve_cis_target_in_meta(cis_gene, cis_aliases, allow_ntc_only)
 
         # ----------------------------------------------------------------
@@ -711,11 +713,7 @@ class bayesDREAM(
                 pos_idx for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows())
                 if cis_gene in self.guide_targets_dict.get(guide_row['guide'], [])
             ])
-            if len(cis_guide_indices) == 0:
-                raise ValueError(
-                    f"No guide in guide_targets_dict targets '{cis_gene}'. "
-                    f"Cannot commit to this cis gene in high-MOI mode."
-                )
+            # (non-empty: checked up front by _resolve_cis_target_in_guide_map)
             has_cis_guide = self.guide_assignment[:, cis_guide_indices].sum(axis=1) > 0
             new_targets = self.meta['target'].tolist()
             for i, has_cis in enumerate(has_cis_guide):
@@ -728,11 +726,6 @@ class bayesDREAM(
             # to cis_gene yet (unknown), so it landed in 'ntc'/'other'. Now that
             # cis_gene is known, reclassify any cell whose guide's plausible targets
             # include cis_gene.
-            if not any(cis_gene in targets for targets in self.guide_targets_dict.values()):
-                raise ValueError(
-                    f"No guide in guide_target maps to '{cis_gene}'. "
-                    f"Cannot commit to this cis gene."
-                )
             has_cis_guide = self.meta['guide'].map(
                 lambda g: cis_gene in self.guide_targets_dict.get(g, [])
             ).values
@@ -745,14 +738,8 @@ class bayesDREAM(
         # ----------------------------------------------------------------
         # Step 5b: subset cells to NTC + cis
         # ----------------------------------------------------------------
-        n_cis_cells = int((self.meta['target'] == cis_gene).sum())
-        if n_cis_cells == 0 and not allow_ntc_only:
-            # Reached only in guide-mapping modes (meta['target'] mode is checked
-            # up front by _resolve_cis_target_in_meta, before anything is modified)
-            raise ValueError(
-                f"add_cis_gene('{cis_gene}'): no cells are assigned to '{cis_gene}' after "
-                f"guide-based reclassification. Pass allow_ntc_only=True to fit NTC cells only."
-            )
+        # (zero cis cells is only possible here with allow_ntc_only=True; checked
+        # up front by the _resolve_cis_target_in_* helpers)
         valid_cells = set(self.meta[self.meta['target'].isin(['ntc', cis_gene])]['cell'].unique())
         n_before = len(self.meta)
         keep_mask = self.meta['cell'].isin(valid_cells).values
@@ -848,6 +835,77 @@ class bayesDREAM(
         'other', 'excluded',
     })
 
+    def _resolve_cis_target_in_guide_map(self, cis_gene: str, cis_aliases: list,
+                                         allow_ntc_only: bool) -> None:
+        """
+        Guide-mapping counterpart of _resolve_cis_target_in_meta (issue #22):
+        make sure ``cis_gene`` appears in ``guide_targets_dict`` and that some
+        cell carries a guide targeting it. Called by add_cis_gene() before it
+        modifies anything, so a failure leaves the model untouched.
+
+        Applies in high-MOI mode and in single-guide mode with a ``guide_target``
+        mapping; a no-op otherwise.
+
+        - If no guide targets ``cis_gene``, try the gene's other identifiers
+          (``cis_aliases``). If exactly one appears in the mapping, relabel it to
+          ``cis_gene`` in ``guide_targets_dict`` (and in ``guide_meta['target']``
+          if present). If several appear, or none, raise.
+        - If no (non-excluded) cell carries a guide targeting the gene, raise
+          unless ``allow_ntc_only=True``.
+        """
+        if not (self.is_high_moi or self.guide_targets_dict is not None):
+            return
+
+        mapped = {t for targets in self.guide_targets_dict.values() for t in targets}
+        label = cis_gene
+        if cis_gene not in mapped:
+            candidates = [a for a in cis_aliases
+                          if a != cis_gene and a not in self._NON_GENE_TARGET_LABELS]
+            matched = [a for a in candidates if a in mapped]
+            if len(matched) > 1:
+                raise ValueError(
+                    f"add_cis_gene('{cis_gene}'): no guide targets '{cis_gene}', and several "
+                    f"other identifiers of this feature appear in the guide mapping: {matched}. "
+                    f"Use one identifier per gene in guide_target, then retry."
+                )
+            if not matched:
+                example = sorted(t for t in mapped if t not in self._NON_GENE_TARGET_LABELS)[:10]
+                raise ValueError(
+                    f"add_cis_gene('{cis_gene}'): No guide in guide_target maps to "
+                    f"'{cis_gene}' or any other identifier of this feature "
+                    f"({candidates or 'none'}). Check that guide_target uses the same naming "
+                    f"as the feature (example targets: {example})."
+                )
+            label = matched[0]
+
+        # Cells carrying a guide that targets the gene (excluded cells never count)
+        if self.is_high_moi:
+            guide_idx = [
+                pos for pos, g in enumerate(self.guide_meta['guide'])
+                if label in self.guide_targets_dict.get(g, [])
+            ]
+            has_guide = np.asarray(self.guide_assignment[:, guide_idx].sum(axis=1)).ravel() > 0
+            n_cells = int((has_guide & (self.meta['target'].values != 'excluded')).sum())
+        else:
+            n_cells = int(self.meta['guide'].map(
+                lambda g: label in self.guide_targets_dict.get(g, [])).sum())
+        if n_cells == 0 and not allow_ntc_only:
+            raise ValueError(
+                f"add_cis_gene('{cis_gene}'): guides targeting '{label}' exist in the mapping, "
+                f"but no retained cell carries one. Pass allow_ntc_only=True to fit NTC cells only."
+            )
+
+        if label != cis_gene:
+            self.guide_targets_dict = {
+                g: [cis_gene if t == label else t for t in targets]
+                for g, targets in self.guide_targets_dict.items()
+            }
+            if self.is_high_moi and 'target' in self.guide_meta.columns:
+                self.guide_meta['target'] = self.guide_meta['target'].replace(label, cis_gene)
+            print(f"[INFO] add_cis_gene: no guide targets '{cis_gene}', but guides target "
+                  f"'{label}', another identifier of the same feature; relabelled it to "
+                  f"'{cis_gene}' in the guide mapping.")
+
     def _resolve_cis_target_in_meta(self, cis_gene: str, cis_aliases: list,
                                     allow_ntc_only: bool) -> None:
         """
@@ -857,7 +915,8 @@ class bayesDREAM(
 
         Only applies when targets come from ``meta['target']`` directly; in
         high-MOI mode or with a ``guide_target`` mapping, add_cis_gene()
-        reclassifies cells from the guide mapping instead.
+        reclassifies cells from the guide mapping instead (see
+        _resolve_cis_target_in_guide_map).
 
         - Cells with ``target == cis_gene``: nothing to do.
         - Otherwise, try the gene's other identifiers (``cis_aliases``: its
