@@ -58,9 +58,9 @@ def _align_tensor(tensor, saved_names, target_names, dim):
     t = tensor.transpose(dim, tensor.ndim - 1)        # [..., T_saved]
     out_shape = t.shape[:-1] + (n_target,)
     if t.is_floating_point():
-        out = torch.full(out_shape, float('nan'), dtype=t.dtype)
+        out = torch.full(out_shape, float('nan'), dtype=t.dtype, device=t.device)
     else:
-        out = torch.zeros(out_shape, dtype=t.dtype)
+        out = torch.zeros(out_shape, dtype=t.dtype, device=t.device)
     for ci, si in enumerate(mapping):
         if si >= 0:
             out[..., ci] = t[..., si]

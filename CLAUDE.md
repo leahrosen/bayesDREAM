@@ -214,7 +214,7 @@ for gene in ['GFI1B', 'MYB', 'TET2']:
 3. If `fit_ntc()` has already run: calls `_extract_cis_alpha_from_ntc_posteriors()` — pulls the gene's alpha from the primary modality posteriors into the cis modality and trims it from the primary posteriors; sets `self.alpha_x_prefit`
 4. Removes the cis gene from the primary modality (counts + feature_meta, index reset)
 5. Subsets `self.meta` and all modalities to NTC + cis cells
-6. Calls `_refilter_zero_count_features()` — drops features that became zero-count after cell subsetting; trims matching axes in stored NTC posteriors via `_trim_feature_axis_in_posteriors()`
+6. Rebuilding each modality on the retained cells (`get_cell_subset()`) drops features that became zero-count or zero-variance there; `_transfer_ntc_results()` trims the stored NTC results (`posterior_samples_ntc`, `alpha_y_prefit_*`) to the surviving features **by feature id** (issue #24). Raises if the cis gene itself is zero-count/constant across the retained cells
 7. Recomputes `guide_code` as compact integers over the retained cells
 8. Reinitialises `sum_factors` on the final cell set
 

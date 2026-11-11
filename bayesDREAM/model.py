@@ -532,9 +532,12 @@ class bayesDREAM(
            init: reclassifies any cell whose guide(s) target ``cis_gene`` from 'ntc'/'other' to
            ``cis_gene`` (excluded cells are never reclassified). In high-MOI mode this also
            prunes guide_assignment/guide_meta/guide_targets_dict down to NTC + cis-gene guides.
-        3. Subsets cells to NTC + cis-targeting cells only.
-        4. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
-           already been run, trims matching feature axes in the stored posteriors.
+        3. Subsets cells to NTC + cis-targeting cells only. Rebuilding each modality on the
+           retained cells drops features that became zero-count or zero-variance there; if
+           fit_ntc() has already been run, the stored NTC results (posterior_samples_ntc,
+           alpha_y_prefit_*) are trimmed to the surviving features by feature id. Raises if
+           the cis gene itself is zero-count or constant across the retained cells.
+        4. (see 3)
         5. If fit_ntc() has already been run, extracts the cis gene's overdispersion parameters
            from the primary modality posteriors into the 'cis' modality (equivalent to having
            set cis_gene at init time).
@@ -651,13 +654,14 @@ class bayesDREAM(
             min_count=primary_mod.min_count,
         )
 
-        # Transfer already-trimmed fitting results to the new primary modality object
-        if ntc_ran:
-            new_primary_mod.posterior_samples_ntc = primary_mod.posterior_samples_ntc
-            new_primary_mod.alpha_y_prefit_mult = primary_mod.alpha_y_prefit_mult
-            new_primary_mod.alpha_y_prefit_add = primary_mod.alpha_y_prefit_add
-            if hasattr(primary_mod, 'loss_ntc'):
-                new_primary_mod.loss_ntc = primary_mod.loss_ntc
+        # Transfer already cis-trimmed fitting results to the new primary modality
+        # object. Constructing a Modality can itself drop features (zero-count /
+        # zero-variance filter), so align by feature id rather than assuming the
+        # feature set is unchanged.
+        # (_extract_cis_alpha_from_ntc_posteriors already removed the cis gene from
+        # the results, so they are indexed by the trans features.)
+        self._transfer_ntc_results(primary_mod, new_primary_mod,
+                                   results_feature_ids=trans_feature_names)
 
         self.modalities[self.primary_modality] = new_primary_mod
         self.cis_gene = cis_gene
@@ -733,13 +737,18 @@ class bayesDREAM(
             if mod.cell_names is not None:
                 cell_idx = [i for i, c in enumerate(mod.cell_names) if c in valid_cells]
                 if len(cell_idx) < len(mod.cell_names):
+                    # get_cell_subset() builds a new Modality, whose __init__ drops
+                    # features that became zero-count or zero-variance across the
+                    # retained cells; _transfer_ntc_results trims the fit_ntc
+                    # results to the surviving features by id (issue #24).
                     new_mod = mod.get_cell_subset(cell_idx)
-                    # Forward fitting results to cell-subsetted copy
-                    new_mod.posterior_samples_ntc = mod.posterior_samples_ntc
-                    new_mod.alpha_y_prefit_mult    = mod.alpha_y_prefit_mult
-                    new_mod.alpha_y_prefit_add     = mod.alpha_y_prefit_add
-                    if hasattr(mod, 'loss_ntc'):
-                        new_mod.loss_ntc = mod.loss_ntc
+                    if mod_name == 'cis' and new_mod.dims['n_features'] == 0:
+                        raise ValueError(
+                            f"Cis gene '{cis_gene}' has zero counts or zero variance across "
+                            f"the retained NTC + {cis_gene} cells ({len(cell_idx)} cells), "
+                            f"so it cannot be modelled."
+                        )
+                    self._transfer_ntc_results(mod, new_mod)
                     self.modalities[mod_name] = new_mod
 
         # ----------------------------------------------------------------
@@ -775,9 +784,10 @@ class bayesDREAM(
             )
 
         # ----------------------------------------------------------------
-        # Step 6: re-filter zero-count features after cell subsetting
+        # Step 6: (features that became zero-count/zero-variance after cell
+        # subsetting were already dropped by get_cell_subset() in step 5b, with
+        # NTC results trimmed to match by _transfer_ntc_results)
         # ----------------------------------------------------------------
-        self._refilter_zero_count_features(ntc_ran)
 
         # ----------------------------------------------------------------
         # Step 7: recompute guide_code for compact indices over retained cells
@@ -888,53 +898,84 @@ class bayesDREAM(
         print(f"[INFO] Trimmed '{cis_gene}' from primary modality posteriors "
               f"(T {T} → {len(trans_idx)})")
 
-    def _refilter_zero_count_features(self, ntc_ran: bool) -> None:
+    @staticmethod
+    def _transfer_ntc_results(old_mod: 'Modality', new_mod: 'Modality',
+                              results_feature_ids: Optional[list] = None) -> None:
         """
-        After cell subsetting in add_cis_gene(), drop features that have become
-        zero-count across the retained NTC + cis cells.  If fit_ntc() has already
-        been run, trim the corresponding axes in the stored NTC posteriors so they
-        stay aligned with the surviving feature set.
+        Attach old_mod's fit_ntc results to new_mod (a rebuilt copy of the same
+        modality), aligned to new_mod's features by feature id.
 
-        Operates on every modality except 'cis' (which is a single feature and
-        cannot usefully be dropped here).
+        Building a Modality (directly, or via get_cell_subset()/get_feature_subset())
+        runs its zero-count/zero-variance feature filter, so new_mod may hold
+        fewer features than old_mod. Copying posterior_samples_ntc /
+        alpha_y_prefit_* across unchanged would leave them longer than the
+        modality's feature axis (issue #24). Every feature-axis tensor is instead
+        reindexed by name (io.load._align_posterior_features, which also handles
+        the multinomial [..., T, K] layout).
+
+        Parameters
+        ----------
+        old_mod, new_mod : Modality
+        results_feature_ids : list, optional
+            Feature ids that old_mod's fit_ntc results are indexed by. Defaults to
+            old_mod.feature_ids; pass it when the results were already trimmed
+            separately (e.g. the cis gene removed from the primary posteriors).
+
+        Raises if new_mod has a feature the results do not cover, or if the
+        alpha_y_prefit arrays do not have one entry per results feature.
         """
-        for mod_name, mod in list(self.modalities.items()):
-            if mod_name == 'cis':
-                continue
+        from .io.load import _align_posterior_features
 
-            n_features = mod.dims['n_features']
+        has_results = (old_mod.posterior_samples_ntc is not None
+                       or old_mod.alpha_y_prefit_mult is not None
+                       or old_mod.alpha_y_prefit_add is not None)
+        if hasattr(old_mod, 'loss_ntc'):
+            new_mod.loss_ntc = old_mod.loss_ntc
+        if not has_results:
+            return
 
-            # Compute per-feature total counts (works for dense, sparse, multinomial)
-            if mod.distribution == 'multinomial':
-                raw = mod.counts  # [F, N, K]
-                feature_sums = np.array(raw.sum(axis=(1, 2))).flatten()
-            elif mod.cells_axis == 1:
-                feature_sums = np.array(mod.counts.sum(axis=1)).flatten()
-            else:
-                feature_sums = np.array(mod.counts.sum(axis=0)).flatten()
+        if results_feature_ids is None:
+            results_feature_ids = old_mod.feature_ids
+        old_ids = list(results_feature_ids) if results_feature_ids is not None else None
+        new_ids = list(new_mod.feature_ids) if new_mod.feature_ids is not None else None
+        if old_ids is None or new_ids is None:
+            raise ValueError(
+                f"Cannot carry fit_ntc results for modality '{old_mod.name}' across a rebuild "
+                f"without feature ids on both the old and the new modality."
+            )
+        unknown = [f for f in new_ids if f not in set(old_ids)]
+        if unknown:
+            raise ValueError(
+                f"Internal error: rebuilt modality '{new_mod.name}' has feature(s) not in the "
+                f"fit_ntc results: {unknown[:5]}"
+            )
+        # alpha_y_prefit_* are [C, T] / [C, T, K]: the feature axis is dim 1.
+        for _name in ('alpha_y_prefit_mult', 'alpha_y_prefit_add'):
+            _a = getattr(old_mod, _name)
+            if _a is not None and (_a.ndim < 2 or _a.shape[1] != len(old_ids)):
+                raise ValueError(
+                    f"Internal error: {old_mod.name}.{_name} has shape {tuple(_a.shape)}, "
+                    f"expected {len(old_ids)} features on dim 1."
+                )
 
-            keep_idx = np.where(feature_sums > 0)[0]
-            n_dropped = n_features - len(keep_idx)
+        if old_ids == new_ids:
+            new_mod.posterior_samples_ntc = old_mod.posterior_samples_ntc
+            new_mod.alpha_y_prefit_mult = old_mod.alpha_y_prefit_mult
+            new_mod.alpha_y_prefit_add = old_mod.alpha_y_prefit_add
+            return
 
-            if n_dropped == 0:
-                continue
+        n_old = len(old_ids)
+        if old_mod.posterior_samples_ntc is not None:
+            new_mod.posterior_samples_ntc, _ = _align_posterior_features(
+                old_mod.posterior_samples_ntc, old_ids, new_ids, n_old)
+        alphas, _ = _align_posterior_features(
+            {'mult': old_mod.alpha_y_prefit_mult, 'add': old_mod.alpha_y_prefit_add},
+            old_ids, new_ids, n_old)
+        new_mod.alpha_y_prefit_mult = alphas['mult']
+        new_mod.alpha_y_prefit_add = alphas['add']
 
-            print(f"[INFO] add_cis_gene: dropping {n_dropped} zero-count features "
-                  f"from modality '{mod_name}' after cell subsetting")
-
-            # Trim posteriors on the existing modality object BEFORE creating subset
-            if mod.posterior_samples_ntc is not None:
-                self._trim_feature_axis_in_posteriors(mod, keep_idx, n_features)
-
-            # Create feature-subsetted copy and re-attach fitting results
-            new_mod = mod.get_feature_subset(keep_idx.tolist())
-            new_mod.posterior_samples_ntc = mod.posterior_samples_ntc  # already trimmed
-            new_mod.alpha_y_prefit_mult   = mod.alpha_y_prefit_mult
-            new_mod.alpha_y_prefit_add    = mod.alpha_y_prefit_add
-            if hasattr(mod, 'loss_ntc'):
-                new_mod.loss_ntc = mod.loss_ntc
-
-            self.modalities[mod_name] = new_mod
+        print(f"[INFO] Trimmed fit_ntc results for modality '{new_mod.name}' to its "
+              f"{len(new_ids)} remaining features ({n_old - len(new_ids)} dropped)")
 
     @staticmethod
     def _trim_feature_axis_in_posteriors(
