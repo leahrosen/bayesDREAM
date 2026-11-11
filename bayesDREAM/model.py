@@ -518,7 +518,7 @@ class bayesDREAM(
     # Deferred cis-gene specification
     # ------------------------------------------------------------------
 
-    def add_cis_gene(self, cis_gene: str) -> None:
+    def add_cis_gene(self, cis_gene: str, allow_ntc_only: bool = False) -> None:
         """
         Specify the cis gene after initialization and prepare the model for cis/trans fitting.
 
@@ -532,9 +532,12 @@ class bayesDREAM(
            init: reclassifies any cell whose guide(s) target ``cis_gene`` from 'ntc'/'other' to
            ``cis_gene`` (excluded cells are never reclassified). In high-MOI mode this also
            prunes guide_assignment/guide_meta/guide_targets_dict down to NTC + cis-gene guides.
-        3. Subsets cells to NTC + cis-targeting cells only.
-        4. Re-filters features that become zero-count after cell subsetting; if fit_ntc() has
-           already been run, trims matching feature axes in the stored posteriors.
+        3. Subsets cells to NTC + cis-targeting cells only. Rebuilding each modality on the
+           retained cells drops features that became zero-count or zero-variance there; if
+           fit_ntc() has already been run, the stored NTC results (posterior_samples_ntc,
+           alpha_y_prefit_*) are trimmed to the surviving features by feature id. Raises if
+           the cis gene itself is zero-count or constant across the retained cells.
+        4. (see 3)
         5. If fit_ntc() has already been run, extracts the cis gene's overdispersion parameters
            from the primary modality posteriors into the 'cis' modality (equivalent to having
            set cis_gene at init time).
@@ -550,16 +553,26 @@ class bayesDREAM(
         Parameters
         ----------
         cis_gene : str
-            Name of the cis gene (must exist in the primary modality's feature_meta). If the
-            model was built with guide_target (high-MOI, or single-guide with a guide_target
-            mapping), at least one guide must target it per guide_targets_dict.
+            Name of the cis gene (must exist in the primary modality's feature_meta). Its
+            cells are found via the guide mapping (high-MOI, or single-guide with a
+            ``guide_target`` mapping), else via ``meta['target']``. In both cases, if
+            ``cis_gene`` itself does not appear, the gene's other identifiers (feature id
+            and the values in its feature_meta row, e.g. gene_id vs gene_name) are tried,
+            and the match is relabelled to ``cis_gene``.
+        allow_ntc_only : bool, default False
+            Allow committing to a cis gene that no cell targets (an NTC-only fit).
+            By default this raises, since it usually means the targets use a different
+            naming convention than ``cis_gene``. A guide mapping in which no guide
+            targets the gene always raises.
 
         Raises
         ------
         ValueError
             If cis_gene is already set, if the gene is not found, if no guide targets it
-            (when a guide_target mapping is in use), or if the gene has zero counts across
-            NTC + cis cells.
+            (when a guide mapping is in use), if no cell targets it (unless
+            ``allow_ntc_only=True``), if several of its identifiers appear among the
+            targets, or if the gene has zero counts or zero variance across NTC + cis
+            cells. All of these except the last are checked before the model is modified.
         """
         if self.cis_gene is not None:
             raise ValueError(
@@ -585,6 +598,22 @@ class bayesDREAM(
 
         print(f"[INFO] add_cis_gene: found '{cis_gene}' at feature iloc {cis_feat_iloc} "
               f"in primary modality (of {n_total_features} features)")
+
+        # Every identifier this gene is known by (feature id + string-valued cells
+        # of its feature_meta row), for matching meta['target'] in step 5a'.
+        cis_aliases = []
+        if primary_mod.feature_ids is not None:
+            cis_aliases.append(str(primary_mod.feature_ids[cis_feat_iloc]))
+        for _v in primary_mod.feature_meta.iloc[cis_feat_iloc].tolist():
+            if isinstance(_v, str) and _v.strip() and _v not in cis_aliases:
+                cis_aliases.append(_v)
+
+        # Resolve cis_gene against the targets (issue #22) BEFORE modifying
+        # anything, so a failure leaves the model untouched and add_cis_gene()
+        # can be retried. Exactly one of these applies, depending on whether
+        # targets come from a guide mapping or from meta['target'].
+        self._resolve_cis_target_in_guide_map(cis_gene, cis_aliases, allow_ntc_only)
+        self._resolve_cis_target_in_meta(cis_gene, cis_aliases, allow_ntc_only)
 
         # ----------------------------------------------------------------
         # Step 2: extract cis gene counts from primary modality
@@ -651,13 +680,14 @@ class bayesDREAM(
             min_count=primary_mod.min_count,
         )
 
-        # Transfer already-trimmed fitting results to the new primary modality object
-        if ntc_ran:
-            new_primary_mod.posterior_samples_ntc = primary_mod.posterior_samples_ntc
-            new_primary_mod.alpha_y_prefit_mult = primary_mod.alpha_y_prefit_mult
-            new_primary_mod.alpha_y_prefit_add = primary_mod.alpha_y_prefit_add
-            if hasattr(primary_mod, 'loss_ntc'):
-                new_primary_mod.loss_ntc = primary_mod.loss_ntc
+        # Transfer already cis-trimmed fitting results to the new primary modality
+        # object. Constructing a Modality can itself drop features (zero-count /
+        # zero-variance filter), so align by feature id rather than assuming the
+        # feature set is unchanged.
+        # (_extract_cis_alpha_from_ntc_posteriors already removed the cis gene from
+        # the results, so they are indexed by the trans features.)
+        self._transfer_ntc_results(primary_mod, new_primary_mod,
+                                   results_feature_ids=trans_feature_names)
 
         self.modalities[self.primary_modality] = new_primary_mod
         self.cis_gene = cis_gene
@@ -683,11 +713,7 @@ class bayesDREAM(
                 pos_idx for pos_idx, (_, guide_row) in enumerate(self.guide_meta.iterrows())
                 if cis_gene in self.guide_targets_dict.get(guide_row['guide'], [])
             ])
-            if len(cis_guide_indices) == 0:
-                raise ValueError(
-                    f"No guide in guide_targets_dict targets '{cis_gene}'. "
-                    f"Cannot commit to this cis gene in high-MOI mode."
-                )
+            # (non-empty: checked up front by _resolve_cis_target_in_guide_map)
             has_cis_guide = self.guide_assignment[:, cis_guide_indices].sum(axis=1) > 0
             new_targets = self.meta['target'].tolist()
             for i, has_cis in enumerate(has_cis_guide):
@@ -700,11 +726,6 @@ class bayesDREAM(
             # to cis_gene yet (unknown), so it landed in 'ntc'/'other'. Now that
             # cis_gene is known, reclassify any cell whose guide's plausible targets
             # include cis_gene.
-            if not any(cis_gene in targets for targets in self.guide_targets_dict.values()):
-                raise ValueError(
-                    f"No guide in guide_target maps to '{cis_gene}'. "
-                    f"Cannot commit to this cis gene."
-                )
             has_cis_guide = self.meta['guide'].map(
                 lambda g: cis_gene in self.guide_targets_dict.get(g, [])
             ).values
@@ -717,6 +738,8 @@ class bayesDREAM(
         # ----------------------------------------------------------------
         # Step 5b: subset cells to NTC + cis
         # ----------------------------------------------------------------
+        # (zero cis cells is only possible here with allow_ntc_only=True; checked
+        # up front by the _resolve_cis_target_in_* helpers)
         valid_cells = set(self.meta[self.meta['target'].isin(['ntc', cis_gene])]['cell'].unique())
         n_before = len(self.meta)
         keep_mask = self.meta['cell'].isin(valid_cells).values
@@ -733,13 +756,18 @@ class bayesDREAM(
             if mod.cell_names is not None:
                 cell_idx = [i for i, c in enumerate(mod.cell_names) if c in valid_cells]
                 if len(cell_idx) < len(mod.cell_names):
+                    # get_cell_subset() builds a new Modality, whose __init__ drops
+                    # features that became zero-count or zero-variance across the
+                    # retained cells; _transfer_ntc_results trims the fit_ntc
+                    # results to the surviving features by id (issue #24).
                     new_mod = mod.get_cell_subset(cell_idx)
-                    # Forward fitting results to cell-subsetted copy
-                    new_mod.posterior_samples_ntc = mod.posterior_samples_ntc
-                    new_mod.alpha_y_prefit_mult    = mod.alpha_y_prefit_mult
-                    new_mod.alpha_y_prefit_add     = mod.alpha_y_prefit_add
-                    if hasattr(mod, 'loss_ntc'):
-                        new_mod.loss_ntc = mod.loss_ntc
+                    if mod_name == 'cis' and new_mod.dims['n_features'] == 0:
+                        raise ValueError(
+                            f"Cis gene '{cis_gene}' has zero counts or zero variance across "
+                            f"the retained NTC + {cis_gene} cells ({len(cell_idx)} cells), "
+                            f"so it cannot be modelled."
+                        )
+                    self._transfer_ntc_results(mod, new_mod)
                     self.modalities[mod_name] = new_mod
 
         # ----------------------------------------------------------------
@@ -775,9 +803,10 @@ class bayesDREAM(
             )
 
         # ----------------------------------------------------------------
-        # Step 6: re-filter zero-count features after cell subsetting
+        # Step 6: (features that became zero-count/zero-variance after cell
+        # subsetting were already dropped by get_cell_subset() in step 5b, with
+        # NTC results trimmed to match by _transfer_ntc_results)
         # ----------------------------------------------------------------
-        self._refilter_zero_count_features(ntc_ran)
 
         # ----------------------------------------------------------------
         # Step 7: recompute guide_code for compact indices over retained cells
@@ -800,6 +829,143 @@ class bayesDREAM(
               f"{self.modalities[self.primary_modality].dims['n_features']} trans features, "
               f"{'NTC posteriors transferred' if ntc_ran else 'fit_ntc() not yet run'}.")
 
+    # meta['target'] labels that are never identifiers of a gene
+    _NON_GENE_TARGET_LABELS = frozenset({
+        'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting',
+        'other', 'excluded',
+    })
+
+    def _resolve_cis_target_in_guide_map(self, cis_gene: str, cis_aliases: list,
+                                         allow_ntc_only: bool) -> None:
+        """
+        Guide-mapping counterpart of _resolve_cis_target_in_meta (issue #22):
+        make sure ``cis_gene`` appears in ``guide_targets_dict`` and that some
+        cell carries a guide targeting it. Called by add_cis_gene() before it
+        modifies anything, so a failure leaves the model untouched.
+
+        Applies in high-MOI mode and in single-guide mode with a ``guide_target``
+        mapping; a no-op otherwise.
+
+        - If no guide targets ``cis_gene``, try the gene's other identifiers
+          (``cis_aliases``). If exactly one appears in the mapping, relabel it to
+          ``cis_gene`` in ``guide_targets_dict`` (and in ``guide_meta['target']``
+          if present). If several appear, or none, raise.
+        - If no (non-excluded) cell carries a guide targeting the gene, raise
+          unless ``allow_ntc_only=True``.
+        """
+        if not (self.is_high_moi or self.guide_targets_dict is not None):
+            return
+
+        mapped = {t for targets in self.guide_targets_dict.values() for t in targets}
+        label = cis_gene
+        if cis_gene not in mapped:
+            candidates = [a for a in cis_aliases
+                          if a != cis_gene and a not in self._NON_GENE_TARGET_LABELS]
+            matched = [a for a in candidates if a in mapped]
+            if len(matched) > 1:
+                raise ValueError(
+                    f"add_cis_gene('{cis_gene}'): no guide targets '{cis_gene}', and several "
+                    f"other identifiers of this feature appear in the guide mapping: {matched}. "
+                    f"Use one identifier per gene in guide_target, then retry."
+                )
+            if not matched:
+                example = sorted(t for t in mapped if t not in self._NON_GENE_TARGET_LABELS)[:10]
+                raise ValueError(
+                    f"add_cis_gene('{cis_gene}'): No guide in guide_target maps to "
+                    f"'{cis_gene}' or any other identifier of this feature "
+                    f"({candidates or 'none'}). Check that guide_target uses the same naming "
+                    f"as the feature (example targets: {example})."
+                )
+            label = matched[0]
+
+        # Cells carrying a guide that targets the gene (excluded cells never count)
+        if self.is_high_moi:
+            guide_idx = [
+                pos for pos, g in enumerate(self.guide_meta['guide'])
+                if label in self.guide_targets_dict.get(g, [])
+            ]
+            has_guide = np.asarray(self.guide_assignment[:, guide_idx].sum(axis=1)).ravel() > 0
+            n_cells = int((has_guide & (self.meta['target'].values != 'excluded')).sum())
+        else:
+            n_cells = int(self.meta['guide'].map(
+                lambda g: label in self.guide_targets_dict.get(g, [])).sum())
+        if n_cells == 0 and not allow_ntc_only:
+            raise ValueError(
+                f"add_cis_gene('{cis_gene}'): guides targeting '{label}' exist in the mapping, "
+                f"but no retained cell carries one. Pass allow_ntc_only=True to fit NTC cells only."
+            )
+
+        if label != cis_gene:
+            self.guide_targets_dict = {
+                g: [cis_gene if t == label else t for t in targets]
+                for g, targets in self.guide_targets_dict.items()
+            }
+            if self.is_high_moi and 'target' in self.guide_meta.columns:
+                self.guide_meta['target'] = self.guide_meta['target'].replace(label, cis_gene)
+            print(f"[INFO] add_cis_gene: no guide targets '{cis_gene}', but guides target "
+                  f"'{label}', another identifier of the same feature; relabelled it to "
+                  f"'{cis_gene}' in the guide mapping.")
+
+    def _resolve_cis_target_in_meta(self, cis_gene: str, cis_aliases: list,
+                                    allow_ntc_only: bool) -> None:
+        """
+        Make sure the cells targeting cis_gene are labelled ``cis_gene`` in
+        ``meta['target']`` (issue #22). Called by add_cis_gene() before it
+        modifies anything.
+
+        Only applies when targets come from ``meta['target']`` directly; in
+        high-MOI mode or with a ``guide_target`` mapping, add_cis_gene()
+        reclassifies cells from the guide mapping instead (see
+        _resolve_cis_target_in_guide_map).
+
+        - Cells with ``target == cis_gene``: nothing to do.
+        - Otherwise, try the gene's other identifiers (``cis_aliases``: its
+          feature id and the string values of its feature_meta row). If exactly
+          one distinct target value matches, relabel those cells to cis_gene. If
+          several match, raise (ambiguous).
+        - If nothing matches: raise, unless ``allow_ntc_only=True``.
+        """
+        if self.is_high_moi or self.guide_targets_dict is not None:
+            return
+
+        targets = self.meta['target']
+        if (targets == cis_gene).any():
+            return
+
+        candidates = [a for a in cis_aliases
+                      if a != cis_gene and a not in self._NON_GENE_TARGET_LABELS]
+        present = set(targets.unique())
+        matched = [a for a in candidates if a in present]
+
+        if len(matched) == 1:
+            alias = matched[0]
+            mask = targets == alias
+            self.meta.loc[mask, 'target'] = cis_gene
+            print(f"[INFO] add_cis_gene: no cells have target '{cis_gene}', but {int(mask.sum())} "
+                  f"have target '{alias}', another identifier of the same feature; relabelled "
+                  f"them to '{cis_gene}'.")
+            return
+
+        if len(matched) > 1:
+            raise ValueError(
+                f"add_cis_gene('{cis_gene}'): no cells have target '{cis_gene}', and several "
+                f"other identifiers of this feature appear in meta['target']: {matched}. "
+                f"Relabel meta['target'] so the cis cells use one identifier, then retry."
+            )
+
+        if allow_ntc_only:
+            print(f"[INFO] add_cis_gene: no cells target '{cis_gene}' (or any of its "
+                  f"identifiers); continuing with NTC cells only (allow_ntc_only=True).")
+            return
+
+        example = [t for t in present if t not in self._NON_GENE_TARGET_LABELS][:10]
+        raise ValueError(
+            f"add_cis_gene('{cis_gene}'): no cells in meta['target'] match '{cis_gene}' or any "
+            f"other identifier of this feature ({candidates or 'none'}), so the fit would use "
+            f"NTC cells only. Check that meta['target'] uses the same naming as the feature "
+            f"(example targets: {example}). Pass allow_ntc_only=True if an NTC-only fit is intended."
+        )
+
     def _extract_cis_alpha_from_ntc_posteriors(
         self, cis_gene: str, cis_feat_iloc: int, n_total_features: int
     ) -> None:
@@ -819,9 +985,11 @@ class bayesDREAM(
         full_alpha_y_mult = ps.get('alpha_y_mult')
         full_alpha_y_add  = ps.get('alpha_y_add')
 
-        # alpha_x_prefit: median of the cis gene's alpha_y_mult samples → [C]
-        if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
-            self.alpha_x_prefit = full_alpha_y_mult[..., cis_feat_iloc].median(dim=0).values
+        # cis gene: posteriors for the cis modality + alpha_x_prefit [C]
+        from .fitting.ntc import extract_cis_ntc_posterior
+        cis_posterior, alpha_x = extract_cis_ntc_posterior(ps, cis_feat_iloc, T)
+        if alpha_x is not None:
+            self._set_alpha_x_prefit(alpha_x)
 
         # alpha_y_prefit for primary modality (trans genes only)
         if primary_mod.distribution == 'negbinom':
@@ -831,36 +999,17 @@ class bayesDREAM(
             if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
                 primary_mod.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
 
-        # Build cis modality's posterior_samples_ntc (matching what ntc.py produces)
         cis_modality = self.modalities['cis']
-        cis_posterior = {}
-        for src_key, dst_key in [
-            ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
-            ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
-            ('mu_ntc',      'mu_ntc'),
-        ]:
-            if src_key in ps and isinstance(ps[src_key], torch.Tensor):
-                v = ps[src_key]
-                if v.shape[-1] == T:
-                    cis_posterior[dst_key] = v[..., cis_feat_iloc:cis_feat_iloc + 1]
-
-        if 'alpha_x_mul' in cis_posterior:
-            raw = cis_posterior['alpha_x_mul']
-            if raw.dim() == 3:
-                S, Cminus1, _ = raw.shape
-                cis_posterior['alpha_x_mult'] = torch.cat(
-                    [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
-                cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
-
-        if 'delta_x_add' in cis_posterior:
-            raw = cis_posterior['delta_x_add']
-            if raw.dim() == 3:
-                S, Cminus1, _ = raw.shape
-                cis_posterior['alpha_x_add'] = torch.cat(
-                    [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
-
         cis_modality.posterior_samples_ntc = cis_posterior
         print(f"[INFO] Extracted '{cis_gene}' posteriors from primary modality NTC fit")
+
+        # File the cis gene's recorded fit_ntc prior parameters under 'cis' too
+        # (the primary modality's table is keyed by feature id, so it needs no trimming)
+        _pp = (getattr(self, 'ntc_prior_params', None) or {}).get(self.primary_modality)
+        if _pp is not None:
+            _ids = (primary_mod.feature_ids if primary_mod.feature_ids is not None
+                    else list(primary_mod.feature_meta.index))
+            self.ntc_prior_params['cis'] = _pp.reindex([str(_ids[cis_feat_iloc])])
 
         # Trim cis gene row from primary modality posteriors in-place
         if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
@@ -880,81 +1029,124 @@ class bayesDREAM(
         print(f"[INFO] Trimmed '{cis_gene}' from primary modality posteriors "
               f"(T {T} → {len(trans_idx)})")
 
-    def _refilter_zero_count_features(self, ntc_ran: bool) -> None:
+    @staticmethod
+    def _transfer_ntc_results(old_mod: 'Modality', new_mod: 'Modality',
+                              results_feature_ids: Optional[list] = None) -> None:
         """
-        After cell subsetting in add_cis_gene(), drop features that have become
-        zero-count across the retained NTC + cis cells.  If fit_ntc() has already
-        been run, trim the corresponding axes in the stored NTC posteriors so they
-        stay aligned with the surviving feature set.
+        Attach old_mod's fit_ntc results to new_mod (a rebuilt copy of the same
+        modality), aligned to new_mod's features by feature id.
 
-        Operates on every modality except 'cis' (which is a single feature and
-        cannot usefully be dropped here).
+        Building a Modality (directly, or via get_cell_subset()/get_feature_subset())
+        runs its zero-count/zero-variance feature filter, so new_mod may hold
+        fewer features than old_mod. Copying posterior_samples_ntc /
+        alpha_y_prefit_* across unchanged would leave them longer than the
+        modality's feature axis (issue #24). Every feature-axis tensor is instead
+        reindexed by name (io.load._align_posterior_features, which also handles
+        the multinomial [..., T, K] layout).
+
+        Parameters
+        ----------
+        old_mod, new_mod : Modality
+        results_feature_ids : list, optional
+            Feature ids that old_mod's fit_ntc results are indexed by. Defaults to
+            old_mod.feature_ids; pass it when the results were already trimmed
+            separately (e.g. the cis gene removed from the primary posteriors).
+
+        Raises if new_mod has a feature the results do not cover, or if the
+        alpha_y_prefit arrays do not have one entry per results feature.
         """
-        for mod_name, mod in list(self.modalities.items()):
-            if mod_name == 'cis':
-                continue
+        from .io.load import _align_posterior_features
 
-            n_features = mod.dims['n_features']
+        has_results = (old_mod.posterior_samples_ntc is not None
+                       or old_mod.alpha_y_prefit_mult is not None
+                       or old_mod.alpha_y_prefit_add is not None)
+        if hasattr(old_mod, 'loss_ntc'):
+            new_mod.loss_ntc = old_mod.loss_ntc
+        if not has_results:
+            return
 
-            # Compute per-feature total counts (works for dense, sparse, multinomial)
-            if mod.distribution == 'multinomial':
-                raw = mod.counts  # [F, N, K]
-                feature_sums = np.array(raw.sum(axis=(1, 2))).flatten()
-            elif mod.cells_axis == 1:
-                feature_sums = np.array(mod.counts.sum(axis=1)).flatten()
-            else:
-                feature_sums = np.array(mod.counts.sum(axis=0)).flatten()
+        if results_feature_ids is None:
+            results_feature_ids = old_mod.feature_ids
+        old_ids = list(results_feature_ids) if results_feature_ids is not None else None
+        new_ids = list(new_mod.feature_ids) if new_mod.feature_ids is not None else None
+        if old_ids is None or new_ids is None:
+            raise ValueError(
+                f"Cannot carry fit_ntc results for modality '{old_mod.name}' across a rebuild "
+                f"without feature ids on both the old and the new modality."
+            )
+        unknown = [f for f in new_ids if f not in set(old_ids)]
+        if unknown:
+            raise ValueError(
+                f"Internal error: rebuilt modality '{new_mod.name}' has feature(s) not in the "
+                f"fit_ntc results: {unknown[:5]}"
+            )
+        # alpha_y_prefit_* are [C, T] / [C, T, K]: the feature axis is dim 1.
+        for _name in ('alpha_y_prefit_mult', 'alpha_y_prefit_add'):
+            _a = getattr(old_mod, _name)
+            if _a is not None and (_a.ndim < 2 or _a.shape[1] != len(old_ids)):
+                raise ValueError(
+                    f"Internal error: {old_mod.name}.{_name} has shape {tuple(_a.shape)}, "
+                    f"expected {len(old_ids)} features on dim 1."
+                )
 
-            keep_idx = np.where(feature_sums > 0)[0]
-            n_dropped = n_features - len(keep_idx)
+        if old_ids == new_ids:
+            new_mod.posterior_samples_ntc = old_mod.posterior_samples_ntc
+            new_mod.alpha_y_prefit_mult = old_mod.alpha_y_prefit_mult
+            new_mod.alpha_y_prefit_add = old_mod.alpha_y_prefit_add
+            return
 
-            if n_dropped == 0:
-                continue
+        from .utils import modality_feature_axis_kwargs
+        axis_kwargs = modality_feature_axis_kwargs(old_mod)
+        n_old = len(old_ids)
+        if old_mod.posterior_samples_ntc is not None:
+            new_mod.posterior_samples_ntc, _ = _align_posterior_features(
+                old_mod.posterior_samples_ntc, old_ids, new_ids, n_old, **axis_kwargs)
+        alphas, _ = _align_posterior_features(
+            {'mult': old_mod.alpha_y_prefit_mult, 'add': old_mod.alpha_y_prefit_add},
+            old_ids, new_ids, n_old, **axis_kwargs)
+        new_mod.alpha_y_prefit_mult = alphas['mult']
+        new_mod.alpha_y_prefit_add = alphas['add']
 
-            print(f"[INFO] add_cis_gene: dropping {n_dropped} zero-count features "
-                  f"from modality '{mod_name}' after cell subsetting")
-
-            # Trim posteriors on the existing modality object BEFORE creating subset
-            if mod.posterior_samples_ntc is not None:
-                self._trim_feature_axis_in_posteriors(mod, keep_idx, n_features)
-
-            # Create feature-subsetted copy and re-attach fitting results
-            new_mod = mod.get_feature_subset(keep_idx.tolist())
-            new_mod.posterior_samples_ntc = mod.posterior_samples_ntc  # already trimmed
-            new_mod.alpha_y_prefit_mult   = mod.alpha_y_prefit_mult
-            new_mod.alpha_y_prefit_add    = mod.alpha_y_prefit_add
-            if hasattr(mod, 'loss_ntc'):
-                new_mod.loss_ntc = mod.loss_ntc
-
-            self.modalities[mod_name] = new_mod
+        print(f"[INFO] Trimmed fit_ntc results for modality '{new_mod.name}' to its "
+              f"{len(new_ids)} remaining features ({n_old - len(new_ids)} dropped)")
 
     @staticmethod
     def _trim_feature_axis_in_posteriors(
         mod: 'Modality', keep_idx: np.ndarray, T: int
     ) -> None:
         """
-        Trim the feature (last) axis of every tensor in mod.posterior_samples_ntc
-        and the alpha_y_prefit arrays to the surviving feature indices.
+        Trim the feature axis of every tensor in mod.posterior_samples_ntc and
+        of the alpha_y_prefit arrays to the surviving feature indices.
+
+        The feature axis comes from utils.feature_axis: last for most
+        distributions, second-to-last for multinomial [..., T, K] tensors (and
+        last for multinomial per-feature scalars [..., T]). alpha_y_prefit_* are
+        always [C, T] / [C, T, K], so their feature axis is dim 1.
 
         Mutates mod in-place; called before get_feature_subset() so the counts
-        array still has T columns.
+        array still has T features.
         """
+        from .utils import feature_axis, modality_feature_axis_kwargs
+        idx = torch.as_tensor(np.asarray(keep_idx), dtype=torch.long)
+        axis_kwargs = modality_feature_axis_kwargs(mod)
+
         ps = mod.posterior_samples_ntc
-        if ps is None:
-            return
+        if ps is not None:
+            for key in list(ps.keys()):
+                v = ps[key]
+                dim = feature_axis(v, T, **axis_kwargs)
+                if dim is not None:
+                    ps[key] = v.index_select(dim, idx.to(v.device))
 
-        for key in list(ps.keys()):
-            v = ps[key]
-            if not isinstance(v, torch.Tensor):
+        for name in ('alpha_y_prefit_mult', 'alpha_y_prefit_add'):
+            a = getattr(mod, name)
+            if a is None:
                 continue
-            if v.shape[-1] == T:
-                ps[key] = v[..., keep_idx]
-
-        if mod.alpha_y_prefit_mult is not None and mod.alpha_y_prefit_mult.shape[-1] == T:
-            mod.alpha_y_prefit_mult = mod.alpha_y_prefit_mult[..., keep_idx]
-
-        if mod.alpha_y_prefit_add is not None and mod.alpha_y_prefit_add.shape[-1] == T:
-            mod.alpha_y_prefit_add = mod.alpha_y_prefit_add[..., keep_idx]
+            if a.ndim < 2 or a.shape[1] != T:
+                raise ValueError(
+                    f"{mod.name}.{name} has shape {tuple(a.shape)}; expected {T} features on dim 1."
+                )
+            setattr(mod, name, a.index_select(1, idx.to(a.device)))
 
     def exclude_trans_genes(
         self,

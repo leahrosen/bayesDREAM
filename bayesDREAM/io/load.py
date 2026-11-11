@@ -7,7 +7,8 @@ import pickle
 import torch
 import pandas as pd
 
-from ..utils import make_names_unique, LEAN_POSTERIOR_KEY, get_guide_axis_labels
+from ..utils import (make_names_unique, LEAN_POSTERIOR_KEY, get_guide_axis_labels,
+                     feature_axis, modality_feature_axis_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +59,9 @@ def _align_tensor(tensor, saved_names, target_names, dim):
     t = tensor.transpose(dim, tensor.ndim - 1)        # [..., T_saved]
     out_shape = t.shape[:-1] + (n_target,)
     if t.is_floating_point():
-        out = torch.full(out_shape, float('nan'), dtype=t.dtype)
+        out = torch.full(out_shape, float('nan'), dtype=t.dtype, device=t.device)
     else:
-        out = torch.zeros(out_shape, dtype=t.dtype)
+        out = torch.zeros(out_shape, dtype=t.dtype, device=t.device)
     for ci, si in enumerate(mapping):
         if si >= 0:
             out[..., ci] = t[..., si]
@@ -69,22 +70,20 @@ def _align_tensor(tensor, saved_names, target_names, dim):
     return aligned, mask
 
 
-def _detect_feature_dim(tensor, n_features_saved):
+def _detect_feature_dim(tensor, n_features_saved, distribution=None, n_categories=None):
     """
     Return the dimension index that corresponds to features, or None.
 
-    Checks last dim first, then second-to-last (for multinomial [C, T, K] tensors).
-    Returns None when no dimension matches n_features_saved (scalars, per-group
-    tensors, etc.).
+    Delegates to utils.feature_axis: for multinomial the [..., T, cat] layout is
+    resolved explicitly (pass ``distribution``/``n_categories``); otherwise the
+    last dim is checked first, then second-to-last. Returns None when no
+    dimension matches n_features_saved (scalars, per-group tensors, etc.).
     """
-    if tensor.ndim >= 1 and tensor.shape[-1] == n_features_saved:
-        return tensor.ndim - 1
-    if tensor.ndim >= 2 and tensor.shape[-2] == n_features_saved:
-        return tensor.ndim - 2
-    return None
+    return feature_axis(tensor, n_features_saved, distribution, n_categories)
 
 
-def _align_posterior_features(posterior_dict, saved_names, target_names, n_features_saved):
+def _align_posterior_features(posterior_dict, saved_names, target_names, n_features_saved,
+                              distribution=None, n_categories=None):
     """
     Align every tensor in `posterior_dict` whose feature dimension equals
     `n_features_saved`, reindexing from `saved_names` to `target_names`.
@@ -111,7 +110,7 @@ def _align_posterior_features(posterior_dict, saved_names, target_names, n_featu
         if not isinstance(v, torch.Tensor):
             aligned[k] = v
             continue
-        dim = _detect_feature_dim(v, n_features_saved)
+        dim = _detect_feature_dim(v, n_features_saved, distribution, n_categories)
         if dim is None:
             aligned[k] = v
         else:
@@ -201,7 +200,7 @@ def _fill_nan_with_baseline(tensor, feat_mask, distribution):
         return tensor
     baseline = 1.0 if distribution == 'negbinom' else 0.0
     t = tensor.clone()
-    feat_dim = _detect_feature_dim(t, len(feat_mask))
+    feat_dim = _detect_feature_dim(t, len(feat_mask), distribution)
     if feat_dim is None:
         return t
     # Move feature axis to last for uniform indexing
@@ -449,6 +448,90 @@ def _reduce_posterior_samples(posterior: dict) -> dict:
     return reduced
 
 
+def _find_feature_by_aliases(aliases, saved_names, saved_feature_meta=None):
+    """
+    Locate one feature in a saved fit by any of its identifiers (issue #23).
+
+    Parameters
+    ----------
+    aliases : list of str
+        Every identifier the feature is known by (feature id, gene_id,
+        gene_name, ...).
+    saved_names : list of str
+        Feature ids saved with the fit (feature-axis order).
+    saved_feature_meta : list of dict, optional
+        Per-feature metadata records saved with the fit (same order); every
+        string value is treated as a possible identifier of that feature.
+
+    Returns
+    -------
+    int or None
+        Position in ``saved_names``; None if no alias identifies a feature.
+
+    Raises
+    ------
+    ValueError
+        If different aliases identify different features.
+
+    An alias that matches several saved features (e.g. a shared biotype value
+    in feature_meta) does not identify anything and is ignored; only aliases
+    that pin down exactly one saved feature count.
+    """
+    value_to_rows = {}
+
+    def _add(value, row):
+        if isinstance(value, str) and value.strip():
+            value_to_rows.setdefault(value, set()).add(row)
+
+    for i, name in enumerate(saved_names):
+        _add(str(name), i)
+    for i, rec in enumerate(saved_feature_meta or []):
+        if isinstance(rec, dict):
+            for v in rec.values():
+                _add(v, i)
+
+    hits = {}
+    for a in aliases:
+        rows = value_to_rows.get(str(a), set())
+        if len(rows) == 1:
+            hits.setdefault(next(iter(rows)), []).append(a)
+    if not hits:
+        return None
+    if len(hits) > 1:
+        detail = "; ".join(f"{saved_names[i]!r} via {als}" for i, als in hits.items())
+        raise ValueError(
+            f"Identifiers {list(aliases)} point to different features in the saved fit: {detail}"
+        )
+    return next(iter(hits))
+
+
+def _extract_cis_from_saved_primary(raw_posterior, cis_idx, n_features, lean):
+    """
+    Build the cis modality's posterior_samples_ntc (and alpha_x_prefit) from a
+    saved primary-modality NTC posterior, matching what fit_ntc/add_cis_gene
+    produce. Handles a full posterior (reduced afterwards if ``lean``) and a
+    precomputed lean one (point estimates plus their _lower/_upper siblings).
+    """
+    from ..fitting.ntc import extract_cis_ntc_posterior
+    from ..utils import is_lean_posterior, LEAN_POSTERIOR_KEY
+
+    cis_posterior, alpha_x = extract_cis_ntc_posterior(raw_posterior, cis_idx, n_features)
+
+    if is_lean_posterior(raw_posterior):
+        # Siblings have no sample dim: add one, slice the same way, drop it again
+        for suffix in ('_lower', '_upper'):
+            sub = {k[:-len(suffix)]: v.unsqueeze(0) for k, v in raw_posterior.items()
+                   if k.endswith(suffix) and isinstance(v, torch.Tensor)}
+            part, _ = extract_cis_ntc_posterior(sub, cis_idx, n_features)
+            for k, v in part.items():
+                cis_posterior[k + suffix] = v.squeeze(0)
+        cis_posterior[LEAN_POSTERIOR_KEY] = True
+    elif lean:
+        cis_posterior = _reduce_posterior_samples(cis_posterior)
+
+    return cis_posterior, alpha_x
+
+
 class ModelLoader:
     """Handles loading fitted parameters."""
 
@@ -462,6 +545,96 @@ class ModelLoader:
             The parent model instance
         """
         self.model = model
+
+    @staticmethod
+    def _read_saved_ntc(input_dir, mod_name, lean):
+        """Read a modality's saved NTC posterior file (same path rules as
+        load_ntc_fit: precomputed lean file if lean, legacy filename fallback).
+        Returns the loaded object, or None if no file exists."""
+        candidates = []
+        if lean:
+            candidates.append(f'posterior_samples_ntc_{mod_name}_lean.pt')
+        candidates += [f'posterior_samples_ntc_{mod_name}.pt',
+                       f'posterior_samples_technical_{mod_name}.pt']
+        for fname in candidates:
+            path = os.path.join(input_dir, fname)
+            if os.path.exists(path):
+                return _torch_load(path, map_location='cpu')
+        return None
+
+    def _load_cis_from_primary_ntc(self, primary_saved, lean, loaded, loaded_summary, verbose):
+        """
+        Populate the 'cis' modality's posterior_samples_ntc (and alpha_x_prefit,
+        and its recorded prior parameters) from the primary modality's saved NTC
+        fit, locating the cis gene by any of its identifiers (issue #23).
+        Warns, rather than raises, if that is not possible: fit_cis() then
+        reports the missing alpha_x itself.
+        """
+        import warnings
+        cis_mod = self.model.modalities['cis']
+        primary = self.model.primary_modality
+
+        def _warn(reason):
+            warnings.warn(
+                f"[WARNING] No NTC fit loaded for the 'cis' modality: no "
+                f"posterior_samples_ntc_cis.pt, and {reason} fit_cis() needs alpha_x "
+                f"from fit_ntc when technical groups are used.", UserWarning)
+
+        if primary_saved is None:
+            _warn(f"no saved NTC fit for primary modality '{primary}' to take the cis gene from.")
+            return
+        if not (isinstance(primary_saved, dict) and 'posterior_samples' in primary_saved):
+            _warn(f"the saved '{primary}' NTC fit predates saved feature names, so the cis gene "
+                  f"cannot be located in it.")
+            return
+        saved_names = primary_saved.get('feature_ids', primary_saved.get('feature_names'))
+        if saved_names is None:
+            _warn(f"the saved '{primary}' NTC fit has no feature names.")
+            return
+        saved_names = [str(n) for n in saved_names]
+
+        # Every identifier the cis gene is known by
+        aliases = []
+        for a in ([cis_mod.feature_ids[0]] if cis_mod.feature_ids is not None else []) \
+                + [self.model.cis_gene] + list(cis_mod.feature_meta.iloc[0].tolist()):
+            if isinstance(a, str) and a.strip() and a not in aliases:
+                aliases.append(a)
+
+        idx = _find_feature_by_aliases(aliases, saved_names, primary_saved.get('feature_meta'))
+        if idx is None:
+            _warn(f"none of the cis gene's identifiers {aliases} were found in the saved "
+                  f"'{primary}' NTC fit.")
+            return
+
+        cis_posterior, alpha_x = _extract_cis_from_saved_primary(
+            primary_saved['posterior_samples'], idx, len(saved_names), lean)
+        if not any(isinstance(v, torch.Tensor) for v in cis_posterior.values()):
+            _warn(f"the saved '{primary}' NTC posterior has no per-feature tensors over its "
+                  f"{len(saved_names)} saved features.")
+            return
+        cis_posterior = {k: (v.to(self.model.device) if isinstance(v, torch.Tensor) else v)
+                         for k, v in cis_posterior.items()}
+        cis_mod.posterior_samples_ntc = cis_posterior
+        loaded['posterior_samples_ntc_cis'] = True
+        parts = ['posterior']
+
+        if alpha_x is not None and not loaded.get('alpha_x_prefit'):
+            self.model._set_alpha_x_prefit(alpha_x.flatten().to(self.model.device))
+            loaded['alpha_x_prefit'] = True
+            parts.append('alpha_x')
+
+        pp = primary_saved.get('prior_params')
+        if pp is not None and saved_names[idx] in pp.get('feature_id', []):
+            j = pp['feature_id'].index(saved_names[idx])
+            if getattr(self.model, 'ntc_prior_params', None) is None:
+                self.model.ntc_prior_params = {}
+            self.model.ntc_prior_params['cis'] = pd.DataFrame(
+                {k: [v[j]] for k, v in pp.items() if k != 'feature_id'},
+                index=pd.Index([saved_names[idx]], name='feature_id'))
+
+        loaded_summary.append(f"cis: {', '.join(parts)} (from '{primary}' NTC fit)")
+        print(f"[LOAD] cis: no posterior_samples_ntc_cis.pt; took '{self.model.cis_gene}' from "
+              f"the '{primary}' NTC fit (saved feature {saved_names[idx]!r}, position {idx})")
 
     def load_ntc_fit(self, input_dir: str = None,
                           modalities: list = None, verbose: bool = False,
@@ -589,11 +762,16 @@ class ModelLoader:
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_x, torch.Tensor) and alpha_x.ndim >= 2 and alpha_x.shape[0] > 1:
                     alpha_x = alpha_x.mean(dim=0)
-                self.model.alpha_x_prefit = alpha_x.flatten()
-                loaded['alpha_x_prefit'] = True
-                loaded_summary.append('alpha_x')
-                if verbose:
-                    print(f"[LOAD] alpha_x_prefit ← {alpha_x_path}")
+                if 'cis' in self.model.modalities:
+                    # Stored on the cis modality as alpha_y_prefit_mult [C, 1] (issue #14)
+                    self.model._set_alpha_x_prefit(alpha_x.flatten())
+                    loaded['alpha_x_prefit'] = True
+                    loaded_summary.append('alpha_x')
+                    if verbose:
+                        print(f"[LOAD] alpha_x_prefit ← {alpha_x_path}")
+                else:
+                    print(f"[LOAD] Skipped {alpha_x_path}: this model has no cis gene yet "
+                          f"('cis' modality), which is where alpha_x is stored.")
 
             # Load alpha_y_prefit (legacy model-level file → primary modality)
             alpha_y_path = os.path.join(input_dir, 'alpha_y_prefit.pt')
@@ -607,6 +785,17 @@ class ModelLoader:
                 loaded['alpha_y_prefit'] = True
                 if verbose:
                     print(f"[LOAD] alpha_y_prefit → {self.model.primary_modality} modality ← {alpha_y_path}")
+
+        # Cis fallback needed? (issue #23) The model has a cis modality, but this
+        # fit has no separate cis file: the cis gene's NTC results are a row of the
+        # primary modality's saved posterior (fit_ntc ran once for all genes).
+        _need_cis_fallback = (
+            'cis' in modalities_to_load
+            and not any(os.path.exists(os.path.join(input_dir, f))
+                        for f in ('posterior_samples_ntc_cis.pt',
+                                  'posterior_samples_technical_cis.pt',
+                                  'posterior_samples_ntc_cis_lean.pt'))
+        )
 
         # Load per-modality alpha_y_prefit and posterior_samples_ntc
         for mod_name in modalities_to_load:
@@ -655,6 +844,14 @@ class ModelLoader:
                     saved_feature_names = loaded_data.get('feature_ids', loaded_data.get('feature_names'))
                     n_features_saved = n_features
 
+                    # Cis fallback (issue #23): take the cis gene's slice from the
+                    # primary modality's saved data now, before alignment drops
+                    # features absent from the current modality (the cis gene).
+                    if mod_name == self.model.primary_modality and _need_cis_fallback:
+                        self._load_cis_from_primary_ntc(loaded_data, lean, loaded,
+                                                        loaded_summary, verbose)
+                        _need_cis_fallback = False
+
                     # Align posteriors to current modality's feature set. Works
                     # unchanged on precomputed-lean tensors: _detect_feature_dim
                     # locates the feature axis by size, not by assuming a
@@ -664,7 +861,8 @@ class ModelLoader:
                     if (current_feature_names is not None and saved_feature_names is not None
                             and current_feature_names != saved_feature_names):
                         posterior_raw, feat_mask = _align_posterior_features(
-                            posterior_raw, saved_feature_names, current_feature_names, n_features_saved)
+                            posterior_raw, saved_feature_names, current_feature_names, n_features_saved,
+                            **modality_feature_axis_kwargs(mod))
                         _report_alignment(f"{mod_name} NTC posterior",
                                           saved_feature_names, current_feature_names, feat_mask)
                         _check_nan_features(feat_mask, mod_name, mask_features)
@@ -700,6 +898,18 @@ class ModelLoader:
                         'distribution': loaded_data.get('distribution'),
                         'n_features': n_features
                     }
+
+                    # Data-driven prior parameters fit_ntc used; absent in fits saved
+                    # before they were recorded (prior sampling then omits the
+                    # data-driven priors rather than approximating them).
+                    if loaded_data.get('prior_params') is not None:
+                        if getattr(self.model, 'ntc_prior_params', None) is None:
+                            self.model.ntc_prior_params = {}
+                        _pp = dict(loaded_data['prior_params'])
+                        self.model.ntc_prior_params[mod_name] = pd.DataFrame(
+                            {k: v for k, v in _pp.items() if k != 'feature_id'},
+                            index=pd.Index(_pp['feature_id'], name='feature_id'),
+                        )
 
                     if loaded_data.get('loss_ntc') is not None:
                         mod.loss_ntc = loaded_data['loss_ntc']
@@ -757,7 +967,8 @@ class ModelLoader:
                 if (current_feature_names is not None and saved_feature_names is not None
                         and current_feature_names != saved_feature_names
                         and n_features_saved is not None):
-                    dim = _detect_feature_dim(alpha_y_to_set, n_features_saved)
+                    dim = _detect_feature_dim(alpha_y_to_set, n_features_saved,
+                                              **modality_feature_axis_kwargs(mod))
                     if dim is not None:
                         alpha_y_to_set, feat_mask = _align_tensor(
                             alpha_y_to_set, saved_feature_names, current_feature_names, dim)
@@ -784,6 +995,18 @@ class ModelLoader:
 
             if mod_loaded:
                 loaded_summary.append(f"{mod_name}: {', '.join(mod_loaded)}")
+
+        # ── cis gene from the primary modality's NTC fit (issue #23) ──
+        # When fit_ntc() ran once for all genes (cis_gene unset) and the cis gene
+        # was set before loading (at init or via add_cis_gene()), no
+        # posterior_samples_ntc_cis.pt / alpha_x_prefit.pt exists: the cis gene's
+        # results are a row of the primary modality's saved posterior. Find it by
+        # any of the gene's identifiers and populate the cis modality from it.
+        if _need_cis_fallback:
+            # Primary modality not loaded in this call: read its saved file for the cis row
+            self._load_cis_from_primary_ntc(
+                self._read_saved_ntc(input_dir, self.model.primary_modality, lean),
+                lean, loaded, loaded_summary, verbose)
 
         # Print summary
         print(f"[LOAD] NTC fit from {input_dir}" + (" (lean=True)" if lean else ""))
@@ -1136,7 +1359,8 @@ class ModelLoader:
                 if (cur_names is not None and saved_names is not None
                         and cur_names != saved_names and n_features is not None):
                     posterior_raw, feat_mask = _align_posterior_features(
-                        posterior_raw, saved_names, cur_names, n_features)
+                        posterior_raw, saved_names, cur_names, n_features,
+                        **modality_feature_axis_kwargs(mod))
                     _report_alignment(f"{label} features", saved_names, cur_names, feat_mask)
 
                     if feat_mask is not None:
@@ -1208,7 +1432,8 @@ class ModelLoader:
                                                  if mod.feature_ids is not None
                                                  else [cur_names[i] for i, m in enumerate(mask_np) if m])
                                 posterior_raw, feat_mask = _align_posterior_features(
-                                    loaded_data['posterior_samples'], saved_names, new_cur_names, n_features)
+                                    loaded_data['posterior_samples'], saved_names, new_cur_names, n_features,
+                                    **modality_feature_axis_kwargs(mod))
                                 # feat_mask should now be all True
                         mod.fitted_feature_mask = feat_mask
 
@@ -1231,7 +1456,7 @@ class ModelLoader:
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                     posterior_dict, n_features, _, extra = _load_trans_posterior(
                         loaded_data, f"trans {self.model.primary_modality}")
-                    self.model.posterior_samples_trans = posterior_dict
+                    self.model._set_posterior_samples_trans(posterior_dict)
                     loaded['posterior_samples_trans'] = True
                     loaded['posterior_samples_trans_metadata'] = extra
                     if loaded_data.get('losses_trans') is not None:
@@ -1244,7 +1469,7 @@ class ModelLoader:
                         print(f"[LOAD] posterior_samples_trans (modality: {extra.get('modality_name')}, "
                               f"{extra.get('n_features')} features) ← {posterior_path}")
                 else:
-                    self.model.posterior_samples_trans = loaded_data
+                    self.model._set_posterior_samples_trans(loaded_data)
                     loaded['posterior_samples_trans'] = True
                     if verbose:
                         print(f"[LOAD] posterior_samples_trans (legacy format) ← {posterior_path}")

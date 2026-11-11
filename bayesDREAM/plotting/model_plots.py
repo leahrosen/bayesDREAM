@@ -73,7 +73,7 @@ class ModelPlottingMixin:
         Parameters
         ----------
         param : str
-            Parameter to plot: 'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc', 'o_y'
+            Parameter to plot: 'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc'
         modality_name : str, optional
             Modality name (default: primary modality)
         technical_group_index : int, optional
@@ -161,66 +161,68 @@ class ModelPlottingMixin:
             return plot_scalar_parameter(prior_samples, post_samples, 'beta_o', metric=metric, **kwargs)
 
         elif param == 'alpha_x':
-            # 1D or 2D parameter (per technical group)
-            if not hasattr(self, 'alpha_x_prefit'):
-                raise ValueError("alpha_x not found. Check if cis gene was included in technical fit.")
+            # alpha_x is not estimated by fit_cis: it is fit_ntc's alpha_y for the
+            # cis gene. Its NTC posterior samples live on the 'cis' modality as
+            # posterior_samples_ntc['alpha_x_mult'] with shape [S, C, 1] (reference
+            # group included); self.alpha_x_prefit is only their [C] median.
+            cis_mod = self.modalities.get('cis')
+            cis_posterior = getattr(cis_mod, 'posterior_samples_ntc', None) if cis_mod is not None else None
+            if not cis_posterior or not any(k in cis_posterior for k in ('alpha_x_mult', 'alpha_x')):
+                raise ValueError(
+                    "alpha_x NTC posterior samples not found on the 'cis' modality. alpha_x is "
+                    "estimated by fit_ntc() (as the cis gene's alpha_y), so run fit_ntc() with "
+                    "the cis gene present, or call add_cis_gene() after fit_ntc()."
+                )
+            require_full_posterior(cis_posterior, "plot_technical_fit('alpha_x')")
 
-            post_samples = self.alpha_x_prefit
-            if hasattr(post_samples, 'numpy'):
-                post_samples = post_samples.numpy()
+            post_samples = cis_posterior.get('alpha_x_mult', cis_posterior.get('alpha_x'))
+            if hasattr(post_samples, 'detach'):
+                post_samples = post_samples.detach().cpu().numpy()
+            post_samples = np.asarray(post_samples)
+            if post_samples.ndim == 3 and post_samples.shape[-1] == 1:
+                post_samples = post_samples[..., 0]  # [S, C, 1] -> [S, C]
+            if post_samples.ndim != 2:
+                raise ValueError(
+                    f"Unexpected alpha_x posterior shape {post_samples.shape}; expected [S, C, 1] or [S, C]."
+                )
+            # Plot on log2 scale, as for alpha_y (reference group = 0)
+            post_samples = np.log2(post_samples + 1e-10)
 
-            # For alpha_x, we need cis priors (will implement below)
-            # For now use technical priors as approximation
-            if 'alpha_x' in prior_dict:
-                prior_samples = prior_dict['alpha_x'].numpy() if hasattr(prior_dict['alpha_x'], 'numpy') else prior_dict['alpha_x']
-            else:
-                # Fall back to alpha_y structure if alpha_x not in prior_dict
-                warnings.warn("alpha_x not in prior_dict - using alpha_y structure as approximation")
-                prior_samples = prior_dict['alpha_y'].numpy() if hasattr(prior_dict['alpha_y'], 'numpy') else prior_dict['alpha_y']
-                if prior_samples.ndim == 3:
-                    prior_samples = prior_samples[:, :, 0]  # Take first gene dimension
+            # Prior: the same fit_ntc prior as alpha_y (identical for every feature),
+            # so any one feature's draw is the alpha_x prior. Prepend the reference row.
+            prior_samples = prior_dict['log2_alpha_y']
+            prior_samples = prior_samples.numpy() if hasattr(prior_samples, 'numpy') else np.asarray(prior_samples)
+            prior_samples = prior_samples[:, :, 0]  # [S, C-1]
+            prior_samples = np.concatenate([np.zeros((prior_samples.shape[0], 1)), prior_samples], axis=1)
 
-            # Get informative technical group names
             group_names = self._get_technical_group_names()
 
-            # Handle different dimensionalities
-            if post_samples.ndim == 1:
-                # (samples,) - single value across all groups
-                return plot_scalar_parameter(prior_samples, post_samples, 'alpha_x', metric=metric, **kwargs)
-            elif post_samples.ndim == 2:
-                # (samples, technical_groups) - one value per group
-                if technical_group_index is not None:
-                    # Check if trying to plot baseline group
-                    if technical_group_index == 0:
-                        # Already caught by earlier check, but this makes it explicit
-                        raise ValueError("Cannot plot technical_group_index=0 (baseline group with no variation)")
+            if technical_group_index is not None:
+                prior_tg = prior_samples[:, technical_group_index]
+                post_tg = post_samples[:, technical_group_index]
+                group_name = group_names[technical_group_index]
+                return plot_scalar_parameter(
+                    prior_tg, post_tg, f'log2(alpha_x) ({group_name})', metric=metric, **kwargs
+                )
 
-                    # Plot single technical group
-                    prior_tg = prior_samples[:, technical_group_index]
-                    post_tg = post_samples[:, technical_group_index]
-                    group_name = group_names[technical_group_index]
+            # Plot all non-reference technical groups as separate "features"
+            if post_samples.shape[1] > 1:
+                prior_samples = prior_samples[:, 1:]
+                post_samples = post_samples[:, 1:]
+                group_names = group_names[1:]
+                print("Note: Excluding baseline technical group (index 0) which has no variation")
 
-                    return plot_scalar_parameter(
-                        prior_tg, post_tg, f'alpha_x ({group_name})', metric=metric, **kwargs
-                    )
-                else:
-                    # Plot all technical groups - treat as separate features
-                    # Exclude baseline group (TG_0) which is always constant
-                    if post_samples.shape[1] > 1:
-                        prior_samples = prior_samples[:, 1:]  # Skip first group
-                        post_samples = post_samples[:, 1:]
-                        group_names = group_names[1:]  # Skip first name
-                        print(f"Note: Excluding baseline technical group (index 0) which has no variation")
-
-                    return plot_1d_parameter(
-                        prior_samples, post_samples, group_names, 'alpha_x',
-                        order_by='input', plot_type='violin', metric=metric, **kwargs
-                    )
-            else:
-                raise ValueError(f"Unexpected alpha_x shape: {post_samples.shape}")
+            return plot_1d_parameter(
+                prior_samples, post_samples, group_names, 'log2(alpha_x)',
+                order_by='input', plot_type='violin', metric=metric, **kwargs
+            )
 
         elif param == 'alpha_y':
             # 1D or 2D parameter: (samples, genes) or (samples, cell_lines, genes)
+            if 'log2_alpha_y' not in prior_dict:
+                raise ValueError(
+                    f"Cannot plot the alpha_y prior: {prior_dict.get('_missing_reason', 'prior not available.')}"
+                )
 
             # Determine if we should plot in log2 space based on distribution
             # Multiplicative (negbinom): plot log2(alpha_y_mult) - baseline is 0 in log2 space
@@ -390,9 +392,55 @@ class ModelPlottingMixin:
                         plot_type=plot_type, metric=metric, is_additive=is_additive, **kwargs
                     )
 
+        elif param == 'mu_ntc':
+            # Per-feature baseline (reference-group) mean, [S, T]
+            if 'mu_ntc' not in posterior:
+                raise ValueError(f"mu_ntc not found in posterior_samples_ntc for modality '{modality.name}'.")
+            if 'mu_ntc' not in prior_dict:
+                raise ValueError(
+                    f"Cannot plot the mu_ntc prior: "
+                    f"{prior_dict.get('_missing_reason', f'no mu_ntc prior for distribution {modality.distribution!r}.')}"
+                )
+
+            post_samples = posterior['mu_ntc']
+            post_samples = post_samples.detach().cpu().numpy() if hasattr(post_samples, 'detach') else np.asarray(post_samples)
+            if post_samples.ndim == 3 and post_samples.shape[1] == 1:
+                post_samples = post_samples[:, 0, :]
+            prior_samples = prior_dict['mu_ntc'].numpy()
+
+            feature_names = list(modality_feature_names)
+            if post_samples.ndim != 2 or post_samples.shape[1] != len(feature_names) \
+                    or prior_samples.shape[1] != len(feature_names):
+                raise ValueError(
+                    f"Shape mismatch: mu_ntc posterior {post_samples.shape}, prior {prior_samples.shape}, "
+                    f"modality '{modality.name}' has {len(feature_names)} features."
+                )
+
+            # Features fit_ntc did not fit have no prior (NaN); drop them
+            fitted = np.isfinite(prior_samples).all(axis=0) & np.isfinite(post_samples).all(axis=0)
+            if not fitted.all():
+                print(f"Note: Excluding {(~fitted).sum()} feature(s) that fit_ntc did not fit")
+                prior_samples = prior_samples[:, fitted]
+                post_samples = post_samples[:, fitted]
+                feature_names = [f for f, keep in zip(feature_names, fitted) if keep]
+
+            if modality.distribution == 'negbinom':
+                # Positive and spanning orders of magnitude across genes: plot log2
+                prior_samples = np.log2(np.maximum(prior_samples, 1e-10))
+                post_samples = np.log2(np.maximum(post_samples, 1e-10))
+                param_label = 'log2(mu_ntc)'
+            else:
+                param_label = 'mu_ntc'
+
+            return plot_1d_parameter(
+                prior_samples, post_samples, feature_names, param_label,
+                order_by, subset_features=subset_features, plot_type=plot_type,
+                metric=metric, **kwargs
+            )
+
         else:
             raise ValueError(f"Unknown parameter: {param}. Must be one of: "
-                           "'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc', 'o_y'")
+                           "'beta_o', 'alpha_x', 'alpha_y', 'mu_ntc'")
 
     def plot_cis_fit(
         self,

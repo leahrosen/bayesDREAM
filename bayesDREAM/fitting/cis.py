@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 import pyro
 import pyro.distributions as dist
-from ..utils import get_guide_axis_labels
+from ..utils import get_guide_axis_labels, check_technical_alpha_shape
 from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
@@ -132,14 +132,9 @@ class CisFitter(FitterBase):
         ## Cell-level variables ##
         ##########################
         if alpha_x is not None:
-            # alpha_x shape [C]: already includes reference group (index 0 = 1.0)
-            # or shape [C-1]: needs reference group prepended
-            if alpha_x.shape[-1] == C:
-                alpha_x_full = alpha_x
-            else:
-                ones_ = torch.ones(1, device=self.model.device)
-                alpha_x_full = torch.cat([ones_, alpha_x], dim=-1)  # shape = [C]
-            alpha_x_used = alpha_x_full[groups_tensor]  # shape = [N]
+            # alpha_x is the fit_ntc point estimate [C], reference group at index 0 (= 1.0)
+            check_technical_alpha_shape(alpha_x, C, name="alpha_x")
+            alpha_x_used = alpha_x[groups_tensor]  # shape = [N]
         else:
             alpha_x_used = torch.ones_like(sum_factor_tensor)  # shape = [N] or [S,N]
 
@@ -483,7 +478,7 @@ class CisFitter(FitterBase):
 
         # convert to gpu for fitting
         if self.model.alpha_x_prefit is not None and self.model.alpha_x_prefit.device != self.model.device:
-            self.model.alpha_x_prefit = self.model.alpha_x_prefit.to(self.model.device)
+            self.model._set_alpha_x_prefit(self.model.alpha_x_prefit.to(self.model.device))
 
         if technical_covariates:
             new_technical_group_code = self.model.meta.groupby(technical_covariates).ngroup()
@@ -493,8 +488,13 @@ class CisFitter(FitterBase):
                 if groups_changed:
                     warnings.warn("technical_group already set. Overwriting with new covariate grouping.")
                     if self.model.alpha_x_prefit is not None:
-                        warnings.warn("Technical groups changed; discarding alpha_x_prefit and refitting.")
-                        self.model.alpha_x_prefit = None
+                        warnings.warn(
+                            "Technical groups changed; discarding alpha_x_prefit, which was "
+                            "estimated by fit_ntc() under the old grouping. fit_cis() does not "
+                            "estimate alpha_x itself, so re-run fit_ntc() with the new technical "
+                            "groups before fit_cis()."
+                        )
+                        self.model._set_alpha_x_prefit(None)
                 else:
                     # Keep loaded alpha_x_prefit when grouping is unchanged (common in stepwise workflows)
                     pass
