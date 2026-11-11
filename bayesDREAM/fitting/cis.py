@@ -478,7 +478,7 @@ class CisFitter(FitterBase):
 
         # convert to gpu for fitting
         if self.model.alpha_x_prefit is not None and self.model.alpha_x_prefit.device != self.model.device:
-            self.model.alpha_x_prefit = self.model.alpha_x_prefit.to(self.model.device)
+            self.model._set_alpha_x_prefit(self.model.alpha_x_prefit.to(self.model.device))
 
         if technical_covariates:
             new_technical_group_code = self.model.meta.groupby(technical_covariates).ngroup()
@@ -494,7 +494,7 @@ class CisFitter(FitterBase):
                             "estimate alpha_x itself, so re-run fit_ntc() with the new technical "
                             "groups before fit_cis()."
                         )
-                        self.model.alpha_x_prefit = None
+                        self.model._set_alpha_x_prefit(None)
                 else:
                     # Keep loaded alpha_x_prefit when grouping is unchanged (common in stepwise workflows)
                     pass

@@ -930,7 +930,7 @@ class bayesDREAM(
         from .fitting.ntc import extract_cis_ntc_posterior
         cis_posterior, alpha_x = extract_cis_ntc_posterior(ps, cis_feat_iloc, T)
         if alpha_x is not None:
-            self.alpha_x_prefit = alpha_x
+            self._set_alpha_x_prefit(alpha_x)
 
         # alpha_y_prefit for primary modality (trans genes only)
         if primary_mod.distribution == 'negbinom':

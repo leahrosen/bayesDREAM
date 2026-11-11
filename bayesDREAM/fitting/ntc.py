@@ -2261,8 +2261,10 @@ class NTCFitter(FitterBase):
             T_all_with_cis = n_trans_features + 1
 
             # ---- cis gene: posteriors for the cis modality + alpha_x_prefit [C] ----
-            cis_posterior, self.model.alpha_x_prefit = extract_cis_ntc_posterior(
+            cis_posterior, _alpha_x = extract_cis_ntc_posterior(
                 posterior_samples, cis_idx_orig, T_all_with_cis)
+            # Stored on the cis modality as alpha_y_prefit_mult [C, 1] (issue #14)
+            self.model._set_alpha_x_prefit(_alpha_x)
 
             # Modality alpha_y: trans genes only → median → [C, T]
             if modality.distribution == 'negbinom':

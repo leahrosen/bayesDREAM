@@ -464,7 +464,7 @@ Fit technical model to estimate baseline overdispersion and cell-line effects fr
 
 **Side Effects:**
 - Sets `self.alpha_y_prefit` (overdispersion parameters for trans features)
-- Sets `self.alpha_x_prefit` (overdispersion for cis feature, if primary modality)
+- Sets the cis feature's technical-group effect `alpha_x` (if primary modality with a cis gene): stored on the `'cis'` modality as `alpha_y_prefit_mult` `[C, 1]`; `model.alpha_x_prefit` reads it as `[C]`
 - Sets `self.alpha_y_type` and `self.alpha_x_type` to `'posterior'`
 - Sets `self.posterior_samples_ntc` (full posterior samples)
 - Sets `self.loss_technical` (optimization loss history)
@@ -676,9 +676,8 @@ Fit trans model to estimate downstream effects as a function of cis expression.
 - `use_epsilon` (bool): Add epsilon for numerical stability in NegativeBinomial. Default: False
 
 **Side Effects:**
-- Sets `self.posterior_samples_trans` (dose-response parameters)
+- Sets `modality.posterior_samples_trans` (dose-response parameters); for the primary modality, `model.posterior_samples_trans` reads the same object
 - Sets `self.loss_trans` (optimization loss history)
-- For modalities: sets `modality.posterior_samples_trans`
 
 **Example:**
 ```python
@@ -885,9 +884,8 @@ Load trans fitting results from HDF5 file.
 - `suffix` (str): Filename suffix to load. Default: 'default'
 
 **Restores:**
-- `self.posterior_samples_trans`
+- Per-modality `posterior_samples_trans` (`model.posterior_samples_trans` reads the primary modality's)
 - `self.loss_trans`
-- Modality-specific posterior samples
 
 **Example:**
 ```python

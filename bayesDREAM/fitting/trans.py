@@ -3221,9 +3221,10 @@ class TransFitter(FitterBase):
         modality.trans_x_input = trans_x_input
         modality.losses_trans = self.losses_trans  # Store loss history
 
-        # For primary modality, also store at model level for direct access via model.posterior_samples_trans
+        # For the primary modality, also expose some results at model level.
+        # (model.posterior_samples_trans is a read alias of the primary
+        # modality's slot set above, issue #14, so it is not copied here.)
         if modality_name == self.model.primary_modality:
-            self.model.posterior_samples_trans = posterior_samples_y
             self.model.losses_trans = self.losses_trans
             self.model.trans_prior_params = trans_prior_params
             self.model.trans_x_input = trans_x_input

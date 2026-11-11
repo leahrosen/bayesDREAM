@@ -619,7 +619,7 @@ class ModelLoader:
         parts = ['posterior']
 
         if alpha_x is not None and not loaded.get('alpha_x_prefit'):
-            self.model.alpha_x_prefit = alpha_x.flatten().to(self.model.device)
+            self.model._set_alpha_x_prefit(alpha_x.flatten().to(self.model.device))
             loaded['alpha_x_prefit'] = True
             parts.append('alpha_x')
 
@@ -762,11 +762,16 @@ class ModelLoader:
                 # Backward compat: if saved as 3D posterior, collapse to mean
                 if isinstance(alpha_x, torch.Tensor) and alpha_x.ndim >= 2 and alpha_x.shape[0] > 1:
                     alpha_x = alpha_x.mean(dim=0)
-                self.model.alpha_x_prefit = alpha_x.flatten()
-                loaded['alpha_x_prefit'] = True
-                loaded_summary.append('alpha_x')
-                if verbose:
-                    print(f"[LOAD] alpha_x_prefit ← {alpha_x_path}")
+                if 'cis' in self.model.modalities:
+                    # Stored on the cis modality as alpha_y_prefit_mult [C, 1] (issue #14)
+                    self.model._set_alpha_x_prefit(alpha_x.flatten())
+                    loaded['alpha_x_prefit'] = True
+                    loaded_summary.append('alpha_x')
+                    if verbose:
+                        print(f"[LOAD] alpha_x_prefit ← {alpha_x_path}")
+                else:
+                    print(f"[LOAD] Skipped {alpha_x_path}: this model has no cis gene yet "
+                          f"('cis' modality), which is where alpha_x is stored.")
 
             # Load alpha_y_prefit (legacy model-level file → primary modality)
             alpha_y_path = os.path.join(input_dir, 'alpha_y_prefit.pt')
@@ -1451,7 +1456,7 @@ class ModelLoader:
                 if isinstance(loaded_data, dict) and 'posterior_samples' in loaded_data:
                     posterior_dict, n_features, _, extra = _load_trans_posterior(
                         loaded_data, f"trans {self.model.primary_modality}")
-                    self.model.posterior_samples_trans = posterior_dict
+                    self.model._set_posterior_samples_trans(posterior_dict)
                     loaded['posterior_samples_trans'] = True
                     loaded['posterior_samples_trans_metadata'] = extra
                     if loaded_data.get('losses_trans') is not None:
@@ -1464,7 +1469,7 @@ class ModelLoader:
                         print(f"[LOAD] posterior_samples_trans (modality: {extra.get('modality_name')}, "
                               f"{extra.get('n_features')} features) ← {posterior_path}")
                 else:
-                    self.model.posterior_samples_trans = loaded_data
+                    self.model._set_posterior_samples_trans(loaded_data)
                     loaded['posterior_samples_trans'] = True
                     if verbose:
                         print(f"[LOAD] posterior_samples_trans (legacy format) ← {posterior_path}")

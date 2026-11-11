@@ -31,7 +31,8 @@ class TechnicalStateMixin:
         self.meta["technical_group_code"] = assign_or_warn_technical_group_code(
             self.meta, covariates, reuse_warning="technical_group previously set. Assuming alpha_x corresponds."
         )
-        self.alpha_x_prefit = sample_or_use_point("alpha_x_posterior", alpha_x, self.device).flatten()
+        # Stored on the 'cis' modality as alpha_y_prefit_mult [C, 1] (issue #14)
+        self._set_alpha_x_prefit(sample_or_use_point("alpha_x_posterior", alpha_x, self.device).flatten())
 
     def set_alpha_y(
         self,

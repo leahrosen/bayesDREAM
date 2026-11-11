@@ -49,6 +49,78 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
     3) Fitting trans effects (model_y).
     """
 
+    # ------------------------------------------------------------------
+    # Model-level aliases for per-modality fit results (issue #14).
+    # The data lives only on the modalities; these names are kept so existing
+    # code that reads them keeps working. Assigning them still works but is
+    # deprecated (it writes through to the modality). Package code uses the
+    # private _set_* methods, which do not warn.
+    # ------------------------------------------------------------------
+    @property
+    def posterior_samples_trans(self):
+        """The primary modality's trans posterior (alias of
+        ``model.get_modality(model.primary_modality).posterior_samples_trans``)."""
+        mods = getattr(self, 'modalities', None)
+        prim = getattr(self, 'primary_modality', None)
+        if not mods or prim not in mods:
+            return None
+        return mods[prim].posterior_samples_trans
+
+    @posterior_samples_trans.setter
+    def posterior_samples_trans(self, value):
+        warnings.warn(
+            "Assigning model.posterior_samples_trans is deprecated: it is stored on the primary "
+            "modality. Assign model.get_modality(model.primary_modality).posterior_samples_trans "
+            "instead.", DeprecationWarning, stacklevel=2)
+        self._set_posterior_samples_trans(value)
+
+    def _set_posterior_samples_trans(self, value):
+        mods = getattr(self, 'modalities', None)
+        prim = getattr(self, 'primary_modality', None)
+        if not mods or prim not in mods:
+            raise ValueError("Cannot store posterior_samples_trans: the primary modality does not exist yet.")
+        mods[prim].posterior_samples_trans = value
+
+    @property
+    def alpha_x_prefit(self):
+        """The cis gene's fit_ntc technical-group effects, shape ``[C]`` (reference
+        group at index 0). Stored on the 'cis' modality as its
+        ``alpha_y_prefit_mult`` with shape ``[C, 1]``; None if there is no 'cis'
+        modality or no fit."""
+        mods = getattr(self, 'modalities', None)
+        cis = mods.get('cis') if mods else None
+        a = getattr(cis, 'alpha_y_prefit_mult', None) if cis is not None else None
+        if a is None:
+            return None
+        if a.ndim != 2 or a.shape[1] != 1:
+            raise ValueError(
+                f"cis modality alpha_y_prefit_mult has shape {tuple(a.shape)}; expected [C, 1].")
+        return a[:, 0]
+
+    @alpha_x_prefit.setter
+    def alpha_x_prefit(self, value):
+        warnings.warn(
+            "Assigning model.alpha_x_prefit is deprecated: alpha_x is stored on the 'cis' modality "
+            "as alpha_y_prefit_mult [C, 1]. Use model.set_alpha_x() or assign "
+            "model.get_modality('cis').alpha_y_prefit_mult instead.", DeprecationWarning, stacklevel=2)
+        self._set_alpha_x_prefit(value)
+
+    def _set_alpha_x_prefit(self, value):
+        """Store alpha_x ([C], reference group first) on the 'cis' modality as its
+        alpha_y_prefit_mult [C, 1]; None clears it."""
+        mods = getattr(self, 'modalities', None)
+        cis = mods.get('cis') if mods else None
+        if value is None:
+            if cis is not None:
+                cis.alpha_y_prefit_mult = None
+            return
+        if cis is None:
+            raise ValueError(
+                "Cannot store alpha_x: there is no 'cis' modality yet. Set cis_gene at "
+                "initialisation or call add_cis_gene() first.")
+        value = torch.as_tensor(value, dtype=torch.float32).flatten()
+        cis.alpha_y_prefit_mult = value.reshape(-1, 1)
+
     def __init__(
         self,
         meta: pd.DataFrame,
@@ -334,7 +406,7 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         set_max_threads(cores)
 
         # Bookkeeping for results
-        self.alpha_x_prefit = None    # from step1: shape [C], always a mean point estimate
+        # alpha_x_prefit: property, stored on the 'cis' modality (issue #14)
         # NOTE: alpha_y_prefit is stored per-modality as a mean point estimate [C, T]
         # Data-driven prior parameters fit_ntc actually used, per modality:
         # {modality_name: pd.DataFrame indexed by feature id, columns e.g.
@@ -1252,7 +1324,7 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         if preserve_fits:
             # Copy technical fit parameters if they exist
             if self.alpha_x_prefit is not None:
-                model_new.alpha_x_prefit = self.alpha_x_prefit.clone() if isinstance(self.alpha_x_prefit, torch.Tensor) else self.alpha_x_prefit
+                model_new._set_alpha_x_prefit(self.alpha_x_prefit.clone() if isinstance(self.alpha_x_prefit, torch.Tensor) else self.alpha_x_prefit)
 
             # Copy all fit attributes from original modalities to new modalities
             # (including 'gene' and 'cis' which were recreated during initialization)
@@ -1327,7 +1399,7 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
             # group labels index the mu_target_i/sigma_target_i sites, which cell subsetting leaves intact
             model_new.mu_sigma_group_labels = getattr(self, 'mu_sigma_group_labels', None)
             if hasattr(self, 'posterior_samples_trans') and self.posterior_samples_trans is not None:
-                model_new.posterior_samples_trans = self.posterior_samples_trans
+                model_new._set_posterior_samples_trans(self.posterior_samples_trans)
             if hasattr(self, 'losses_trans') and self.losses_trans is not None:
                 model_new.losses_trans = self.losses_trans
 
