@@ -7,7 +7,8 @@ import pickle
 import torch
 import pandas as pd
 
-from ..utils import make_names_unique, LEAN_POSTERIOR_KEY, get_guide_axis_labels
+from ..utils import (make_names_unique, LEAN_POSTERIOR_KEY, get_guide_axis_labels,
+                     feature_axis, modality_feature_axis_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -69,22 +70,20 @@ def _align_tensor(tensor, saved_names, target_names, dim):
     return aligned, mask
 
 
-def _detect_feature_dim(tensor, n_features_saved):
+def _detect_feature_dim(tensor, n_features_saved, distribution=None, n_categories=None):
     """
     Return the dimension index that corresponds to features, or None.
 
-    Checks last dim first, then second-to-last (for multinomial [C, T, K] tensors).
-    Returns None when no dimension matches n_features_saved (scalars, per-group
-    tensors, etc.).
+    Delegates to utils.feature_axis: for multinomial the [..., T, cat] layout is
+    resolved explicitly (pass ``distribution``/``n_categories``); otherwise the
+    last dim is checked first, then second-to-last. Returns None when no
+    dimension matches n_features_saved (scalars, per-group tensors, etc.).
     """
-    if tensor.ndim >= 1 and tensor.shape[-1] == n_features_saved:
-        return tensor.ndim - 1
-    if tensor.ndim >= 2 and tensor.shape[-2] == n_features_saved:
-        return tensor.ndim - 2
-    return None
+    return feature_axis(tensor, n_features_saved, distribution, n_categories)
 
 
-def _align_posterior_features(posterior_dict, saved_names, target_names, n_features_saved):
+def _align_posterior_features(posterior_dict, saved_names, target_names, n_features_saved,
+                              distribution=None, n_categories=None):
     """
     Align every tensor in `posterior_dict` whose feature dimension equals
     `n_features_saved`, reindexing from `saved_names` to `target_names`.
@@ -111,7 +110,7 @@ def _align_posterior_features(posterior_dict, saved_names, target_names, n_featu
         if not isinstance(v, torch.Tensor):
             aligned[k] = v
             continue
-        dim = _detect_feature_dim(v, n_features_saved)
+        dim = _detect_feature_dim(v, n_features_saved, distribution, n_categories)
         if dim is None:
             aligned[k] = v
         else:
@@ -201,7 +200,7 @@ def _fill_nan_with_baseline(tensor, feat_mask, distribution):
         return tensor
     baseline = 1.0 if distribution == 'negbinom' else 0.0
     t = tensor.clone()
-    feat_dim = _detect_feature_dim(t, len(feat_mask))
+    feat_dim = _detect_feature_dim(t, len(feat_mask), distribution)
     if feat_dim is None:
         return t
     # Move feature axis to last for uniform indexing
@@ -857,7 +856,8 @@ class ModelLoader:
                     if (current_feature_names is not None and saved_feature_names is not None
                             and current_feature_names != saved_feature_names):
                         posterior_raw, feat_mask = _align_posterior_features(
-                            posterior_raw, saved_feature_names, current_feature_names, n_features_saved)
+                            posterior_raw, saved_feature_names, current_feature_names, n_features_saved,
+                            **modality_feature_axis_kwargs(mod))
                         _report_alignment(f"{mod_name} NTC posterior",
                                           saved_feature_names, current_feature_names, feat_mask)
                         _check_nan_features(feat_mask, mod_name, mask_features)
@@ -962,7 +962,8 @@ class ModelLoader:
                 if (current_feature_names is not None and saved_feature_names is not None
                         and current_feature_names != saved_feature_names
                         and n_features_saved is not None):
-                    dim = _detect_feature_dim(alpha_y_to_set, n_features_saved)
+                    dim = _detect_feature_dim(alpha_y_to_set, n_features_saved,
+                                              **modality_feature_axis_kwargs(mod))
                     if dim is not None:
                         alpha_y_to_set, feat_mask = _align_tensor(
                             alpha_y_to_set, saved_feature_names, current_feature_names, dim)
@@ -1353,7 +1354,8 @@ class ModelLoader:
                 if (cur_names is not None and saved_names is not None
                         and cur_names != saved_names and n_features is not None):
                     posterior_raw, feat_mask = _align_posterior_features(
-                        posterior_raw, saved_names, cur_names, n_features)
+                        posterior_raw, saved_names, cur_names, n_features,
+                        **modality_feature_axis_kwargs(mod))
                     _report_alignment(f"{label} features", saved_names, cur_names, feat_mask)
 
                     if feat_mask is not None:
@@ -1425,7 +1427,8 @@ class ModelLoader:
                                                  if mod.feature_ids is not None
                                                  else [cur_names[i] for i, m in enumerate(mask_np) if m])
                                 posterior_raw, feat_mask = _align_posterior_features(
-                                    loaded_data['posterior_samples'], saved_names, new_cur_names, n_features)
+                                    loaded_data['posterior_samples'], saved_names, new_cur_names, n_features,
+                                    **modality_feature_axis_kwargs(mod))
                                 # feat_mask should now be all True
                         mod.fitted_feature_mask = feat_mask
 

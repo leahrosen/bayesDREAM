@@ -864,6 +864,57 @@ def check_tensor(name, tensor):
     print(f"  has Inf: {torch.isinf(tensor).any().item()}")
 
 
+def feature_axis(tensor, n_features, distribution=None, n_categories=None):
+    """
+    Return the axis of ``tensor`` that indexes features, or None.
+
+    Used wherever per-feature fit results (posterior samples, alpha_y_prefit,
+    lean ``_lower``/``_upper`` siblings) must be sliced or reindexed by feature.
+
+    - multinomial: tensors are ``[..., T, cat]`` where the trailing category
+      axis has K, K-1 or 0 entries (e.g. ``A`` [S, T, K], ``alpha``/``Vmax_a``
+      [S, T, K-1], ``alpha_n_coupling_a`` [S, T, 0]), or ``[..., T]`` for
+      per-feature scalars (e.g. ``sigma_n_a`` [S, T]). The second-to-last axis
+      is preferred whenever it has ``n_features`` entries and the last axis is a
+      category axis, so a feature count that happens to equal the category
+      count cannot be mistaken for the category axis.
+    - other distributions: the last axis if it has ``n_features`` entries, else
+      the second-to-last (unchanged legacy behaviour).
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+    n_features : int
+    distribution : str, optional
+        The modality's distribution. If None, the non-multinomial rule is used.
+    n_categories : int, optional
+        Multinomial K. If None, any trailing axis is accepted as a category axis
+        when the second-to-last axis matches ``n_features``.
+    """
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+        return None
+    nd = tensor.ndim
+    if distribution == 'multinomial':
+        if nd >= 2 and tensor.shape[-2] == n_features:
+            if n_categories is None or tensor.shape[-1] in (n_categories, n_categories - 1, 0):
+                return nd - 2
+        if tensor.shape[-1] == n_features:
+            return nd - 1
+        return None
+    if tensor.shape[-1] == n_features:
+        return nd - 1
+    if nd >= 2 and tensor.shape[-2] == n_features:
+        return nd - 2
+    return None
+
+
+def modality_feature_axis_kwargs(mod):
+    """``distribution``/``n_categories`` of a Modality, for :func:`feature_axis`."""
+    dims = getattr(mod, 'dims', None) or {}
+    return {'distribution': getattr(mod, 'distribution', None),
+            'n_categories': dims.get('n_categories')}
+
+
 def check_technical_alpha_shape(alpha, C, trailing_shape=(), name="alpha"):
     """
     Validate a fit_ntc technical-group point estimate before it is used.

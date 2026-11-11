@@ -1036,13 +1036,15 @@ class bayesDREAM(
             new_mod.alpha_y_prefit_add = old_mod.alpha_y_prefit_add
             return
 
+        from .utils import modality_feature_axis_kwargs
+        axis_kwargs = modality_feature_axis_kwargs(old_mod)
         n_old = len(old_ids)
         if old_mod.posterior_samples_ntc is not None:
             new_mod.posterior_samples_ntc, _ = _align_posterior_features(
-                old_mod.posterior_samples_ntc, old_ids, new_ids, n_old)
+                old_mod.posterior_samples_ntc, old_ids, new_ids, n_old, **axis_kwargs)
         alphas, _ = _align_posterior_features(
             {'mult': old_mod.alpha_y_prefit_mult, 'add': old_mod.alpha_y_prefit_add},
-            old_ids, new_ids, n_old)
+            old_ids, new_ids, n_old, **axis_kwargs)
         new_mod.alpha_y_prefit_mult = alphas['mult']
         new_mod.alpha_y_prefit_add = alphas['add']
 
@@ -1054,28 +1056,38 @@ class bayesDREAM(
         mod: 'Modality', keep_idx: np.ndarray, T: int
     ) -> None:
         """
-        Trim the feature (last) axis of every tensor in mod.posterior_samples_ntc
-        and the alpha_y_prefit arrays to the surviving feature indices.
+        Trim the feature axis of every tensor in mod.posterior_samples_ntc and
+        of the alpha_y_prefit arrays to the surviving feature indices.
+
+        The feature axis comes from utils.feature_axis: last for most
+        distributions, second-to-last for multinomial [..., T, K] tensors (and
+        last for multinomial per-feature scalars [..., T]). alpha_y_prefit_* are
+        always [C, T] / [C, T, K], so their feature axis is dim 1.
 
         Mutates mod in-place; called before get_feature_subset() so the counts
-        array still has T columns.
+        array still has T features.
         """
+        from .utils import feature_axis, modality_feature_axis_kwargs
+        idx = torch.as_tensor(np.asarray(keep_idx), dtype=torch.long)
+        axis_kwargs = modality_feature_axis_kwargs(mod)
+
         ps = mod.posterior_samples_ntc
-        if ps is None:
-            return
+        if ps is not None:
+            for key in list(ps.keys()):
+                v = ps[key]
+                dim = feature_axis(v, T, **axis_kwargs)
+                if dim is not None:
+                    ps[key] = v.index_select(dim, idx.to(v.device))
 
-        for key in list(ps.keys()):
-            v = ps[key]
-            if not isinstance(v, torch.Tensor):
+        for name in ('alpha_y_prefit_mult', 'alpha_y_prefit_add'):
+            a = getattr(mod, name)
+            if a is None:
                 continue
-            if v.shape[-1] == T:
-                ps[key] = v[..., keep_idx]
-
-        if mod.alpha_y_prefit_mult is not None and mod.alpha_y_prefit_mult.shape[-1] == T:
-            mod.alpha_y_prefit_mult = mod.alpha_y_prefit_mult[..., keep_idx]
-
-        if mod.alpha_y_prefit_add is not None and mod.alpha_y_prefit_add.shape[-1] == T:
-            mod.alpha_y_prefit_add = mod.alpha_y_prefit_add[..., keep_idx]
+            if a.ndim < 2 or a.shape[1] != T:
+                raise ValueError(
+                    f"{mod.name}.{name} has shape {tuple(a.shape)}; expected {T} features on dim 1."
+                )
+            setattr(mod, name, a.index_select(1, idx.to(a.device)))
 
     def exclude_trans_genes(
         self,
