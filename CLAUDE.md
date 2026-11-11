@@ -221,6 +221,7 @@ for gene in ['GFI1B', 'MYB', 'TET2']:
 **Constraints:**
 - `label` must be provided explicitly when `cis_gene` is omitted at init
 - `fit_cis()` and `fit_trans()` require `add_cis_gene()` to have been called first
+- Cis cells come from `meta['target']` (unless a guide mapping is used). If no cell has `target == cis_gene`, `add_cis_gene()` tries the gene's other identifiers (feature id, `gene_id`/`gene_name`/... in its feature_meta row) and relabels matches to `cis_gene`; if nothing matches it raises instead of silently fitting NTC-only (pass `allow_ntc_only=True` to allow that) — issue #22
 - `adjust_ntc_sum_factor()` and `fit_ntc()` can safely be called before `add_cis_gene()`
 - `guide_code` is computed over all cells at init (harmless), then recomputed compactly inside `add_cis_gene()` (single-guide mode only — stays `-1` in high-MOI mode)
 

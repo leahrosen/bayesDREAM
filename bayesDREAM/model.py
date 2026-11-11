@@ -518,7 +518,7 @@ class bayesDREAM(
     # Deferred cis-gene specification
     # ------------------------------------------------------------------
 
-    def add_cis_gene(self, cis_gene: str) -> None:
+    def add_cis_gene(self, cis_gene: str, allow_ntc_only: bool = False) -> None:
         """
         Specify the cis gene after initialization and prepare the model for cis/trans fitting.
 
@@ -556,12 +556,22 @@ class bayesDREAM(
             Name of the cis gene (must exist in the primary modality's feature_meta). If the
             model was built with guide_target (high-MOI, or single-guide with a guide_target
             mapping), at least one guide must target it per guide_targets_dict.
+            Otherwise its cells are found via ``meta['target']``: if no cell has
+            ``target == cis_gene``, the gene's other identifiers (feature id and the
+            values in its feature_meta row, e.g. gene_id vs gene_name) are tried, and
+            matching cells are relabelled to ``cis_gene``.
+        allow_ntc_only : bool, default False
+            Allow committing to a cis gene that no cell targets (an NTC-only fit).
+            By default this raises, since it usually means ``meta['target']`` uses
+            a different naming convention than ``cis_gene``.
 
         Raises
         ------
         ValueError
             If cis_gene is already set, if the gene is not found, if no guide targets it
-            (when a guide_target mapping is in use), or if the gene has zero counts across
+            (when a guide_target mapping is in use), if no cell targets it (unless
+            ``allow_ntc_only=True``) or several of its identifiers appear in
+            ``meta['target']``, or if the gene has zero counts or zero variance across
             NTC + cis cells.
         """
         if self.cis_gene is not None:
@@ -588,6 +598,20 @@ class bayesDREAM(
 
         print(f"[INFO] add_cis_gene: found '{cis_gene}' at feature iloc {cis_feat_iloc} "
               f"in primary modality (of {n_total_features} features)")
+
+        # Every identifier this gene is known by (feature id + string-valued cells
+        # of its feature_meta row), for matching meta['target'] in step 5a'.
+        cis_aliases = []
+        if primary_mod.feature_ids is not None:
+            cis_aliases.append(str(primary_mod.feature_ids[cis_feat_iloc]))
+        for _v in primary_mod.feature_meta.iloc[cis_feat_iloc].tolist():
+            if isinstance(_v, str) and _v.strip() and _v not in cis_aliases:
+                cis_aliases.append(_v)
+
+        # Resolve cis_gene against meta['target'] (issue #22) BEFORE modifying
+        # anything, so a failure leaves the model untouched and add_cis_gene()
+        # can be retried.
+        self._resolve_cis_target_in_meta(cis_gene, cis_aliases, allow_ntc_only)
 
         # ----------------------------------------------------------------
         # Step 2: extract cis gene counts from primary modality
@@ -721,6 +745,14 @@ class bayesDREAM(
         # ----------------------------------------------------------------
         # Step 5b: subset cells to NTC + cis
         # ----------------------------------------------------------------
+        n_cis_cells = int((self.meta['target'] == cis_gene).sum())
+        if n_cis_cells == 0 and not allow_ntc_only:
+            # Reached only in guide-mapping modes (meta['target'] mode is checked
+            # up front by _resolve_cis_target_in_meta, before anything is modified)
+            raise ValueError(
+                f"add_cis_gene('{cis_gene}'): no cells are assigned to '{cis_gene}' after "
+                f"guide-based reclassification. Pass allow_ntc_only=True to fit NTC cells only."
+            )
         valid_cells = set(self.meta[self.meta['target'].isin(['ntc', cis_gene])]['cell'].unique())
         n_before = len(self.meta)
         keep_mask = self.meta['cell'].isin(valid_cells).values
@@ -809,6 +841,71 @@ class bayesDREAM(
         print(f"[INFO] add_cis_gene('{cis_gene}') complete: {n_after} cells, "
               f"{self.modalities[self.primary_modality].dims['n_features']} trans features, "
               f"{'NTC posteriors transferred' if ntc_ran else 'fit_ntc() not yet run'}.")
+
+    # meta['target'] labels that are never identifiers of a gene
+    _NON_GENE_TARGET_LABELS = frozenset({
+        'ntc', 'NTC', 'non-targeting', 'non-targeting-control', 'Non-Targeting',
+        'other', 'excluded',
+    })
+
+    def _resolve_cis_target_in_meta(self, cis_gene: str, cis_aliases: list,
+                                    allow_ntc_only: bool) -> None:
+        """
+        Make sure the cells targeting cis_gene are labelled ``cis_gene`` in
+        ``meta['target']`` (issue #22). Called by add_cis_gene() before it
+        modifies anything.
+
+        Only applies when targets come from ``meta['target']`` directly; in
+        high-MOI mode or with a ``guide_target`` mapping, add_cis_gene()
+        reclassifies cells from the guide mapping instead.
+
+        - Cells with ``target == cis_gene``: nothing to do.
+        - Otherwise, try the gene's other identifiers (``cis_aliases``: its
+          feature id and the string values of its feature_meta row). If exactly
+          one distinct target value matches, relabel those cells to cis_gene. If
+          several match, raise (ambiguous).
+        - If nothing matches: raise, unless ``allow_ntc_only=True``.
+        """
+        if self.is_high_moi or self.guide_targets_dict is not None:
+            return
+
+        targets = self.meta['target']
+        if (targets == cis_gene).any():
+            return
+
+        candidates = [a for a in cis_aliases
+                      if a != cis_gene and a not in self._NON_GENE_TARGET_LABELS]
+        present = set(targets.unique())
+        matched = [a for a in candidates if a in present]
+
+        if len(matched) == 1:
+            alias = matched[0]
+            mask = targets == alias
+            self.meta.loc[mask, 'target'] = cis_gene
+            print(f"[INFO] add_cis_gene: no cells have target '{cis_gene}', but {int(mask.sum())} "
+                  f"have target '{alias}', another identifier of the same feature; relabelled "
+                  f"them to '{cis_gene}'.")
+            return
+
+        if len(matched) > 1:
+            raise ValueError(
+                f"add_cis_gene('{cis_gene}'): no cells have target '{cis_gene}', and several "
+                f"other identifiers of this feature appear in meta['target']: {matched}. "
+                f"Relabel meta['target'] so the cis cells use one identifier, then retry."
+            )
+
+        if allow_ntc_only:
+            print(f"[INFO] add_cis_gene: no cells target '{cis_gene}' (or any of its "
+                  f"identifiers); continuing with NTC cells only (allow_ntc_only=True).")
+            return
+
+        example = [t for t in present if t not in self._NON_GENE_TARGET_LABELS][:10]
+        raise ValueError(
+            f"add_cis_gene('{cis_gene}'): no cells in meta['target'] match '{cis_gene}' or any "
+            f"other identifier of this feature ({candidates or 'none'}), so the fit would use "
+            f"NTC cells only. Check that meta['target'] uses the same naming as the feature "
+            f"(example targets: {example}). Pass allow_ntc_only=True if an NTC-only fit is intended."
+        )
 
     def _extract_cis_alpha_from_ntc_posteriors(
         self, cis_gene: str, cis_feat_iloc: int, n_total_features: int
