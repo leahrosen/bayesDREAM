@@ -223,6 +223,7 @@ for gene in ['GFI1B', 'MYB', 'TET2']:
 - `fit_cis()` and `fit_trans()` require `add_cis_gene()` to have been called first
 - Cis cells come from `meta['target']` (unless a guide mapping is used). If no cell has `target == cis_gene`, `add_cis_gene()` tries the gene's other identifiers (feature id, `gene_id`/`gene_name`/... in its feature_meta row) and relabels matches to `cis_gene`; if nothing matches it raises instead of silently fitting NTC-only (pass `allow_ntc_only=True` to allow that) — issue #22
 - `adjust_ntc_sum_factor()` and `fit_ntc()` can safely be called before `add_cis_gene()`
+- `load_ntc_fit()` on a model whose cis gene is already set (at init or via `add_cis_gene()`) works with a shared, all-genes NTC fit: when there is no `posterior_samples_ntc_cis.pt`, it locates the cis gene in the primary modality's saved posterior by any of its identifiers (feature id, `gene_id`/`gene_name`/... from either side's feature metadata) and fills the `'cis'` modality and `alpha_x_prefit` from it — issue #23
 - `guide_code` is computed over all cells at init (harmless), then recomputed compactly inside `add_cis_gene()` (single-guide mode only — stays `-1` in high-MOI mode)
 
 **Supported in high-MOI mode too** (`guide_assignment`/`guide_meta` provided at init, `cis_gene` omitted):

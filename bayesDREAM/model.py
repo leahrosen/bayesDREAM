@@ -926,9 +926,11 @@ class bayesDREAM(
         full_alpha_y_mult = ps.get('alpha_y_mult')
         full_alpha_y_add  = ps.get('alpha_y_add')
 
-        # alpha_x_prefit: median of the cis gene's alpha_y_mult samples → [C]
-        if full_alpha_y_mult is not None and full_alpha_y_mult.shape[-1] == T:
-            self.alpha_x_prefit = full_alpha_y_mult[..., cis_feat_iloc].median(dim=0).values
+        # cis gene: posteriors for the cis modality + alpha_x_prefit [C]
+        from .fitting.ntc import extract_cis_ntc_posterior
+        cis_posterior, alpha_x = extract_cis_ntc_posterior(ps, cis_feat_iloc, T)
+        if alpha_x is not None:
+            self.alpha_x_prefit = alpha_x
 
         # alpha_y_prefit for primary modality (trans genes only)
         if primary_mod.distribution == 'negbinom':
@@ -938,34 +940,7 @@ class bayesDREAM(
             if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
                 primary_mod.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
 
-        # Build cis modality's posterior_samples_ntc (matching what ntc.py produces)
         cis_modality = self.modalities['cis']
-        cis_posterior = {}
-        for src_key, dst_key in [
-            ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
-            ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
-            ('mu_ntc',      'mu_ntc'),
-        ]:
-            if src_key in ps and isinstance(ps[src_key], torch.Tensor):
-                v = ps[src_key]
-                if v.shape[-1] == T:
-                    cis_posterior[dst_key] = v[..., cis_feat_iloc:cis_feat_iloc + 1]
-
-        if 'alpha_x_mul' in cis_posterior:
-            raw = cis_posterior['alpha_x_mul']
-            if raw.dim() == 3:
-                S, Cminus1, _ = raw.shape
-                cis_posterior['alpha_x_mult'] = torch.cat(
-                    [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
-                cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
-
-        if 'delta_x_add' in cis_posterior:
-            raw = cis_posterior['delta_x_add']
-            if raw.dim() == 3:
-                S, Cminus1, _ = raw.shape
-                cis_posterior['alpha_x_add'] = torch.cat(
-                    [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
-
         cis_modality.posterior_samples_ntc = cis_posterior
         print(f"[INFO] Extracted '{cis_gene}' posteriors from primary modality NTC fit")
 

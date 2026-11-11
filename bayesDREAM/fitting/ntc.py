@@ -178,6 +178,66 @@ def negbinom_mu_ntc_lognormal_params(mu_x_mean_tensor, mu_x_sd_tensor):
     return log_mu, log_sigma
 
 
+def extract_cis_ntc_posterior(posterior_samples, cis_idx, n_features):
+    """
+    Slice one feature (the cis gene) out of a primary-modality fit_ntc posterior.
+
+    Single implementation shared by fit_ntc (cis gene appended to the fit),
+    add_cis_gene() (cis gene chosen after fit_ntc) and load_ntc_fit() (cis gene
+    taken from the primary modality's saved posterior when no separate cis file
+    exists, issue #23).
+
+    Parameters
+    ----------
+    posterior_samples : dict
+        Primary-modality posterior_samples_ntc, feature axis last, with
+        ``n_features`` features (including the cis gene).
+    cis_idx : int
+        Position of the cis gene on the feature axis.
+    n_features : int
+        Feature-axis length of ``posterior_samples``; only tensors whose last
+        dimension equals it are sliced.
+
+    Returns
+    -------
+    cis_posterior : dict
+        The cis modality's posterior_samples_ntc: ``log2_alpha_x``,
+        ``alpha_x_mul``, ``delta_x_add``, ``o_x``, ``mu_ntc`` (each ``[..., 1]``),
+        plus ``alpha_x_mult``/``alpha_x`` and ``alpha_x_add`` ``[S, C, 1]`` with
+        the reference group (1.0 / 0.0) prepended.
+    alpha_x_prefit : torch.Tensor or None
+        ``[C]`` posterior median of the cis gene's ``alpha_y_mult``, or None if
+        the posterior has no ``alpha_y_mult`` over ``n_features`` features.
+    """
+    alpha_x_prefit = None
+    full_alpha_y_mult = posterior_samples.get('alpha_y_mult')
+    if isinstance(full_alpha_y_mult, torch.Tensor) and full_alpha_y_mult.shape[-1] == n_features:
+        alpha_x_prefit = full_alpha_y_mult[..., cis_idx].median(dim=0).values
+
+    cis_posterior = {}
+    for src_key, dst_key in [
+        ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
+        ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
+        ('mu_ntc',      'mu_ntc'),
+    ]:
+        v = posterior_samples.get(src_key)
+        if isinstance(v, torch.Tensor) and v.shape[-1] == n_features:
+            cis_posterior[dst_key] = v[..., cis_idx:cis_idx + 1]
+
+    raw = cis_posterior.get('alpha_x_mul')  # [S, C-1, 1]
+    if raw is not None and raw.dim() == 3:
+        cis_posterior['alpha_x_mult'] = torch.cat(
+            [torch.ones(raw.shape[0], 1, 1, device=raw.device, dtype=raw.dtype), raw], dim=1)
+        cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
+
+    raw = cis_posterior.get('delta_x_add')  # [S, C-1, 1]
+    if raw is not None and raw.dim() == 3:
+        cis_posterior['alpha_x_add'] = torch.cat(
+            [torch.zeros(raw.shape[0], 1, 1, device=raw.device, dtype=raw.dtype), raw], dim=1)
+
+    return cis_posterior, alpha_x_prefit
+
+
 class NTCFitter(FitterBase):
     """Handles NTC fitting: estimates gene-specific overdispersion and batch effects."""
 
@@ -2200,8 +2260,9 @@ class NTCFitter(FitterBase):
             trans_idx    = list(range(cis_idx_orig))  # 0 .. n_trans_features-1
             T_all_with_cis = n_trans_features + 1
 
-            # alpha_x_prefit: median over posterior samples → [C]
-            self.model.alpha_x_prefit = full_alpha_y_mult[..., cis_idx_orig].median(dim=0).values
+            # ---- cis gene: posteriors for the cis modality + alpha_x_prefit [C] ----
+            cis_posterior, self.model.alpha_x_prefit = extract_cis_ntc_posterior(
+                posterior_samples, cis_idx_orig, T_all_with_cis)
 
             # Modality alpha_y: trans genes only → median → [C, T]
             if modality.distribution == 'negbinom':
@@ -2209,32 +2270,7 @@ class NTCFitter(FitterBase):
             else:
                 modality.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
 
-            # ---- Store cis gene posteriors in cis modality ----
             cis_modality = self.model.get_modality('cis')
-            cis_posterior = {}
-            for src_key, dst_key in [
-                ('log2_alpha_y', 'log2_alpha_x'), ('alpha_y_mul', 'alpha_x_mul'),
-                ('delta_y_add', 'delta_x_add'),   ('o_y',         'o_x'),
-                ('mu_ntc',      'mu_ntc'),
-            ]:
-                if src_key in posterior_samples:
-                    cis_posterior[dst_key] = posterior_samples[src_key][..., cis_idx_orig:cis_idx_orig+1]
-
-            if 'alpha_x_mul' in cis_posterior:
-                raw = cis_posterior['alpha_x_mul']  # [S, C-1, 1]
-                if raw.dim() == 3:
-                    S, Cminus1, _ = raw.shape
-                    cis_posterior['alpha_x_mult'] = torch.cat(
-                        [torch.ones(S, 1, 1, device=raw.device), raw], dim=1)
-                    cis_posterior['alpha_x'] = cis_posterior['alpha_x_mult']
-
-            if 'delta_x_add' in cis_posterior:
-                raw = cis_posterior['delta_x_add']  # [S, C-1, 1]
-                if raw.dim() == 3:
-                    S, Cminus1, _ = raw.shape
-                    cis_posterior['alpha_x_add'] = torch.cat(
-                        [torch.zeros(S, 1, 1, device=raw.device), raw], dim=1)
-
             cis_modality.posterior_samples_ntc = cis_posterior
             print(f"[INFO] Stored cis gene posteriors in 'cis' modality: {list(cis_posterior.keys())}")
 
