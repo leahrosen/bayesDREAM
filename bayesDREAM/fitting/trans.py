@@ -503,7 +503,11 @@ class TransFitter(FitterBase):
                 #   sigma = |y_ntc − Amean| floored at 10% of response amplitude
                 #
                 # Fallback (no NTC posterior): fixed-shift approach using response amplitude.
-                delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
+                # Response amplitude: Vmax_mean_tensor is already Q95 - Q05 (location-
+                # invariant). Subtracting Amean again would make the prior width depend
+                # on where the data are centred (and collapse to epsilon for data with a
+                # large positive offset).
+                delta_A = Vmax_mean_tensor.clamp_min(epsilon_tensor)
                 if y_ntc_tensor is not None:
                     sigma_A = (y_ntc_tensor - Amean_tensor).abs().clamp_min(delta_A * 0.1)
                     mean_A  = (1.0 - _o_y_weight) * Amean_tensor + _o_y_weight * y_ntc_tensor
@@ -2055,24 +2059,31 @@ class TransFitter(FitterBase):
             # For normal/studentt, Q05 can legitimately be ≤ 0 (e.g. negative SpliZ scores),
             # and the linear-space prior works fine with negative Amean — so only floor NaNs.
             # NaN Amean values (no valid observations) are handled by the fallback below.
+            # For normal/studentt no positive floor is applied at all: a NaN Q05 (no
+            # finite observations) is left NaN and filled by the NaN fallback below with
+            # the median baseline of the other features, rather than a count-scale constant.
             if distribution in ('negbinom', 'binomial'):
                 _q05_was_zero = (Amean_tensor <= 0) | torch.isnan(Amean_tensor)
-            else:  # normal, studentt: Q05 can be ≤ 0; only catch NaN
-                _q05_was_zero = torch.isnan(Amean_tensor)
-            if _q05_was_zero.any():
-                n_q05_zero = _q05_was_zero.sum().item()
-                _amean_floor = self._t(2.0 ** -10)
-                if _q01_ntc_for_floor is not None:
-                    _amean_floor = torch.minimum(_q01_ntc_for_floor, _amean_floor)
-                Amean_tensor = torch.where(_q05_was_zero, _amean_floor.expand_as(Amean_tensor), Amean_tensor)
-                print(f"[INFO] Q05 floor: {n_q05_zero} features raised to {_amean_floor.item():.3e} (min(q01_ntc, 2^-10))")
-            Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))
+                if _q05_was_zero.any():
+                    n_q05_zero = _q05_was_zero.sum().item()
+                    _amean_floor = self._t(2.0 ** -10)
+                    if _q01_ntc_for_floor is not None:
+                        _amean_floor = torch.minimum(_q01_ntc_for_floor, _amean_floor)
+                    Amean_tensor = torch.where(_q05_was_zero, _amean_floor.expand_as(Amean_tensor), Amean_tensor)
+                    print(f"[INFO] Q05 floor: {n_q05_zero} features raised to {_amean_floor.item():.3e} (min(q01_ntc, 2^-10))")
+                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
+            # Vmax_mean is the response amplitude Q95 - Q05, which is ≥ 0 for every
+            # distribution (location-invariant for normal/studentt).
             Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
 
             # Mean across all cells — used as a data-driven floor for the A prior upper
             # anchor. When y_ntc ≈ 0 (gene absent in NTC but expressed in perturbations),
             # this prevents both anchors collapsing to the same floor value.
-            mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0).clamp_min(self._t(1e-12))  # [T]
+            # Only used by the negbinom (log2-space) A prior; for normal/studentt the
+            # mean may legitimately be ≤ 0, so it is left unclamped.
+            mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0)  # [T]
+            if distribution in ('negbinom', 'binomial'):
+                mean_y_corrected_tensor = mean_y_corrected_tensor.clamp_min(self._t(1e-12))
 
         elif y_obs_for_prior.ndim == 3:  # [N, T, K] — multinomial
             K_obs = y_obs_for_prior.shape[2]
@@ -2125,7 +2136,18 @@ class TransFitter(FitterBase):
                 print(f"[INFO] Using fallback: mean={valid_mean.item():.3f}, var={valid_var_val.item():.3f}")
                 fallback_A    = torch.clamp(valid_mean * 0.5, min=0.01, max=0.99)
                 fallback_Vmax = torch.clamp(valid_mean,       min=0.01, max=0.99)
-            else:  # negbinom, normal, studentt
+            elif distribution in ['normal', 'studentt']:
+                # Continuous data on (-inf, inf): fill with the median baseline (Q05) and
+                # median amplitude (Q95 - Q05) of the other features — no halving and no
+                # positive floor on the baseline, which are count-data conventions.
+                valid_A    = Amean_tensor[~torch.isnan(Amean_tensor)]
+                valid_Vmax = Vmax_mean_tensor[~torch.isnan(Vmax_mean_tensor)]
+                fallback_A    = torch.median(valid_A)    if valid_A.numel()    > 0 else self._t(0.0)
+                fallback_Vmax = torch.median(valid_Vmax) if valid_Vmax.numel() > 0 else self._t(1.0)
+                fallback_Vmax = fallback_Vmax.clamp_min(self._t(1e-3))
+                print(f"[INFO] Using fallback: A={fallback_A.item():.3f}, "
+                      f"amplitude={fallback_Vmax.item():.3f} (medians across other features)")
+            else:  # negbinom
                 valid_A   = Amean_tensor[~torch.isnan(Amean_tensor)]
                 valid_var = cell_var[~torch.isnan(cell_var)]
                 if valid_A.numel() > 0:
@@ -3191,7 +3213,7 @@ class TransFitter(FitterBase):
             elif distribution in ('normal', 'studentt'):
                 _Amean_np = Amean_tensor.cpu().numpy()
                 _Vmax_mean_np = Vmax_mean_tensor.cpu().numpy()
-                _delta_A_np = np.maximum(_Vmax_mean_np - _Amean_np, epsilon)
+                _delta_A_np = np.maximum(_Vmax_mean_np, epsilon)  # = Q95 - Q05, as in _model_y
                 if sigma_hat_tensor is not None:
                     _sigma_hat_np = sigma_hat_tensor.cpu().numpy()
                     _sigma_ref = max(float(_sigma_hat_np.mean()), epsilon)

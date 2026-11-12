@@ -236,7 +236,8 @@ x_inflection = xc * ((K - 1) / (K + 1))^(1/K)
 **Interpretation:**
 - Total change in expression from minimum to maximum cis expression
 - For negbinom: log2 fold change in expression level
-- For normal: absolute change in score
+- For binomial: change in probability (`*_delta_p` columns)
+- For normal/studentt: absolute change in score (`*_delta` columns; log2FC is never reported)
 
 ## Using Summaries in R
 

@@ -1028,7 +1028,13 @@ class NTCFitter(FitterBase):
         else:
             raise ValueError(f"Unexpected number of dimensions: {counts_ntc_array.ndim}")
 
-        zero_count_mask = feature_sums_ntc == 0
+        if distribution in ('normal', 'studentt'):
+            # Continuous data on (-inf, inf): a sum of exactly 0 is not "no data"
+            # (e.g. centred/z-scored scores). Exclusion is decided by the
+            # no-finite-values / zero-variance check below instead.
+            zero_count_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
+        else:
+            zero_count_mask = feature_sums_ntc == 0
         zero_std_mask = np.zeros(len(feature_sums_ntc), dtype=bool)
 
         # --- Per-group zero-count check for negbinom ---

@@ -24,6 +24,32 @@ from tqdm import tqdm
 from ..utils import is_lean_posterior
 
 
+def _activity_scale(posterior, distribution, A_samples):
+    """
+    Denominator of the FDR activity test  P(alpha * Vmax / scale > epsilon).
+
+    - negbinom / binomial / multinomial: the baseline A (relative change).
+    - normal / studentt: the residual noise SD ``sigma_y`` (per posterior sample).
+      A is a location on (-inf, inf) there, so a ratio to it is meaningless and
+      depends on where the data are centred; sigma_y makes the test "effect larger
+      than epsilon x the noise SD", which is location-invariant.
+    """
+    if distribution in ('normal', 'studentt'):
+        if 'sigma_y' not in posterior:
+            raise ValueError(
+                f"FDR activity test for '{distribution}' needs 'sigma_y' in the trans "
+                f"posterior (it is sampled by fit_trans for normal/studentt)."
+            )
+        sig = posterior['sigma_y']
+        if isinstance(sig, torch.Tensor):
+            sig = sig.detach().cpu().numpy()
+        sig = np.asarray(sig, dtype=float)
+        if sig.ndim >= 3 and sig.shape[1] == 1:
+            sig = sig.squeeze(1)
+        return np.maximum(sig, 1e-12)
+    return np.maximum(A_samples, 1e-12)
+
+
 class ModelSummarizer:
     """
     Export bayesDREAM results as CSV files for plotting.
@@ -1758,13 +1784,16 @@ class ModelSummarizer:
         - function_type: Function type (additive_hill, single_hill)
         - x_obs_min, x_obs_max: Observed x range (min/max of guide-level x_true)
 
-        For negbinom/normal/studentt distributions:
+        For negbinom distributions:
         - observed_log2fc: log2(y_max / y_min) over observed x range from fitted function
         - full_log2fc_median/lower/upper: log2(y_max / y_min) over theoretical x range (0 to ∞)
 
         For binomial distributions (e.g., splicing_sj):
         - observed_delta_p: y_max - y_min over observed x range (probability difference)
         - full_delta_p_median/lower/upper: y_max - y_min over theoretical x range
+
+        For normal/studentt distributions (values on (-inf, inf); differences, never log2FC):
+        - observed_delta, full_delta_median/lower/upper: y_max - y_min, as for binomial
 
         FDR columns (all function types; fdr_alpha, fdr_beta, is_dependent, fit_type
         and which_active are all NaN for fits run with fit_trans(regularise=False),
@@ -1835,7 +1864,7 @@ class ModelSummarizer:
         - EC50_a_log2fc, EC50_b_log2fc: EC50 in log2FC x-space (log2(K) - log2(x_ntc))
         - inflection_a_log2fc_median, inflection_b_log2fc_median: Inflection points in log2FC x-space
 
-        For negbinom/normal/studentt (log2FC y-space):
+        For negbinom (log2FC y-space):
         - dg_du_at_u0, dg_du_at_u0_lower, dg_du_at_u0_upper: First derivative of log2FC at u=0 with 95% CI
         - d2g_du2_at_u0, d2g_du2_at_u0_lower, d2g_du2_at_u0_upper: Second derivative at u=0 with 95% CI
         - d3g_du3_at_u0, d3g_du3_at_u0_lower, d3g_du3_at_u0_upper: Third derivative at u=0 with 95% CI
@@ -1852,6 +1881,11 @@ class ModelSummarizer:
         - first_deriv_roots_delta_p_median: Roots of dp/du=0 in u-space
         - second_deriv_roots_delta_p_median: Roots of d²p/du²=0
         - third_deriv_roots_delta_p_median: Roots of d³p/du³=0
+
+        For normal/studentt (difference y-space; log2fc_at_u0 is NOT written):
+        - delta_at_u0, A_delta, dy_du_at_u0 / d2y_du2_at_u0 / d3y_du3_at_u0 (+ _lower/_upper),
+          first/second/third_deriv_roots_delta_median: same as the binomial columns with
+          'delta_p' -> 'delta' and 'p' -> 'y'.
         - A_delta_p: Baseline in delta_p space (A - y_ntc)
 
         For single_hill:
@@ -2221,7 +2255,8 @@ class ModelSummarizer:
         fdr_applicable = _trans_priors.get('regularise', True)
         if fdr_applicable:
             fdr_cols = self._compute_bayesian_fdr(posterior, function_type, n_features,
-                                                  n_cats_per_feature=n_cats_per_feature)
+                                                  n_cats_per_feature=n_cats_per_feature,
+                                                  distribution=modality.distribution)
         else:
             fdr_cols = {'fdr_alpha': np.full(n_features, np.nan),
                         'fdr_beta': np.full(n_features, np.nan)}
@@ -2444,6 +2479,7 @@ class ModelSummarizer:
         n_features: int,
         activity_epsilon: float = 0.01,
         n_cats_per_feature: Optional[np.ndarray] = None,
+        distribution: str = 'negbinom',
     ) -> dict:
         """
         Compute per-component Bayesian q-values (FDR-equivalents) for Hill components.
@@ -2551,7 +2587,7 @@ class ModelSummarizer:
             if (alpha_s is not None and alpha_s.ndim >= 2 and
                     vmax_s is not None and vmax_s.ndim >= 2 and
                     A_s    is not None and A_s.ndim    >= 2):
-                ratio = alpha_s * vmax_s / np.maximum(A_s, 1e-12)
+                ratio = alpha_s * vmax_s / _activity_scale(posterior, distribution, A_s)
                 return (ratio > activity_epsilon).mean(axis=0)
 
             # Fallback: use posterior mean of alpha
@@ -2786,7 +2822,13 @@ class ModelSummarizer:
 
         # Check distribution type for delta_p vs log2fc handling
         distribution = data.get('distribution', 'negbinom')
-        is_binomial = (distribution == 'binomial')
+        # Difference (y - y_ntc) instead of log2FC y-space for distributions where a
+        # ratio is not meaningful: binomial (probabilities) and normal/studentt
+        # (continuous on (-inf, inf), can be ≤ 0). Column names: binomial keeps its
+        # historical 'delta_p' / 'dp_du' names; normal/studentt use 'delta' / 'dy_du'.
+        is_delta = distribution in ('binomial', 'normal', 'studentt')
+        _dn = 'delta_p' if distribution == 'binomial' else 'delta'   # delta column stem
+        _dv = 'p' if distribution == 'binomial' else 'y'             # derivative variable
 
         def extract_param(name):
             """Helper to extract parameter with consistent handling of samples vs point estimates."""
@@ -3077,12 +3119,12 @@ class ModelSummarizer:
         # These avoid the alpha–Vmax non-identifiability by using the well-constrained product.
         _ACTIVITY_EPSILON = 0.01
         if (alpha_full.ndim >= 2 and Vmax_a_full.ndim >= 2 and A_full.ndim >= 2):
-            _ratio_a = alpha_full * Vmax_a_full / np.maximum(A_full, 1e-12)
+            _ratio_a = alpha_full * Vmax_a_full / _activity_scale(posterior, distribution, A_full)
             p_active_a = (_ratio_a > _ACTIVITY_EPSILON).mean(axis=0)
         else:
             p_active_a = alpha_median.copy()  # fallback to median[alpha]
         if (beta_full.ndim >= 2 and Vmax_b_full.ndim >= 2 and A_full.ndim >= 2):
-            _ratio_b = beta_full * Vmax_b_full / np.maximum(A_full, 1e-12)
+            _ratio_b = beta_full * Vmax_b_full / _activity_scale(posterior, distribution, A_full)
             p_active_b = (_ratio_b > _ACTIVITY_EPSILON).mean(axis=0)
         else:
             p_active_b = beta_median.copy()  # fallback to median[beta]
@@ -3287,7 +3329,7 @@ class ModelSummarizer:
                     umax = max(float(np.nanmax(u_range_local)), float(np.max(u_ec50))) + 1.0
                     u_range_local = np.linspace(umin, umax, 6000)
 
-                if is_binomial:
+                if is_delta:
                     # For binomial (delta_p = S - S_ntc):
                     # dp/du = S' * x * ln(2) → roots when S' = 0
                     # d²p/du² ∝ S' + x*S'' → roots when S' + x*S'' = 0
@@ -3429,7 +3471,7 @@ class ModelSummarizer:
                 _beta_range_i  = 0.0 if not active_b[i] else beta_i
                 if _is_flat_i:
                     full_log2fc_i = 0.0
-                elif is_binomial:
+                elif is_delta:
                     full_log2fc_i = self._full_delta_p_from_extrema_and_boundaries(
                         A_i, _alpha_range_i, Vmax_a_i, K_a_i, n_a_i,
                         _beta_range_i, Vmax_b_i, K_b_i, n_b_i,
@@ -3447,7 +3489,7 @@ class ModelSummarizer:
 
                 # Observed dynamic range over observed x range
                 if x_obs_min is not None and x_obs_max is not None:
-                    if is_binomial:
+                    if is_delta:
                         obs_log2fc_i, (x_minloc, x_maxloc) = self._compute_observed_delta_p_fitted(
                             A_i, _alpha_range_i, Vmax_a_i, _beta_range_i, Vmax_b_i,
                             K_a_i, n_a_i, K_b_i, n_b_i,
@@ -3502,7 +3544,7 @@ class ModelSummarizer:
                             if not active_b[i]:
                                 beta_s = 0.0
 
-                            if is_binomial:
+                            if is_delta:
                                 v = self._observed_delta_p_candidates_no_roots(
                                     A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
                                     beta_s, Vmax_b_s, K_b_s, n_b_s,
@@ -3560,7 +3602,7 @@ class ModelSummarizer:
                             if not active_b[i]:
                                 beta_s = 0.0
 
-                            if is_binomial:
+                            if is_delta:
                                 val = self._full_delta_p_candidates_no_roots(
                                     A_s, alpha_s, Vmax_a_s, K_a_s, n_a_s,
                                     beta_s, Vmax_b_s, K_b_s, n_b_s,
@@ -3619,10 +3661,10 @@ class ModelSummarizer:
 
         # Derivative roots in u-space: only add when both flags were True
         if compute_log2fc_params and compute_derivative_roots:
-            if is_binomial:
-                data['first_deriv_roots_delta_p_median']  = first_deriv_roots_log2fc_mean_list
-                data['second_deriv_roots_delta_p_median'] = second_deriv_roots_log2fc_mean_list
-                data['third_deriv_roots_delta_p_median']  = third_deriv_roots_log2fc_mean_list
+            if is_delta:
+                data[f'first_deriv_roots_{_dn}_median']  = first_deriv_roots_log2fc_mean_list
+                data[f'second_deriv_roots_{_dn}_median'] = second_deriv_roots_log2fc_mean_list
+                data[f'third_deriv_roots_{_dn}_median']  = third_deriv_roots_log2fc_mean_list
             else:
                 data['first_deriv_roots_log2fc_median']  = first_deriv_roots_log2fc_mean_list
                 data['second_deriv_roots_log2fc_median'] = second_deriv_roots_log2fc_mean_list
@@ -3630,13 +3672,13 @@ class ModelSummarizer:
 
         # Full and observed dynamic ranges: only add when compute_log2fc_params=True
         if compute_log2fc_params:
-            if is_binomial:
-                data['full_delta_p_median'] = full_log2fc_mean_list
-                data['full_delta_p_lower'] = full_log2fc_lower_list
-                data['full_delta_p_upper'] = full_log2fc_upper_list
-                data['observed_delta_p'] = observed_log2fc_list
-                data['observed_delta_p_lower'] = observed_log2fc_lower_list
-                data['observed_delta_p_upper'] = observed_log2fc_upper_list
+            if is_delta:
+                data[f'full_{_dn}_median'] = full_log2fc_mean_list
+                data[f'full_{_dn}_lower'] = full_log2fc_lower_list
+                data[f'full_{_dn}_upper'] = full_log2fc_upper_list
+                data[f'observed_{_dn}'] = observed_log2fc_list
+                data[f'observed_{_dn}_lower'] = observed_log2fc_lower_list
+                data[f'observed_{_dn}_upper'] = observed_log2fc_upper_list
             else:
                 data['full_log2fc_median'] = full_log2fc_mean_list
                 data['full_log2fc_lower'] = full_log2fc_lower_list
@@ -3701,7 +3743,7 @@ class ModelSummarizer:
 
                 # For negbinom, we need y_at_ntc > 0 and y_ntc_i > 0
                 # For binomial, we only need y_at_ntc to be valid (y_ntc_i can be any probability)
-                if not is_binomial and (y_at_ntc <= epsilon or y_ntc_i <= epsilon):
+                if not is_delta and (y_at_ntc <= epsilon or y_ntc_i <= epsilon):
                     return np.nan, np.nan, np.nan
 
                 S_prime = self._additive_hill_first_derivative(
@@ -3721,7 +3763,7 @@ class ModelSummarizer:
                 x3 = x_ntc ** 3
                 ln2_sq = ln2 ** 2
 
-                if is_binomial:
+                if is_delta:
                     # For binomial: compute dp/du (delta_p derivatives in u-space)
                     # where p = S(x) and u = log2(x) - log2(x_ntc), so dx/du = x * ln(2)
                     #
@@ -3777,7 +3819,7 @@ class ModelSummarizer:
                     else:
                         log2fc_at_0[i] = np.nan
                     # For binomial: compute delta_p = p(x_ntc) - p_ntc
-                    if is_binomial and np.isfinite(y_ntc_i):
+                    if is_delta and np.isfinite(y_ntc_i):
                         delta_p_at_0[i] = y_at_ntc - y_ntc_i
                     # Derivatives at u0 are zero for flat genes (only stored if compute_derivative_roots)
                     if compute_derivative_roots:
@@ -3814,11 +3856,14 @@ class ModelSummarizer:
                 H_b_at_ntc = self._hill_value(x_ntc, Vmax_b_i, K_b_i, n_b_i)
                 y_at_ntc = A_i + alpha_i * H_a_at_ntc + beta_i * H_b_at_ntc
 
-                if is_binomial and np.isfinite(y_ntc_i):
+                if is_delta and np.isfinite(y_ntc_i):
                     delta_p_at_0[i] = y_at_ntc - y_ntc_i
 
-                if y_at_ntc > epsilon and y_ntc_i > epsilon:
-                    log2fc_at_0[i] = np.log2(y_at_ntc) - np.log2(y_ntc_i)
+                _y_positive = (y_at_ntc > epsilon and y_ntc_i > epsilon)
+                # Delta-space derivatives don't need positive y (normal/studentt can be ≤ 0).
+                if is_delta or _y_positive:
+                    if _y_positive:
+                        log2fc_at_0[i] = np.log2(y_at_ntc) - np.log2(y_ntc_i)
 
                     # Derivatives at u0: only computed when compute_derivative_roots=True
                     if compute_derivative_roots:
@@ -3883,22 +3928,24 @@ class ModelSummarizer:
                 print(f"  [loop2] total: {time.time() - _t_loop2_start:.1f}s")
 
             # log2fc_at_u0 is always added (cheap, per-gene scalar) when compute_log2fc_params=True
-            data['log2fc_at_u0'] = log2fc_at_0
-            if is_binomial:
-                data['delta_p_at_u0'] = delta_p_at_0
+            # (not for normal/studentt: a log-ratio of values that can be ≤ 0 is meaningless)
+            if distribution not in ('normal', 'studentt'):
+                data['log2fc_at_u0'] = log2fc_at_0
+            if is_delta:
+                data[f'{_dn}_at_u0'] = delta_p_at_0
 
             # Derivative columns only added when compute_derivative_roots=True
             if compute_derivative_roots:
-                if is_binomial:
-                    data['dp_du_at_u0'] = dg_du_at_0
-                    data['dp_du_at_u0_lower'] = dg_du_at_0_lower
-                    data['dp_du_at_u0_upper'] = dg_du_at_0_upper
-                    data['d2p_du2_at_u0'] = d2g_du2_at_0
-                    data['d2p_du2_at_u0_lower'] = d2g_du2_at_0_lower
-                    data['d2p_du2_at_u0_upper'] = d2g_du2_at_0_upper
-                    data['d3p_du3_at_u0'] = d3g_du3_at_0
-                    data['d3p_du3_at_u0_lower'] = d3g_du3_at_0_lower
-                    data['d3p_du3_at_u0_upper'] = d3g_du3_at_0_upper
+                if is_delta:
+                    data[f'd{_dv}_du_at_u0'] = dg_du_at_0
+                    data[f'd{_dv}_du_at_u0_lower'] = dg_du_at_0_lower
+                    data[f'd{_dv}_du_at_u0_upper'] = dg_du_at_0_upper
+                    data[f'd2{_dv}_du2_at_u0'] = d2g_du2_at_0
+                    data[f'd2{_dv}_du2_at_u0_lower'] = d2g_du2_at_0_lower
+                    data[f'd2{_dv}_du2_at_u0_upper'] = d2g_du2_at_0_upper
+                    data[f'd3{_dv}_du3_at_u0'] = d3g_du3_at_0
+                    data[f'd3{_dv}_du3_at_u0_lower'] = d3g_du3_at_0_lower
+                    data[f'd3{_dv}_du3_at_u0_upper'] = d3g_du3_at_0_upper
                 else:
                     data['dg_du_at_u0'] = dg_du_at_0
                     data['dg_du_at_u0_lower'] = dg_du_at_0_lower
@@ -3933,9 +3980,9 @@ class ModelSummarizer:
             # A (baseline) in transformed y-space
             # For negbinom: A_log2fc = log2(A) - log2(y_ntc)
             # For binomial: A_delta_p = A - y_ntc
-            if is_binomial:
+            if is_delta:
                 A_delta_p = A_median - y_ntc
-                data['A_delta_p'] = A_delta_p
+                data[f'A_{_dn}'] = A_delta_p
             else:
                 A_log2fc = np.full(n_features, np.nan)
                 valid_A = (A_median > epsilon) & (y_ntc > epsilon)
@@ -4127,10 +4174,17 @@ class ModelSummarizer:
                         data[f'{hill_param}_cat{k}_lower'] = np.quantile(ck, 0.025, axis=0)
                         data[f'{hill_param}_cat{k}_upper'] = np.quantile(ck, 0.975, axis=0)
 
+        # y-space for range/baseline columns: difference (y - y_ntc) for binomial and
+        # normal/studentt, log2FC for negbinom (same convention as additive_hill).
+        _sh_dist = data.get('distribution', 'negbinom')
+        _sh_is_delta = _sh_dist in ('binomial', 'normal', 'studentt')
+        _sh_y = ('delta_p' if _sh_dist == 'binomial'
+                 else 'delta' if _sh_is_delta else 'log2fc')
+
         # Compute product-based FDR for single_hill: P(alpha * Vmax / A > epsilon)
         _ACTIVITY_EPSILON = 0.01
         if alpha_full.ndim >= 2 and Vmax_full.ndim >= 2 and A_full.ndim >= 2:
-            _ratio = alpha_full * Vmax_full / np.maximum(A_full, 1e-12)
+            _ratio = alpha_full * Vmax_full / _activity_scale(posterior, _sh_dist, A_full)
             p_active = (_ratio > _ACTIVITY_EPSILON).mean(axis=0)
         else:
             p_active = alpha_mean.copy()
@@ -4181,12 +4235,18 @@ class ModelSummarizer:
                 np.where(n_u < 0, 0.0, Vmax_mean)
             )
 
-            y0 = np.maximum(A_mean + alpha_mean * hill0, eps)
-            yinf = np.maximum(A_mean + alpha_mean * hillinf, eps)
-
             fdr_inactive = q_active >= fdr_threshold
-            log2fc_vals = np.log2(np.maximum(y0, yinf) / np.minimum(y0, yinf))
-            data['full_log2fc_median'] = np.where(fdr_inactive, 0.0, log2fc_vals)
+            if _sh_is_delta:
+                # Difference space (binomial / normal / studentt): |y(inf) - y(0)|,
+                # no positivity floor (normal/studentt values can be <= 0).
+                y0 = A_mean + alpha_mean * hill0
+                yinf = A_mean + alpha_mean * hillinf
+                range_vals = np.abs(yinf - y0)
+            else:
+                y0 = np.maximum(A_mean + alpha_mean * hill0, eps)
+                yinf = np.maximum(A_mean + alpha_mean * hillinf, eps)
+                range_vals = np.log2(np.maximum(y0, yinf) / np.minimum(y0, yinf))
+            data[f'full_{_sh_y}_median'] = np.where(fdr_inactive, 0.0, range_vals)
 
             # CI from posterior samples (coherent; use all available samples)
             if Vmax_full.ndim == 2 and compute_lfc_ci:
@@ -4209,25 +4269,29 @@ class ModelSummarizer:
                         # boundaries for single hill
                         if abs(n_s) < 1e-15:
                             # constant hill = 0.5*V everywhere -> no boundary range
-                            y0_s = max(A_s + a_s * 0.5 * V_s, eps)
+                            y0_s = A_s + a_s * 0.5 * V_s
                             yinf_s = y0_s
                         else:
                             h0 = V_s if n_s < 0 else 0.0
                             hinf = 0.0 if n_s < 0 else V_s
-                            y0_s = max(A_s + a_s * h0, eps)
-                            yinf_s = max(A_s + a_s * hinf, eps)
-        
-                        vals.append(np.log2(max(y0_s, yinf_s) / min(y0_s, yinf_s)))
+                            y0_s = A_s + a_s * h0
+                            yinf_s = A_s + a_s * hinf
+
+                        if _sh_is_delta:
+                            vals.append(abs(yinf_s - y0_s))
+                        else:
+                            y0_s, yinf_s = max(y0_s, eps), max(yinf_s, eps)
+                            vals.append(np.log2(max(y0_s, yinf_s) / min(y0_s, yinf_s)))
         
                     if vals:
                         lo[i] = np.quantile(vals, 0.025)
                         hi[i] = np.quantile(vals, 0.975)
         
-                data['full_log2fc_lower'] = lo
-                data['full_log2fc_upper'] = hi
+                data[f'full_{_sh_y}_lower'] = lo
+                data[f'full_{_sh_y}_upper'] = hi
             else:
-                data['full_log2fc_lower'] = data['full_log2fc_median']
-                data['full_log2fc_upper'] = data['full_log2fc_median']
+                data[f'full_{_sh_y}_lower'] = data[f'full_{_sh_y}_median']
+                data[f'full_{_sh_y}_upper'] = data[f'full_{_sh_y}_median']
 
             if verbose:
                 print(f"    full_log2fc (median + CI):  {time.time() - _t_sh:.1f}s")
@@ -4237,15 +4301,17 @@ class ModelSummarizer:
         if compute_log2fc_params:
             if (x_obs_min is not None) and (x_obs_max is not None) and np.isfinite(x_obs_min) and np.isfinite(x_obs_max):
                 obs = []
+                _obs_fn = (self._compute_observed_delta_p_fitted if _sh_is_delta
+                           else self._compute_observed_log2fc_fitted)
                 for i in range(n_features):
                     obs.append(
-                        self._compute_observed_log2fc_fitted(
+                        _obs_fn(
                             A_mean[i], alpha_mean[i], Vmax_mean[i], 0.0, 0.0,
                             K_mean[i], n_used[i], 1.0, 1.0,
                             float(x_obs_min), float(x_obs_max)
                         )
                     )
-                data['observed_log2fc'] = obs
+                data[f'observed_{_sh_y}'] = obs
 
             if (x_obs_min is not None) and (x_obs_max is not None) and (Vmax_full.ndim == 2) and compute_lfc_ci:
                 eps = 1e-10
@@ -4275,18 +4341,21 @@ class ModelSummarizer:
                             H = self._hill_value(x, V_s, K_s, n_s)
                             return A_s + a_s * H
 
-                        y0 = max(y_at(x0), eps)
-                        y1 = max(y_at(x1), eps)
-                        vals.append(np.log2(max(y0, y1) / min(y0, y1)))
+                        if _sh_is_delta:
+                            vals.append(abs(y_at(x1) - y_at(x0)))
+                        else:
+                            y0 = max(y_at(x0), eps)
+                            y1 = max(y_at(x1), eps)
+                            vals.append(np.log2(max(y0, y1) / min(y0, y1)))
 
                     lo[i] = np.quantile(vals, 0.025)
                     hi[i] = np.quantile(vals, 0.975)
 
-                data['observed_log2fc_lower'] = lo
-                data['observed_log2fc_upper'] = hi
+                data[f'observed_{_sh_y}_lower'] = lo
+                data[f'observed_{_sh_y}_upper'] = hi
             else:
-                data['observed_log2fc_lower'] = data.get('observed_log2fc', np.full(n_features, np.nan))
-                data['observed_log2fc_upper'] = data.get('observed_log2fc', np.full(n_features, np.nan))
+                data[f'observed_{_sh_y}_lower'] = data.get(f'observed_{_sh_y}', np.full(n_features, np.nan))
+                data[f'observed_{_sh_y}_upper'] = data.get(f'observed_{_sh_y}', np.full(n_features, np.nan))
 
             if verbose:
                 print(f"    observed_log2fc (mean + CI): {time.time() - _t_sh:.1f}s")
@@ -4348,10 +4417,13 @@ class ModelSummarizer:
 
     
             y_ntc_arr = np.asarray(y_ntc, dtype=float)
-            outA = np.full(n_features, np.nan)
-            okA = (A_mean > eps) & (y_ntc_arr > eps)
-            outA[okA] = np.log2(A_mean[okA]) - np.log2(y_ntc_arr[okA])
-            data['A_log2fc'] = outA
+            if _sh_is_delta:
+                data[f'A_{_sh_y}'] = A_mean - y_ntc_arr
+            else:
+                outA = np.full(n_features, np.nan)
+                okA = (A_mean > eps) & (y_ntc_arr > eps)
+                outA[okA] = np.log2(A_mean[okA]) - np.log2(y_ntc_arr[okA])
+                data['A_log2fc'] = outA
 
     
             # Also roots in log2FC x-space, if present:
