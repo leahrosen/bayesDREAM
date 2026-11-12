@@ -52,7 +52,8 @@ From: python:3.11-slim
         seaborn \
         h5py \
         psutil \
-        pyyaml
+        pyyaml \
+        statsmodels
 
     cd /opt/bayesDREAM
     python -m pip install --no-cache-dir -e .
