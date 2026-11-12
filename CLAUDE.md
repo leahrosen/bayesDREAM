@@ -102,7 +102,7 @@ The main class in `bayesDREAM/model.py` implements multi-modal Bayesian modeling
 - `add_cis_gene(cis_gene, allow_ntc_only=False)`: Specifies the cis gene after initialization (see **Deferred Cis-Gene Workflow** below). Can be called before or after `fit_ntc()`.
 - `set_alpha_x(alpha_x, covariates)`: Sets cis gene overdispersion parameters
 - `set_alpha_y(alpha_y, covariates)`: Sets trans gene overdispersion parameters
-- `adjust_ntc_sum_factor(covariates, ...)`: Adjusts NTC sum factors for covariates
+- `adjust_ntc_sum_factor(covariates, ..., pool_batches=True)`: Removes each guide's systematic sum-factor shift vs NTC. Default: one log-space offset per guide (NTC guides included), pooled across covariate groups; `pool_batches=False` is the legacy per-(group, guide) ratio
 - `fit_cis(sum_factor_col, ...)`: Fits cis effects using `_model_x`. `independent_mu_sigma=True` fits `mu`/`sigma` per group = (NTC | cis) x covariates: cis guides by `mu_sigma_covariates` (default `guide_covariates`), NTC by `mu_sigma_covariates_ntc` (default `guide_covariates_ntc`). `guide_covariates` splits only non-NTC guides and `guide_covariates_ntc` only NTC guides (never combined)
 - `set_x_true(x_true)`: Sets true cis expression for trans modeling
 - **Where fit results live (issue #14):** per-modality only. `model.posterior_samples_trans` is a property reading the primary modality's `posterior_samples_trans`; `model.alpha_x_prefit` is a property reading the `'cis'` modality's `alpha_y_prefit_mult` (`[C, 1]`, returned as `[C]`). Assigning either still works but raises a `DeprecationWarning` and writes through to the modality; package code uses `_set_posterior_samples_trans()` / `_set_alpha_x_prefit()`.

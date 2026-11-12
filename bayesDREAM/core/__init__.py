@@ -488,7 +488,8 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         self,
         sum_factor_col_old: str = "sum_factor",
         sum_factor_col_adj: str = "sum_factor_adj",
-        covariates: list[str] = None # Technical group covariates (e.g., ["lane", "cell_line"]) or could be empty
+        covariates: list[str] = None, # Technical group covariates (e.g., ["lane", "cell_line"]) or could be empty
+        pool_batches: bool = True,
     ):
         """
         Step 1 of sum factor adjustment: Normalize guides to NTC controls.
@@ -514,6 +515,18 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
         covariates : list of str, optional
             Technical group covariates to group by for adjustment (e.g., ['cell_line', 'lane']).
             If None or empty, uses global mean across all cells.
+        pool_batches : bool
+            If True (default), estimate ONE log-space offset per guide, pooled across
+            covariate groups: each cell's log(sum_factor) minus the mean log(sum_factor)
+            of the NTC cells in its own covariate group, averaged over all of the
+            guide's cells. Every guide -- NTC guides included -- is then corrected by
+            that single offset, so each cell keeps its own depth relative to the other
+            cells of its guide, and the covariate (batch) shift stays in the factor.
+            The offset's precision depends on the guide's total cell count, not on its
+            count per covariate group. If False, the legacy per-(group, guide)
+            correction below is used; with few cells per (group, guide) it largely
+            replaces each cell's own depth by its group's NTC mean (a single cell in a
+            group gets exactly that mean).
 
         Returns
         -------
@@ -522,7 +535,16 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
 
         Notes
         -----
-        **Single-guide mode** (low MOI): for each guide within each covariate group:
+        **pool_batches=True** (default), single-guide and high MOI alike:
+        - ref_c = mean log(sum_factor) over NTC cells in cell c's covariate group
+        - delta_g = mean over guide g's cells of (log(sum_factor_c) - ref_c)
+          (high MOI: per-group guide means minus the cells_per_guide-weighted NTC
+          guide mean, then weighted by the guide's cells in each group)
+        - log(sf_adj_c) = log(sf_c) - delta_g (high MOI: minus the sum over the cell's guides)
+        Cells in a covariate group without NTC cells don't contribute to delta_g but are
+        still corrected; a guide with no cells in any NTC-backed group raises ValueError.
+
+        **pool_batches=False**, single-guide mode (low MOI): for each guide within each covariate group:
         - Compute mean NTC sum factor: mean_ntc
         - Compute mean guide sum factor: mean_guide
         - Adjustment factor = mean_ntc / mean_guide
@@ -620,7 +642,45 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
                 # (4) Additive correction per cell in log-space
                 log_sf_adj[pos_indices] -= ga @ delta_g
 
-            if not covariates:
+            if pool_batches:
+                n_guides = guide_assignment.shape[1]
+                num = np.zeros(n_guides)
+                den = np.zeros(n_guides)
+                if covariates:
+                    groups = [g["_pos"].values for _, g in
+                              meta_out.assign(_pos=np.arange(len(meta_out))).groupby(covariates)]
+                else:
+                    groups = [np.arange(len(meta_out))]
+                for pos in groups:
+                    ga = guide_assignment[pos]
+                    lsf = log_sf[pos]
+                    cells_per_guide = np.asarray(ga.sum(axis=0)).ravel().astype(float)
+                    mean_log_sf_g = np.where(
+                        cells_per_guide > 0,
+                        np.asarray(ga.T @ lsf).ravel() / np.maximum(cells_per_guide, 1.0),
+                        np.nan,
+                    )
+                    ntc_means = mean_log_sf_g[is_ntc_guide]
+                    ntc_counts = cells_per_guide[is_ntc_guide]
+                    valid = ~np.isnan(ntc_means) & (ntc_counts > 0)
+                    if valid.sum() == 0:
+                        continue  # no NTC reference in this group
+                    ref = np.average(ntc_means[valid], weights=ntc_counts[valid])
+                    has = cells_per_guide > 0
+                    num[has] += cells_per_guide[has] * (mean_log_sf_g[has] - ref)
+                    den[has] += cells_per_guide[has]
+                total_cells = np.asarray(guide_assignment.sum(axis=0)).ravel()
+                unestimable = (den == 0) & (total_cells > 0)
+                if unestimable.any():
+                    bad = self.guide_meta['guide'].values[unestimable][:5].tolist() \
+                        if 'guide' in self.guide_meta.columns else np.where(unestimable)[0][:5].tolist()
+                    raise ValueError(
+                        f"adjust_ntc_sum_factor(pool_batches=True): {int(unestimable.sum())} guide(s) "
+                        f"have cells only in covariate groups without NTC cells, e.g. {bad}."
+                    )
+                delta_g = np.where(den > 0, num / np.maximum(den, 1.0), 0.0)
+                log_sf_adj = log_sf - np.asarray(guide_assignment @ delta_g).ravel()
+            elif not covariates:
                 _apply_highmoi_correction(np.arange(len(meta_out)))
             else:
                 meta_out["_pos"] = np.arange(len(meta_out))
@@ -630,6 +690,25 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
 
             meta_out[sum_factor_col_adj] = np.exp(log_sf_adj)
 
+        elif pool_batches:
+            log_sf = pd.Series(np.log(meta_out[sum_factor_col_old].values.astype(float)), index=meta_out.index)
+            is_ntc = (meta_out["target"] == "ntc").values
+            ntc_log_sf = log_sf.where(is_ntc)
+            if covariates:
+                ref = ntc_log_sf.groupby([meta_out[c] for c in covariates], dropna=False).transform("mean")
+            else:
+                ref = pd.Series(ntc_log_sf.mean(), index=meta_out.index)
+            # NaN where the cell's covariate group has no NTC cells (excluded from delta_g)
+            resid = log_sf - ref
+            delta_g = resid.groupby(meta_out["guide_used"]).mean()
+            unestimable = delta_g.index[delta_g.isna()]
+            if len(unestimable):
+                raise ValueError(
+                    f"adjust_ntc_sum_factor(pool_batches=True): {len(unestimable)} guide(s) have cells "
+                    f"only in covariate groups without NTC cells, e.g. {list(unestimable[:5])}."
+                )
+            meta_out["adjustment_factor"] = np.exp(-meta_out["guide_used"].map(delta_g).values)
+            meta_out[sum_factor_col_adj] = meta_out[sum_factor_col_old] * meta_out["adjustment_factor"]
         elif not covariates:
             # (1) Mean sum_factor among NTC rows, grouped by covariates (e.g. lane, cell_line)
             mean_ntc_value = meta_out.loc[meta_out['target'] == 'ntc', sum_factor_col_old].mean()
@@ -692,7 +771,8 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
             primary_mod.sum_factors = pd.DataFrame(index=meta_out['cell'].values)
         primary_mod.sum_factors[sum_factor_col_adj] = meta_out.set_index('cell')[sum_factor_col_adj]
 
-        print(f"[INFO] Created '{sum_factor_col_adj}' in modality sum_factors with NTC-based guide-level adjustment.")
+        print(f"[INFO] Created '{sum_factor_col_adj}' in modality sum_factors with NTC-based guide-level adjustment "
+              f"({'one log-space offset per guide, pooled across ' + str(covariates) if pool_batches else 'per covariate group'}).")
 
     def refit_sumfactor(
         self,

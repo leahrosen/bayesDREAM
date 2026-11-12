@@ -979,26 +979,27 @@ model.save_trans_summary(suffix='additive_hill')
 
 ```python
 model.adjust_ntc_sum_factor(
-    covariates,
+    covariates=None,
     sum_factor_col_old='sum_factor',
-    sum_factor_col_adj='sum_factor_adj'
+    sum_factor_col_adj='sum_factor_adj',
+    pool_batches=True,
 )
 ```
 
-Adjust sum factors based on NTC mean within covariate groups.
+Rescale sum factors so each guide's systematic library-size shift relative to NTC is removed.
 
 **Parameters:**
-- `covariates` (list of str): Covariates to group by
+- `covariates` (list of str, optional): Technical groups (e.g. `['batch']`). The NTC reference is computed within each group.
 - `sum_factor_col_old` (str): Input sum factor column. Default: `'sum_factor'`
 - `sum_factor_col_adj` (str): Output adjusted column. Default: `'sum_factor_adj'`
+- `pool_batches` (bool): Default `True`. One log-space offset per guide (NTC guides included): each cell's `log(sum_factor)` minus the mean `log(sum_factor)` of the NTC cells in its own covariate group, averaged over all the guide's cells. Then `sum_factor_adj = sum_factor * exp(-offset)`. The group (batch) shift stays in the factor, each cell keeps its depth relative to its guide, and precision depends on the guide's total cells, not cells per group. `False` restores the legacy per-(group, guide) ratio `mean_ntc / mean_guide` in linear space, which with few cells per group largely replaces each cell's depth by its group's NTC mean.
 
 **Side Effects:**
-- Adds `sum_factor_col_adj` column to `self.meta`
-- Adds `adjustment_factor` column to `self.meta`
+- Adds `sum_factor_col_adj` to the primary modality's `sum_factors`
 
 **Example:**
 ```python
-model.adjust_ntc_sum_factor(covariates=['lane', 'cell_line'])
+model.adjust_ntc_sum_factor(covariates=['batch'])
 ```
 
 ---
