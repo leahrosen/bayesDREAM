@@ -109,6 +109,7 @@ The main class in `bayesDREAM/model.py` implements multi-modal Bayesian modeling
 - `permute_genes(genes2permute, ...)`: Permutes guide-gene associations for null testing
 - `refit_sumfactor(covariates, ...)`: Re-estimates sum factors based on posterior cis expression
 - `fit_trans(sum_factor_col, function_type, modality_name, ...)`: Fits trans effects using `_model_y`. Default `x_level='cell', x_uncertainty='sample'`: each SVI step conditions on a fresh fit_cis posterior draw of x_true (fixed data, never a latent of `_model_y`); needs full `posterior_samples_cis` and raises otherwise. `x_uncertainty='median'` and `x_level='guide'` exist but are not recommended (see docs/FIT_TRANS_GUIDE.md)
+- `add_y_at_x_log2fc(x_log2fc, ...)`: optional step after `save_trans_summary()`; appends the fitted y effect at x log2FC value(s) (±inf allowed) relative to the curve's own value at the NTC x reference, per posterior draw, to the trans summary. Not-dependent features are 0 (not evaluated). Callable repeatedly
 
 **Function Types for Trans Modeling:**
 

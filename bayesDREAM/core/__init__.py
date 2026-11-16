@@ -1608,6 +1608,10 @@ class _BayesDREAMCore(TechnicalStateMixin, ModelPlottingMixin, DiagnosticsMixin)
     def save_trans_summary(self, *args, **kwargs):
         return self._summarizer.save_trans_summary(*args, **kwargs)
 
+    @functools.wraps(ModelSummarizer.add_y_at_x_log2fc)
+    def add_y_at_x_log2fc(self, *args, **kwargs):
+        return self._summarizer.add_y_at_x_log2fc(*args, **kwargs)
+
     @functools.wraps(ModelSummarizer.classify_second_deriv_roots)
     def classify_second_deriv_roots(self, *args, **kwargs):
         return self._summarizer.classify_second_deriv_roots(*args, **kwargs)

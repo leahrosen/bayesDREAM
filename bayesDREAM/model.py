@@ -2511,6 +2511,10 @@ class bayesDREAM(
     def save_trans_summary(self, *args, **kwargs):
         return super().save_trans_summary(*args, **kwargs)
 
+    @functools.wraps(_BayesDREAMCore.add_y_at_x_log2fc)
+    def add_y_at_x_log2fc(self, *args, **kwargs):
+        return super().add_y_at_x_log2fc(*args, **kwargs)
+
     @functools.wraps(_BayesDREAMCore.classify_second_deriv_roots)
     def classify_second_deriv_roots(self, *args, **kwargs):
         return super().classify_second_deriv_roots(*args, **kwargs)
