@@ -959,6 +959,7 @@ Export trans fit results as CSV files.
 - `output_dir` (str, optional): Directory for CSV files. Defaults to `{output_dir}/{label}/summaries/trans_{suffix}/`
 - `modalities` (list, optional): Modalities to export. Defaults to last fit modality
 - `suffix` (str): Identifier for this fit. Default: 'default'
+- `y_at_x_log2fc` (float or list, optional): off by default. Adds the fitted y effect at x log2FC = v, relative to the curve's own value at the NTC x reference (`y_log2fc_at_<tag>_median/lower/upper` for negbinom, `y_diff_at_*` for normal/studentt, `delta_p_at_*` for binomial; tag `xm1` for v=-1), per posterior draw, with x_ref drawn from the fit_cis posterior when available. Inactive components are gated to 0. Also adds `x_log2fc_<tag>_extrapolated` and `y_at_x_log2fc_x_ref_source`. See `docs/SUMMARY_EXPORT_GUIDE.md`.
 
 **Exports (varies by function_type):**
 - `A_summary.csv`: Amplitude parameters

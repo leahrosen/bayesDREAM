@@ -1745,6 +1745,7 @@ class ModelSummarizer:
         verbose: bool = True,
         max_features: Optional[int] = None,
         fdr_threshold: float = 0.05,
+        y_at_x_log2fc=None,
     ):
         """
         Save trans fit parameters as feature-wise CSV.
@@ -1867,6 +1868,16 @@ class ModelSummarizer:
         - o_y_ntc_median: Median o_y from fit_ntc (posterior_samples_ntc)
         - group_{g}_alpha_y_median: Technical group effect for group g (median, from fit_ntc)
 
+        If y_at_x_log2fc is given, for each value v (tag e.g. 'xm1' for v=-1, 'xp0p5' for
+        v=0.5; see _add_y_at_x_log2fc() for details):
+        - y_log2fc_at_{tag}_median/lower/upper (negbinom): log2 y(x_ref*2^v) - log2 y(x_ref),
+          y_diff_at_{tag}_* (normal/studentt): y(x_ref*2^v) - y(x_ref),
+          delta_p_at_{tag}_* (binomial): p(x_ref*2^v) - p(x_ref).
+          Relative to the fitted curve's own value at x_ref (not to fit_ntc's y_ntc), so a
+          flat curve gives exactly 0.
+        - x_log2fc_{tag}_extrapolated: x_ntc_matched*2^v lies outside [x_obs_min, x_obs_max]
+        - y_at_x_log2fc_x_ref_source: 'cis_draws' or 'x_ntc_matched' (see below)
+
         Parameters
         ----------
         output_dir : str, optional
@@ -1929,6 +1940,20 @@ class ModelSummarizer:
             Threshold on fdr_alpha/fdr_beta used to compute the `is_dependent` column
             (default: 0.05). Does not affect the `classification` column, which uses
             its own internal default independently.
+        y_at_x_log2fc : float or list of float, optional
+            Off by default. x log2FC value(s) v at which to evaluate the fitted curve's
+            y effect, relative to the curve's own value at the NTC reference x_ref:
+            effect = f(y(x_ref * 2**v)) - f(y(x_ref)), with f = log2 for negbinom and the
+            identity otherwise. Computed per trans posterior draw, so the reported 95%
+            interval carries the curve's uncertainty. When the full fit_cis posterior
+            draws are available (posterior_samples_cis not lean), x_ref is drawn too:
+            for each trans draw, x_ref is the median x_true over NTC cells in one fit_cis
+            draw, which adds the uncertainty of the NTC x level. Otherwise x_ref is the
+            point x_ntc_matched. Components that are not active (fdr >= fdr_threshold or
+            the Hill exponent's CI covers 0) are removed before evaluating, so
+            not-dependent features get exactly 0, consistent with observed_log2fc.
+            Fits with regularise=False are not gated. Not supported for multinomial.
+            Example: y_at_x_log2fc=-1 gives the effect of halving the cis gene.
         """
         if output_dir is None:
             output_dir = os.path.join(self.model.output_dir, self.model.label)
@@ -2284,6 +2309,20 @@ class ModelSummarizer:
                       f"not_dependent={n_flat}  (fdr_threshold={fdr_threshold})")
                 print(f"  which_active (of single_hill): a={n_single_a}  b={n_single_b}")
 
+        if y_at_x_log2fc is not None:
+            _t0 = time.time()
+            data.update(self._add_y_at_x_log2fc(
+                posterior, function_type, modality.distribution, n_features,
+                x_log2fc_values=y_at_x_log2fc,
+                active_a=active_a if fdr_applicable else None,
+                active_b=active_b if fdr_applicable else None,
+                x_ntc_matched=_x_ntc_matched,
+                x_obs_min=x_obs_min, x_obs_max=x_obs_max,
+                verbose=verbose,
+            ))
+            if verbose:
+                print(f"  _add_y_at_x_log2fc:         {time.time() - _t0:.1f}s")
+
         # Add phi_y (overdispersion) from posterior o_y: phi_y = 1 / o_y^2
         # Also add o_y directly.
         if 'o_y' in posterior:
@@ -2399,6 +2438,172 @@ class ModelSummarizer:
         print(f"       {n_features} features, function_type={function_type}")
 
         return df
+
+    @staticmethod
+    def _x_log2fc_tag(v: float) -> str:
+        """Column tag for an x log2FC value: -1 -> 'xm1', 0.5 -> 'xp0p5'."""
+        sign = 'm' if v < 0 else 'p'
+        mag = f"{abs(float(v)):g}".replace('.', 'p')
+        return f"x{sign}{mag}"
+
+    def _cis_x_ref_draws(self, n_draws: int, verbose: bool = False):
+        """
+        Per-draw NTC x reference from the fit_cis posterior: for each of n_draws
+        trans draws, the median x_true over NTC cells in one fit_cis draw (draws
+        resampled with a fixed seed when the counts differ). Returns [n_draws] or
+        None when no full cis posterior over model.meta's cells is available.
+        """
+        ps = getattr(self.model, 'posterior_samples_cis', None)
+        if ps is None or is_lean_posterior(ps):
+            return None
+        if 'x_true' in ps:
+            draws = ps['x_true']
+            log2_scale = False
+        elif 'log_x_true' in ps:
+            draws = ps['log_x_true']
+            log2_scale = True
+        else:
+            return None
+        draws = draws.detach().cpu().double().numpy() if isinstance(draws, torch.Tensor) \
+            else np.asarray(draws, dtype=float)
+        if draws.ndim < 2:
+            return None
+        draws = draws.reshape(draws.shape[0], -1)
+        if log2_scale:
+            draws = 2.0 ** draws
+        ntc_mask = (self.model.meta['target'].values == 'ntc')
+        if draws.shape[1] != len(ntc_mask) or not ntc_mask.any():
+            if verbose:
+                print(f"  [y_at_x_log2fc] cis draws cover {draws.shape[1]} cells, model.meta "
+                      f"has {len(ntc_mask)} ({int(ntc_mask.sum())} NTC); using x_ntc_matched")
+            return None
+        x_ref_cis = np.median(draws[:, ntc_mask], axis=1)  # [S_cis]
+        S_cis = x_ref_cis.shape[0]
+        if S_cis == n_draws:
+            return x_ref_cis
+        rng = np.random.default_rng(0)
+        return x_ref_cis[rng.choice(S_cis, size=n_draws, replace=S_cis < n_draws)]
+
+    def _add_y_at_x_log2fc(
+        self, posterior, function_type, distribution, n_features,
+        x_log2fc_values, active_a=None, active_b=None,
+        x_ntc_matched=None, x_obs_min=None, x_obs_max=None, verbose=False,
+    ):
+        """
+        Fitted y effect at given x log2FC value(s), relative to the curve's own value at
+        the NTC reference x_ref (see save_trans_summary's y_at_x_log2fc). Evaluated per
+        trans posterior draw with the same Hill form as _model_y:
+            single_hill:   y = A + alpha*Hill_a(x)
+            additive_hill: y = A + alpha*Hill_a(x) + beta*Hill_b(x)
+            nested_hill:   y = A + alpha*Hill_b(Hill_a(x))
+        active_a / active_b ([T] bool or None): components that are not active get weight
+        0 in every draw (None = no gating, e.g. regularise=False).
+        Returns a dict of new columns.
+        """
+        from ..utils import Hill_based_positive_logK
+
+        out = {}
+        if distribution == 'multinomial':
+            print("[WARNING] y_at_x_log2fc is not supported for multinomial; skipped.")
+            return out
+        if x_ntc_matched is None:
+            print("[WARNING] y_at_x_log2fc: x_ntc_matched (median x_true over NTC cells) "
+                  "is unavailable; skipped.")
+            return out
+
+        vals = np.atleast_1d(np.asarray(x_log2fc_values, dtype=float))
+
+        def _p(name):
+            if name not in posterior:
+                return None
+            p = posterior[name]
+            p = p.detach().cpu().double().numpy() if isinstance(p, torch.Tensor) \
+                else np.asarray(p, dtype=float)
+            if p.ndim == 3 and p.shape[1] == 1:
+                p = p.squeeze(1)
+            if p.ndim == 1:
+                p = p[None, :]
+            if p.ndim != 2:
+                raise ValueError(f"y_at_x_log2fc: unexpected shape {p.shape} for '{name}'")
+            if p.shape[1] == 1:
+                p = np.broadcast_to(p, (p.shape[0], n_features))
+            return p[:, :n_features]
+
+        def _logK(comp):
+            lk = _p(f'log_K_{comp}')
+            return lk if lk is not None else np.log(np.clip(_p(f'K_{comp}'), 1e-300, None))
+
+        A = _p('A')
+        if A is None:
+            A = np.zeros((1, n_features))
+        Vmax_a, n_a, logK_a = _p('Vmax_a'), _p('n_a'), _logK('a')
+        alpha = _p('alpha')
+        if alpha is None:
+            alpha = np.ones((1, n_features))
+        two_comp = function_type in ('additive_hill', 'nested_hill')
+        if two_comp:
+            Vmax_b, n_b, logK_b = _p('Vmax_b'), _p('n_b'), _logK('b')
+            beta = _p('beta')
+            if beta is None:
+                beta = np.ones((1, n_features))
+
+        if active_a is not None:
+            if function_type == 'nested_hill':
+                alpha = alpha * (np.asarray(active_a) | np.asarray(active_b))[None, :]
+            else:
+                alpha = alpha * np.asarray(active_a, dtype=float)[None, :]
+                if two_comp:
+                    beta = beta * np.asarray(active_b, dtype=float)[None, :]
+
+        S = max(p.shape[0] for p in [A, Vmax_a, n_a, logK_a, alpha])
+        x_ref = self._cis_x_ref_draws(S, verbose=verbose) if S > 1 else None
+        out['y_at_x_log2fc_x_ref_source'] = 'cis_draws' if x_ref is not None else 'x_ntc_matched'
+        if x_ref is None:
+            x_ref = np.full(S, float(x_ntc_matched))
+        if verbose:
+            print(f"  [y_at_x_log2fc] {S} trans draws; x_ref from "
+                  f"{out['y_at_x_log2fc_x_ref_source']}")
+
+        # float32, as in _model_y (Hill_based_positive_logK's soft clamp overflows to
+        # inf/NaN for float64 inputs); the log2 differences are taken in float64.
+        t = lambda a: torch.as_tensor(np.ascontiguousarray(a), dtype=torch.float32)
+
+        def _curve(x):  # x: [S] -> y: [S, T]
+            xs = t(x)[:, None]
+            Ha = Hill_based_positive_logK(xs, Vmax=t(Vmax_a), A=0, logK=t(logK_a), n=t(n_a))
+            if function_type == 'single_hill':
+                y = t(A) + t(alpha) * Ha
+            elif function_type == 'additive_hill':
+                Hb = Hill_based_positive_logK(xs, Vmax=t(Vmax_b), A=0, logK=t(logK_b), n=t(n_b))
+                y = t(A) + t(alpha) * Ha + t(beta) * Hb
+            else:  # nested_hill
+                Hb = Hill_based_positive_logK(Ha, Vmax=t(Vmax_b), A=0, logK=t(logK_b), n=t(n_b))
+                y = t(A) + t(alpha) * Hb
+            return y.numpy().astype(np.float64)
+
+        y0 = _curve(x_ref)
+        if distribution == 'negbinom':
+            prefix = 'y_log2fc_at'
+            tiny = np.finfo(float).tiny
+            g0 = np.log2(np.clip(y0, tiny, None))
+        elif distribution == 'binomial':
+            prefix, g0 = 'delta_p_at', y0
+        else:
+            prefix, g0 = 'y_diff_at', y0
+
+        for v in vals:
+            tag = self._x_log2fc_tag(v)
+            y1 = _curve(x_ref * 2.0 ** v)
+            g1 = np.log2(np.clip(y1, tiny, None)) if distribution == 'negbinom' else y1
+            eff = g1 - g0  # [S, T]; exactly 0 where every component is gated off
+            out[f'{prefix}_{tag}_median'] = np.median(eff, axis=0)
+            out[f'{prefix}_{tag}_lower'] = np.quantile(eff, 0.025, axis=0)
+            out[f'{prefix}_{tag}_upper'] = np.quantile(eff, 0.975, axis=0)
+            if x_obs_min is not None and x_obs_max is not None:
+                x_target = float(x_ntc_matched) * 2.0 ** v
+                out[f'x_log2fc_{tag}_extrapolated'] = bool(
+                    x_target < x_obs_min or x_target > x_obs_max)
+        return out
 
     # ========================================================================
     # Helper Methods

@@ -158,6 +158,28 @@ model.save_trans_summary(
 - `compute_inflection` (bool): Whether to compute inflection points for Hill functions (default: True)
 - `compute_full_log2fc` (bool): Whether to compute full log2FC range (default: True)
 
+### y effect at a given x log2FC (`y_at_x_log2fc`, optional)
+
+```python
+model.save_trans_summary(y_at_x_log2fc=[-1, -0.5])
+```
+
+For each value v, evaluates the fitted curve at the NTC reference x_ref and at x_ref * 2^v and reports the difference: `log2 y(x_ref * 2^v) - log2 y(x_ref)` for negbinom, the plain difference for normal/studentt and binomial. Multinomial is not supported.
+
+- **Reference is the curve itself**, not fit_ntc's `y_ntc`. A flat curve gives exactly 0, and the result doesn't depend on any offset between the trans fit's NTC level (its own cells, its sum factor column) and the shared NTC fit.
+- **Per posterior draw.** Each trans draw is evaluated, and `_median/_lower/_upper` give the median and 95% interval. If the full fit_cis posterior is loaded (not lean), each trans draw also gets its own x_ref: the median x_true over NTC cells in one fit_cis draw, so the interval includes the uncertainty of the NTC x level. Otherwise x_ref is `x_ntc_matched`. Which one was used is in `y_at_x_log2fc_x_ref_source`.
+- **Gated.** Components that are not active (same criterion as `is_dependent` / `which_active`) are removed in every draw, so not-dependent features get 0. Fits with `regularise=False` are not gated.
+- **Extrapolation.** `x_log2fc_<tag>_extrapolated` is True when `x_ntc_matched * 2^v` lies outside `[x_obs_min, x_obs_max]`. The value there is the curve extrapolated beyond the data.
+
+Columns, with tag `xm1` for v = -1, `xm0p5` for -0.5 and `xp1` for +1:
+
+| distribution | columns |
+|---|---|
+| negbinom | `y_log2fc_at_<tag>_median/_lower/_upper` |
+| normal, studentt | `y_diff_at_<tag>_median/_lower/_upper` |
+| binomial | `delta_p_at_<tag>_median/_lower/_upper` |
+| all | `x_log2fc_<tag>_extrapolated`, `y_at_x_log2fc_x_ref_source` |
+
 ### Output File
 
 **`trans_feature_summary_{modality}.csv`**
