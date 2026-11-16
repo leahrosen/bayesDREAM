@@ -158,6 +158,33 @@ model.save_trans_summary(
 - `compute_inflection` (bool): Whether to compute inflection points for Hill functions (default: True)
 - `compute_full_log2fc` (bool): Whether to compute full log2FC range (default: True)
 
+### y effect at a given x log2FC (`add_y_at_x_log2fc()`)
+
+A separate, optional step after `save_trans_summary()` that appends columns to `trans_feature_summary_{modality}.csv` (or to a summary DataFrame passed as `summary=`). It can be called repeatedly; columns for a value already present are overwritten.
+
+```python
+model.save_trans_summary()
+model.add_y_at_x_log2fc(-1)
+model.add_y_at_x_log2fc([-4, float('-inf'), float('inf')])
+```
+
+For each value v, evaluates the fitted curve at the NTC reference x_ref and at x_ref * 2^v and reports the difference: `log2 y(x_ref * 2^v) - log2 y(x_ref)` for negbinom, the plain difference for normal/studentt and binomial. Multinomial is not supported.
+
+- **Reference is the curve itself**, not fit_ntc's `y_ntc`. A flat curve gives exactly 0, and the result doesn't depend on any offset between the trans fit's NTC level and the shared NTC fit.
+- **±inf** use the Hill function's exact limits (x → 0 and x → ∞).
+- **Per posterior draw.** `_median/_lower/_upper` are the median and 95% interval over trans draws. If the full fit_cis posterior is loaded (`load_cis_fit(lean=False)`), each trans draw also gets its own x_ref: the median x_true over NTC cells in one fit_cis draw, so the interval includes the uncertainty of the NTC x level. Otherwise x_ref is `x_ntc_matched`. `y_at_x_log2fc_x_ref_source` records which was used.
+- **Only dependent features are evaluated** (`is_dependent`), using only their active components (`which_active`). Not-dependent features are set to 0 without evaluation. Fits with `regularise=False` have no gating, and every feature is evaluated.
+- **Extrapolation.** `x_log2fc_<tag>_extrapolated` is True when `x_ntc_matched * 2^v` lies outside `[x_obs_min, x_obs_max]`, and always for ±inf.
+
+Columns, with tag `xm1` for v = -1, `xm0p5` for -0.5, `xp1` for +1 and `xminf`/`xpinf` for ±inf:
+
+| distribution | columns |
+|---|---|
+| negbinom | `y_log2fc_at_<tag>_median/_lower/_upper` |
+| normal, studentt | `y_diff_at_<tag>_median/_lower/_upper` |
+| binomial | `delta_p_at_<tag>_median/_lower/_upper` |
+| all | `x_log2fc_<tag>_extrapolated`, `y_at_x_log2fc_x_ref_source` |
+
 ### Output File
 
 **`trans_feature_summary_{modality}.csv`**

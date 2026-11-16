@@ -14,6 +14,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import math
 import torch
 from scipy.special import betainc
 from scipy.optimize import brentq
@@ -601,8 +602,10 @@ def calculate_mu_x_guide(guide, x_obs_ntc_factored, guides_ntc):
 ########################################
 
 def default_sigmoid_clamp(dtype):
-    # log(max_float) is ~88.7 for float32, ~709.8 for float64
-    log_max = torch.log(torch.tensor(torch.finfo(dtype).max))
+    # log(max_float) is ~88.7 for float32, ~709.8 for float64. Taken in Python floats:
+    # torch.tensor(finfo(float64).max) defaults to float32, overflows to inf and made the
+    # clamp inf, so Hill_based_positive_logK returned NaN for float64 inputs.
+    log_max = math.log(torch.finfo(dtype).max)
     return float(0.75 * log_max)  # 0.75 is conservative
 
 def Hill_based_positive_logK(x, Vmax, A, logK, n):

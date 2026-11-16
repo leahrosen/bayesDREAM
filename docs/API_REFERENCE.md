@@ -973,6 +973,22 @@ model.save_trans_summary(suffix='additive_hill')
 
 ---
 
+#### add_y_at_x_log2fc()
+
+```python
+model.add_y_at_x_log2fc(x_log2fc, modality_name=None, summary=None, output_dir=None, save=True)
+```
+
+Appends the fitted y effect at x log2FC value(s) `x_log2fc` (float or list; `-inf`/`+inf` allowed) to the trans summary written by `save_trans_summary()`, relative to the curve's own value at the NTC x reference. Computed per posterior draw (x_ref also drawn from the fit_cis posterior when it is fully loaded); not-dependent features are 0 without evaluation and inactive components are dropped. Can be called repeatedly. Columns: `y_log2fc_at_<tag>_median/lower/upper` (negbinom), `y_diff_at_*` (normal/studentt), `delta_p_at_*` (binomial), `x_log2fc_<tag>_extrapolated`, `y_at_x_log2fc_x_ref_source`; tag `xm1` for -1, `xminf` for -inf. See `docs/SUMMARY_EXPORT_GUIDE.md`.
+
+```python
+model.save_trans_summary()
+model.add_y_at_x_log2fc(-1)
+model.add_y_at_x_log2fc([-4, float('-inf'), float('inf')])
+```
+
+---
+
 ### Utility Methods
 
 #### adjust_ntc_sum_factor()

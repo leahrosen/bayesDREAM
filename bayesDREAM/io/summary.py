@@ -1867,6 +1867,9 @@ class ModelSummarizer:
         - o_y_ntc_median: Median o_y from fit_ntc (posterior_samples_ntc)
         - group_{g}_alpha_y_median: Technical group effect for group g (median, from fit_ntc)
 
+        To add the fitted y effect at a given x log2FC (e.g. -1, -4, -inf), call
+        add_y_at_x_log2fc() on the saved summary afterwards.
+
         Parameters
         ----------
         output_dir : str, optional
@@ -2398,6 +2401,288 @@ class ModelSummarizer:
         print(f"[SAVE] Trans summary saved to {output_file}")
         print(f"       {n_features} features, function_type={function_type}")
 
+        return df
+
+    def _cis_x_ref_draws(self, n_draws: int, verbose: bool = False):
+        """
+        Per-draw NTC x reference from the fit_cis posterior: for each of n_draws
+        trans draws, the median x_true over NTC cells in one fit_cis draw (draws
+        resampled with a fixed seed when the counts differ). Returns [n_draws] or
+        None when no full cis posterior over model.meta's cells is available.
+        """
+        ps = getattr(self.model, 'posterior_samples_cis', None)
+        if ps is None or is_lean_posterior(ps):
+            return None
+        if 'x_true' in ps:
+            draws = ps['x_true']
+            log2_scale = False
+        elif 'log_x_true' in ps:
+            draws = ps['log_x_true']
+            log2_scale = True
+        else:
+            return None
+        draws = draws.detach().cpu().double().numpy() if isinstance(draws, torch.Tensor) \
+            else np.asarray(draws, dtype=float)
+        if draws.ndim < 2:
+            return None
+        draws = draws.reshape(draws.shape[0], -1)
+        if log2_scale:
+            draws = 2.0 ** draws
+        ntc_mask = (self.model.meta['target'].values == 'ntc')
+        if draws.shape[1] != len(ntc_mask) or not ntc_mask.any():
+            if verbose:
+                print(f"  [y_at_x_log2fc] cis draws cover {draws.shape[1]} cells, model.meta "
+                      f"has {len(ntc_mask)} ({int(ntc_mask.sum())} NTC); using x_ntc_matched")
+            return None
+        x_ref_cis = np.median(draws[:, ntc_mask], axis=1)  # [S_cis]
+        S_cis = x_ref_cis.shape[0]
+        if S_cis == n_draws:
+            return x_ref_cis
+        rng = np.random.default_rng(0)
+        return x_ref_cis[rng.choice(S_cis, size=n_draws, replace=S_cis < n_draws)]
+
+    @staticmethod
+    def _x_log2fc_tag(v: float) -> str:
+        """Column tag for an x log2FC value: -1 -> 'xm1', 0.5 -> 'xp0p5', -inf -> 'xminf'."""
+        sign = 'm' if v < 0 else 'p'
+        mag = 'inf' if np.isinf(v) else f"{abs(float(v)):g}".replace('.', 'p')
+        return f"x{sign}{mag}"
+
+    @staticmethod
+    def _hill_frac(x, logK, n):
+        """
+        x^n / (K^n + x^n) elementwise (torch, broadcasting), with the exact limits at x = 0
+        and x = inf: 0 / 1 for n > 0, 1 / 0 for n < 0, 1/2 for n = 0. Finite x > 0 goes
+        through Hill_based_positive_logK, i.e. the same expression _model_y uses.
+        """
+        from ..utils import Hill_based_positive_logK
+        x, logK, n = torch.broadcast_tensors(x, logK, n)
+        regular = (x > 0) & torch.isfinite(x)
+        x_safe = torch.where(regular, x, torch.ones_like(x))
+        frac = Hill_based_positive_logK(x_safe, Vmax=1.0, A=0.0, logK=logK, n=n)
+        half = torch.full_like(n, 0.5)
+        at_0 = torch.where(n > 0, torch.zeros_like(n), torch.where(n < 0, torch.ones_like(n), half))
+        at_inf = torch.where(n > 0, torch.ones_like(n), torch.where(n < 0, torch.zeros_like(n), half))
+        return torch.where(regular, frac, torch.where(x <= 0, at_0, at_inf))
+
+    def add_y_at_x_log2fc(
+        self,
+        x_log2fc,
+        modality_name: Optional[str] = None,
+        summary: Optional[pd.DataFrame] = None,
+        output_dir: Optional[str] = None,
+        save: bool = True,
+        verbose: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Append the fitted y effect at given x log2FC value(s) to a trans summary.
+
+        For each value v, the fitted curve is evaluated at the NTC reference x_ref and at
+        x_ref * 2**v, and the difference is reported:
+            negbinom:         log2 y(x_ref * 2**v) - log2 y(x_ref)
+            normal/studentt:  y(x_ref * 2**v) - y(x_ref)
+            binomial:         p(x_ref * 2**v) - p(x_ref)
+        The reference is the curve's own value at x_ref, not fit_ntc's y_ntc, so a flat
+        curve gives exactly 0. v may be -inf (x -> 0) or +inf (x -> inf); both use the Hill
+        function's exact limits.
+
+        Computed per trans posterior draw (median and 95% interval over draws). When the
+        full fit_cis posterior is loaded (load_cis_fit(lean=False)), x_ref is drawn too:
+        for each trans draw, the median x_true over NTC cells in one fit_cis draw, so the
+        interval includes the uncertainty of the NTC x level. Otherwise x_ref is the
+        summary's x_ntc_matched.
+
+        Only dependent features are evaluated (summary's is_dependent), and within them
+        only the active components (which_active); inactive components are dropped in every
+        draw. Not-dependent features are set to 0 without evaluation. For fits without
+        gating (regularise=False, is_dependent all NaN) every feature and component is
+        evaluated.
+
+        Can be called repeatedly (e.g. once for -1, then for [-4, -inf]); columns for a
+        value already present are overwritten.
+
+        Parameters
+        ----------
+        x_log2fc : float or list of float
+            x log2FC value(s), relative to x_ref. -1 = halving the cis gene.
+        modality_name : str, optional
+            Trans modality (default: primary modality).
+        summary : pd.DataFrame, optional
+            Trans summary from save_trans_summary(). If None, it is read from
+            <output_dir>/trans_feature_summary_<modality>.csv.
+        output_dir : str, optional
+            Directory of the summary CSV (default: model.output_dir/model.label).
+        save : bool
+            Write the updated summary back to <output_dir>/trans_feature_summary_<modality>.csv
+            (default True).
+
+        Adds, per value (tag 'xm1' for -1, 'xm0p5' for -0.5, 'xp1' for +1, 'xminf' for -inf):
+        - y_log2fc_at_<tag>_median/_lower/_upper (negbinom), y_diff_at_<tag>_* (normal,
+          studentt) or delta_p_at_<tag>_* (binomial)
+        - x_log2fc_<tag>_extrapolated: x_ntc_matched * 2**v outside [x_obs_min, x_obs_max]
+          (always True for +-inf)
+        and y_at_x_log2fc_x_ref_source: 'cis_draws' or 'x_ntc_matched'.
+
+        Returns
+        -------
+        pd.DataFrame
+            The summary with the new columns.
+        """
+        if modality_name is None:
+            modality_name = self.model.primary_modality
+        modality = self.model.get_modality(modality_name)
+        distribution = modality.distribution
+        if distribution == 'multinomial':
+            raise ValueError("add_y_at_x_log2fc does not support multinomial modalities.")
+        if output_dir is None:
+            output_dir = os.path.join(self.model.output_dir, self.model.label)
+        path = os.path.join(output_dir, f'trans_feature_summary_{modality_name}.csv')
+        if summary is None:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"{path} not found; run save_trans_summary() first "
+                                        "or pass summary=.")
+            summary = pd.read_csv(path, low_memory=False)
+        df = summary.copy()
+
+        if modality_name == self.model.primary_modality:
+            posterior = self.model.posterior_samples_trans
+        else:
+            posterior = getattr(modality, 'posterior_samples_trans', None)
+        if posterior is None:
+            raise ValueError(f"No trans posterior for modality '{modality_name}'; run or load "
+                             "fit_trans first.")
+
+        function_type = str(df['function_type'].iloc[0])
+        if function_type not in ('single_hill', 'additive_hill', 'nested_hill'):
+            raise ValueError(f"add_y_at_x_log2fc: unsupported function_type {function_type!r}")
+
+        # Summary rows -> posterior feature columns, by feature id.
+        feature_ids = [str(f) for f in (modality.feature_ids if modality.feature_ids is not None
+                                        else range(modality.counts.shape[0]))]
+        pos = {f: i for i, f in enumerate(feature_ids)}
+        feats = df['feature'].astype(str)
+        missing = [f for f in feats if f not in pos]
+        if missing:
+            raise ValueError(f"{len(missing)} summary feature(s) not in modality "
+                             f"'{modality_name}', e.g. {missing[:5]}")
+        col_idx = feats.map(pos).to_numpy()
+        n_total = len(feature_ids)
+
+        # Which rows / components to evaluate.
+        def _as_bool(col):
+            return df[col].astype(str).str.lower().eq('true').to_numpy()
+        gated = 'is_dependent' in df.columns and df['is_dependent'].notna().any()
+        if gated:
+            evaluate = _as_bool('is_dependent')
+            which = df['which_active'].astype(str) if 'which_active' in df.columns \
+                else pd.Series('a', index=df.index)
+            act_a = which.isin(['a', 'both']).to_numpy()
+            act_b = which.isin(['b', 'both']).to_numpy()
+            if function_type == 'nested_hill':  # alpha gates the whole nested curve
+                act_a = act_a | act_b
+        else:
+            evaluate = np.ones(len(df), dtype=bool)
+            act_a = act_b = np.ones(len(df), dtype=bool)
+        rows = np.flatnonzero(evaluate)
+        cols = col_idx[rows]
+
+        # x reference and observed range.
+        if 'x_ntc_matched' in df.columns and df['x_ntc_matched'].notna().any():
+            x_ntc_matched = float(df['x_ntc_matched'].dropna().iloc[0])
+        else:
+            ntc_mask = (self.model.meta['target'].values == 'ntc')
+            if not ntc_mask.any() or getattr(self.model, 'x_true', None) is None:
+                raise ValueError("No x_ntc_matched in the summary and no NTC cells / x_true "
+                                 "to compute it from.")
+            xt = self.model.x_true
+            xt = xt.detach().cpu().numpy() if isinstance(xt, torch.Tensor) else np.asarray(xt)
+            x_ntc_matched = float(np.median(xt[ntc_mask]))
+        x_obs_min = float(df['x_obs_min'].iloc[0]) if 'x_obs_min' in df.columns else None
+        x_obs_max = float(df['x_obs_max'].iloc[0]) if 'x_obs_max' in df.columns else None
+
+        def _p(name, default=None):
+            if name not in posterior:
+                return default
+            p = posterior[name]
+            p = p.detach().cpu().double().numpy() if isinstance(p, torch.Tensor) \
+                else np.asarray(p, dtype=float)
+            if p.ndim == 3 and p.shape[1] == 1:
+                p = p.squeeze(1)
+            if p.ndim == 1:
+                p = p[None, :]
+            if p.ndim != 2:
+                raise ValueError(f"add_y_at_x_log2fc: unexpected shape {p.shape} for '{name}'")
+            if p.shape[1] == 1:
+                p = np.broadcast_to(p, (p.shape[0], n_total))
+            return torch.as_tensor(np.ascontiguousarray(p[:, cols]), dtype=torch.float64)
+
+        def _logK(comp):
+            lk = _p(f'log_K_{comp}')
+            return lk if lk is not None else torch.log(_p(f'K_{comp}').clamp_min(1e-300))
+
+        ones = torch.ones((1, len(rows)), dtype=torch.float64)
+        A = _p('A', torch.zeros_like(ones))
+        Vmax_a, n_a, logK_a = _p('Vmax_a'), _p('n_a'), _logK('a')
+        alpha = _p('alpha', ones) * torch.as_tensor(act_a[rows], dtype=torch.float64)
+        two_comp = function_type in ('additive_hill', 'nested_hill')
+        if two_comp:
+            Vmax_b, n_b, logK_b = _p('Vmax_b'), _p('n_b'), _logK('b')
+            beta = _p('beta', ones)
+            if function_type == 'additive_hill':
+                beta = beta * torch.as_tensor(act_b[rows], dtype=torch.float64)
+
+        S = max(t.shape[0] for t in [A, Vmax_a, n_a, logK_a, alpha])
+        x_ref = self._cis_x_ref_draws(S, verbose=verbose) if S > 1 else None
+        x_ref_source = 'cis_draws' if x_ref is not None else 'x_ntc_matched'
+        if x_ref is None:
+            x_ref = np.full(S, x_ntc_matched)
+        x_ref = torch.as_tensor(x_ref, dtype=torch.float64)[:, None]  # [S, 1]
+
+        def _curve(x):  # x: [S, 1] -> y: [S, n_rows]
+            Ha = Vmax_a * self._hill_frac(x, logK_a, n_a)
+            if function_type == 'single_hill':
+                return A + alpha * Ha
+            if function_type == 'additive_hill':
+                return A + alpha * Ha + beta * Vmax_b * self._hill_frac(x, logK_b, n_b)
+            return A + alpha * Vmax_b * self._hill_frac(Ha, logK_b, n_b)  # nested_hill
+
+        if distribution == 'negbinom':
+            prefix = 'y_log2fc_at'
+            g = lambda y: torch.log2(y.clamp_min(torch.finfo(torch.float64).tiny))
+        else:
+            prefix = 'delta_p_at' if distribution == 'binomial' else 'y_diff_at'
+            g = lambda y: y
+
+        values = [float(v) for v in np.atleast_1d(np.asarray(x_log2fc, dtype=object))]
+        g0 = g(_curve(x_ref)) if len(rows) else None
+        for v in values:
+            tag = self._x_log2fc_tag(v)
+            med, lo, hi = (np.zeros(len(df)) for _ in range(3))
+            if len(rows):
+                x1 = torch.zeros_like(x_ref) if v == -np.inf else (
+                    torch.full_like(x_ref, np.inf) if v == np.inf else x_ref * 2.0 ** v)
+                eff = (g(_curve(x1)) - g0).numpy()
+                med[rows] = np.median(eff, axis=0)
+                lo[rows] = np.quantile(eff, 0.025, axis=0)
+                hi[rows] = np.quantile(eff, 0.975, axis=0)
+            df[f'{prefix}_{tag}_median'] = med
+            df[f'{prefix}_{tag}_lower'] = lo
+            df[f'{prefix}_{tag}_upper'] = hi
+            if np.isinf(v):
+                df[f'x_log2fc_{tag}_extrapolated'] = True
+            elif x_obs_min is not None and x_obs_max is not None:
+                x_t = x_ntc_matched * 2.0 ** v
+                df[f'x_log2fc_{tag}_extrapolated'] = bool(x_t < x_obs_min or x_t > x_obs_max)
+        df['y_at_x_log2fc_x_ref_source'] = x_ref_source
+
+        if verbose:
+            print(f"[add_y_at_x_log2fc] {modality_name}: x log2FC {values}; evaluated "
+                  f"{len(rows)}/{len(df)} features ({'dependent only' if gated else 'ungated'}), "
+                  f"{S} draws, x_ref from {x_ref_source}")
+        if save:
+            df.to_csv(path, index=False)
+            if verbose:
+                print(f"[SAVE] {path}")
         return df
 
     # ========================================================================
