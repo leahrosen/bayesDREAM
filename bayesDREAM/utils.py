@@ -915,6 +915,46 @@ def modality_feature_axis_kwargs(mod):
             'n_categories': dims.get('n_categories')}
 
 
+def technical_group_count(codes, alpha=None, name="alpha"):
+    """
+    Number of technical groups C for indexing a fit_ntc alpha by technical_group_code.
+
+    Cells index alpha by their ``technical_group_code``, so C is the size of the
+    group axis of the fit_ntc estimate, not the number of distinct codes among
+    the current cells: a model subset to fewer groups than the (shared) NTC fit
+    keeps the original codes. Without an alpha, C is ``max(code) + 1``.
+
+    Parameters
+    ----------
+    codes : array-like of int
+        technical_group_code per cell.
+    alpha : torch.Tensor, optional
+        fit_ntc point estimate with the group axis first (``[C]``, ``[C, T]``
+        or ``[C, T, K]``).
+    name : str
+        Name used in the error message.
+
+    Raises
+    ------
+    ValueError
+        If a cell's code is negative or does not index into ``alpha``.
+    """
+    codes = np.asarray(codes)
+    max_code = int(codes.max()) if codes.size else -1
+    if codes.size and int(codes.min()) < 0:
+        raise ValueError(f"technical_group_code contains negative values (min {int(codes.min())}).")
+    if alpha is None:
+        return max_code + 1
+    C = int(alpha.shape[0])
+    if max_code >= C:
+        raise ValueError(
+            f"technical_group_code goes up to {max_code}, but {name} has only {C} "
+            f"technical groups. {name} must be the fit_ntc point estimate for the "
+            f"current technical groups; re-run fit_ntc() (or load_ntc_fit())."
+        )
+    return C
+
+
 def check_technical_alpha_shape(alpha, C, trailing_shape=(), name="alpha"):
     """
     Validate a fit_ntc technical-group point estimate before it is used.
