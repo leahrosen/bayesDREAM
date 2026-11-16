@@ -23,7 +23,7 @@ import pyro.optim as optim
 import pyro.infer as infer
 import pyro.poutine as poutine
 
-from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, check_tensor, is_lean_posterior, check_technical_alpha_shape
+from ..utils import find_beta, Hill_based_positive, Hill_based_positive_logK, check_tensor, is_lean_posterior, check_technical_alpha_shape, technical_group_count
 from . import FitterBase
 
 
@@ -1675,7 +1675,8 @@ class TransFitter(FitterBase):
 
         # Check if technical_group_code exists (for correction)
         if "technical_group_code" in meta_subset.columns:
-            C = meta_subset['technical_group_code'].nunique()
+            C = technical_group_count(meta_subset['technical_group_code'].values,
+                                      alpha_y_prefit, name="alpha_y_prefit")
             groups_tensor = torch.tensor(meta_subset['technical_group_code'].values, dtype=torch.long, device=self.model.device)
             print(f"[INFO] Using technical_group_code with {C} groups for correction")
         else:

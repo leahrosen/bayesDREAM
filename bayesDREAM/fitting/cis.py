@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 import pyro
 import pyro.distributions as dist
-from ..utils import get_guide_axis_labels, check_technical_alpha_shape
+from ..utils import get_guide_axis_labels, check_technical_alpha_shape, technical_group_count
 from pyro.distributions.transforms import iterated, affine_autoregressive
 import pyro.optim as optim
 import pyro.infer as infer
@@ -500,7 +500,8 @@ class CisFitter(FitterBase):
                     pass
 
             self.model.meta["technical_group_code"] = new_technical_group_code
-            C = self.model.meta['technical_group_code'].nunique()
+            C = technical_group_count(self.model.meta['technical_group_code'].values,
+                                      self.model.alpha_x_prefit, name="alpha_x")
             groups_tensor = torch.tensor(self.model.meta['technical_group_code'].values, dtype=torch.long, device=self.model.device)
 
             # alpha_x_prefit is required when technical_covariates are specified
@@ -518,7 +519,8 @@ class CisFitter(FitterBase):
         else:
             # alpha_x_prefit exists but no new technical_covariates specified
             # Use existing technical groups
-            C = self.model.meta['technical_group_code'].nunique()
+            C = technical_group_count(self.model.meta['technical_group_code'].values,
+                                      self.model.alpha_x_prefit, name="alpha_x")
             groups_tensor = torch.tensor(self.model.meta['technical_group_code'].values, dtype=torch.long, device=self.model.device)
         
         N = self.model.meta.shape[0]

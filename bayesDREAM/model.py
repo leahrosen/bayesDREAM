@@ -998,6 +998,12 @@ class bayesDREAM(
         else:
             if full_alpha_y_add is not None and full_alpha_y_add.shape[-1] == T:
                 primary_mod.alpha_y_prefit_add = full_alpha_y_add[..., trans_idx].median(dim=0).values
+        # Trim any other alpha_y_prefit_* still covering the cis gene (e.g.
+        # load_ntc_fit() sets alpha_y_prefit_add for negbinom too); feature axis is dim 1.
+        for _name in ('alpha_y_prefit_mult', 'alpha_y_prefit_add'):
+            _a = getattr(primary_mod, _name, None)
+            if isinstance(_a, torch.Tensor) and _a.ndim >= 2 and _a.shape[1] == T:
+                setattr(primary_mod, _name, _a[:, trans_idx])
 
         cis_modality = self.modalities['cis']
         cis_modality.posterior_samples_ntc = cis_posterior
