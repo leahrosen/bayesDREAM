@@ -3012,7 +3012,12 @@ def _compute_posterior_fdr(posterior, activity_epsilon: float = 0.01):
         if (alpha_s is not None and alpha_s.ndim >= 2
                 and vmax_s is not None and vmax_s.ndim >= 2
                 and A_s    is not None and A_s.ndim    >= 2):
-            ratio = alpha_s * vmax_s / np.maximum(A_s, 1e-12)
+            # Denominator mirrors io/summary._activity_scale: noise SD sigma_y for
+            # normal/studentt (the only distributions whose trans posterior has
+            # sigma_y), baseline A otherwise.
+            sig_s = _to_np('sigma_y')
+            scale = np.maximum(sig_s if sig_s is not None else A_s, 1e-12)
+            ratio = alpha_s * vmax_s / scale
             return (ratio > activity_epsilon).mean(axis=0)
         if alpha_s is not None:
             # Fallback point estimate of alpha (not a P(active) draw-count, so
@@ -5534,6 +5539,7 @@ def plot_xy_data(
         For negbinom: excludes cells with y_obs < min_counts
         For binomial: minimum denominator
         For multinomial: minimum total counts
+        Ignored for normal/studentt (continuous, not count data).
     color_palette : dict, optional
         Custom colors for technical groups, keyed by the group label string
         Example: {'K562': 'crimson', 'TF1': 'dodgerblue'}
@@ -6005,8 +6011,10 @@ def plot_xy_data(
     if min_counts is None:
         if modality.distribution == 'negbinom':
             min_counts = 0  # Include all cells for gene expression
-        else:
+        elif modality.distribution in ('binomial', 'multinomial'):
             min_counts = 3  # Require min counts for binomial/multinomial
+        else:
+            min_counts = 0  # normal/studentt: continuous data, no count threshold
 
     # Get color palette
     if color_palette is None:

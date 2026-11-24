@@ -357,8 +357,11 @@ class Modality:
         ----------------------
         negbinom   : drop feature if total counts < min_count OR std across cells == 0
         normal/
-        studentt   : drop feature if std across cells == 0
-                     (sum of values < min_count is also checked for consistency)
+        studentt   : drop feature if it has no finite value, or if the NaN-aware std
+                     across cells == 0. min_count is NOT applied: the values are
+                     continuous on (-inf, inf), so a total-count threshold is
+                     meaningless (a feature of negative scores would sum below it).
+                     NaNs are missing observations, not zero-variance evidence.
         binomial   : drop feature if denominator sum < min_count (too few observations)
                      OR ratio std (numer/denom) across cells == 0
         multinomial: drop feature if total counts (summed over cells+categories) < min_count
@@ -395,7 +398,20 @@ class Modality:
 
             keep = has_data & has_variance
 
-        else:  # negbinom, normal, studentt
+        elif self.distribution in ('normal', 'studentt'):
+            # Continuous data: only drop features with no finite value or zero
+            # variance across cells (NaN = missing, ignored). No min_count.
+            cell_ax = self.cells_axis
+            vals = (self.counts.toarray() if sparse.issparse(self.counts)
+                    else np.asarray(self.counts, dtype=float))
+            has_finite = np.isfinite(vals).any(axis=cell_ax)
+            import warnings as _warnings
+            with np.errstate(invalid='ignore'), _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN rows
+                stds = np.nanstd(np.where(np.isfinite(vals), vals, np.nan), axis=cell_ax)
+            keep = has_finite & (np.nan_to_num(stds, nan=0.0) > 0)
+
+        else:  # negbinom
             cell_ax = self.cells_axis
 
             if self.is_sparse:
@@ -420,10 +436,11 @@ class Modality:
         keep_idx = np.where(keep)[0]
         n_before = self.dims['n_features']
 
-        print(
-            f"[Modality '{self.name}'] Removed {n_removed}/{n_before} feature(s) "
-            f"with total counts < {min_count} or zero variance across cells."
-        )
+        if self.distribution in ('normal', 'studentt'):
+            _reason = "with no finite values or zero variance across cells."
+        else:
+            _reason = f"with total counts < {min_count} or zero variance across cells."
+        print(f"[Modality '{self.name}'] Removed {n_removed}/{n_before} feature(s) {_reason}")
 
         # ------------------------------------------------------------------ #
         # 2. Apply mask to counts and auxiliary arrays                        #

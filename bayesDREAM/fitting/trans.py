@@ -424,6 +424,7 @@ class TransFitter(FitterBase):
         o_y_ntc_tensor=None,
         sigma_hat_tensor=None,
         alpha_n_coupling: float = 10.0,
+        sigma_n_rate: float = 1.0,
         latents_only=False,
     ):
 
@@ -503,7 +504,11 @@ class TransFitter(FitterBase):
                 #   sigma = |y_ntc − Amean| floored at 10% of response amplitude
                 #
                 # Fallback (no NTC posterior): fixed-shift approach using response amplitude.
-                delta_A = (Vmax_mean_tensor - Amean_tensor).clamp_min(epsilon_tensor)
+                # Response amplitude: Vmax_mean_tensor is already Q95 - Q05 (location-
+                # invariant). Subtracting Amean again would make the prior width depend
+                # on where the data are centred (and collapse to epsilon for data with a
+                # large positive offset).
+                delta_A = Vmax_mean_tensor.clamp_min(epsilon_tensor)
                 if y_ntc_tensor is not None:
                     sigma_A = (y_ntc_tensor - Amean_tensor).abs().clamp_min(delta_A * 0.1)
                     mean_A  = (1.0 - _o_y_weight) * Amean_tensor + _o_y_weight * y_ntc_tensor
@@ -697,7 +702,7 @@ class TransFitter(FitterBase):
                 # Per-gene n scale: sampled inside trans_plate so each gene is
                 # independently regularised (prevents one noisy gene from inflating
                 # the global sigma and loosening the prior for all other genes).
-                sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(1.0)))
+                sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(sigma_n_rate)))
 
                 # For multinomial, we need per-category parameters (K-1 categories, Kth is residual)
                 if distribution == 'multinomial' and K is not None:
@@ -824,7 +829,7 @@ class TransFitter(FitterBase):
 
                 # Sample all required parameters (additive_hill and nested_hill need second set)
                 if function_type in ['additive_hill', 'nested_hill']:
-                    sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
+                    sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(sigma_n_rate)))
                     if not use_alpha:
                         # No sparsity gate (regularise=False): beta fixed at 1, like alpha.
                         if distribution == 'multinomial' and K is not None:
@@ -1337,6 +1342,7 @@ class TransFitter(FitterBase):
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
+        sigma_n_rate: float = 1.0,
         regularise: bool = True,
         x_level: str = 'cell',
         x_uncertainty: str = 'sample',
@@ -1469,6 +1475,13 @@ class TransFitter(FitterBase):
             so every feature is fitted with an active Hill curve. p_n, init_temp,
             final_temp and alpha_n_coupling then have no effect. All other priors
             (including the n prior) are unchanged.
+        sigma_n_rate : float, optional
+            Rate of the Exponential prior on each feature's Hill-coefficient spread:
+            n_raw ~ Normal(n_mu_raw, sigma_n), sigma_n ~ Exponential(sigma_n_rate), for
+            both n_a and n_b. Default 1.0 (prior mean of sigma_n = 1), which keeps |n|
+            mostly below ~3. Lower it (e.g. 0.1) to allow steep, switch-like responses
+            (|n| ~ 10), e.g. when the cis gene moves only a fraction of a log2 unit.
+            Applies with and without regularise. Must be > 0.
         debug : bool, optional
             If True, run the slow debug SVI step that checks all parameters for
             non-finite values at every iteration and prints detailed diagnostics
@@ -1532,6 +1545,9 @@ class TransFitter(FitterBase):
         # specify it.  This must happen before _do_warmup and guide initialisation,
         # both of which depend on function_type.
         # ---------------------------
+        if not (np.isfinite(sigma_n_rate) and sigma_n_rate > 0):
+            raise ValueError(f"sigma_n_rate must be a positive finite number, got {sigma_n_rate}")
+
         if not regularise:
             # No sparsity gates → nothing for the alpha/n coupling penalty to act on.
             alpha_n_coupling = 0.0
@@ -2032,7 +2048,7 @@ class TransFitter(FitterBase):
 
         # Compute cell-level Q05/Q95 for Amean/Vmax priors (always, regardless of guide count)
         _q05_was_zero = None
-        mean_y_corrected_tensor = None  # [T]; set below for 2D distributions (negbinom, binomial)
+        mean_y_corrected_tensor = None  # [T]; set below for 2D data (negbinom, binomial, normal, studentt); stays None for multinomial
         if y_obs_for_prior.ndim == 2:  # [N, T]
             Amean_tensor = torch.nanquantile(y_obs_for_prior, 0.05, dim=0)  # [T]
             Vmax_raw     = torch.nanquantile(y_obs_for_prior, 0.95, dim=0)  # [T]
@@ -2056,24 +2072,31 @@ class TransFitter(FitterBase):
             # For normal/studentt, Q05 can legitimately be ≤ 0 (e.g. negative SpliZ scores),
             # and the linear-space prior works fine with negative Amean — so only floor NaNs.
             # NaN Amean values (no valid observations) are handled by the fallback below.
+            # For normal/studentt no positive floor is applied at all: a NaN Q05 (no
+            # finite observations) is left NaN and filled by the NaN fallback below with
+            # the median baseline of the other features, rather than a count-scale constant.
             if distribution in ('negbinom', 'binomial'):
                 _q05_was_zero = (Amean_tensor <= 0) | torch.isnan(Amean_tensor)
-            else:  # normal, studentt: Q05 can be ≤ 0; only catch NaN
-                _q05_was_zero = torch.isnan(Amean_tensor)
-            if _q05_was_zero.any():
-                n_q05_zero = _q05_was_zero.sum().item()
-                _amean_floor = self._t(2.0 ** -10)
-                if _q01_ntc_for_floor is not None:
-                    _amean_floor = torch.minimum(_q01_ntc_for_floor, _amean_floor)
-                Amean_tensor = torch.where(_q05_was_zero, _amean_floor.expand_as(Amean_tensor), Amean_tensor)
-                print(f"[INFO] Q05 floor: {n_q05_zero} features raised to {_amean_floor.item():.3e} (min(q01_ntc, 2^-10))")
-            Amean_tensor     = Amean_tensor.clamp_min(self._t(1e-12))
+                if _q05_was_zero.any():
+                    n_q05_zero = _q05_was_zero.sum().item()
+                    _amean_floor = self._t(2.0 ** -10)
+                    if _q01_ntc_for_floor is not None:
+                        _amean_floor = torch.minimum(_q01_ntc_for_floor, _amean_floor)
+                    Amean_tensor = torch.where(_q05_was_zero, _amean_floor.expand_as(Amean_tensor), Amean_tensor)
+                    print(f"[INFO] Q05 floor: {n_q05_zero} features raised to {_amean_floor.item():.3e} (min(q01_ntc, 2^-10))")
+                Amean_tensor = Amean_tensor.clamp_min(self._t(1e-12))
+            # Vmax_mean is the response amplitude Q95 - Q05, which is ≥ 0 for every
+            # distribution (location-invariant for normal/studentt).
             Vmax_mean_tensor = (Vmax_raw - Amean_tensor).clamp_min(self._t(1e-3))
 
             # Mean across all cells — used as a data-driven floor for the A prior upper
             # anchor. When y_ntc ≈ 0 (gene absent in NTC but expressed in perturbations),
             # this prevents both anchors collapsing to the same floor value.
-            mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0).clamp_min(self._t(1e-12))  # [T]
+            # Only used by the negbinom (log2-space) A prior; for normal/studentt the
+            # mean may legitimately be ≤ 0, so it is left unclamped.
+            mean_y_corrected_tensor = torch.nanmean(y_obs_for_prior, dim=0)  # [T]
+            if distribution in ('negbinom', 'binomial'):
+                mean_y_corrected_tensor = mean_y_corrected_tensor.clamp_min(self._t(1e-12))
 
         elif y_obs_for_prior.ndim == 3:  # [N, T, K] — multinomial
             K_obs = y_obs_for_prior.shape[2]
@@ -2126,7 +2149,18 @@ class TransFitter(FitterBase):
                 print(f"[INFO] Using fallback: mean={valid_mean.item():.3f}, var={valid_var_val.item():.3f}")
                 fallback_A    = torch.clamp(valid_mean * 0.5, min=0.01, max=0.99)
                 fallback_Vmax = torch.clamp(valid_mean,       min=0.01, max=0.99)
-            else:  # negbinom, normal, studentt
+            elif distribution in ['normal', 'studentt']:
+                # Continuous data on (-inf, inf): fill with the median baseline (Q05) and
+                # median amplitude (Q95 - Q05) of the other features — no halving and no
+                # positive floor on the baseline, which are count-data conventions.
+                valid_A    = Amean_tensor[~torch.isnan(Amean_tensor)]
+                valid_Vmax = Vmax_mean_tensor[~torch.isnan(Vmax_mean_tensor)]
+                fallback_A    = torch.median(valid_A)    if valid_A.numel()    > 0 else self._t(0.0)
+                fallback_Vmax = torch.median(valid_Vmax) if valid_Vmax.numel() > 0 else self._t(1.0)
+                fallback_Vmax = fallback_Vmax.clamp_min(self._t(1e-3))
+                print(f"[INFO] Using fallback: A={fallback_A.item():.3f}, "
+                      f"amplitude={fallback_Vmax.item():.3f} (medians across other features)")
+            else:  # negbinom
                 valid_A   = Amean_tensor[~torch.isnan(Amean_tensor)]
                 valid_var = cell_var[~torch.isnan(cell_var)]
                 if valid_A.numel() > 0:
@@ -2539,6 +2573,7 @@ class TransFitter(FitterBase):
             x_level=x_level,
             x_uncertainty=x_uncertainty,
             regularise=regularise,
+            sigma_n_rate=float(sigma_n_rate),
         )
 
         def _load_and_validate_ckpt(path, context="loading checkpoint"):
@@ -2564,10 +2599,15 @@ class TransFitter(FitterBase):
             _stored_reg = ckpt.get('regularise', True)
             if _stored_reg != regularise:
                 _bad.append(f"  regularise: checkpoint={_stored_reg}, current call={regularise}")
+            # A different n prior would silently mix two models in one fit. Checkpoints
+            # predating the parameter don't record it, so they can't be checked.
+            _stored_rate = ckpt.get('sigma_n_rate')
+            if _stored_rate is not None and _stored_rate != float(sigma_n_rate):
+                _bad.append(f"  sigma_n_rate: checkpoint={_stored_rate}, current call={sigma_n_rate}")
             if _bad:
                 raise ValueError(
                     f"[{context}] Checkpoint metadata mismatch — cannot resume "
-                    f"(parameter shapes differ):\n" + "\n".join(_bad)
+                    f"(parameter shapes or priors differ):\n" + "\n".join(_bad)
                 )
             # Non-structural mismatches → warn only
             # Use effective_function_type when available (warmup checkpoints store
@@ -2750,6 +2790,7 @@ class TransFitter(FitterBase):
                 o_y_ntc_tensor=o_y_ntc_tensor,
                 sigma_hat_tensor=sigma_hat_tensor,
                 alpha_n_coupling=current_coupling,
+                sigma_n_rate=sigma_n_rate,
             )
             if debug:
                 try:
@@ -2891,6 +2932,7 @@ class TransFitter(FitterBase):
                 "o_y_ntc_tensor": self._to_cpu(o_y_ntc_tensor) if o_y_ntc_tensor is not None else None,
                 "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor) if sigma_hat_tensor is not None else None,
                 "alpha_n_coupling": alpha_n_coupling,
+                "sigma_n_rate": sigma_n_rate,
             }
         else:
             model_inputs = {
@@ -2930,6 +2972,7 @@ class TransFitter(FitterBase):
                 "o_y_ntc_tensor": o_y_ntc_tensor,
                 "sigma_hat_tensor": sigma_hat_tensor,
                 "alpha_n_coupling": alpha_n_coupling,
+                "sigma_n_rate": sigma_n_rate,
             }
 
         if self.model.device.type == "cuda":
@@ -3099,7 +3142,7 @@ class TransFitter(FitterBase):
                 'nmin':             float(nmin.item()),
                 'nmax':             float(nmax.item()),
                 'n_mu_raw':         n_mu_raw_prior,
-                'sigma_n_prior_rate': 1.0,           # Exp(1) prior per gene → mean sigma = 1
+                'sigma_n_prior_rate': float(sigma_n_rate),  # sigma_n ~ Exp(rate) per gene; mean sigma = 1/rate
                 # Vmax_a / Vmax_b (log-normal for negbinom/normal/studentt)
                 'Vmax_log_mu':      Vmax_log_mu_p,   # [T] numpy array or None
                 'Vmax_log_sigma':   Vmax_log_sigma_p, # scalar or None
@@ -3192,7 +3235,7 @@ class TransFitter(FitterBase):
             elif distribution in ('normal', 'studentt'):
                 _Amean_np = Amean_tensor.cpu().numpy()
                 _Vmax_mean_np = Vmax_mean_tensor.cpu().numpy()
-                _delta_A_np = np.maximum(_Vmax_mean_np - _Amean_np, epsilon)
+                _delta_A_np = np.maximum(_Vmax_mean_np, epsilon)  # = Q95 - Q05, as in _model_y
                 if sigma_hat_tensor is not None:
                     _sigma_hat_np = sigma_hat_tensor.cpu().numpy()
                     _sigma_ref = max(float(_sigma_hat_np.mean()), epsilon)

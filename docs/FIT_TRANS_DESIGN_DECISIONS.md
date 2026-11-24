@@ -137,7 +137,7 @@ where `weight = o_y / (o_y + beta_o_beta/beta_o_alpha)` adaptively blends toward
 ## 5. n (Hill Coefficient) Prior — Hierarchical
 
 ```
-sigma_n_a  ~ Exponential(1/2)                  # global hyperprior (mean = 2)
+sigma_n_a  ~ Exponential(sigma_n_rate)         # per-feature spread; default rate 1 (mean = 1)
 n_mu_raw   = half_n * atanh((n_mu - center_n) / half_n)   # inverse soft_clamp of n_mu = 0
 n_a_raw    ~ Normal(n_mu_raw, sigma_n_a)        # per-gene in unconstrained space
 n_a        = soft_clamp(n_a_raw, nmin, nmax)   # constrained to safe range
@@ -160,6 +160,8 @@ K and Vmax priors are **per-gene and data-driven** (magnitudes are gene-specific
 |--------|------|--------|-----------|
 | (archive) | pre-2026 | `Exp(1/5)`, mean = 5 | Original value |
 | `8d8332d` | 2026-03-30 | `Exp(1/2)`, mean = 2 | Exp(1/5) allowed sigma_n to grow so large that n routinely hit the physical overflow bounds (nmin/nmax ≈ ±38). Exp(1/2) covers biological Hill coefficients ~0.5–8 without systematic boundary hits. |
+| `708dc91` | 2026-04-08 | `Exp(1)`, mean = 1 | Reverted to Exp(1) inside a large refactor commit, without a stated reason. |
+| (this branch) | 2026-11-24 | `Exp(sigma_n_rate)`, default 1 | Rate exposed as a `fit_trans` parameter; default unchanged. Exp(1) keeps \|n\| mostly ≲ 3, which can flatten switch-like responses where the cis gene moves only a fraction of a log2 unit (Panten2026 guide fitness, MYC and GFI1B CRISPRa: needs \|n\| ≈ 10; `sigma_n_rate=0.1` recovers them). Lowering the rate raises the risk of the overflow-bound hits that motivated the 2026-03 tightening. |
 
 ### Hard Clamp → Soft Clamp (`_soft_clamp`)
 

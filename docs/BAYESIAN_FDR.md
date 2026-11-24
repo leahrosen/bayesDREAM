@@ -81,6 +81,20 @@ Dividing by $A_i$ makes the quantity expression-scale invariant (a 10% perturbat
 on a lowly expressed gene has the same scale as a 10% perturbation on a highly
 expressed gene).
 
+**Normal / Student-t.** The baseline $A_i$ is a location on $(-\infty, \infty)$ and can
+be zero or negative, so a ratio to it is meaningless (and would change if the data
+were shifted). For these distributions the denominator is the residual noise SD
+$\sigma_{y,i}^{(s)}$ from the same posterior sample:
+
+$$r_i^{(s)} = \frac{\alpha_i^{(s)} \cdot \text{Vmax}_{a,i}^{(s)}}{\sigma_{y,i}^{(s)}}$$
+
+i.e. "effect larger than $\varepsilon$ times the per-cell noise SD". With
+$\varepsilon = 0.01$ this is comparable to the negbinom threshold: for a negative
+binomial, the per-cell SD is roughly $o_y \cdot \mu$ for moderately expressed genes,
+so 1% of baseline is about 1–2% of the noise SD at typical $o_y \approx 0.5$–$1$.
+(Implemented in `io/summary._activity_scale`; mirrored in
+`plotting/xy_plots._compute_posterior_fdr`.)
+
 The **local FDR** for component A of gene $i$ is then:
 
 $$\text{lfdr}_{i,A} = 1 - P\!\left(r_i > \varepsilon \mid \text{data}\right)
@@ -175,6 +189,8 @@ for each gene $i$ (and analogously for component B):
 **Step 1: Compute normalized effect size per sample**
 $$r_{i,A}^{(s)} \leftarrow \frac{\alpha_i^{(s)} \cdot \text{Vmax}_{a,i}^{(s)}}{\max(A_i^{(s)},\, 10^{-12})}$$
 
+(for normal/studentt: $\max(\sigma_{y,i}^{(s)}, 10^{-12})$ in the denominator instead)
+
 **Step 2: Compute activity probability**
 $$p_{i,A} \leftarrow \frac{1}{S}\sum_{s=1}^{S} \mathbf{1}[r_{i,A}^{(s)} > \varepsilon]$$
 
@@ -208,7 +224,7 @@ These are used by `_classify_additive_hill` to assign each gene to:
 `flat`, `single_positive`, `single_negative`, `additive_positive`, `additive_negative`,
 `non_monotonic_min`, or `non_monotonic_max`.
 
-### `full_log2fc` / `full_delta_p`
+### `full_log2fc` / `full_delta_p` / `full_delta`
 
 A gene is classified as **flat** (full dynamic range = 0) if both components fail the
 FDR threshold:
