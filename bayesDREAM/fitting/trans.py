@@ -2047,7 +2047,7 @@ class TransFitter(FitterBase):
 
         # Compute cell-level Q05/Q95 for Amean/Vmax priors (always, regardless of guide count)
         _q05_was_zero = None
-        mean_y_corrected_tensor = None  # [T]; set below for 2D distributions (negbinom, binomial)
+        mean_y_corrected_tensor = None  # [T]; set below for 2D data (negbinom, binomial, normal, studentt); stays None for multinomial
         if y_obs_for_prior.ndim == 2:  # [N, T]
             Amean_tensor = torch.nanquantile(y_obs_for_prior, 0.05, dim=0)  # [T]
             Vmax_raw     = torch.nanquantile(y_obs_for_prior, 0.95, dim=0)  # [T]
