@@ -424,6 +424,7 @@ class TransFitter(FitterBase):
         o_y_ntc_tensor=None,
         sigma_hat_tensor=None,
         alpha_n_coupling: float = 10.0,
+        sigma_n_rate: float = 1.0,
         latents_only=False,
     ):
 
@@ -701,7 +702,7 @@ class TransFitter(FitterBase):
                 # Per-gene n scale: sampled inside trans_plate so each gene is
                 # independently regularised (prevents one noisy gene from inflating
                 # the global sigma and loosening the prior for all other genes).
-                sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(1.0)))
+                sigma_n_a = pyro.sample("sigma_n_a", dist.Exponential(self._t(sigma_n_rate)))
 
                 # For multinomial, we need per-category parameters (K-1 categories, Kth is residual)
                 if distribution == 'multinomial' and K is not None:
@@ -828,7 +829,7 @@ class TransFitter(FitterBase):
 
                 # Sample all required parameters (additive_hill and nested_hill need second set)
                 if function_type in ['additive_hill', 'nested_hill']:
-                    sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(1.0)))
+                    sigma_n_b = pyro.sample("sigma_n_b", dist.Exponential(self._t(sigma_n_rate)))
                     if not use_alpha:
                         # No sparsity gate (regularise=False): beta fixed at 1, like alpha.
                         if distribution == 'multinomial' and K is not None:
@@ -1341,6 +1342,7 @@ class TransFitter(FitterBase):
         predictive_checkpoint: str = None,
         restart_from_checkpoint: bool = True,
         alpha_n_coupling: float = 10.0,
+        sigma_n_rate: float = 1.0,
         regularise: bool = True,
         x_level: str = 'cell',
         x_uncertainty: str = 'sample',
@@ -1473,6 +1475,13 @@ class TransFitter(FitterBase):
             so every feature is fitted with an active Hill curve. p_n, init_temp,
             final_temp and alpha_n_coupling then have no effect. All other priors
             (including the n prior) are unchanged.
+        sigma_n_rate : float, optional
+            Rate of the Exponential prior on each feature's Hill-coefficient spread:
+            n_raw ~ Normal(n_mu_raw, sigma_n), sigma_n ~ Exponential(sigma_n_rate), for
+            both n_a and n_b. Default 1.0 (prior mean of sigma_n = 1), which keeps |n|
+            mostly below ~3. Lower it (e.g. 0.1) to allow steep, switch-like responses
+            (|n| ~ 10), e.g. when the cis gene moves only a fraction of a log2 unit.
+            Applies with and without regularise. Must be > 0.
         debug : bool, optional
             If True, run the slow debug SVI step that checks all parameters for
             non-finite values at every iteration and prints detailed diagnostics
@@ -1536,6 +1545,9 @@ class TransFitter(FitterBase):
         # specify it.  This must happen before _do_warmup and guide initialisation,
         # both of which depend on function_type.
         # ---------------------------
+        if not (np.isfinite(sigma_n_rate) and sigma_n_rate > 0):
+            raise ValueError(f"sigma_n_rate must be a positive finite number, got {sigma_n_rate}")
+
         if not regularise:
             # No sparsity gates → nothing for the alpha/n coupling penalty to act on.
             alpha_n_coupling = 0.0
@@ -2560,6 +2572,7 @@ class TransFitter(FitterBase):
             x_level=x_level,
             x_uncertainty=x_uncertainty,
             regularise=regularise,
+            sigma_n_rate=float(sigma_n_rate),
         )
 
         def _load_and_validate_ckpt(path, context="loading checkpoint"):
@@ -2585,10 +2598,15 @@ class TransFitter(FitterBase):
             _stored_reg = ckpt.get('regularise', True)
             if _stored_reg != regularise:
                 _bad.append(f"  regularise: checkpoint={_stored_reg}, current call={regularise}")
+            # A different n prior would silently mix two models in one fit. Checkpoints
+            # predating the parameter don't record it, so they can't be checked.
+            _stored_rate = ckpt.get('sigma_n_rate')
+            if _stored_rate is not None and _stored_rate != float(sigma_n_rate):
+                _bad.append(f"  sigma_n_rate: checkpoint={_stored_rate}, current call={sigma_n_rate}")
             if _bad:
                 raise ValueError(
                     f"[{context}] Checkpoint metadata mismatch — cannot resume "
-                    f"(parameter shapes differ):\n" + "\n".join(_bad)
+                    f"(parameter shapes or priors differ):\n" + "\n".join(_bad)
                 )
             # Non-structural mismatches → warn only
             # Use effective_function_type when available (warmup checkpoints store
@@ -2771,6 +2789,7 @@ class TransFitter(FitterBase):
                 o_y_ntc_tensor=o_y_ntc_tensor,
                 sigma_hat_tensor=sigma_hat_tensor,
                 alpha_n_coupling=current_coupling,
+                sigma_n_rate=sigma_n_rate,
             )
             if debug:
                 try:
@@ -2912,6 +2931,7 @@ class TransFitter(FitterBase):
                 "o_y_ntc_tensor": self._to_cpu(o_y_ntc_tensor) if o_y_ntc_tensor is not None else None,
                 "sigma_hat_tensor": self._to_cpu(sigma_hat_tensor) if sigma_hat_tensor is not None else None,
                 "alpha_n_coupling": alpha_n_coupling,
+                "sigma_n_rate": sigma_n_rate,
             }
         else:
             model_inputs = {
@@ -2951,6 +2971,7 @@ class TransFitter(FitterBase):
                 "o_y_ntc_tensor": o_y_ntc_tensor,
                 "sigma_hat_tensor": sigma_hat_tensor,
                 "alpha_n_coupling": alpha_n_coupling,
+                "sigma_n_rate": sigma_n_rate,
             }
 
         if self.model.device.type == "cuda":
@@ -3120,7 +3141,7 @@ class TransFitter(FitterBase):
                 'nmin':             float(nmin.item()),
                 'nmax':             float(nmax.item()),
                 'n_mu_raw':         n_mu_raw_prior,
-                'sigma_n_prior_rate': 1.0,           # Exp(1) prior per gene → mean sigma = 1
+                'sigma_n_prior_rate': float(sigma_n_rate),  # sigma_n ~ Exp(rate) per gene; mean sigma = 1/rate
                 # Vmax_a / Vmax_b (log-normal for negbinom/normal/studentt)
                 'Vmax_log_mu':      Vmax_log_mu_p,   # [T] numpy array or None
                 'Vmax_log_sigma':   Vmax_log_sigma_p, # scalar or None
