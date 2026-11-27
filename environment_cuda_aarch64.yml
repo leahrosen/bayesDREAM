@@ -22,8 +22,8 @@ dependencies:
   - scikit-learn>=1.3.0
 
   # R and Bioconductor packages for preprocessing.
-  # If the solve fails on these (bioconda aarch64 coverage is incomplete),
-  # remove these four lines and run prepare_inputs / scran on an x86 node.
+  # Tested on NAISS Arrhenius GH200 nodes (2026-11): bioconda provides
+  # linux-aarch64 builds (scran 1.40.0), and calculateSumFactors runs.
   - r-base>=4.0
   - bioconductor-scran>=1.20
   - r-irkernel

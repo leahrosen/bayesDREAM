@@ -129,6 +129,9 @@ pip install -e .
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
+Tested on NAISS Arrhenius GH200 nodes (2026-11): PyTorch 2.5.1 (CUDA 12.6, from
+conda-forge), Pyro 1.9.2 and scran 1.40.0 (bioconda linux-aarch64) all install and run.
+
 To have `~/.bashrc` pick the right conda per node, wrap the `conda init` block in a
 check on `uname -m`:
 
@@ -137,7 +140,6 @@ case "$(uname -m)" in
     aarch64) __conda_root=/path/to/software/miniforge3_aarch64 ;;
     *)       __conda_root=/path/to/software/miniconda3 ;;
 esac
-# >>> conda initialize >>>
 __conda_setup="$("$__conda_root/bin/conda" 'shell.bash' 'hook' 2> /dev/null)"
 if [ $? -eq 0 ]; then
     eval "$__conda_setup"
@@ -147,15 +149,20 @@ else
     export PATH="$__conda_root/bin:$PATH"
 fi
 unset __conda_setup __conda_root
-# <<< conda initialize <<<
 ```
 
-Note: don't keep the `# >>> conda initialize >>>` markers if you might ever re-run
-`conda init`, since it would overwrite this block.
+This replaces the `# >>> conda initialize >>>` ... `# <<< conda initialize <<<` block.
+Leave those markers out: `conda init` rewrites whatever sits between them.
 
-If the env solve fails on the R/Bioconductor packages (bioconda's aarch64 coverage is
-incomplete), remove them from the yml. You only need them for preprocessing
-(`scran` sum factors), which can run on an x86 node with `environment_cpu.yml`.
+Optionally, `export CONDA_PKGS_DIRS=...` inside the `aarch64)` branch to keep a
+separate package cache for the ARM install. Without it, conda caches packages in
+`<install>/pkgs`.
+
+**Git on compute nodes:** if you authenticate to GitHub through a forwarded SSH agent
+(`ForwardAgent yes` on your laptop), the agent reaches the login node but not a compute
+node entered via `salloc` + `jobsh`/`srun`. There `git fetch` fails with
+`Permission denied (publickey)`. Run git on the login node (same filesystem), and the
+install/fitting on the compute node.
 
 ### AMD GPUs (ROCm)
 
