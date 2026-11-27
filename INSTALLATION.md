@@ -12,10 +12,12 @@ bayesDREAM provides architecture-specific conda environments:
 |-----------------|----------|----------|
 | `environment_cpu.yml` | CPU-only | Local dev, login nodes, M1/M2 Mac |
 | `environment_cuda.yml` | NVIDIA GPU | CUDA 12.1 (most GPU clusters) |
+| `environment_cuda_aarch64.yml` | NVIDIA GPU, ARM CPU | Grace Hopper (GH200) / other aarch64 GPU nodes |
 | `environment_rocm.yml` | AMD GPU | ROCm 6.0 (AMD GPU clusters) |
 
 **Quick reference:**
 - **NVIDIA GPU cluster** → `environment_cuda.yml`
+- **NVIDIA GPU cluster with ARM nodes** (`uname -m` prints `aarch64`, e.g. GH200) → `environment_cuda_aarch64.yml` (see [ARM (aarch64) GPU nodes](#arm-aarch64-gpu-nodes-eg-grace-hopper))
 - **AMD GPU cluster** → `environment_rocm.yml`
 - **No GPU / Local Mac** → `environment_cpu.yml`
 
@@ -98,6 +100,62 @@ You should see:
 CUDA available: True
 CUDA version: 12.1
 ```
+
+### ARM (aarch64) GPU nodes (e.g. Grace Hopper)
+
+Some clusters (e.g. NAISS Arrhenius) have x86_64 login nodes but ARM (`aarch64`) GPU
+nodes. Check with `uname -m` on both. If they differ:
+
+- **A conda installed on the x86 login node cannot run on the aarch64 GPU node.** A
+  typical symptom is `conda` failing with `import: unable to open X server` followed by a
+  bash syntax error on `sys.argv`: the x86 Python can't execute, so bash falls back to
+  interpreting the `conda` Python script as a shell script.
+- `environment_cuda.yml` won't solve on aarch64 either: the `pytorch`/`nvidia` channels
+  have no aarch64 CUDA builds.
+
+Install a second, aarch64 conda alongside the x86 one, **from the GPU node**:
+
+```bash
+# On an aarch64 GPU node (e.g. inside salloc)
+cd /path/to/software
+wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh
+bash Miniforge3-Linux-aarch64.sh -b -p $PWD/miniforge3_aarch64
+source miniforge3_aarch64/etc/profile.d/conda.sh
+
+cd /path/to/bayesDREAM_forClaude
+conda env create -f environment_cuda_aarch64.yml
+conda activate bayesdream_cuda
+pip install -e .
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+To have `~/.bashrc` pick the right conda per node, wrap the `conda init` block in a
+check on `uname -m`:
+
+```bash
+case "$(uname -m)" in
+    aarch64) __conda_root=/path/to/software/miniforge3_aarch64 ;;
+    *)       __conda_root=/path/to/software/miniconda3 ;;
+esac
+# >>> conda initialize >>>
+__conda_setup="$("$__conda_root/bin/conda" 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+elif [ -f "$__conda_root/etc/profile.d/conda.sh" ]; then
+    . "$__conda_root/etc/profile.d/conda.sh"
+else
+    export PATH="$__conda_root/bin:$PATH"
+fi
+unset __conda_setup __conda_root
+# <<< conda initialize <<<
+```
+
+Note: don't keep the `# >>> conda initialize >>>` markers if you might ever re-run
+`conda init`, since it would overwrite this block.
+
+If the env solve fails on the R/Bioconductor packages (bioconda's aarch64 coverage is
+incomplete), remove them from the yml. You only need them for preprocessing
+(`scran` sum factors), which can run on an x86 node with `environment_cpu.yml`.
 
 ### AMD GPUs (ROCm)
 

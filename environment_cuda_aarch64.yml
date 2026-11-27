@@ -1,0 +1,66 @@
+name: bayesdream_cuda
+# NVIDIA GPU environment for ARM (aarch64) nodes, e.g. NVIDIA Grace Hopper (GH200).
+#
+# Use this instead of environment_cuda.yml when `uname -m` on the GPU node prints
+# `aarch64`. The `pytorch`/`nvidia` channels used by environment_cuda.yml have no
+# aarch64 CUDA builds, so PyTorch comes from conda-forge (`pytorch-gpu`) here.
+#
+# Requires an aarch64 conda (e.g. Miniforge3-Linux-aarch64.sh). An x86_64
+# conda installed on an x86 login node cannot run on an aarch64 node.
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  # Python version
+  - python=3.11
+
+  # Core scientific computing
+  - numpy>=1.24.0
+  - scipy>=1.10.0
+  - pandas>=2.0.0
+  - scikit-learn>=1.3.0
+
+  # R and Bioconductor packages for preprocessing.
+  # If the solve fails on these (bioconda aarch64 coverage is incomplete),
+  # remove these four lines and run prepare_inputs / scran on an x86 node.
+  - r-base>=4.0
+  - bioconductor-scran>=1.20
+  - r-irkernel
+  - r-data.table
+
+  # PyTorch with CUDA support (conda-forge, CUDA 12.x, aarch64)
+  - pytorch-gpu>=2.2.0
+
+  # Visualization
+  - matplotlib>=3.7
+  - seaborn>=0.12
+
+  # Pyro probabilistic programming
+  - pip
+  - pip:
+    - pyro-ppl>=1.9.0
+    - adjustText>=1.0.0  # Non-overlapping label placement for volcano plots
+
+  # Statistical modeling (GAMs for systematic shift test)
+  - statsmodels>=0.14.0
+
+  # Data I/O
+  - h5py>=3.8.0
+
+  # Performance
+  - openblas
+
+  # Jupyter
+  - jupyterlab>=4.0
+  - ipykernel
+  - notebook
+  - ipywidgets
+
+# Installation instructions (run ON the aarch64 GPU node):
+# 1. Confirm architecture:   uname -m        # -> aarch64
+# 2. Create the environment: conda env create -f environment_cuda_aarch64.yml
+# 3. Activate:               conda activate bayesdream_cuda
+# 4. Install bayesDREAM:     pip install -e .
+# 5. Verify GPU access:
+#    python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
